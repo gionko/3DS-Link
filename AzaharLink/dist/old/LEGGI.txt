@@ -1,0 +1,81 @@
+AzaharLink - dist/old/ : LE VERSIONI VECCHIE
+===========================================
+
+NESSUNO DI QUESTI FILE VA USATO PER LE PROVE. La versione da installare e da provare e' UNA SOLA: la 1.0.1, cioe'
+dist/3DSLink.cia (da FBI) o dist/3DSLink.3dsx (l'app 3DS Link, che ha preso il posto dell'app Setup): il plugin AzaharLink.3gx e' DENTRO l'app, che lo
+scrive da sola in SD:/3ds/3DSLink/ (dalla 1.0.1 non e' piu' un file di dist/), con il piano di prove di dist/LEGGIMI.txt e di
+PROVE_HARDWARE.md. Questa cartella tiene le build precedenti, con i nomi originali, solo per riferimento (e per
+confrontare un log vecchio con un file vecchio). Niente e' stato cancellato: le build piu' vecchie (0.1.11, 0.1.12, gli esperimenti con
+plugin vuoti), una build scartata della 0.1.16 (mai provata, con una regola di memoria poi cambiata) e il vecchio LEGGIMI.txt con le note scritte
+dall'utente nella PROVA 1 sono in analysis/old_tests/ del repository (fuori da git).
+
+Come riconoscerle: il nome del file e la prima riga del log
+    ==== AzaharLink <versione> (built ...) ====
+(l'orologio della console c'e' solo dalla 0.1.15.1). Nella cartella del gioco (SD:/luma/plugins/<ID del gioco>/) deve esserci
+UN solo .3gx alla volta.
+
+AzaharLink-0.1.14.3gx     896.353 byte   md5 d3f1bad55d8e04260c919290f930432c   (costruita il 2026-10-08)
+    L'ultima versione prima della riscrittura della 0.1.15. Provata su hardware SOLO con Final Fantasy Explorers (tre
+    sessioni, 0 errori di socket, uscite pulite). Difetti noti: con debug=1 e debug=2 i caricamenti sono molto piu' lunghi
+    (il registro costa CPU e scheda SD); il debug predefinito era 1; il gioco non si accorge del collegamento perso, della
+    stanza chiusa e del coperchio (la sessione UDS resta "connessa"); blocco dei socket da 384 KB. Ignora le chiavi
+    rcvbuf_kb e sleep_stop dell'ini.
+
+AzaharLink-0.1.15.3gx     951.203 byte   md5 a4d3c727a1f7d4f668d2217ec94e33d8   (costruita il 2026-10-10)
+    La 0.1.15 finale. DIFETTO NOTO: con debug=1 fa crashare Zelda Tri Force Heroes quando si chiude il gioco (HOME, poi
+    Chiudi software): schermata di eccezione di Luma "data abort" nel processo Alice, PC 0x00105ACC. Visto sulla tua
+    console il 2026-10-10 con la build INTERMEDIA della 0.1.15; la finale ha lo stesso gancio e nell'emulatore riempie
+    gli stessi 464 byte e sovrascrive lo stesso oggetto. A debug=0 il percorso che crasha non c'e'. Corretto nel codice della
+    0.1.16 e 0.1.17 (README.md, "Difetto corretto"); visto su una console UNA volta, il 2026-10-14, con la 0.1.16: un'uscita
+    di TFH a debug=1 senza schermata di eccezione (PROVA 4); la prova completa sono le uscite del piano di PROVE_HARDWARE.md.
+    In piu', rispetto alla 0.1.17: la scala di riconnessione 2/4/6/8/10 s anche con la
+    WiFi spenta, l'avviso falso "Memory margin low" su TFH, la riga "plugin total" che sommava anche le attese, nessun filtro
+    delle lobby estranee nella stanza. Legge sleep_stop come acceso/spento (qualunque valore diverso da 0, anche 2 o vuoto,
+    e' "acceso", e agisce anche da host, il caso che bloccava la console): con un ini della 0.1.17 porta sleep_stop a 0
+    prima di usarla.
+
+AzaharLink-0.1.15.1.3gx   958.035 byte   md5 fcf37414e2cc514dda676ff5bc4d7f8f   (costruita il 2026-10-11)
+    L'hotfix della 0.1.15: toglie la formattazione printf dal percorso del gancio (la causa del crash di TFH). Non e' mai
+    girata su una console. Superata: la 0.1.17 contiene tutto quello che c'e' qui e le correzioni chieste dalla PROVA 1 e dalla PROVA 2
+    del 2026-10-10. Nessun difetto nuovo noto, ma non e' piu' una versione da provare. Attenzione: legge sleep_stop come
+    acceso/spento (il 2 per lei e' "acceso" anche da host, il caso che bloccava la console), quindi con un ini della 0.1.17
+    porta sleep_stop a 0 prima di usarla.
+
+AzaharLink-0.1.16.3gx     997.090 byte   md5 700f5c17447bd820b2ee9ce2ce1a86c3   (costruita il 2026-10-13)
+    La 0.1.16, superata dalla 0.1.17. Provata su hardware in TRE sessioni (PROVA 3: Final Fantasy Explorers, 2DS XL + 3DS XL +
+    Android; PROVA 4: Zelda Tri Force Heroes, 2DS XL + 3DS XL + Azahar su PC; il 2026-10-14; PROVA 5: Mario Party: The Top 100,
+    3DS XL client di una lobby Azahar, la notte 14-15; PROVE_HARDWARE.md, parti 3.4-3.6), sempre con debug=1. Il comportamento
+    di rete e' pulito (nessun errore di socket; in FFE e TFH nessun WARNING e nessun frame sovrascritto; in Mario Party 31 avvisi
+    "frames lost" in 67 minuti) e l'uscita di TFH su una console e' stata senza schermata di eccezione: la prima
+    prova su hardware della correzione del crash della 0.1.15. DIFETTO NOTO: l'uscita con il registro a debug=1 su una scheda SD
+    piena e lenta. La cattura di debug (anello da 512 KB) pieno si svuota in decine di secondi e l'uscita non aveva un limite
+    di tempo: "Chiudi software" ha impiegato moltissimo e il registro principale si e' fermato prima di "process event EXIT" (sulla
+    2DS XL dell'utente, scheda da 128 GB piena: l'ultima riga e' circa 7 s dopo il tasto HOME, nessuna "shutdown: begin"). Corretto nel
+    codice della 0.1.17 (la cattura ha mezzo secondo dopo l'inizio dell'uscita, il registro principale va sul file per primo);
+    non ancora visto su una console. A debug=0 non c'e' cattura e il difetto non si vede.
+
+AzaharLinkSetup.3dsx      408.404 byte   md5 c8fe3361acb932f90c4a1dee0824cdd7   (costruita il 2026-10-10)
+    L'app Setup della 0.1.15 (mostra v0.1.15). Non ha la riga "End session on sleep", non scrive tutte le 15 chiavi
+    dell'ini (nell'ini della PROVA 1 mancavano sleep_stop e rcvbuf_kb) ed e' stata costruita con codice condiviso piu'
+    vecchio. Usa quella nuova: dist/3DSLink.3dsx. Quella vecchia conserva comunque le chiavi che non conosce.
+
+AzaharLinkSetup-0.1.16.3dsx   427.000 byte   md5 ebf6f3b3a9da56af9664da90503b3411   (costruita il 2026-10-13)
+    L'app Setup della 0.1.16 (mostra v0.1.16), superata da quella della 0.1.17 (AzaharLinkSetup-0.1.17.3dsx qui sotto). Ha la riga
+    "End session on sleep" e scrive tutte le 15 chiavi come quella nuova.
+
+AzaharLinkSetup-0.1.17.3dsx   427.000 byte   md5 a2eeca54fe6f989ef976cbe762e88579   (costruita il 2026-10-14)
+    L'ultima app con il nome e la forma "Setup" (mostra v0.1.17; stava in dist/ fino al 2026-10-15). Sostituita dall'app 3DS Link
+    (dist/3DSLink.3dsx, nella stessa cartella di AzaharLink.3gx): stesse impostazioni e stesso ini, pagine nuove (Enable titles for Azahar, controllo dell'installazione,
+    scansione dei titoli, Plugin Loader). Se sulla SD c'e' ancora /3ds/AzaharLinkSetup.3dsx, si puo' cancellare.
+
+AzaharLink-1.0.0.3gx   1.011.858 byte   md5 a49ba6e5639dedcabe453fea66bfe768   (costruita il 2026-10-21)
+    Il plugin della 1.0.0, l'ultimo che stava in dist/ come file a se': dalla 1.0.1 il plugin e' dentro l'app (3DSLink.cia e 3DSLink.3dsx) e non si
+    consegna piu' da solo. La 1.0.0 fu provata il 2026-10-22 solo con l'installazione pulita da FBI, che non lasciava nessun AzaharLink.3gx in
+    /3ds/3DSLink: e' il difetto che la 1.0.1 chiude. Questo file e' quello che era in dist/ con la 1.0.0 (il suo SHA-256 e' in
+    DlpLink/releases.tsv, riga 1.0.0).
+
+Tornare indietro a una di queste (solo per un confronto, non per le prove): togli il .3gx della 0.1.17 dalla cartella del
+gioco e metti quello vecchio al suo posto. L'ini a 15 chiavi va bene per tutte, con sleep_stop a 0 per la 0.1.15 e la
+0.1.15.1; la 0.1.14 ignora le chiavi nuove.
+Altre build ancora piu' vecchie (0.1.11, 0.1.12, esperimenti con plugin vuoti e i loro log) sono in analysis/old_tests/ del
+repository (fuori da git): non servono.

@@ -1,0 +1,27 @@
+Author: AzaharLink contributors
+
+Version: # Plugin version
+    Major: 1
+    Minor: 0
+    Revision: 2
+
+Targets: # Low TitleId of games which are compatibles with this plugin (0 for all)
+
+Title: AzaharLink
+
+Summary: Local wireless over the internet through an Azahar room
+
+Description: |
+  Tunnels a game's local wireless (UDS) through an Azahar
+  multiplayer room, so a real 3DS can play with Azahar
+  players and other 3DS consoles over the internet.
+
+  1. Set the room address and your nickname in the menu
+  2. Switch on "Connect to room"
+  3. Open the game's multiplayer menu as usual
+
+Compatibility: Console
+
+MemorySize: 5MiB
+
+UsePrivateMemory: false # a private mapping is charged to the game's memory budget (FFE then hangs)

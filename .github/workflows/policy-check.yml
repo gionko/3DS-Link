@@ -1,0 +1,15 @@
+name: policy check
+
+# The plain-text check of the settings and rules that decide what the plugin does to a game, and of the vendored delivery module.
+# It needs nothing but bash and coreutils; the build and the other tests need Docker images and items of your own console (see the README).
+on:
+  push:
+  pull_request:
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Policy check
+        run: bash AzaharLink/Tests/policy_check.sh

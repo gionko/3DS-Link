@@ -1,0 +1,183 @@
+BasicInfo:
+  Title                   : ChildProbe
+  CompanyCode             : "00"
+  ProductCode             : CTR-P-PRBE
+  ContentType             : Application
+  Logo                    : Homebrew
+
+TitleInfo:
+  UniqueId                : 0xFD51
+  Category                : DlpChild
+  Version                 : 0
+
+Option:
+  # false: i figli DLP vengono installati in NAND, non su SD. Con true l'exheader prende il bit
+  # "SD application" e fs rifiuta di servire ExeFS:/.code (0xE0C046F8, fs/NOT_SUPPORTED) -> panic in loader.
+  # Dlplay di sistema, titolo NAND, ha infatti SCI.flags=0x01 (solo compressed). Vedi README 2026-10-18 (5).
+  UseOnSD                 : false
+  FreeProductCode         : true
+  MediaFootPadding        : false
+  # true: il contenuto dell'NCCH viene CIFRATO. Con false makerom scrive NoCrypto e il contenuto
+  # resta in chiaro: il sistema apre ExeFS:/.code e ne legge la dimensione, ma si RIFIUTA di
+  # leggerlo (0xE0C046F8). Dimostrato il 2026-10-18 consegnando il figlio DLP VERO di Tetris
+  # decifrato: crepa identico al nostro, mentre lo stesso file cifrato parte. Vedi README (17).
+  # Con -target t la chiave e' quella fissa di soli zeri (flags[7] bit0 FixedCryptoKey): nessuna
+  # chiave da procurarsi, niente boot9.
+  EnableCrypt             : true
+  EnableCompress          : true
+
+AccessControlInfo:
+  CoreVersion             : 2
+  DescVersion             : 2
+  ReleaseKernelMajor      : "02"
+  ReleaseKernelMinor      : "33"
+  UseExtSaveData          : false
+# FileSystemAccess: vuota. Il figlio DLP vero di Tetris ha fsAccessInfo = 0: nessun accesso al
+# filesystem. Vedi README 2026-10-18 (12).
+  MemoryType              : Application
+  SystemMode              : 64MB
+  IdealProcessor          : 0
+  AffinityMask            : 1
+  Priority                : 16
+  MaxCpu                  : 0x9E
+  HandleTableSize         : 0x200
+  DisableDebug            : false
+  EnableForceDebug        : false
+  CanWriteSharedPage      : true
+  CanUsePrivilegedPriority: false
+  CanUseNonAlphabetAndNumber: true
+  PermitMainFunctionArgument: true
+  CanShareDeviceMemory    : true
+  RunnableOnSleep         : false
+  SpecialMemoryArrange    : true
+  SystemModeExt           : Legacy
+  CpuSpeed                : 268MHz
+  EnableL2Cache           : false
+  CanAccessCore2          : false
+  IORegisterMapping:
+   - 1ff00000-1ff7ffff
+  MemoryMapping:
+   - 1f000000-1f5fffff:r
+  SystemCallAccess:
+    ArbitrateAddress: 34
+    Break: 60
+    CancelTimer: 28
+    ClearEvent: 25
+    ClearTimer: 29
+    CloseHandle: 35
+    ConnectToPort: 45
+    ControlMemory: 1
+    CreateAddressArbiter: 33
+    CreateEvent: 23
+    CreateMemoryBlock: 30
+    CreateMutex: 19
+    CreateSemaphore: 21
+    CreateThread: 8
+    CreateTimer: 26
+    DuplicateHandle: 39
+    ExitProcess: 3
+    ExitThread: 9
+    GetCurrentProcessorNumber: 17
+    GetHandleInfo: 41
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetResourceLimit: 56
+    GetResourceLimitCurrentValues: 58
+    GetResourceLimitLimitValues: 57
+    GetSystemInfo: 42
+    GetSystemTick: 40
+    GetThreadContext: 59
+    GetThreadId: 55
+    GetThreadIdealProcessor: 15
+    GetThreadPriority: 11
+    MapMemoryBlock: 31
+    OutputDebugString: 61
+    QueryMemory: 2
+    ReleaseMutex: 20
+    ReleaseSemaphore: 22
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
+    SetThreadPriority: 12
+    SetTimer: 27
+    SignalEvent: 24
+    SleepThread: 10
+    UnmapMemoryBlock: 32
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+  ServiceAccessControl:
+   - APT:U
+   - ac:u
+   - am:net
+   - boss:U
+   - cam:u
+   - cecd:u
+   - cfg:nor
+   - cfg:u
+   - csnd:SND
+   - dsp::DSP
+   - frd:u
+   - fs:USER
+   - gsp::Gpu
+   - gsp::Lcd
+   - hid:USER
+   - http:C
+   - ir:rst
+   - ir:u
+   - ir:USER
+   - mic:u
+   - mcu::HWC
+   - ndm:u
+   - news:s
+   - nwm::EXT
+   - nwm::UDS
+   - ptm:sysm
+   - ptm:u
+   - pxi:dev
+   - soc:U
+   - ssl:C
+   - y2r:u
+
+SystemControlInfo:
+  SaveDataSize: 0KB
+  RemasterVersion: 0
+  StackSize: 0x40000
+  Dependency:
+    ac: 0x0004013000002402
+    am: 0x0004013000001502
+    boss: 0x0004013000003402
+    camera: 0x0004013000001602
+    cecd: 0x0004013000002602
+    cfg: 0x0004013000001702
+    codec: 0x0004013000001802
+    csnd: 0x0004013000002702
+    dlp: 0x0004013000002802
+    dsp: 0x0004013000001A02
+    friends: 0x0004013000003202
+    gpio: 0x0004013000001B02
+    gsp: 0x0004013000001C02
+    hid: 0x0004013000001D02
+    http: 0x0004013000002902
+    i2c: 0x0004013000001E02
+    ir: 0x0004013000003302
+    mcu: 0x0004013000001F02
+    mic: 0x0004013000002002
+    ndm: 0x0004013000002B02
+    news: 0x0004013000003502
+    nim: 0x0004013000002C02
+    nwm: 0x0004013000002D02
+    pdn: 0x0004013000002102
+    ps: 0x0004013000003102
+    ptm: 0x0004013000002202
+    ro: 0x0004013000003702
+    socket: 0x0004013000002E02
+    spi: 0x0004013000002302
+    ssl: 0x0004013000002F02
+
+# Il figlio DLP vero di Tetris e' un CXI CON RomFS: NCCH flags[5] = 0x03 (Data+Executable) e
+# nessun bit NoMountRomFS in flags[7]. Senza RomFS makerom produce 0x02 / NoMountRomFS, che
+# e' l'unica differenza rimasta rispetto al file che sappiamo partire. Vedi README 2026-10-18 (13).
+RomFs:
+  RootPath                : build/romfs

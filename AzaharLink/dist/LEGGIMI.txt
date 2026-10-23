@@ -1,0 +1,910 @@
+AzaharLink 1.0.2 - LEGGIMI
+==========================
+
+Questa cartella (dist/) contiene UNA SOLA versione da installare e da provare: la 1.0.2. Le build vecchie sono in dist/old/
+e NON servono ai test. La documentazione lunga e' nel repository: README.md (cosa fa, come e' fatto, che cosa e' stato provato)
+e PROVE_HARDWARE.md (il piano di prove completo, con i criteri, e lo storico delle prove vecchie). Questo file e' la forma breve.
+
+NOVITA' DELLA 1.0.1 (2026-10-22). Nasce dalla prima installazione PULITA di 3DSLink.cia 1.0.0 con FBI su una console. L'utente ha scritto: il
+plugin non era una risorsa del CIA, quindi installando il CIA non compariva AzaharLink.3gx in /3ds/3DSLink ("abbiamo sempre detto pacchetto
+unico"); se 3DS Link non ha il plugin per qualsiasi motivo, l'opzione "3DS Link" non puo' essere messa su ON; il nome dell'app e' "3DS Link",
+non "Connects Nintendo 3DS - v1.0.0" (quello e' lo slogan); in "About" la riga "This app" diceva "unknown" mentre "3DS Link" diceva "v1.0.0";
+non c'era scritto da nessuna parte "Creata da Gionko" ne' un grazie ad Azahar, FBI, 3dbrew e a tutte le risorse usate e copiate; e nella guida
+di boot9 i passi sono una lista VERTICALE, quindi devono muoversi con su/giu', non con sinistra/destra. Cosa cambia:
+  UN PACCHETTO SOLO: il plugin AzaharLink.3gx e' DENTRO l'app, e l'app lo scrive da sola in SD:/3ds/3DSLink/AzaharLink.3gx.
+  3DSLink.cia e 3DSLink.3dsx portano il plugin come risorsa (lo stesso file, byte per byte: lo prova ogni costruzione, con la dimensione e lo
+  SHA-256) e dist/ non ha piu' un AzaharLink.3gx da copiare: i file da consegnare sono DUE. L'app, a ogni avvio, confronta il file della SD con il
+  plugin che ha dentro, byte per byte (un'intestazione buona non basta: un file tagliato o rovinato ce l'ha); se manca, e' di un'altra versione
+  o e' diverso lo riscrive (file temporaneo, il vecchio messo da parte finche' il nuovo non e' riletto) e la pagina principale lo dice una volta
+  ("The plugin was put in ..."). Al primo avvio lo scrive solo dopo il Si' alla domanda: con il No non scrive niente sulla SD.
+  SENZA IL PLUGIN GIUSTO SULLA SD L'INTERRUTTORE "3DS Link" NON SI ACCENDE: e' grigio e su OFF, A (o destra/sinistra) dice che cosa manca e,
+  se ci ha provato, perche' non l'ha potuto scrivere (scheda piena o bloccata, una cartella con quel nome...); un interruttore che era ON va
+  su OFF una volta. Il file che torna (o "Settings" > "Installation check", riga "Plugin file", A "Fix") lo libera. Con una Luma3DS troppo
+  vecchia vale prima la frase della Luma.
+  "Installation check": la riga "Plugin file" confronta il file con l'app e A lo rimette dall'app; la ricerca nella SD intera non c'e' piu'
+  (il plugin non e' un file da trovare). Il pacchetto del Download Play ("3DS Link Delivery") si compone dal plugin che l'app ha dentro, non
+  da un file della scheda: un .3gx tagliato sulla SD non puo' piu' finire nel pacchetto (era un limite noto della 1.0.0).
+  Pesi: 3DSLink.cia da 0,99 a 1,55 MB e 3DSLink.3dsx da 1,33 a 2,37 MB; il figlio del Download Play da 2.282.432 a 2.847.680 byte (11 blocchi invece di 9: in
+  aria circa 12 s invece di 10, per proporzione, non misurato; la stima della preparazione sale da circa 14 s a circa 18 s, anche questa non misurata).
+  "About 3DS Link": la prima riga e' il NOME, "3DS Link", con la versione a destra ("v1.0.1"); la sua nota comincia con "Connects Nintendo
+  3DS", lo slogan. Righe nuove: "Created by Gionko"; "Installed as" al posto di "This app: unknown" (da CIA "installed app", con il Title
+  ID 000400000F83D100 e la cartella dei dati; da .3dsx il nome del file e il percorso; senza percorso "no path given": mai "unknown"); la riga
+  del plugin (versione e dimensione del file della SD, o "missing", "damaged", ...); "Credits and thanks", dove A apre l'elenco di tutto
+  quello che 3DS Link usa o ha copiato, ringraziato per nome con autore, uso e licenza (Azahar e Citra, FBI, 3dbrew, devkitPro, libctru,
+  citro2d/citro3d, Luma3DS, CTRPluginFramework, ENet, GodMode9, makerom/ctrtool, Pillow). Lo stesso elenco e' CREDITS.md.
+  LA GUIDA "How to get boot9.bin": la croce su/giu' cambia passo (su = indietro, giu' = avanti), come L e R; sinistra e destra non fanno
+  piu' niente. Il piede dice "Up/L Back" e "Down/R Next".
+Sul PC: tutti i test a 0 errori e il controllo delle regole con i suoi mutanti (README, "Novita' 1.0.1"). MAI su una console: si riparte
+dall'installazione pulita con FBI (sezione 7, PASSO 0; CHECKLIST_DA_VERIFICARE.md, righe P1-P12).
+
+La 0.1.17 e' la 0.1.16 piu' TRE modifiche piccole: (a) la fine di un lancio non aspetta piu' la cattura di debug (dopo l'evento di
+uscita la cattura ha mezzo secondo per scrivere quello che ha nell'anello da 512 KB, il resto si perde; il registro principale va
+sul file per primo; una riga nuova dice quanto manca: "shutdown: the capture was cut at the end: N KB of it were not written ...");
+(b) la notifica APT si classifica dai suoi 16 bit bassi (Mario Party: The Top 100 manda 0x1BC00001 per il tasto HOME: ora e' il
+tasto HOME, e 0x1BC00005 / 0x1BC00006 sono inizio del sonno / risveglio; la riga del registro dice il numero del segnale e, se la
+parola aveva altri bit, " | reply word 0x1bc00001" dopo il risultato; con sleep_stop=0, il predefinito, cambiano solo il registro,
+la traccia della sospensione e lo svuotamento del registro al tasto HOME); (c) la notifica di memoria e la riga Status dicono
+"all memory in use" quando il gioco lascia meno di 256 KB liberi ("New 3DS memory mode: all memory in use", Status "Game memory:
+all in use (New 3DS mode)"; sopra 256 KB la cifra e' quella di prima). L'utente ha deciso si' a (b) e a (c) il 2026-10-15. NON e'
+mai stata eseguita su una console. Il motore UDS e il client della stanza sono quelli della 0.1.16, e il gancio pure tranne la
+lettura della notifica APT (b), quindi le prove su hardware della 0.1.16 che li riguardano valgono ancora. Sul PC (seconda
+esecuzione sulla 0.1.17, 2026-10-15): tutti i test unitari a 0 errori (screen_text_test 231 controlli, link_policy_test 2.597,
+log_files_test 761), policy_mutants 189 casi con 0 non visti, controlli dello stack passati (48 limiti dei frame, grafo delle chiamate
+pulito, chain_sim 418 controlli e 0 errori) (README, "Test"). L'app 3DS Link (nessun cambio nel plugin) e' stata verificata sul PC
+(settings_test 383, games_test 1.306, paths_test 197, logrot_test 64, log_module_test 32, ncch_icon_test 22 controlli, 0 errori; policy_mutants 360 casi, 0 non visti) e nell'emulatore
+Azahar; MAI su una console. Dopo il primo uso su una console l'app e' stata rifatta (tappa C): nessun percorso fisso (tutto parte dalla
+cartella da cui l'hai avviata), UNA sola cartella per i due file, primo avvio guidato, "Installation check" che risolve i problemi con A,
+stanze con un nome, un solo interruttore "Debug log" per tutti i registri. Da guardare per primi, sulla console: il primo avvio, la domanda
+sul Plugin Loader (plg:ldr, comandi 2 e 3, verificati sul sorgente di Luma3DS) e la lettura dei nomi e delle icone con le chiavi
+(sezione 4, punto 1; piano: passo 1, punti 3 e 4).
+
+Dopo la prima prova dell'app su una console (la 0.1.17 sulla New 2DS XL) l'app e' stata rifatta ancora (tappa D; il plugin non e'
+cambiato di un byte e la versione resta 0.1.17): bottoni veri in fondo a ogni pagina (nelle domande A "Yes" a destra e B "No" a
+sinistra); il primo avvio finisce con il riepilogo e START continua senza uscire dall'app (B annulla); boot9.bin mancante e' un AVVISO
+giallo, non un problema; la cartella dell'app si chiama 3DSLink (se l'app e' gia' in una cartella 3DSLink, quella e' la cartella
+dell'app); i nomi "Enable Titles for Azahar Emulator" e "Titles Delivery"; le copie del plugin si fanno in sottofondo ("Enabling..." /
+"Enabled"); "Titles Delivery" ha schermi propri, in inglese, al posto di quelli di testo in italiano del modulo. Sul PC: games_test
+1.306 e paths_test 197 controlli. MAI su una console: passo 1 (punti 3 e 4) e passo 5. Il pacchetto CIA che porta con se' il plugin e
+lo mette in SD:/3ds/3DSLink era allora un passo successivo: e' fatto nella 1.0.1 (vedi in cima).
+
+Dopo un secondo giro di modifiche l'app e' stata rifatta ancora (tappa E; il plugin non e' cambiato di un byte e la versione resta
+0.1.17): la pagina principale (la barra dello schermo tocco si chiama "Options"; le righe sono "3DS Link", "Room address" e "Enable
+Titles for Azahar Emulator" (oggi, tappa I: "Azahar Emulator Room" e "Enable Titles for Azahar Emulator Net") in un blocco, poi "Titles Delivery", poi "Settings", che e' la vecchia "Configuration"; "Nickname" e "Password"
+non sono piu' sulla pagina principale: il nickname e' la prima riga di "Settings", la password e' di ogni stanza; la batteria e lo
+spazio libero della SD stanno nella barra in alto); una stanza e' UNA cosa con quattro campi (nome, indirizzo, porta e la SUA
+password); i bottoni dei popup dentro la scheda; le pagine con bottoni in piu' o senza START hanno i bottoni su tutta la larghezza;
+"Titles Delivery" senza START, con due righe ("Installed Titles" non c'e' piu'), "reading N%" al posto di "wait", un elenco di
+"Send Titles" con icone, lettere G U D colorate (oggi barrette senza lettera: tappa I), dimensioni e tempi per parte e il controllo dei titoli quando si preme Y; il tasto
+HOME spento con il distintivo "HOME off". Sul PC: settings_test 383 controlli. MAI su una console: passo 1 (punti 1, 3 e 4) e passo 5.
+
+Dopo un terzo giro di modifiche l'app e' stata rifatta ancora (tappa F; il plugin non e' cambiato di un byte e la versione resta
+0.1.17): il primo avvio ha il popup della domanda centrato e, sullo schermo alto, SEI righe fisse (lettura dei titoli, boot9.bin,
+Seed database, Plugin file, Plugin folder, Plugin Loader); due controlli nuovi, "Seed database" (la copia dei seed che la console
+tiene nella sua NAND: se non si legge e' un avviso, niente da sistemare) e "Plugin Loader" (spento = problema, A lo accende); in
+"Installation check" il bottone A "Fix" c'e' solo se la riga scelta si puo' sistemare; l'app non porta piu' con se' i file delle
+build precedenti (3DSLink.servers, 3DSLink.games, la vecchia cache dei nomi) e l'elenco delle stanze nasce dalla stanza di
+AzaharLink.ini SOLO se servers.txt non esiste (per partire senza stanze togli host= da AzaharLink.ini: l'ini e' in
+SD:/luma/plugins/, non nella cartella dell'app); nella pagina di una stanza la riga "Test room" mostra un popup che resta fino a
+A/B; "Titles Delivery" ha schede e popup nuovi, "N min left" nella schermata dell'invio, B chiede "Close the room?" (A "Yes, close
+it", B "No") e il bottone Y "Speed" non c'e' piu'. Sul PC: games_test 1.315 controlli (era 1.306). MAI su una console: passo 1
+(punti 3 e 4) e passo 5.
+
+Dopo un quarto giro di modifiche l'app e' stata rifatta ancora (tappa G; il plugin non e' cambiato di un byte e la versione resta
+0.1.17): ogni schermo alto ha la stessa barra (il titolo a sinistra; a destra batteria e spazio libero della SD); la riga e la
+pagina che abilitano i titoli si chiamano "Enable Titles for Azahar Emulator" (oggi "... Net", tappa I); aprendo "Send Titles" o "Receive Titles" compare un
+popup "Loading" con tre puntini che si muovono (le liste ci mettono un attimo); "Send Titles" dice "Select titles to share" in fondo
+e il menu di "Titles Delivery" dice "Options"; mentre si copia il plugin ("Enabling..."/"Disabling...") HOME e START sono spenti
+(distintivo rosso "HOME off", START grigio) e tornano quando ogni copia e' finita. La schermata di ricezione ha le barre "Installed"
+e "Downloaded", una riga di stato colorata (verde riceve, giallo "waiting: the sender is serving others", rosso "connection lost")
+e i riceventi della stanza. Sulla console che invia ogni ricevente ha il nome della sua console, una percentuale e uno stato;
+Su/Giu' (o un tocco) sceglie un ricevente e lo schermo alto ne mostra i dettagli (stato, scaricato e installato, tempo che manca,
+velocita' di installazione, qualita' del collegamento, spazio libero, ogni titolo); B chiede ancora "Close the room?". Il modulo di
+consegna, lato che invia, ora tiene i nomi dei riceventi e ha due correzioni (le patch documentate sono OTTO, vedi il README): una
+console che entra in una stanza che sta gia' inviando riceve l'elenco in pochi secondi (prima poteva aspettare circa 30 s: l'elenco
+si perdeva con la coda della radio piena). Sul PC: games_test 1.315, settings_test 383, paths_test 197 controlli, 0 errori; schermi controllati
+nell'emulatore con numeri inventati. MAI su una console: la ricezione in una stanza che sta gia' inviando (servono due riceventi),
+i nomi dei riceventi, il thread che legge i tasti, HOME spento durante le copie e tutto il trasferimento vero sulla radio UDS
+(passo 5, punto 6).
+
+Dopo un giro di revisione prima di "Download and Play" (solo l'app: il plugin non e' cambiato di un byte e la versione resta 0.1.17):
+i minuti della schermata dell'invio sono ora calcolati da cio' che manca davvero a ogni ricevente, titolo per titolo, nell'ordine in
+cui chi invia serve la stanza (un titolo alla volta; chi entra in ritardo e vuole un titolo gia' mandato lo fa rimandare tutto), con
+la velocita' vera della radio e quella di installazione di ogni console; la scheda di un ricevente dice anche quanto aspetta prima
+del suo titolo ("starts in ..."), e le parole "All receivers finished", "Waiting for receivers" e "Receivers not answering" non si
+confondono piu'. I riceventi mostrano la stessa percentuale e gli stessi minuti. Corretto: le impostazioni e l'elenco delle stanze
+si scrivono con un file temporaneo (mai a meta' se la SD si riempie o si toglie), un file che non si riesce a leggere non si riscrive
+mai con i valori di base, la prova di scrittura sulla SD non si ripete a ogni ritorno alla pagina principale, la stanza scelta e'
+quella toccata anche se la scansione cambia l'elenco, un thread bloccato non viene piu' liberato mentre gira, con gli schermi
+spenti (SELECT) arriva solo SELECT, Su/Giu' si ripetono tenendoli premuti, Y non avvia una ricezione che non entra nella SD e un
+errore che chiude la stanza dice perche'. Tolto il codice che nessuno usava e le copie di cio' che era scritto piu' volte. Sul PC:
+settings_test 391, games_test 1303, paths_test 210, eta_test 53 controlli, 0 errori; schermi rivisti nell'emulatore con numeri
+inventati. MAI su una console: i minuti veri (servono una stanza che sta gia' inviando e due riceventi, uno che entra dopo).
+
+Dopo la prova a quattro console del 2026-10-17 l'app e il modulo di consegna sono stati rifatti ancora (tappa H; il plugin non e'
+cambiato di un byte e la versione resta 0.1.17). In alto, in "Send Titles" e in "Receive Titles", c'e' "Wi-Fi CH n" (il canale radio
+della stanza: 1, 6 o 11) e nell'elenco delle stanze ogni stanza ha la targhetta "CH n": due stanze vicine sul 6 e sull'11 si rallentano
+del 15-20%, sull'1 e sull'11 no. Chi invia ha lo schermo basso "Receivers" nuovo (due righe per ricevente, cinque visibili, scorrimento
+fino a sette) e "Room N%" non scende piu'. Colori degli stati: scarica blu, installa giallo, "waiting" giallo (aspetta il suo turno),
+finito verde, "had errors" arancione (ha finito con un titolo fallito), muto rosso (tiene il suo nome, per esempio "Friend-B silent 12s",
+e dopo 30 s esce dalla stanza), appena entrato grigio. Chi riceve vede "installing NN%" sulla riga del titolo e, a download finito,
+"all downloaded: installing" in verde. "Installation check" ha una riga nuova, "Luma3DS" (tabella alla sezione 4, punto 0). Un titolo
+che AM non riesce a installare non lascia piu' niente sulla console. L'icona e' nuova. Sul PC: games_test 1.322, eta_test 72,
+settings_test 391, paths_test 210 controlli. MAI su una console: la prova e' "Prossima prova su strada (build del 2026-10-17)" in
+PROVE_HARDWARE.md (qui: sezione 7, passo 5, punto 7).
+
+Dopo il secondo giro dalla prova della build 810be51b l'app e' stata rifatta ancora (tappa I; il plugin non e' cambiato di un byte e la
+versione resta 0.1.17). Con una Luma3DS sotto la 13.0 (riga rossa "not work" di "Installation check") la parte Azahar dell'app si spegne a
+ogni avvio: l'interruttore "3DS Link" va su OFF da solo e si blocca, le righe "Azahar Emulator Room" e
+"Enable Titles for Azahar Emulator Net" sono in grigio, "Titles Delivery" e "Settings" restano usabili (sezione 4, punto 0). Nomi nuovi:
+"Room address" e' ora "Azahar Emulator Room" (il menu in gioco del plugin tiene "Room address") e
+"Enable Titles for Azahar Emulator" e' ora "Enable Titles for Azahar Emulator Net". Il tipo di un titolo (gioco, aggiornamento, DLC) e'
+una sola barretta colorata senza lettera (blu, verde, rosso) in tutte le liste e nella legenda "Game  Update  DLC": le lettere G U D non ci
+sono piu'. Sul PC: i test dell'app hanno i conteggi della tappa H e policy_mutants 541 mutanti; nell'emulatore, con una build di prova che
+finge la Luma 10.2.1, si sono viste le tre righe in grigio, OFF, l'ini con enabled=0, i toast e le barrette. MAI su una console: la prova e'
+"Prossima prova su strada (build del 2026-10-17)" in PROVE_HARDWARE.md (punti 7-9; qui: sezione 7, passo 5, punto 7).
+
+Dopo la prova a tre console del 2026-10-18 l'app e' stata ritoccata ancora (tappa J; il plugin non e' cambiato di un byte e la versione
+resta 0.1.17). Con una Luma3DS sotto la 13.0 la scheda della pagina principale e i messaggi delle righe in grigio dicono solo "This Luma is
+not supported" (la versione resta nella riga "Luma3DS" di "Installation check"); tra i pulsanti A e Start non c'e' piu' nessun suggerimento.
+A ogni avvio l'app guarda le cartelle di sd:/luma/plugins/ dei giochi abilitati: se la copia di AzaharLink.3gx che contengono e' diversa dal
+file accanto all'app (una versione vecchia), la rifa da sola, e la pagina principale dice "Plugin updated in N title(s)."; una cartella con
+un altro plugin non si tocca mai. Sul PC: games_test 1.348 controlli, policy_mutants 548 mutanti (568 dopo la tappa K). MAI su una console.
+
+Dopo la prima prova con Tekken (2026-10-18, sera) il plugin e' cambiato (tappa K; la versione resta 0.1.17, il log d'avvio dice "built Oct 18
+2026"; l'app e' quella della tappa J). Con Tekken, chi entra nella stanza creata dall'altra console la vedeva ma il gioco dava un errore: 100 ms
+dopo il collegamento Tekken chiede i dati dell'host (GetApplicationData, 0x81 byte), il plugin rispondeva 0 byte e il gioco usciva subito. Ora
+un client risponde con i dati del beacon dell'host, come il firmware. Sul PC: test_main 167.606 controlli (49 nuovi, con il beacon vero di
+Tekken), tutta la suite senza fallimenti. MAI su una console: la prova e' "Prossima prova su strada: Tekken" in PROVE_HARDWARE.md (metti il
+nuovo AzaharLink.3gx accanto a 3DSLink.3dsx e apri l'app: le copie nelle cartelle dei giochi si aggiornano da sole; dalla 1.0.1 il plugin e'
+dentro l'app: installa la 3DSLink.cia nuova, apri l'app, e' lei a riscrivere il file e poi le copie).
+
+Dopo i test del 19-10-2026 (tappa L) i log e l'ini del plugin stanno con i file dell'app, in SD:/3ds/3DSLink/ (sezione 5): l'app
+sposta da sola un AzaharLink.ini trovato in SD:/luma/plugins/ e lo dice con un avviso; il plugin legge ancora il posto vecchio finche'
+il file nuovo manca. I log non si azzerano piu' a un avvio e crescono in blocchi da 64 MB numerati in ordine (fino a 50 per log).
+Dai log: Kirby Battle Royale non usa nwm::UDS ma Download Play (dlp) per il gioco locale, che gira nel modulo di sistema con la radio
+vera: "attiva il WiFi" e' il suo modo di dire che dlp non parte; il plugin non c'entra. Balloon Fight (Virtual Console): l'abort e'
+dentro CTRPluginFramework, prima del nostro codice (il suo gancio sulla memoria condivisa del gioco non trova la sequenza nei titoli
+VC). Tekken con Azahar come client: e' lo stesso difetto di GetApplicationData corretto nel plugin, ma in Azahar (da segnalare; intanto
+la stanza del gioco la crea l'emulatore).
+
+Dalla lettura dei sette log (tappa M, NOTE_LAG_2026-10-19.md): su internet la rete e' 53-55 ms di un giro da 57-68 (il plugin 4-8);
+in LAN il plugin e' un quarto di un senso da 14 ms; i blocchi comuni di 100-270 ms in LAN (tutte e due le console mute insieme) sono
+dell'access point o del PC della stanza. Corretti nel plugin: il throttle di ENet non distrugge piu' frame al mittente (SSF4 ne perdeva
+il 6 %), i beacon e i dati broadcast escono UNSEQUENCED (non restano dietro un affidabile perso), una pausa del thread di rete non e'
+piu' scambiata per una perdita (niente ritrasmissioni e timeout gonfiati). Due numeri nuovi nella riga "stats: link": "throttled N" (deve
+restare 0) e "rtt samples skipped N". net_thread_core accetta 2 e 3 (New 3DS) per la prova A/B. MAI su una console: la prova e'
+"Prossima sessione: il lag" in PROVE_HARDWARE.md.
+
+ATTENZIONE (mattina del 20-10-2026): le build dal 19-10 sera (tappa M) fino a quella delle 00:55 del 20-10 NON ENTRAVANO IN NESSUNA
+STANZA (il throttle di ENet configurato prima della connessione: la stanza vera non rispondeva). La build di questa cartella e'
+quella corretta (verificata sul PC contro la stanza vera: entra). Se hai una di quelle build sulla console, sostituisci tutti e
+due i file.
+
+Dopo la tappa P (20-10-2026, pomeriggio: la scrittura del log piu' leggera; cambia solo AzaharLink.3gx, i numeri sono nella
+tabella in fondo) debug resta 0 o 1 e con 1 si cattura tutto come prima: cambia come i byte vanno sulla scheda. La cattura va in
+scritture da 64 KB (erano 16) con UN flush per passata invece di uno a ogni scrittura (un flush costa quanto una scrittura
+piccola: erano sedici per passata), una passata tagliata lascia la scheda al gioco per il tempo che l'ha tenuta, e
+l'esadecimale di un frame si formatta in un colpo. In piu' NESSUN thread sopra il writer aspetta piu' un lock del log: con il
+log acceso un thread del gioco che trovava il lock occupato dal writer (priorita' minima, lock senza ereditarieta') restava
+fermo finche' tutti i thread sopra il writer lasciavano il core, e un gioco che gira a vuoto alla schermata iniziale non lo
+lascia mai: molto probabilmente il blocco di Tekken alla schermata Bandai Namco con il debug acceso (da confermare sul log di
+quel lancio). Ora quei thread provano il lock per qualche microsecondo e rinunciano alla riga, contata ("log: N lines of
+other threads were given up ..."). Dai log della sessione con Friend-A (20-10, build della tappa O) Tekken si e' bloccato due
+volte con il debug acceso e gioco e writer si fermano nello stesso istante: e' quel quadro. In piu': il writer gira SOPRA i thread
+del gioco (priorita' 0x2E, era la piu' bassa) cosi' nessun thread del gioco puo' interromperlo mentre tiene un lock; il filtro di
+scansione e' acceso (in NSMB2 la console elencava Gionko-PC, cioe' l'emulatore con la lobby di Tekken nella stessa stanza, e ci
+entrava in loop: ora una rete di un altro gioco non arriva al gioco); con il debug acceso compare a schermo "AzaharLink debug: SD
+card busy N%, capture lost M%" quando e' il log a rallentare il gioco (al massimo una volta al minuto). MAI su una console. Se
+Tekken si blocca ancora con il debug acceso, mandami AzaharLink.log di quel lancio. All'avvio, con il log acceso, una riga
+confronta la memoria della regione applicazione con l'ultimo lancio dello stesso gioco, anche con altri giochi in mezzo ("mem
+against the last launch of this title: ... the same"): e' la prova che un'uscita non lascia nulla (AzaharLink.mem tiene l'ultimo
+valore di ogni gioco, gli ultimi 16; con debug=0 non si tocca). Con il log acceso compare anche, al massimo una volta al minuto,
+"AzaharLink debug: room link silent N times (150+ ms): WiFi" quando i datagrammi della stanza si fermano 150 ms o piu': dai log
+del 20-10 i buchi del gioco in Tekken DS-DS nascono li' (sul DS di Gionko 17-23 al minuto, su quello di Friend-A 0-2), nel tratto
+wifi, non nel gioco e non nel plugin.
+
+Correzione dell'app (21-10-2026; cambia 3DSLink.3dsx): START ("Save & exit") mentre la scansione dei titoli girava ancora faceva
+crashare l'app (schermata rossa di Luma, tre dump identici). L'app aspettava il thread di scansione per 10 secondi, ma il timeout del
+kernel (0x09401BFE) non e' negativo e R_SUCCEEDED lo prendeva per "finito": liberava lo stato mentre il thread ci scriveva ancora.
+Ora solo 0 conta come finito e il thread di scansione si ferma al passo successivo quando si chiude l'app.
+
+3DS Link e' UN CIA SOLO, e il figlio per il Download Play lo fa l'app (decisione dell'utente, 21-10-2026). In dist/ ci sono due file
+(3DSLink.cia e 3DSLink.3dsx: dalla 1.0.1 il plugin e' dentro tutti e due e non e' piu' un file di dist/); dist/dlp/child.cia NON c'e' piu' e non va copiato da nessuna parte. La voce "3DS Link
+Delivery" costruisce da sola, la prima volta che la apri (e ogni volta che cambia la versione), il pacchetto che le altre console
+scaricano: SD:/3ds/3DSLink/dlp/child.cia, dal CIA dell'app, dal plugin e dal "modello" del figlio che l'app porta dentro (il figlio
+senza il suo RomFS, 250.944 byte). Lo schermo dice che cosa sta facendo e quanto manca ("Preparing the package", "One time only ... it
+should take about N s, and it can take longer", poi "It takes about N s" dal passo misurato; B ferma con una domanda e non lascia niente a meta'); la stanza non si apre mentre il pacchetto si costruisce. Il CIA
+dell'app lo prende, in quest'ordine, da SD:/3ds/3DSLink/dlp/3dslink.cia (se c'e' ed e' di questa versione: lo lascia l'installatore del
+Download Play) o dal titolo installato (servono boot9.bin e movable.sed e la scansione dei titoli finita). Il lavoro e' stimato in circa
+14 secondi (16 con la copia dal titolo installato) con velocita' prudenti MAI MISURATE su una console; sul PC e' 63 ms.
+L'interruttore di emergenza: Settings > "Download Play delivery" (acceso di default, e' nel file 3DSLink.cfg dell'app): spento, la voce
+e' spenta ("switched off") e niente della funzione gira; il resto dell'app funziona come prima. Condividere vuole boot9.bin: senza, la
+voce e' spenta ("needs boot9.bin", in giallo) e il tasto Y apre la guida "How to get boot9.bin" (GodMode9 passo per passo, otto
+passi, L/R o su/giu' per muoversi, B chiude): la guida c'e' anche nell'installatore, a installazione finita, come avviso che non
+blocca niente (il tasto Y), e nella pagina 3DS Link Delivery mentre la stanza e' aperta (la stanza va avanti: una console mostra la
+guida e l'altra fa i passi). Fra "Titles Delivery" e "3DS Link Delivery" nella pagina principale non c'e' spazio: e' un servizio solo in
+due parti. PROVATO SUL PC (il compositore rifa' il figlio di makerom byte per byte, verify_cia.py lo dichiara valido, il modello che
+l'app porta compone figli validi con due CIA diversi dell'app, la costruzione da zero non ha cicli); MAI SU UNA CONSOLE: la
+schermata di preparazione, il tempo e la memoria, l'interruttore, la guida disegnata (CHECKLIST_DA_VERIFICARE.md O15-O20). In un
+Azahar privato (console fittizia, nessuna chiave vera) queste schermate sono state viste il 21-22-10-2026; il README, punto 17,
+dice che cosa si e' visto e che cosa no (il passaggio dal file rifiutato alla copia dal titolo installato, no).
+APERTO (limiti noti, non blocchi): il compositore controlla del CIA dell'app l'intestazione, il TMD e la catena di hash (non il
+biglietto, i certificati, il meta ne' le firme); del plugin, che dalla 1.0.1 e' la risorsa dell'app (non piu' un file della scheda: la
+costruzione prova dimensione e SHA-256 di quello che l'app porta), controlla ancora l'intestazione; l'interruttore con un valore
+illeggibile nel file resta acceso (scelta); il tempo vero e la memoria su una Old 3DS non sono mai stati misurati.
+
+Il figlio "3DS Link Installer" (21-10-2026) installa l'app e il plugin sulla console che lo riceve (installa se manca, aggiorna se c'e'
+una versione piu' vecchia, con la stessa versione rinfresca solo il plugin, con una piu' nuova non tocca niente); dopo l'installazione
+lascia SD:/3ds/3DSLink/dlp/3dslink.cia (la copia del CIA dell'app, da cui anche quella console puo' fare da host) e, se manca boot9.bin,
+mostra l'avviso con la guida; scrive un registro in sdmc:/3ds/3DSLink/installer_log.txt e non crea mai 3DSLink.cfg. L'icona e' ora un
+quadrato opaco con la cornice grigia a tutto campo: gli angoli non sono piu' neri (smdhtool appiattiva la trasparenza sul nero).
+Provato su PC e (l'installatore di prima della copia e della guida) nell'emulatore, MAI su una console.
+
+Novita' dell'app (21-10-2026; cambia 3DSLink.3dsx, il plugin e' lo stesso): la voce "3DS Link Delivery" del menu principale, fra Titles
+Delivery e Settings. La console diventa un host Download Play e offre "3DS Link" a UNA console per volta che ha solo il Download Play
+di sistema (e Luma3DS): quella lo scarica, lo installa e lo avvia da sola. La stanza ha due posti (questa console e uno) e si rifa'
+dopo ogni console (1-4 s). La schermata dice chi e' dentro, a che punto e' (la percentuale e' di cio' che e' stato INVIATO: l'installazione
+e' sull'altra console e qui non si vede), la velocita', il tempo che manca e i pacchetti ripetuti; X manda via la console che e' dentro,
+B chiude la stanza (chiede conferma solo se qualcuno e' dentro), SELECT spegne gli schermi, Y apre la guida. Il pacchetto
+<cartella 3DSLink>/dlp/child.cia lo compone l'app (vedi sopra). La parte sull'aria e' la libreria di DlpLink, provata su console dalla
+sua sessione; la schermata dell'app non e' mai stata su una console.
+
+Dopo la tappa O (notte del 19-10-2026: le prestazioni del plugin, punti 5-8 di NOTE_LAG_2026-10-19.md; cambiano tutti e due i
+file) il motore del plugin non tiene piu' il suo lock mentre segnala un evento al gioco, mentre costruisce un frame da inviare o
+nei giri a vuoto del thread di rete (gli stalli da 10-32 ms di Tetris e SSF4 venivano da li'); il thread di rete aspetta nel socket
+0 ms se c'e' un frame da mandare, 1 ms per 10 ms dopo un invio, 3 ms altrimenti; con debug=1 ci sono righe nuove (chi chiama ogni
+comando e a che priorita', quanto e' tenuto il lock, quanto il gioco lascia aspettare i frame in coda). La chiave radio_like ha un
+terzo valore: radio_like=2 (nell'app "Radio-like data" = All (twice)) manda i dati unicast senza ritrasmissioni e DUE VOLTE alle
+console che numerano i loro frame, cioe' con questo 3DS Link (scartano la copia dal numero; a un Azahar o a un plugin vecchio il
+frame va una volta, con ritrasmissioni, come al livello 1), e consegna il flusso della stanza appena arriva invece di aspettare un
+pacchetto perso. Il rischio che resta: due copie perse insieme (un blocco della LAN) sono un frame perso per sempre, dove il
+livello 1 lo ritrasmette. Si prova in A/B contro 1 nella stessa sessione (PROVE_HARDWARE.md). MAI su una console.
+
+Dopo la revisione del codice dell'app (tappa N, sera del 19-10-2026; cambia solo 3DSLink.3dsx) un titolo la cui ricezione si ferma a meta'
+(B, mittente sparito, spegnimento) non resta piu' nella lista del sistema: il modulo lo toglie come dopo un errore e la pagina del risultato
+dice "stopped before this title was complete". "Installation check" ha la riga nuova "Installed titles": verde "N titles, all usable", o
+gialla con l'elenco di cio' che non si puo' usare (installazioni cominciate e mai finite, titoli che il sistema non sa descrivere, DLC con
+contenuti mancanti); A chiede conferma mostrando la lista e poi cancella SOLO quelli (una installazione mai finita perde solo la sua meta',
+non il ticket), e la scansione riparte; "Send Titles" non li offre ("incomplete"). Se il sistema rifiuta l'elenco delle versioni per colpa di
+un titolo rotto, l'app e il modulo chiedono titolo per titolo (prima ogni icona si rileggeva a ogni avvio: avvio lento). La barra della
+scansione dice il passo ("names: 12 of 221 titles", "games: 30 of 172", poi "221 titles, 172 games"). Le copie del plugin nelle cartelle
+dei giochi si ricontrollano solo quando AzaharLink.3gx della cartella dell'app cambia (3DSLink.cfg ricorda dimensione e data: plugin_stamp=).
+Sul PC: games_test 1.366, settings_test 412, paths_test 225 controlli; 622 mutanti. MAI su una console: la prova e' nella tappa N di
+PROVE_HARDWARE.md.
+
+Nello stesso AzaharLink.3gx ci sono anche le correzioni dell'audit di tutte le risposte UDS (NOTE_AUDIT_UDS_2026-10-18.md): sei revisori hanno confrontato
+ogni comando con il vero modulo nwm del firmware; corrette sette risposte (GetNodeInformation(0), changed_nodes, due join insieme, SetApplicationData
+vuoto, canale 0, EAPoL-Start sconosciuto, beacon dell'host), le altre sono in elenco nella nota con il consiglio per ognuna. Sul PC: test_main
+167.716 controlli. MAI su una console.
+
+La 0.1.16 e' stata provata su hardware in TRE sessioni, con debug=1: PROVA 3 (Final Fantasy Explorers, con Azahar per Android) e
+PROVA 4 (Zelda Tri Force Heroes, con Azahar su PC), il 2026-10-14 con la New 2DS XL dell'utente + la New 3DS XL di Friend-A; PROVA 5
+(Mario Party: The Top 100, un gioco nuovo senza codice specifico: la 3DS XL client di una lobby ospitata da un Azahar, 4 nodi per 55
+minuti, 67 minuti in un lancio) la notte 14-15; PROVE_HARDWARE.md, parti 3.4-3.6. 0 errori di socket in tutte e tre (in Mario Party
+31 avvisi "frames lost": vedi i limiti, sezione 9) e PRIMA uscita di TFH con la correzione del crash su una console (la 3DS XL di
+Friend-A: uscita completa nel registro, UNA uscita su UNA console). Sulla 2DS XL dell'utente (scheda SD da 128 GB piena) invece
+l'uscita e' stata lunghissima e il registro principale finisce prima dell'evento di uscita (nessuna schermata di eccezione: non e' il
+crash della 0.1.15; la causa e' un'inferenza, non una prova: la cattura piena su una scheda lenta tiene occupato lo scrittore; e'
+quello che la 0.1.17 cambia). L'utente accetta l'uscita lenta a debug=1 con un log enorme: a debug=0 non c'e' cattura. NON sono ancora
+stati provati: la WiFi tagliata e la riconnessione, il coperchio, i numeri a debug=0 (c'e' solo la percezione dell'utente:
+caricamenti accettabili), Old 3DS / Old 2DS; gemelli e lobby estranea con dati non hanno mai visto traffico (0 = 0 in tutte e tre le
+sessioni, anche con l'host Azahar). Si comincia dalla serata TFH (passo 2: le uscite): vedi la sezione 7.
+
+1. I FILE DI QUESTA CARTELLA
+---------------------------------------------------------------------------------------------------------------------------
+  3DSLink.cia             1.714.112 byte   md5 5482a65b004154164173859d55ad20d4    3DS Link come app installabile (FBI): Title ID 000400000F83D100, versione 1.0.2,
+                                                                             costruita dallo stesso 3DSLink.elf del .3dsx (DlpLink/tools/build_all.sh). E' il PACCHETTO
+                                                                             UNICO: il plugin e' dentro, e l'app lo scrive in SD:/3ds/3DSLink/AzaharLink.3gx da sola. E' l'UNICO
+                                                                             file da consegnare per condividere 3DS Link: il figlio per il Download Play (child.cia) NON si
+                                                                             consegna, lo compone l'app (SD:/3ds/3DSLink/dlp/child.cia)
+  3DSLink.3dsx            2.374.788 byte   md5 9c28392be9505609be75b42bdfc40ef8    l'app 3DS Link (mostra v1.0.2; la stessa del CIA, per l'Homebrew Launcher; identica a
+                                                                             ConfigApp/3DSLink.3dsx del repository; porta dentro lo stesso plugin e non vuole nessun altro file;
+                                                                             contiene anche il modulo di consegna dei titoli, Titles Delivery, e l'host Download Play, 3DS Link Delivery)
+  AzaharLink.3gx          1.011.866 byte   md5 bb20d5261100d6ec17f8fa62ecc7b023    NON e' un file di questa cartella: e' DENTRO i due file sopra (la risorsa che l'app
+                                                                             scrive in SD:/3ds/3DSLink/AzaharLink.3gx: questa dimensione e questo md5 sono quelli del file che deve
+                                                                             comparire sulla SD, per controllarlo; intestazione 3gx: versione 1.0.2, memoria condivisa, non privata)
+  default.3gx             non c'e' piu': 3DS Link abilita il plugin titolo per titolo e non lo usa (vedi sezione 2)
+  LEGGIMI.txt             questo file
+  test-1android-23ds/     i registri grezzi della PROVA 3 (2dsxl/ = New 2DS XL, 3dsxl/ = New 3DS XL): non servono all'installazione
+                          e non vanno modificati. I registri grezzi della PROVA 4 sono nella radice del repository, in
+                          "zelda test 2 ds 1 azahar/" (gionko/ = New 2DS XL, friend-a/ = New 3DS XL), quelli della PROVA 5 in
+                          "mario party 100 3 azahar 1 ds/", fuori da dist/.
+  old/                    le build vecchie con i loro nomi (0.1.14, 0.1.15, 0.1.15.1, 0.1.16 e le vecchie app Setup, fino a
+                          AzaharLinkSetup-0.1.17.3dsx) e
+                          old/LEGGI.txt, che dice che cosa e' ognuna e il suo difetto noto. NON usarle per i test.
+  (se il plugin viene ricostruito il md5 cambia di qualche byte: vale quello dei file di dist/.)
+
+2. COSA COPIARE SULLA SD
+---------------------------------------------------------------------------------------------------------------------------
+  dist/3DSLink.cia             ->  si installa con FBI (SD, il file, Install CIA). E' la strada consigliata: niente altro da copiare, perche' il
+                                   plugin e' dentro e l'app lo scrive da sola nella sua cartella (al primo avvio, dopo il Si' alla domanda; poi a ogni
+                                   avvio lo controlla e, se manca o e' diverso, lo rimette)
+  dist/3DSLink.3dsx            ->  oppure una cartella QUALSIASI della SD, di solito SD:/3ds/3DSLink.3dsx   (la stessa app; si apre dal Homebrew
+                                   Launcher; ogni percorso dell'app parte dalla cartella in cui l'hai messa: niente e' fisso; il plugin e' dentro anche qui:
+                                   non serve copiare AzaharLink.3gx, e' l'app che lo scrive in SD:/3ds/3DSLink/. Un AzaharLink.3gx messo a mano accanto al .3dsx si usa dove sta, e se e'
+                                   diverso dal plugin dell'app viene riscritto)
+  AzaharLink.3gx (la copia nei titoli)  ->  la fa l'app: con l'interruttore di "Enable Titles for Azahar Emulator Net" mette una copia del plugin, preso da
+                                   SD:/3ds/3DSLink/AzaharLink.3gx, in SD:/luma/plugins/<ID del titolo a 16 cifre
+                                   esadecimali MAIUSCOLE>/AzaharLink.3gx, una per titolo abilitato; e' la strada normale
+                               oppure, a mano e senza l'app: copia il file SD:/3ds/3DSLink/AzaharLink.3gx (quello che l'app ha scritto) in SD:/luma/plugins/<ID del titolo>/AzaharLink.3gx (un titolo solo: Final
+                                   Fantasy Explorers = 000400000016E700, Zelda Tri Force Heroes = 0004000000177000); un default.3gx non serve
+                                   e non c'e' piu' in dist/
+  l'ini                        ->  SD:/3ds/3DSLink/AzaharLink.ini          (lo crea l'app 3DS Link; il plugin lo scrive solo quando
+                                   salvi una modifica fatta dal suo menu in gioco)
+  boot9.bin (consigliato)      ->  accanto a 3DSLink.3dsx (cercato per primo), poi nella cartella 3DSLink dell'app, oppure in SD:/gm9/out/
+                                   (dove lo mette GodMode9, anche col nome <seriale>_boot9_00.bin che gli da' GodMode9 2.x, o con un nome qualsiasi: l'app lo riconosce da cosa c'e' dentro), oppure dove vuoi tu: se manca, in "Settings" > "Installation check" la
+                                   riga boot9.bin si tocca con A e offre di cercarlo in tutta la SD, di scegliere una cartella o di dire
+                                   come ottenerlo; l'app lo usa dov'e' e ne ricorda il percorso. Serve per CONDIVIDERE: INVIARE titoli con "Titles
+                                   Delivery" e offrire 3DS Link con "3DS Link Delivery" (per RICEVERE basta una Luma3DS con le patch delle firme, e il movable.sed si legge dalla NAND
+                                   della console, non dalla SD) e, dove il sistema non lascia leggere le icone a un 3dsx (e' il caso delle
+                                   quattro console provate), per leggere i nomi e le icone di "Enable Titles for Azahar Emulator Net". Se manca e' un
+                                   AVVISO giallo, non un problema: 3DS Link funziona, solo condividere (inviare titoli, offrire 3DS Link) lo richiede; il tasto Y apre la guida per ottenerlo; l'app lo dice
+                                   nella pagina principale e nel suo controllo dell'installazione
+  la cartella dell'app (3DSLink): se 3DSLink.3dsx sta in una cartella che si chiama gia' 3DSLink (per esempio SD:/3ds/3DSLink/), quella e'
+                               la cartella dell'app; altrimenti si crea una cartella 3DSLink accanto al 3dsx. Dentro: 3DSLink.cfg,
+                               servers.txt, le cache dei titoli, park/ e i registri della consegna, e AzaharLink.3gx (lo scrive l'app, dal
+                               plugin che ha dentro; boot9.bin invece lo metti tu, li' o accanto al 3dsx). Un'app avviata senza percorso (installata come CIA, o
+                               un emulatore) usa SD:/3ds/3DSLink. Nella cartella dlp/ c'e' il pacchetto che 3DS Link Delivery offre
+                               (child.cia, lo compone l'app) e la copia del CIA dell'app (3dslink.cia, la lascia l'installatore).
+
+  - Luma carica UN SOLO .3gx per titolo: prima guarda la cartella SD:/luma/plugins/<ID del titolo>/ e usa il primo file che
+    finisce in .3gx; solo se la cartella non esiste o non ne ha, usa SD:/luma/plugins/default.3gx (un plugin per TUTTI i titoli: 3DS Link
+    non lo usa; se c'e', "Installation check" lo dice). Quindi nella cartella del titolo deve esserci UN SOLO .3gx alla volta: per
+    cambiare versione togli il vecchio, copia il nuovo (o lascia fare all'app: rifa' da sola una copia di un'altra dimensione), chiudi del
+    tutto il gioco e rilancialo. Se per un titolo hai gia' una cartella con un altro plugin (cheat, CTGP-7...), l'app dice "other plugin"
+    e non la tocca: non si possono usare insieme (metti AzaharLink.3gx in quella cartella al posto dell'altro).
+  - Il Plugin Loader va attivato in Luma3DS (menu Rosalina: L + Giu' + Select): vedi il punto 0 di COME SI COMINCIA. Se e' spento il
+    gioco parte SENZA il plugin e senza nessun messaggio.
+  - La console deve essere collegata a internet via WiFi (e' quel collegamento che trasporta il gioco) e raggiungere l'IP della
+    stanza Azahar (stessa LAN del PC: l'indirizzo locale del PC; da fuori serve l'inoltro della porta UDP 24872 sul router).
+
+3. L'INI: LE 15 CHIAVI (nell'ordine in cui plugin e app le scrivono, sempre tutte, fine riga LF)
+---------------------------------------------------------------------------------------------------------------------------
+  Una riga chiave=valore. Gli interruttori accettano 1/on/true/yes e 0/off/false/no (maiuscole o minuscole); un valore
+  sbagliato vale il predefinito della chiave (acceso per i cinque interruttori: "enabled=oops" resta acceso, "enabled=off" spegne;
+  0 per sleep_stop, che un refuso non deve mai accendere).
+
+  enabled=1              0 = il plugin non intercetta nulla (nessun gancio): il gioco usa la wireless vera; vale dall'avvio dopo
+  host=                  indirizzo della stanza (IP o nome, per esempio 10.139.0.1); vuoto = nessuna stanza
+  port=24872             porta UDP della stanza
+  nickname=              nome nella stanza (4-20 caratteri); vuoto = il nome del profilo della console
+  password=              la password della stanza in uso (nell'app ogni stanza ha la sua: usare una stanza la scrive qui); vuota se non ne ha
+  tunnel=1               come enabled
+  autoconnect=1          entra nella stanza appena il gioco e' partito (con il menu in gioco spento vale sempre: entra da solo)
+  radio_like=1           0 = tutto affidabile; 1 = beacon e dati broadcast senza ritrasmissioni (un pacchetto perso non blocca
+                         tutto); 2 = anche i dati unicast, mandati due volte alle console con 3DS Link (a un Azahar una volta,
+                         affidabile), e il flusso della stanza consegnato appena arriva
+  socket_buffers=1       0 = non chiede l'anello di ricezione da 64 KB (resta quello predefinito, 4416 byte)
+  net_thread_core=-1     core del thread di rete (-1 qualsiasi, 0, 1)
+  menu_key=L+R+Select    combinazione che apre il menu in gioco (Select ne fa sempre parte); off (o none) = il menu non si apre mai
+  game_name=             nome del gioco mostrato nella stanza (vuoto = letto dal gioco)
+  debug=0                0 = NESSUN log e nessun file; 1 = tutto (vedi "I file di log"); un vecchio 2 vale 1
+  rcvbuf_kb=64           8, 16, 32 o 64: puo' solo ABBASSARE l'anello di ricezione (64 KB e' il massimo duro del servizio soc)
+  sleep_stop=0           coperchio: 0 = solo registrato (predefinito); 1 = alla sospensione chiude la sessione UDS e la stanza e al
+                         risveglio rientra, ma SOLO se la console non e' host; 2 = vale anche per l'host
+
+  Per le prove non scrivere a mano sleep_stop ne' rcvbuf_kb: ci sono gia' (0 e 64). L'app 3DS Link completa da sola, appena la apri,
+  un ini con meno chiavi, senza cambiare i valori che ci sono (il plugin riscrive tutte le 15 chiavi solo quando salva una modifica
+  fatta dal suo menu, non all'avvio del gioco).
+
+4. COME SI COMINCIA
+---------------------------------------------------------------------------------------------------------------------------
+  0. SU OGNI CONSOLE, UNA VOLTA: attiva il Plugin Loader di Luma3DS (menu Rosalina: L + Giu' + Select, voce "Plugin Loader", poi "Enabled"; la
+     posizione della voce dipende dalla versione di Luma). Con il Plugin Loader spento il gioco parte normalmente ma il plugin NON
+     viene caricato: nessuna notifica "Joined room", nessun file di log, i giocatori Azahar non ti vedono e nessun messaggio dice
+     perche'. Il 2026-10-14, al primo avvio sulla console di Friend-A, era cosi': attivato l'interruttore e rilanciato il gioco (non e'
+     servito riavviare la console) la stanza si e' aperta al primo colpo. Se dopo un riavvio della console il plugin non parte piu',
+     ricontrolla questo interruttore.
+     CHE LUMA3DS SERVE (l'app lo dice nella riga "Luma3DS" di "Installation check"; il Plugin Loader esiste solo dalla Luma UFFICIALE 13.0,
+     2023-07-20; "Titles Delivery" non lo usa e funziona su tutte; aggiornare Luma da 3DS Link non e' in programma):
+        sotto la 13.0 (10.1.1, 10.2.1)  il plugin NON funziona (nessun Plugin Loader)         riga ROSSA   "not work"
+        13.0 - 13.2                     dovrebbe funzionare, MAI PROVATA                      riga GIALLA  "maybe"
+        13.3 e piu' nuove               provata (13.3.3 sulle console A e B)                  riga VERDE   "tested"
+     CON IL ROSSO LA PARTE AZAHAR DELL'APP SI SPEGNE (a ogni avvio dell'app e a ogni ritorno alla pagina principale): l'interruttore
+     "3DS Link" va su OFF da solo e si blocca (in grigio; A dice "Luma3DS 10.2.1 is too old: 3DS Link cannot be switched on."; l'app scrive
+     enabled=0 nell'ini e, dopo un aggiornamento di Luma, l'interruttore resta su OFF finche' non lo riaccendi); le righe "Azahar Emulator
+     Room" e "Enable Titles for Azahar Emulator Net" sono in grigio (A dice "Needs Luma3DS 13.0 or newer: this console runs 10.2.1."); la
+     scheda dice "3DS Link is OFF" con il motivo in rosso; "Titles Delivery" e "Settings" restano usabili. Non vale per il giallo "maybe"
+     (13.0 - 13.2) ne' se la versione non si legge (emulatore). TIPO DI UN TITOLO: in tutte le liste, nella scheda "Offered" e nella
+     legenda "Game  Update  DLC" e' una sola barretta colorata SENZA lettera (blu gioco, verde aggiornamento, rosso DLC).
+  1. PRIMA copia da parte l'ini attuale (serve al passo 1). Poi apri 3DS Link: dalla HOME se l'hai installata con FBI (3DSLink.cia: e' la strada
+     consigliata, vedi il PASSO 0 del piano) o dal Homebrew Launcher (3DSLink.3dsx); il plugin e' dentro e lo scrive l'app. Ogni pagina ha bottoni veri in fondo allo schermo tocco, e un tocco fa quello che fa il
+     tasto: [B Back], [A <azione>], [X ..] e [Y ..] dove servono (in quelle pagine non c'e' START) e [START Save & exit]. Una pagina con bottoni in piu'
+     (X, Y) o senza START ha i bottoni su tutta la larghezza, uguali e a uguale distanza; le pagine di Titles Delivery, l'elenco delle
+     stanze e la pagina di una stanza NON hanno START (l'app si lascia dalla pagina principale: da dentro Titles Delivery esce solo B).
+     In ogni domanda A ("Yes") sta a DESTRA e B ("No") a SINISTRA, tutti e due DENTRO la scheda del popup.
+     IL PRIMO AVVIO (nella cartella dell'app, 3DSLink/, non c'e' 3DSLink.cfg) comincia con una domanda:
+     "First start: 3DS Link will scan the SD card and check your installation. This takes a while. Continue?"
+     B (No) chiude l'app subito e NON scrive niente sulla SD, nemmeno la cartella 3DSLink/. A (Si') avvia una sequenza guidata (sullo
+     schermo alto la scheda riempie tutto lo schermo; su quello tocco "Checking your installation" sta al centro): (a) la scansione dei
+     titoli installati (barra di avanzamento; crea le cache dei nomi e delle icone), (b) boot9.bin, (c) il Seed database (la copia dei seed che la console tiene nella sua NAND: si legge da sola, non serve boot9.bin; se non si legge e' un avviso), (d) il file AzaharLink.3gx (che l'app ha scritto da sola in SD:/3ds/3DSLink appena hai risposto Si': il passo dice "put there by 3DS Link"), (e) la
+     cartella SD:/luma/plugins (se manca offre di crearla), (f) il Plugin Loader di Rosalina; poi, se e' SPENTO, una domanda Si'/No (Si' lo
+     accende subito, senza passare dal menu Rosalina); poi il RIEPILOGO, cioe' l'"Installation check" con [B Cancel] [A Fix] [START
+     Continue] ("Installation: All OK" oppure i problemi e gli avvisi: toccandone uno si va a risolverlo; il bottone A "Fix" c'e' solo se la riga scelta si puo' sistemare: su una riga a posto restano B e START). START scrive 3DSLink.cfg e
+     apre la pagina principale SENZA uscire dall'app; B annulla (3DSLink.cfg non si scrive e il primo avvio ricomincia alla prossima
+     apertura). Gli avvii dopo il primo non fermano nessuno: rileggono in sottofondo solo le novita'. Sullo schermo alto della pagina
+     principale la barra chiara ha "3DS Link" e la versione a sinistra e, a destra, la batteria (un piccolo simbolo e la percentuale, "+"
+     quando carica) e lo spazio libero della SD ("SD 26.5 GB free"); sotto, in righe tutte della stessa dimensione (il testo e' piu'
+     grande di prima): WiFi (tre barre di segnale e "connected" / "not connected"), Plugin Loader, Name (il nome), Join (come ci si
+     unisce), Room (la stanza) e "Installation": "All OK" (verde) oppure i problemi e gli avvisi in poche parole (per esempio "boot9.bin
+     missing - A on Installation check"; rossa se c'e' un problema, GIALLA se ci sono solo avvisi, come boot9.bin mancante). Lo schermo
+     tocco ha la barra "Options" e le righe (le prime tre sono un blocco, poi c'e' uno stacco, "Titles Delivery", un altro stacco e "Settings"):
+     "3DS Link" (interruttore ON/OFF; con una Luma3DS sotto la 13.0 va su OFF da solo e si blocca), "Azahar Emulator Room" (era "Room address"; elenco di stanze, fino a 10; ogni stanza ha QUATTRO campi: nome fino a 12 caratteri,
+     anche vuoto, indirizzo senza la porta, porta 1-65535 (24872 se non la cambi) e la SUA password; A usa la stanza sotto il cursore
+     (nell'ini vanno indirizzo, porta e la password di quella stanza), Y la cambia con una pagina a quattro righe (A su una riga =
+     tastiera, Y salva, B annulla) o, sull'ultima riga "Add a room...", ne aggiunge una; X toglie una stanza dopo la domanda "Remove the
+     room"; una stanza nuova, o con indirizzo, porta o password cambiati, si prova subito (B annulla la prova) e, se risponde, diventa la
+     stanza in uso, se no chiede se usarla lo stesso; cambiare solo il nome salva senza prova; la pagina di una stanza ha anche la riga "Test room" (sotto Password; A = Test): entra nella stanza con quei dati e mostra un popup che RESTA fino a A/B, con i tre passi e "The room answers" (nome della stanza e giocatori) o l'errore con la sua spiegazione, e non salva niente; la prima volta la password unica dell'ini
+     passa alla stanza in uso), "Enable Titles for Azahar Emulator Net" (era "Enable Titles for Azahar Emulator"; i titoli installati, uno per riga con icona, nome intero e ON/OFF: ON copia il plugin in
+     SD:/luma/plugins/<ID>/; OFF lo toglie. La copia la fa un thread in sottofondo, una dopo l'altra: si possono accendere piu' titoli
+     di fila, e la riga dice "Enabling..." poi "Enabled" per 2 secondi (spegnendo "Disabling..." / "Disabled"); un nome troppo lungo
+     si taglia con "..." e sulla riga scelta scorre; "other plugin" = nella cartella c'e' un altro plugin: va tolto a mano), "Titles
+     Delivery" (invio e ricezione di titoli fra console 3DS sulla wireless locale: "Send Titles" e "Receive Titles"; finche' la lista dei
+     titoli si legge le righe dicono "reading N%" e A apre "Reading your titles", che apre da sola la pagina scelta; nessuna pagina ha
+     START; "Send Titles" e' spenta se manca boot9.bin, per "Receive Titles" servono il Wi-Fi acceso e una Luma3DS con le patch delle
+     firme; gli schermi sono dell'app, in inglese; mai provata su una console: passo 5 del piano) e "Settings" (era "Configuration"):
+     "Nickname" (4-20 caratteri; vuoto = il nome del profilo della console), "Join room at title start",
+     "Radio-like broadcast data", "End session on sleep" = sleep_stop (Off / Client only / Always), "Debug log (full traffic)" (UN solo
+     interruttore per tutti i registri: spento di norma, si accende per le prove; acceso, anche Titles Delivery scrive il suo registro),
+     "In-game menu" (spento = il menu in gioco non si apre mai, menu_key=off, la stanza si cerca da sola all'avvio; acceso =
+     L+R+Select), "Test the connection" (entra nella stanza, mostra nome, giocatori e il MAC assegnato, poi esce: se funziona la parte
+     di rete e' a posto), "Installation check" (tre livelli: problema rosso, avviso giallo, a posto verde; le righe da sistemare si
+     toccano con A: rimette il plugin dall'app, cerca boot9.bin in tutta la SD, crea /luma/plugins, accende il Plugin Loader; boot9.bin mancante e' un avviso; la riga "Seed database" non si puo' sistemare; la riga "Luma3DS" dice la versione di Luma: rossa "not work" sotto la 13.0 (e spegne la parte Azahar dell'app: punto 0), gialla "maybe" dalla 13.0 alla 13.2, verde "tested" dalla 13.3, e non si puo' sistemare), "About 3DS Link".
+  2. Avvia il gioco. Dopo circa 5 secondi compare la notifica "Joined room ...". Apri il menu del multiplayer locale del gioco
+     come al solito: la partita compare nella lista ai giocatori Azahar e viceversa.
+  3. In gioco, L+R+Select apre il menu del plugin (Status, Room address [la voce del plugin: nell'app la riga si chiama "Azahar Emulator Room"], Nickname, Password, Connect to room, Radio-like
+     broadcast data, AzaharLink at game start, Debug log). Status -> A mostra i numeri dell'ultima finestra di 5 s.
+  4. CONTROLLO DELL'AVVIO, in ogni log (con debug=1), prima di tutto il resto:
+         ==== AzaharLink 1.0.2 (built ...), console clock 2026-10-14 hh:mm:ss.mmm ====
+         console: application memory region 124 MiB (New 3DS memory layout)
+         soc: reserved a 128 KB buffer at 0x0dfe0000, ... SO_RCVBUF limited to 64 KB      (TFH: 0x0ffa0000)
+         soc: sockets ready (128 KB buffer at 0x0dfe0000, now state 11 perm 0)
+         soc: SO_RCVBUF default 4416, asked 65536 -> rc 0 (errno 0), ring now 65536      <- LA RIGA CHIAVE
+         res: ... game heap @0x08000000: 23064 KB                                          (FFE; con la 0.1.14 erano 22808)
+     Se dopo "ring now" non c'e' 65536, a schermo compare anche "socket buffer is N KB, 64 KB asked": mandami il log.
+
+5. I FILE DI LOG (in SD:/3ds/3DSLink/, con l'ini e i file dell'app; fino al 19-10-2026 erano in SD:/luma/plugins/)
+---------------------------------------------------------------------------------------------------------------------------
+  Con debug=0 (predefinito) il plugin NON scrive nessun file di log: un problema si vede a schermo con la sua ragione e i numeri
+  sono nel menu in gioco (Status -> A). Per le prove si usa debug=1:
+    AzaharLink.log          il registro principale (righe di controllo, statistiche ogni 5 s, mem:/res: ogni 30 s); non si
+                            azzera mai a un avvio: cresce in blocchi da 64 MB numerati in ordine (quando AzaharLink.log arriva a
+                            64 MB diventa AzaharLink.N.log con N il numero piu' alto presente + 1, e ne nasce uno nuovo; .1.log
+                            e' il piu' vecchio); al massimo 50 file, poi il piu' basso se ne va
+    AzaharLink.debug.log    la cattura: ogni frame UDS con il payload, ogni comando, ogni servizio che il gioco apre, ogni
+                            chiamata IPC (le ripetitive con risultato 0 sono contate: le prime 3 per secondo intere, poi una riga
+                            "x97 from ... to ..."); stessi blocchi da 64 MB in ordine (AzaharLink.debug.1.log il piu' vecchio,
+                            ... fino a 50 file); righe LOST = buchi della cattura
+    AzaharLink.sleep.log    la traccia del coperchio (una riga per evento, scritta e svuotata subito da un thread suo)
+    3DSLink-TitleDelivery.log   il registro di "Titles Delivery": sta nella cartella 3DSLink dell'app, NON in luma/plugins; lo scrive il
+                            modulo solo con "Debug log (full traffic)" acceso (lo stesso interruttore del plugin; spento non nasce nessun
+                            file; nasce quando una stanza si apre o si entra in una; le righe sono in italiano, le scrive il modulo);
+                            ruota su 8 file da 64 MiB (3DSLink-TitleDelivery.log e' il piu' recente, poi .1.log ... .7.log)
+  Le righe che servono di piu' (il dettaglio e' nel README, "Diagnosi"):
+    stats: ms per second ...   ms di CPU al secondo, senza le attese: "plugin total N (CPU)", thread di rete / thread del gioco / log;
+                               "net loop W = cpu C + waiting V + other O" si chiude a circa 1000
+    stats: soc calls ...       chiamate al servizio dei socket per tipo (numero, media e massimo in us, oltre 20 e 100 ms), il massimo letto da
+                               una passata e quanto riempie l'anello, "gaps between room datagrams" (buchi di 50-99 ... 500+ ms), "twin
+                               candidates" (seconde copie dell'host), in coda "filters:" (lobby estranee, ...)
+    stats: uds ...             consegnati, scarti per motivo, "overwritten", "ring peak N units", "host beacons N, longest silence M ms"
+    stats: capture: ...        quanto ha preso e perso la cattura in quella finestra
+    mem: ... e res: ...        ogni 30 s: memoria del gioco e del plugin, "clock gap" (cresce quando la console dorme), limiti del processo
+    WARNING (shown on screen)  tutto cio' che il plugin ti mostra anche a schermo
+    apt: ReplySleepQuery ...   se NON e' preceduta da "apt: notification 3 (sleep query)" e' una risposta che il gioco manda da solo
+                               (quando apre nwm::UDS: a circa 35 s dall'avvio in FFE, pochi millisecondi prima in TFH; e dopo HOME):
+                               non e' un tasto e non impedisce la sospensione
+    shutdown: begin|done       la fine del lancio. La riga NUOVA della 0.1.17 "shutdown: the capture was cut at the end: N KB of it
+                               were not written (the card was too slow to take them in 500 ms)" viene DOPO "shutdown: done" e compare
+                               solo se la scheda non ha fatto in tempo a prendere l'anello della cattura (attesa con l'anello pieno
+                               su una scheda lenta; non e' un errore): N KB sono la coda della cattura che manca nel file
+  ATTENZIONE: debug=1 e' una modalita' di diagnosi, non di gioco. Una sessione di 25-27 minuti pesa 58-68 MB (2,15-2,74 MB al minuto;
+  il file ruota a 64 MiB dopo circa 24 minuti) e i caricamenti diventano MOLTO piu' lunghi (nella PROVA 3: 52-74 s per l'avvio di una
+  quest FFE e fino a 164 s per il ritorno alla lobby sulla 2DS XL, contro 52 s e 26 s sulla 3DS XL; probabilmente perche' la cattura
+  scrive sulla stessa SD da cui il gioco legge). Per giocare lascia "Debug log" spento (debug=0): secondo l'utente il costo e' al
+  massimo mezzo secondo - un secondo per caricamento. Usa debug=1 solo per mandare i log. Cancella i vecchi log prima di ogni passo.
+  LA SCHEDA SD CONTA (consigli per i log): su una scheda lenta o quasi piena l'anello da 512 KB della cattura si riempie, si perdono
+  record e le finestre di stats si allungano (PROVA 3 e 4: la 2DS XL dell'utente, 128 GB PIENA, ha perso il 20,5% dei record pesanti con
+  FFE e il 3,55% con TFH; la 3DS XL di Friend-A, 128 GB quasi vuota, lo 0,79% e lo 0,12%, ma il 57% con Mario Party: PROVA 5, circa 6
+  volte i frame di FFE). Quindi: i log a debug=1 raccoglili, quando
+  puoi, dalla console con la scheda piu' libera (quella di Friend-A); la 2DS XL con la scheda piena gioca a debug=0; prima di una
+  sessione a debug=1 su quella scheda libera circa 20 GB o usa una scheda nuova; se FTPD (o un altro homebrew) si pianta dopo una
+  sessione, riprova con il plugin spento (Plugin Loader spento, o enabled=0 nell'ini) e con spazio libero sulla scheda (nella PROVA 4
+  si e' piantato due volte sulla 2DS XL piena; causa ignota). L'uscita lenta a debug=1 su una scheda piena l'utente
+  la accetta e non si prova piu': li' si gioca a debug=0.
+  La cattura arriva sul file con 10-35 s di ritardo (nella PROVA 3, con l'anello vuoto, fino a 5 ms da "shutdown: done"; con l'anello
+  pieno il ritardo c'e'): aspetta 20 s dopo l'ultima azione prima di uscire dal gioco. Con la 0.1.17 l'uscita non aspetta piu' la cattura
+  oltre mezzo secondo: quello che l'anello ha ancora si perde e la riga "capture was cut" lo dice; i 20 s riducono il caso, non lo tolgono.
+  ORDINE DEI FILE dopo una rotazione: AzaharLink.debug.log e' il file CORRENTE (il piu' recente), AzaharLink.debug.1.log quello ruotato
+  prima, .2 quello prima ancora (piu' alto il numero, piu' vecchio il file; lo stesso per AzaharLink.log e AzaharLink.old.log). Se copi
+  i file di due console nella stessa cartella il programma di copia aggiunge " (1)" al nome del secondo: una cartella per console.
+
+6. REGOLE PER OGNI PROVA
+---------------------------------------------------------------------------------------------------------------------------
+  - Regola 0: il Plugin Loader di Luma3DS attivo su ogni console (punto 0 di COME SI COMINCIA). Se manca non compare nessun messaggio.
+  - UN passo alla volta. Prima di ognuno cancella dalla SD AzaharLink.log, .old.log, .debug*.log e .sleep.log.
+  - Annota l'ORA di ogni azione (della console; del PC per le azioni sul PC), il ruolo (client/host) e dove sei (lobby/quest).
+    Aspetta 20 s dopo l'ultima azione.
+  - NON cambiare l'orologio delle console fra un passo e l'altro: non serve che siano uguali (nella PROVA 3 una era avanti di 59 min
+    46,8 s, costante, e basto'), serve che non si muovano: la differenza serve a mettere insieme i registri.
+  - ini: debug=1 per le prove (debug=0 solo dove il passo lo dice). sleep_stop resta 0 tranne nei passi 4c-4e.
+  - Il coperchio si chiude SOLO nel passo 4.
+  - Se compare una schermata di eccezione di Luma: FOTOGRAFALA e premi un tasto NORMALE (A, B...). MAI il tasto di accensione e
+    MAI il coperchio (uno spegnimento brusco fa rimostrare il dump con dei bit sbagliati). Poi fermati e mandami le foto.
+  - Se lo schermo resta nero per piu' di 30 s: menu di Rosalina (L+Giu'+Select) per vedere se il sistema risponde, poi tieni premuto
+    l'accensione ~4 s e annota l'ora. Non aspettare 15 minuti.
+  - Prima di aprire per la prima volta l'app 3DS Link nuova copia da parte l'ini attuale (serve al passo 1).
+
+7. IL PIANO DI PROVE (ordine di costo e di rischio; criteri completi e righe di log da cercare in PROVE_HARDWARE.md, parte 2)
+---------------------------------------------------------------------------------------------------------------------------
+  Si comincia dal PASSO 0 (1.0.1: l'installazione pulita con FBI, il plugin che compare da solo, l'interruttore, About, la guida). Il piano e' corto di proposito: QUATTRO PASSI (1, 2a-2b, 3b-3d, 4a-4e; la 3a e' tolta), PIU' il PASSO 5 facoltativo (Titles Delivery, invio e
+  ricezione di titoli fra due console: in fondo, prima delle letture passive). Si e' tolto solo cio' che i registri o le
+  parole dell'utente coprono davvero (PROVE 3, 4 e 5). Il codice nuovo dell'uscita della 0.1.17 tocca solo l'uscita CON la cattura (debug=1;
+  le altre due modifiche, APT e testo della memoria, non hanno un passo a se': si leggono nei registri) e
+  l'utente accetta l'uscita lenta a debug=1: LE USCITE SONO 4, tutte sulla build nuova, invece di 12. SE HAI UNA SOLA SERATA: il PASSO 2
+  (le uscite di TFH). Le "vecchie prove 1-20" (il piano del 2026-10-13) sono nella tabella "Stato" di PROVE_HARDWARE.md (parte 2) e,
+  in breve, nella mappa "VECCHIE PROVE -> PASSI" in fondo a questa sezione. I tempi sono stime, non misure. Prima di tutto, su ogni
+  console: il Plugin Loader (punto 0 di COME SI COMINCIA).
+
+  LE USCITE (HOME, poi Chiudi software) provano due cose: che la correzione del crash di Tri Force Heroes alla chiusura regga (la 0.1.15
+  a debug=1 dava una schermata di eccezione) e che la fine di un lancio non resti bloccata dalla cattura su una scheda lenta (PROVA 4).
+  Sono 4, tutte sulla 0.1.17: TFH debug=1 x1 (2a), TFH debug=0 x2 (2b), FFE debug=0 x1 (3d). A debug=0 non c'e' cattura e l'uscita e'
+  quella di prima. (Con la 0.1.16 ci sono gia': TFH debug=1 una uscita pulita su una console e una da riesaminare; FFE debug=1 due
+  pulite; FFE debug=0 due finite bene secondo l'utente; Mario Party debug=1 una, registro completo e uscita lenta per l'utente. Non
+  contano per la 0.1.17.) Consiglio: debug=1 su una scheda piena = uscita lenta, gioca a debug=0. Flusso di ogni uscita: avvia il
+  gioco, aspetta ALMENO 20 s (dove il passo lo dice: dopo una partita di almeno 10 minuti), premi HOME, aspetta circa 5 s, Chiudi
+  software (e conferma). Annota: pulito (torni al menu HOME) / schermata di eccezione / schermo nero / la console si riavvia; se dopo
+  FTPD o l'Homebrew Launcher partono; a debug=1 anche i secondi da "Chiudi software" al menu HOME (un'osservazione, nessuna soglia).
+  CRITERIO: 0 schermate di eccezione in tutte le uscite; a debug=0 basta tornare al menu HOME in poco tempo (nessun cronometro, salvo
+  che sia lento); a debug=1, nel registro principale "process event EXIT", "shutdown: begin", "shutdown: done", dove "shutdown: done" e'
+  l'ultima riga OPPURE e' seguita solo dalla riga nuova "shutdown: the capture was cut at the end: ..." (non e' un errore: dice quanto
+  della cattura manca). Se mancano sia "shutdown: done" sia quella riga, il registro e' incompleto: e' il difetto della PROVA 4,
+  scrivimelo con l'ora. Se compare una schermata di eccezione: foto, tasto normale, fermati e mandami le foto.
+
+  PASSO 0 - L'INSTALLAZIONE PULITA CON FBI (1.0.1; circa 15 minuti; e' da qui che si parte, CHECKLIST_DA_VERIFICARE.md righe P1-P4 e P9-P12)
+     Prima: una console senza 3DS Link (se c'e' la 1.0.0: toglila da FBI, Titles > 3DS Link > Delete Title) e senza la cartella SD:/3ds/3DSLink/
+     (cancellala dal PC; copia da parte l'ini se vuoi tenerlo). Sulla SD metti SOLO 3DSLink.cia, niente AzaharLink.3gx.
+     1. Installa 3DSLink.cia con FBI. Apri 3DS Link dalla HOME. Compare la domanda del primo avvio; rispondi Si' (A).
+     2. Finito il primo avvio, guarda la SD dal PC: SD:/3ds/3DSLink/AzaharLink.3gx ESISTE, con la dimensione e il md5 della sezione 1 (la riga
+        AzaharLink.3gx). Nel passo "Plugin file" del riepilogo c'era scritto "put there by 3DS Link"; sulla pagina principale compare, una volta,
+        "The plugin was put in sdmc:/3ds/3DSLink."; "Settings" > "Installation check": la riga "Plugin file" e' verde.
+     3. Torna indietro: chiudi l'app, cancella AzaharLink.3gx dal PC, riapri l'app: torna da solo (stesso messaggio). Poi cambia un byte del file
+        (o taglialo) e riapri: "The plugin in ... was damaged: it was replaced." e il md5 e' di nuovo quello giusto. Senza modifiche, al
+        prossimo avvio nessun messaggio e nessuna scrittura (la data del file non cambia).
+     4. L'interruttore: togli di nuovo il file e metti la levetta della SD in sola lettura (o sul PC metti una CARTELLA chiamata
+        AzaharLink.3gx al posto del file): riapri l'app. L'interruttore "3DS Link" e' grigio e OFF, A dice che cosa manca e perche' non e' stato
+        scritto, la scheda in alto dice "The plugin is not on the card". Rimetti la SD in scrittura (o togli la cartella), "Settings" >
+        "Installation check" > "Plugin file" > A (Fix): il file torna e l'interruttore si puo' accendere.
+     5. "Settings" > "About 3DS Link": "3DS Link" e "v1.0.2"; la nota comincia con "Connect, share, play together"; c'e' la riga dell'autore (Gionko); "Installed as" dice "installed app"
+        (mai "unknown"); "Credits and thanks" apre l'elenco (12 voci), si scorre con su/giu', B torna. Poi la guida "How to get boot9.bin" (Y dalla
+        voce 3DS Link Delivery spenta, o dal controllo dell'installazione): su/giu' cambiano passo.
+     6. (1.0.2) La HOME: con l'app installata e MAI aperta, il pacchetto mostra il NOME "3DS Link" e l'editore "Powered by Gionko" (non lo slogan);
+        selezionando l'icona, lo schermo in alto mostra il BANNER (modello 3D con i due anelli, "3DS Link", sotto "Connect, share, play together") e si sente il jingle.
+        Non si vede nell'emulatore: si giudica qui.
+     7. (1.0.2) "3DS Link Delivery": con la stanza aperta, in alto a destra "Wi-Fi CH n" (1, 6 o 11), come in "Titles Delivery".
+     8. (1.0.2) Sulla console che riceve 3DS Link dal Download Play, a lavoro finito: A e B tornano alla HOME, Y apre la guida (se manca boot9.bin),
+        gli altri tasti non fanno niente.
+     Annota quello che vedi, anche a schermo (i testi tagliati: su 400x240 non sono stati visti da nessuno su una console).
+
+  PASSO 1 - BANCO (circa 40 minuti, nessun amico, nessuna partita lunga) [vecchie prove 12 e 17b]
+     Prima: copia da parte l'ini attuale; metti sulla SD un ini vecchio (13 chiavi, sleep_stop=1, un # commento con un BOM davanti); per i punti 3 e 4 una SD senza la cartella 3DSLink/ accanto all'app (primo avvio) e un
+     boot9.bin in un posto strano (una sottocartella); per un secondo giro facoltativo del punto 3 la stessa app in SD:/3ds/3DSLink/ con
+     boot9.bin li' (il plugin lo scrive l'app). Per il punto 4: un servers.txt di una build precedente (nella cartella 3DSLink dell'app: una stanza
+     con nome e senza password) e, nell'ini, host, port e password di quella stanza.
+     1. App 3DS Link e ini (circa 10 minuti): l'app nuova riscrive l'ini vecchio con le 15 chiavi senza cambiare i valori e mostra v1.0.2;
+        la pagina principale ha la barra "Options" e le righe 3DS Link, Azahar Emulator Room, Enable Titles for Azahar Emulator Net, Titles Delivery, Settings
+        (niente "Nickname" ne' "Password"), e sullo schermo alto la versione, la batteria e lo spazio libero della SD nella barra e le righe
+        WiFi, Plugin Loader, Name, Join, Room, Installation; in "Settings" la prima riga e' "Nickname" (4-20 caratteri; vuoto = il nome
+        del profilo) e la riga "End session on sleep" gira Off -> Client only -> Always -> Off; "In-game menu" e "Debug log" si accendono e si spengono;
+        con l'ini mancante lo crea con i predefiniti; un ini che non riesce a leggere (per esempio una cartella con quel nome) non lo
+        sovrascrive; il commento con il BOM resta un commento pulito. Alla fine rimetti l'ini con debug=1.
+     2. Menu spento (circa 5 minuti): con menu_key=off (riga "In-game menu" spenta) avvia un gioco qualsiasi (Mario Party: The Top 100
+        ha gia' girato senza codice specifico): L+R+Select e Select NON aprono il menu e Select resta libero per il gioco; la stanza si
+        apre da sola ("Joined room ..." dopo circa 5-7 s); senza host nell'ini compare "no room address".
+     3. Primo avvio e controllo dell'installazione (circa 15 minuti): senza 3DSLink/ accanto all'app compare la domanda del primo avvio
+        (sezione 4, punto 1), con B (No) a sinistra e A (Si') a destra. Prima B: l'app esce subito e sulla SD non c'e'
+        NIENTE di nuovo (nemmeno 3DSLink/). Riapri e A (Si'): scansione dei titoli con la barra (annota quanto dura; sullo schermo alto la
+        scheda riempie tutto lo schermo, su quello tocco "Checking your installation" sta al centro), boot9.bin, il .3gx (che l'app ha scritto), /luma/plugins, la
+        domanda sul Plugin Loader (solo se e' spento) e il riepilogo ("Installation check" con [B Cancel] [A Fix] [START Continue]). Prova B
+        sul riepilogo: l'app esce senza scrivere 3DSLink.cfg e alla riapertura il primo avvio ricomincia; poi di nuovo fino al riepilogo e
+        START: si scrive 3DSLink/3DSLink.cfg e si apre la pagina principale SENZA uscire dall'app. Con boot9.bin fuori posto e' un AVVISO:
+        riga gialla in testa, cursore su di lei con la nota (a cosa serve, dove non e' stato trovato, cosa fa A), intestazione
+        "Installation: 1 warning", e sulla pagina principale la riga "Installation" gialla ("boot9.bin missing - A on Installation
+        check"). Poi "Settings" > "Installation check": con boot9.bin fuori posto, A sulla sua riga > "Search the whole SD card" lo
+        trova (annota il tempo su una scheda piena; B annulla) e lo usa dov'e'; lo stesso con "Choose a folder"; con il .3gx spostato
+        altrove (o rovinato) A sulla riga "Plugin file" lo rimette dall'app (non c'e' nessuna ricerca da fare); senza /luma/plugins A la crea; con
+        /luma/plugins/default.3gx una riga informativa dice che non e' usato. Le righe stanno in ordine (problemi, avvisi, poi cio' che
+        va bene); la pagina principale dice "All OK" quando va tutto bene. Facoltativo, un secondo giro: l'app avviata da
+        SD:/3ds/3DSLink/3DSLink.3dsx (con il .3gx e boot9.bin li'): quella e' la cartella dell'app e non ne nasce un'altra 3DSLink/3DSLink/.
+     4. Stanze (circa 15 minuti): "Azahar Emulator Room" > "Add a room..." (o Y su quella riga): la pagina della stanza ha quattro righe, "Name",
+        "Address", "Port" e "Password" (A su una riga = tastiera; Y salva; B annulla; il nome puo' restare vuoto); salvando, la stanza si
+        prova subito (B annulla la prova); con la stanza del PC accesa diventa la stanza in uso; con un indirizzo sbagliato compare
+        "Could not reach the room. Use it as the active room anyway?". Y su una stanza gia' nell'elenco la cambia con la stessa pagina:
+        cambiare solo il nome salva senza prova, cambiare indirizzo, porta o password la prova; se era la stanza in uso resta in uso con
+        i dati nuovi. X toglie una stanza dopo la domanda "Remove the room" (Yes/No). UNA PASSWORD PER STANZA: due stanze con password
+        diverse, usa una (A) e poi l'altra e guarda password= nell'ini: segue la stanza usata. LA PASSWORD DI PRIMA: con il servers.txt di
+        una build precedente (senza password) e un ini con host, port e password, la stanza in uso prende quella password, una volta
+        sola. Il registro di Titles Delivery si prova nel passo 5.
+     Mandami: l'ini prima e dopo (e servers.txt prima e dopo il punto 4), e cosa hanno mostrato i punti 3 e 4 (le schermate, i tempi della scansione e della ricerca).
+
+  PASSO 2 - SERATA TFH (circa 60 minuti; per la partita serve un giocatore: un PC con Azahar o un amico)
+  [vecchie prove 2, 1, 17a, 11 a debug=0]. 2a viene per prima. La lobby di TFH da host e da client e i testi di memoria non sono piu'
+  prove (vecchie 13 e 10: fatte in PROVA 4): si guardano solo nei registri.
+     2a. UNA USCITA DI TFH con debug=1 (la prova del crash e della 0.1.17; era x3; cancella i log). Sulla console con la scheda piu'
+         libera (la 3DS XL di Friend-A), dopo ALMENO 10 MINUTI DI PARTITA in lobby con un altro giocatore (come la PROVA 4): chiudi la
+         lobby, aspetta 20 s (non di piu'), HOME, 5 s, Chiudi software. PASSA SE nessuna schermata di eccezione e, nel registro
+         principale, in quest'ordine (in mezzo possono esserci altre righe: room:, stats:, "soc: socExit ...", "shutdown: the capture
+         took ...", "shutdown: N ndm:u request(s) ..."; prima di EXIT ci sono di norma "process event HOME_ENTER" e "HOME_EXIT"), con
+         "shutdown: done" ULTIMA riga oppure seguita solo dalla riga "capture was cut":
+             process event EXIT (#1) at ... s: the game is closing | console clock ...
+             shutdown: begin (N hook sites, network ...)
+             shutdown: done
+             [shutdown: the capture was cut at the end: N KB of it were not written (...)]     <- solo se la cattura e' stata tagliata
+         Il registro principale deve essere COMPLETO (c'e' "process event EXIT": nella PROVA 4 con la 0.1.16 mancava). Se le righe "stats:
+         capture: ring N KB now" prima dell'uscita dicono 300-480 KB l'anello era pieno e ti aspetti la riga "capture was cut" (non e' un
+         errore); sulla scheda di Friend-A e' improbabile e va bene lo stesso. La riga "ipc ... cmd=0x000b0000" nel debug.log e' solo un
+         bonus (c'era nelle PROVE 3, 4 e 5; con l'anello pieno la 0.1.17 butta la coda della cattura, quindi puo' mancare). Annota i
+         secondi da "Chiudi software" al menu HOME (osservazione, nessuna soglia) e se FTPD parte dopo. Mandami AzaharLink.log e
+         AzaharLink.debug.log. Se compare una schermata di eccezione: fermati e NON fare 2b.
+     2b. DUE USCITE DI TFH a debug=0, la seconda dopo una partita (era x3: la riduzione poggia sull'analisi della causa, il crash
+         richiedeva debug=1). Nessun log; una lobby di TFH, host o client, 10 minuti. (1) Uscita breve: avvia TFH, aspetta 20 s, HOME, 5 s,
+         Chiudi software. (2) In partita: menu (L+R+Select) -> Status -> A e fotografa lo schermo tre volte (inizio, meta', fine); scrivi
+         come ti e' sembrata la fluidita' e quanto durano i caricamenti; alla fine HOME, 5 s, Chiudi software. Per ogni uscita basta che
+         torni al menu HOME in poco tempo (un cronometro serve solo se e' lento).
+         PASSA SE: uscite pulite (torni al menu HOME, 0 schermate di eccezione), nessun AzaharLink*.log sulla SD (in luma/plugins/ solo
+         l'ini e il .3gx), Status "Game memory: 55 MB free (New 3DS mode)", mai "Memory margin low", le foto ci sono (CPU del plugin
+         dell'ordine di PROVA 3: 47-53 ms/s a 3 nodi senza lo scrittore del log, FFE; e' una misura, non una soglia). Niente log da mandare.
+
+  PASSO 3 - SERATA FFE DI RETE (circa 60 minuti; FFE, debug=1; un PC con Azahar che ospita la lobby e almeno un altro giocatore Azahar)
+  [vecchie prove 5, 7, 20, 16, 3; la 6 e la 4 tolte]. 3b e' la sessione della console come CLIENT (manda tutti i file debug.log/.1/.2);
+  3c e' una sessione nuova, da host (cancella i log); 3d chiude. La 3a (gemelli e lobby estranea) e' TOLTA: la PROVA 5 ha fatto il
+  client di una lobby ospitata da un Azahar per 67 minuti; gemelli e lobby estranea restano letture passive. Le scansioni del client,
+  i rientri nella lobby e i tempi di caricamento si leggono passivamente nei registri di questa serata.
+     3b. RICONNESSIONE (la console client di una lobby FFE ospitata dal PC, in lobby e una volta in quest; assorbe le vecchie 7 e 20): interruttore wireless (o router) spento
+         10 s e riacceso, 5 VOLTE di fila aspettando "room: Joined" fra l'uno e l'altro; poi un taglio da 3 s e uno da 20 s; poi 2 cicli con il
+         menu in gioco: "Connect to room" spento 3 s e acceso; poi, DURANTE UNA QUEST da client (il PC come altro giocatore), un taglio da
+         10 s: il gioco deve tornare alla lobby da solo e "uds: the room link is gone (reason 5)" compare UNA volta. Per ogni taglio: UNA riga "room: the console's WiFi is down (network state N)" e
+         NESSUN "room: connecting" finche' e' giu'; "the console's WiFi is back (network state 2) after N ms: joining the room at once"
+         entro ~0,5 s dal ritorno vero; ogni fallimento dice ragione ed errno; un fallimento veloce e' seguito dal tentativo dopo 2,0 s dal
+         suo inizio, uno che aspetta i 5 s della stanza ("the room did not answer within 5000 ms") dal successivo subito (righe a ~5 s:
+         normale); "uds: the room link is gone (reason 5)" UNA volta per perdita (a 3 s la stanza puo' reggere senza perdita: allora la riga non
+         c'e' e va bene), stesso nome e stesso MAC al rientro, il gioco torna alla
+         sua lobby da solo; l'anello: la riga "soc: SO_RCVBUF default ..., ring now 65536" la scrivono solo i PRIMI 8 SOCKET del lancio
+         (ogni tentativo che crea un socket ne conta uno; dal quinto all'ottavo dice "default -1"); dopo l'ottavo il registro scrive solo
+         un CAMBIO di esito ("soc: SO_RCVBUF asked 65536, ring now N (it was M on the earlier sockets)"), che NON deve comparire: la sua
+         assenza e' il caso buono; in ogni caso nessun avviso a schermo "socket buffer is N KB, 64 KB asked"; 0 socket errors; MAI "room:
+         the network thread did not stop within 2000 ms: abandoned" nei cicli Connect spento/acceso. Annotami il valore grezzo N del byte
+         quando la WiFi e' su (se non e' 2 il blocco non scatta mai; nelle PROVE 3 e 4 valeva 2, anche nei cali brevi di intensita', perfino
+         a 0 per 50 ms) e le righe "link: shared page wifi strength
+         ... network state ..." del primo taglio. Se avvii il gioco con la WiFi GIA' spenta il plugin prova la stanza ogni 2 s (errno -115)
+         finche' non vede un 2: voluto.
+     3c. LA CONSOLE COME HOST (sessione nuova, il PC e un secondo giocatore Azahar entrano; niente coperchio; vecchie 16 e 7 da host):
+         uno CHIUDE L'EMULATORE DI COLPO (annota l'ora); un giocatore esce dal menu del gioco e rientra entro 3 s; da host un taglio da 3 s
+         e uno da 10 s in lobby (a 3 s la stanza regge, a 10 s cade). Facoltativo: se il gioco ha un comando per espellere un giocatore,
+         usalo una volta (EjectClient: FFE non lo chiama). Righe: "uds: role idle -> host", "uds: node N left the room: removed"
+         (circa 3 s dopo l'uscita di colpo), "uds: node N authenticates again", "uds: node N sent a Deauthentication: removed" (chi esce
+         dal menu: gia' visto nella PROVA 3); i beacon continuano e la lobby si riempie di nuovo; ai tagli come 3b.
+     3d. UNA USCITA DI FFE a debug=0 (vecchia 3; la 4, a debug=1, e' tolta): metti debug=0, avvia FFE, aspetta almeno 20 s, HOME, aspetta
+         circa 5 s, Chiudi software: nessun log, conta solo che torni al menu HOME in poco tempo (cronometro solo se e' lento).
+
+  PASSO 4 - COPERCHIO (FFE, debug=1) - il caso piu' rischioso, per ultimo [vecchia prova 8]. OBBLIGATORIE 4a e 4b (circa 45 minuti):
+  sleep_stop resta 0. 4c, 4d e 4e SOLO se sleep_stop 1 o 2 deve diventare un'opzione offerta; se il predefinito resta 0 e nelle istruzioni
+  si scrive di non chiudere il coperchio durante la partita, ci si ferma a 4b. In quest'ordine, una alla volta:
+     4a (era 8a) sleep_stop=0 da CLIENT: coperchio 3 s e poi 30 s, in lobby e in quest (4 coperchi); poi una pressione breve dell'accensione.
+     4b (era 8b) controllo del blocco nero: sleep_stop=0 da HOST in quest (almeno 60 s, il PC come client), coperchio 10 s, prima con
+        debug=1 poi con debug=0 (almeno 3 ripetizioni per caso se non si blocca); se resta nero oltre 30 s: menu di Rosalina, poi
+        accensione 4 s, annota l'ora.
+     4c (era 8c, facoltativa) sleep_stop=1 ("Client only") da client, 3 s (se vuoi anche 30 s), in lobby e in quest.
+     4d (era 8d, facoltativa, PER ULTIMA) sleep_stop=2 ("Always") da HOST + quest + coperchio 10 s (se resta nero oltre 30 s: menu di
+        Rosalina, poi accensione 4 s, annota l'ora).
+     4e (era 8e, facoltativa, solo se la 4d si e' bloccata) la stessa con debug=0, 3 volte, per escludere il registro e la scheda SD.
+     Poi rimetti sleep_stop a 0. Mandami AzaharLink.sleep.log. Passa se il file comincia con "sleep: the trail of this launch begins" e
+     per ogni sospensione ha le notifiche APT 3/5/6, la risposta del gioco, "framework event SLEEP_ENTER/SLEEP_EXIT", "WOKE UP: the
+     console's clock ran N ms ahead of the tick" (N ~ durata del coperchio) e "alive 1 s / 5 s after the wake-up"; con sleep_stop=0 il
+     gioco non si pianta piu' che con la 0.1.15. Se la console si pianta l'ultima riga del file dice dove. Dalle PROVE 3 e 4: una riga "apt:
+     ReplySleepQuery ... answer 0 (reject)" SENZA una "apt: notification 3" prima non e' una richiesta di sospensione (la manda il gioco da
+     solo): non e' un tasto e non impedisce la sospensione; nelle vere richieste ci si aspetta "notification 3" -> "answer 1 (accept)".
+
+  PASSO 5 - TITLES DELIVERY (facoltativo, dopo le uscite; circa 40 minuti; due console con la stessa 3DSLink.3dsx o 3DSLink.cia: il plugin e' dentro)
+     Prima: Wi-Fi acceso (l'interruttore sul fianco della console) e "Debug log (full traffic)" acceso. Su quella che invia: boot9.bin
+     (accanto all'app, nella cartella 3DSLink, in SD:/gm9/out/ o dove l'app lo ha trovato) e un titolo piccolo installato (non sull'altra).
+     Su quella che riceve: una Luma3DS con le patch delle firme. Facoltativo, per confrontare la velocita': il .3dsx autonomo da cui il
+     modulo viene sulla stessa coppia.
+     1. (una console, 10 minuti) apri "Titles Delivery" dalla pagina principale. Lo schermo alto dice cos'e' la pagina e la nota della riga
+        scelta; le righe sono due, "Send Titles" e "Receive Titles" ("Installed Titles" non c'e' piu'); la barra in alto ha la batteria e lo
+        spazio libero della SD; finche' la scansione dei titoli gira le righe dicono "reading N%" e A apre "Reading your titles", una
+        barra che apre da sola la pagina scelta quando la lista e' pronta (B annulla).
+        Senza boot9.bin "Send Titles" e' spenta e scura, con "needs boot9.bin" e la nota gialla "boot9.bin is missing" che dice come
+        rimediare, e "Receive Titles" si apre lo stesso. NESSUNA pagina di Titles Delivery ha START: i bottoni stanno su tutta la larghezza
+        e da dentro si esce solo con B (l'app si lascia dalla pagina principale). I nomi sono quelli lunghi del resto dell'app e aprire
+        la pagina non rilegge niente.
+     2. (20 minuti) la console che invia: "Send Titles". L'elenco ha la piccola icona del gioco, il nome, una barretta colorata senza lettera
+        per ogni cosa che il gioco ha (blu gioco, verde aggiornamento, rosso DLC) e la casella; la legenda "Game  Update  DLC" sta a destra del titolo sullo schermo alto; niente nomi di soli
+        punti interrogativi. A sul titolo piccolo sceglie tutte le sue parti; X o destra mostra le parti una per una (tipo nel suo colore,
+        dimensione e tempo, per esempio "180 MB  2 min"). Lo schermo alto: il gioco sotto il cursore (icona grande, nome, title id, ogni
+        parte con dimensione e tempo) e in fondo "N titles, SIZE, TIME to send" (circa 1,6 MiB/s su una New 3DS, 1,4 su una Old 3DS).
+        Y ("Send") CONTROLLA i titoli scelti uno dopo l'altro (una scheda sopra lo schermo alto: "Checking the titles", "2 of 5: ..." e
+        una barra, con lo schermo tocco com'era; un titolo che non si puo' inviare resta fuori e dice perche'), poi "Open the room"
+        (Yes/No dentro il popup; dice dimensione e tempo) > Yes. Sulla stanza aperta lo schermo alto ha "Offered" (un gioco con
+        aggiornamento e DLC su UNA riga, con le barrette colorate e la dimensione totale; l'intestazione dice titoli, dimensione e tempo) e le schede
+        dell'avanzamento e della connessione (dalla tappa G senza "speed mode": "repeated packets: N (X% of all sent)"). La console che riceve: "Receive Titles" (l'elenco
+        delle stanze ha solo B e A): la stanza
+        dell'altra compare da sola nell'elenco (nome della console, numero di titoli e dimensione); A ("Join"), poi l'elenco di cio' che
+        offre, raggruppato per gioco: prova X (tutti / nessuno); lo schermo alto dice quanto hai scelto, la barra della SD (verde cio' che
+        c'e', rosso cio' che si aggiunge), il tempo stimato e gli avvisi sullo spazio; l'etichetta "installed" compare se hai gia' il
+        titolo (sceglierlo lo sovrascrive). Y ("Receive"): gli schermi di avanzamento ("Installed" e "Downloaded", velocita', tempo che
+        manca, stato di ogni titolo). Sulla console che invia: la stanza (percentuale, velocita', tempo che manca, chi e' collegato e le
+        barre "Downloaded" / "Installed" di ogni ricevente); "Waiting for receivers" ha a destra i minuti che mancano ("N min left"); il piede e' [B Close] [SELECT Screens off/on] e il bottone Y "Speed" non c'e' piu'. B (o "Close") chiede "Close the room?" (A "Yes, close it", B "No") e deve rispondere alla PRIMA pressione, anche breve. SELECT spegne e riaccende gli schermi, su tutte e due.
+     3. (5 minuti) alla fine, su quella che riceve la pagina del risultato (ogni titolo "installed" / "error" / "not chosen"; B o A la
+        chiudono) e l'elenco dei titoli si rilegge da solo; il titolo installato compare nel menu HOME e parte. Su quella che invia B
+        chiede "Close the room?" e A ("Yes, close it") chiude la stanza.
+     4. (5 minuti) uscite: mentre la stanza e' aperta e mentre si sceglie e si riceve il modulo spegne il tasto HOME (il registro dice
+        "APT: tasto HOME ignorato durante il trasferimento"), e l'app lo spegne mentre l'elenco delle stanze cerca: in tutti questi momenti HOME non fa niente e nella barra
+        dello schermo tocco c'e' un piccolo distintivo rosso "HOME off" (una casa barrata); si esce con B (su
+        quella che riceve prova un B a meta' ricezione, poi riapri "Receive Titles": la radio deve essere libera). Fuori da questi momenti
+        (il menu di "Titles Delivery", la scelta di cosa inviare) HOME e Chiudi software chiudono l'app senza schermate di eccezione.
+        Dopo una stanza o una ricezione le pagine di 3DS Link, "Test the connection" compresa, devono funzionare ancora.
+     5. (10 minuti, una console) i controlli nuovi e la prova della stanza. In "Installation check" (e nei passi del primo avvio):
+        "Seed database" verde con la dimensione se la console lo lascia leggere, avviso giallo "not readable" (senza A, niente da
+        sistemare) se no; "Plugin Loader" verde "enabled", oppure, dopo averlo spento dal menu di Rosalina (L + Giu' + Select), rosso
+        "disabled" con A che lo riaccende. Poi "Azahar Emulator Room" > una stanza > "Test room": con la stanza del PC accesa il popup resta
+        fino a A/B e dice "The room answers" (nome e giocatori); con un indirizzo o una password sbagliati resta e dice l'errore.
+     6. (tre console se puoi, circa 20 minuti) la tappa G. Il popup "Loading" aprendo "Send Titles" e "Receive Titles"; in "Enable
+        Titles for Azahar Emulator Net" il distintivo rosso "HOME off" e START grigio mentre una riga dice "Enabling..." (tornano a copie
+        finite). IL PUNTO CHE CONTA: una console invia e inizia a servire la prima; poi una SECONDA entra nella stanza GIA' in invio:
+        l'elenco deve arrivare in pochi secondi, non in 30. Su chi invia: i nomi dei riceventi (i nomi delle loro console), Su/Giu'
+        sceglie un ricevente e lo schermo alto mostra i suoi dettagli. Su chi riceve: i colori dello stato (verde riceve, giallo
+        "waiting: the sender is serving others", rosso "connection lost: looking for the sender..."). A fine ricezione il riepilogo
+        elenca i titoli (fino a 16) con dimensione, stato e tempo; in alto byte arrivati, tempo vero e velocita' media; B torna alla
+        pagina principale, A al menu di Titles Delivery, START esce dall'app. Dopo la revisione: i minuti dell'invio non saltano e
+        aumentano quando entra una console che vuole un titolo gia' mandato; la scheda di un ricevente dice "starts in ..." se aspetta.
+     7. (la prossima prova su strada, build del 2026-10-17; il dettaglio e' in PROVE_HARDWARE.md, "Prossima prova su strada"; in ordine di
+        valore) lo schermo "Receivers" con 6-7 riceventi (scorrimento, nomi, "waiting"); il nome di una console spenta che resta ("silent N s")
+        e che dopo 30 s esce; "all downloaded: installing" sull'ultima console; "Room N%" che non scende; "Wi-Fi CH n" in alto e la targhetta
+        "CH n" nell'elenco (con due stanze: canali diversi? il 6 accanto all'11 e' la coppia cattiva); la riga "Luma3DS" (rossa sulla 10.x,
+        verde sulla 13.3.3); sulla 10.x le tre righe in grigio e "3DS Link" su OFF (A su ognuna dice perche'; nell'ini enabled=0), sulla 13.3.3 niente cambia;
+        le barrette colorate senza lettera nelle liste e nelle legende; una DLC che fallisce (quella di Fire Emblem Echoes) non deve lasciare niente; poi, nel registro, grep di
+        "chiamata lenta", "senza nome", "pulizia dopo l'errore", "fine ricezione", "stanza piena".
+     Annota: MiB/s e durata (sulla console che invia i MiB/s, su quella che riceve "Installing at ... MiB/s") contro il tempo stimato,
+     se il titolo installato parte dal menu HOME, se la barra della SD e gli avvisi sullo spazio corrispondono allo spazio vero, cosa
+     fanno HOME (e se compare "HOME off"), B e SELECT, i tempi del punto 1, il testo di ogni errore. PASSA SE: la stanza compare da sola nell'elenco dell'altra
+     console; la ricezione finisce con "All received" e il titolo installato parte; il tempo stimato e' dello stesso ordine del vero;
+     nessuna schermata di eccezione; nessuna pagina di Titles Delivery ha START (da dentro esce B); il controllo dei titoli a Y lascia fuori
+     quello che non si puo' inviare e dice perche'; B dentro la stanza e dentro la ricezione lascia la console usabile, e sulla console che invia chiede "Close the room?" alla prima pressione; "Seed database", "Plugin Loader" e "Test room" dicono il vero (punto 5); al punto 6 il secondo ricevente ha l'elenco in pochi secondi e i nomi dei riceventi ci sono; le pagine di 3DS Link vanno
+     dopo i giri; con "Debug log" acceso 3DSLink-TitleDelivery.log nasce nella cartella 3DSLink quando si apre una stanza o si entra in
+     una (spento non nasce nessun file; le righe sono in italiano). Facoltativo: stessa velocita' e stesso esito del .3dsx autonomo.
+     Mandami 3DSLink-TitleDelivery.log (e .1.log se c'e') di tutte e due.
+
+  LETTURE PASSIVE (nessuna sessione in piu': si leggono nei registri che arrivano comunque; criteri in PROVE_HARDWARE.md, parte 2)
+     - scansioni del client (vecchia 14): "uds: scan 0x0f: ... K with other ids", K = 0; la lobby compare alla PRIMA ricerca fatta dopo la
+       sua nascita (obiettivo, proposta: 5 lanci da client letti; PROVE 3-5: 3).
+     - bind tra una sessione e l'altra (vecchia 15): righe "uds: N frame(s) of the last session were still queued ... dropped" e "Unbind
+       ... (N frames stored, M pushed out)" quando si esce dalla lobby e si rientra o l'host la chiude e la riapre: M = 0 (finora sempre).
+     - gemelli e lobby estranea con dati (vecchia 6): "stats: soc calls ... twin candidates N (dropped D, delivered alone U)" e la coda
+       "filters: ..." (compare solo nelle finestre in cui uno dei suoi quattro contatori non e' zero): gemelli D ~ echo (+-10%), U sotto il
+       2% di N; nessuna coda "filters:" = foreign_shadow 0 (il caso normale); se c'e', conta il numero prima di "passed on by a client that
+       only counts" in quella finestra (il client per ora conta soltanto e consegna lo stesso, "frames lost" PUO' comparire; un host
+       scarta). Finora tutti 0 nelle tre sessioni, anche con l'host Azahar e 4 nodi (PROVA 5): mai esercitati.
+     - 4 giocatori, CPU (vecchia 11): visti in PROVA 5 (4 nodi per 55 minuti): "plugin total" meno "log writer" 27 / 33 / 34 ms/s.
+     - peso della cattura e tempi di caricamento a debug=1 (vecchia 9): nessuna riga "LOST ... control" (finora 0); la clausola "a debug=1
+       i caricamenti sono vicini a quelli di debug=0" NON e' superata (FFE: 2DS XL 74 s e 164 s contro 52 s e 26 s della 3DS XL) ed e'
+       una questione di sola diagnosi: debug=1 serve per i log, non per giocare; nessun lavoro in piu'.
+     - caricamenti da host a debug=0 (facoltativo): un cronometro, solo se capita una partita FFE a debug=0 con la 3DS host.
+     - Old 3DS / Old 2DS: solo se ne compare una (un avvio di FFE con debug=1 e la notifica "Old 3DS memory mode: N MB free").
+     - Memoria e ndm (vecchie 10 e 18) non sono piu' prove, ma i registri le mostrano: UNA notifica "New 3DS memory mode: 55 MB free" a
+       ~20 s, mem:/res: piatti, risultati ndm tutti 0; se compare altro, scrivimelo.
+
+  VECCHIE PROVE -> PASSI: 1 -> 2b (x2) | 2 -> 2a (x1) | 3 -> 3d (x1; 2 gia' finite bene secondo l'utente con la 0.1.16) | 4 -> tolta (2 pulite con la
+  0.1.16, codice nuovo coperto da 2a) | 5 -> 3b | 6 -> tolta (fatta in PROVA 5; resta lettura passiva) | 7 -> 3b (client) e 3c (host) | 8 -> 4
+  (4a-4e) | 9 -> letture passive | 10 -> tolta | 11 -> 2b e lettura passiva | 12 -> 1 | 13 -> tolta (fatta in PROVA 3 e 4) | 14 -> lettura
+  passiva | 15 -> lettura passiva | 16 -> 3c | 17 -> 2b (17a) e 1 (17b) | 18 -> tolta | 19 -> lasciata cadere | 20 -> 3b.
+
+8. COSA MANDARMI DOPO OGNI PASSO
+---------------------------------------------------------------------------------------------------------------------------
+  AzaharLink.log (+ AzaharLink.old.log se c'e'), AzaharLink.debug.log (+ AzaharLink.debug.1.log, AzaharLink.debug.2.log ... se ci
+  sono), per il passo 4 anche
+  AzaharLink.sleep.log, le foto (schermate di eccezione, pagina Status), due righe su cosa hai visto sullo schermo del gioco con
+  l'ora, e l'esito: passa / non passa / altro. Per ogni USCITA anche: se FTPD (o l'Homebrew Launcher) partono e, a debug=1, quanti
+  secondi passano da "Chiudi software" al menu HOME (a debug=0 solo se e' lento). Con debug=0 non c'e' nessun log da mandare: per un problema metti debug=1 e ripeti.
+  Una cartella per console (scrivi quale e' quale): la copia aggiunge " (1)" al nome dei file del secondo.
+
+9. LIMITI NOTI (l'elenco completo e' nel README.md)
+---------------------------------------------------------------------------------------------------------------------------
+  - Niente e' stato provato su una Old 3DS / Old 2DS. Il codice legge dal kernel i limiti di memoria; provato solo in Azahar.
+  - La 0.1.17 non e' mai stata su una console. Con la 0.1.16 ci sono tre sessioni (PROVA 3, FFE; PROVA 4, TFH; PROVA 5, Mario Party;
+    tutte a debug=1): la WiFi tagliata, il coperchio e debug=0 con i numeri non sono mai stati provati; gemelli e lobby estranea con
+    dati non hanno mai visto traffico (0 = 0, anche con l'host Azahar).
+  - Le modifiche dell'app delle tappe C, D ed E (primo avvio, cartella dell'app, bottoni, copie in sottofondo, Titles Delivery con schermi
+    propri, la stanza con i suoi quattro campi e la sua password, la pagina principale nuova) non sono mai state su una console, e
+    l'invio e la ricezione veri non sono mai stati provati: vedi il passo 1 (punti 1, 3 e 4) e il passo 5.
+  - Con debug=1 la cattura satura la SD: nelle PROVE 3 e 4, sulla 2DS XL (scheda piena), persi il 20,5% dei record pesanti con FFE e il
+    3,55% con TFH, caricamenti fino a 164 s e, con la 0.1.16, un'uscita lunghissima con il registro principale che si ferma prima
+    dell'evento di uscita (PROVA 4); con Mario Party (PROVA 5) il 57% anche sulla scheda quasi vuota di Friend-A. E' un limite di debug=1
+    (diagnosi), non di debug=0. La 0.1.17 limita lo svuotamento finale a mezzo secondo (e dice quanto manca), ma non e' ancora stata
+    vista su una console.
+  - Giochi a traffico alto (Mario Party: The Top 100, PROVA 5: 230-470 frame/s dalla stanza): l'anello di ricezione del gioco (512 unita',
+    circa 85 frame) tiene 0,2-0,4 s di traffico e trabocca nelle raffiche, quindi l'avviso "N frames lost, the game reads too slowly"
+    compare circa ogni 2 minuti (31 in 67 minuti, al massimo uno al minuto): e' vero, un nwm vero perderebbe allo stesso modo. Osservato,
+    nessuna modifica; se una volta al minuto a schermo con un gioco cosi' e' troppo, dimmelo.
+  - Mario Party: The Top 100 prende tutta la regione di memoria: con la 0.1.16 la notifica diceva "New 3DS memory mode: 0 KB free" a
+    circa 20 s (vera, ma sembrava allarmante). Corretto nella 0.1.17: sotto 256 KB liberi dice "New 3DS memory mode: all memory in
+    use" e la riga Status "Game memory: all in use (New 3DS mode)".
+  - Sempre con Mario Party la 0.1.16 stampava il tasto HOME come "apt: notification 465567745 (?)" (0x1BC00001, sconosciuto).
+    Corretto nella 0.1.17: il segnale sono i 16 bit bassi della parola, quindi e' il tasto HOME.
+  - Il filtro del client contro le lobby estranee nella stanza conta soltanto (foreign_shadow): per accenderlo serve una modifica al
+    codice, dopo aver letto il contatore in una sessione vera. Un host le scarta.
+  - Un thread di rete bloccato per piu' di 2 s viene abbandonato e tiene il suo socket (l'anello da 64 KB) finche' non si sveglia:
+    nel blocco da 128 KB entra un solo anello da 64 KB, quindi la sessione successiva puo' ottenerne uno da 32 KB (notifica "socket
+    buffer is 32 KB, 64 KB asked"). La riga "abandoned" non deve comparire nei cicli normali.
+  - La WiFi della console si guarda dal byte 0x1FF81067 (2 = connessa): il blocco dei tentativi comincia solo dopo che e' stato letto
+    un 2 almeno una volta su quella console (se non vale mai 2 nessuno resta chiuso fuori).
+  - La cifra della CPU e' un limite superiore (un thread scavalcato dentro il nostro codice e' addebitato) e non misura il passaggio
+    del gancio (~0,1% nel modello).
+  - Con piu' di 4 giocatori i dati crescono come (N-1)^2: un titolo da 8 giocatori supererebbe l'anello e il ciclo di rete.
+  - FFE con tre o piu' giocatori: i personaggi degli altri possono "scivolare" in posa di riposo. Indagato a lungo: trasporto,
+    buffer e memoria sono sani; l'indizio piu' forte e' l'orologio di sessione del gioco (gli Azahar sul PC girano al ~115% e quello
+    della console resta indietro). Non attribuito al plugin; da riprovare con tutti gli Azahar al 100% di velocita'.
+  - Home -> Homebrew Channel / FTPD in caricamento infinito: e' successo con la 0.1.12 (dopo una prova con la memoria condivisa) e di nuovo
+    il 2026-10-14 (PROVA 4): FTPD si e' piantato due volte dopo l'uscita da TFH sulla 2DS XL con la scheda piena, e ha funzionato dopo il
+    riavvio della console. Causa ignota (sospetto: la scheda piena; non e' provato ne' che c'entri la scheda ne' che non c'entri il
+    plugin). Se ricapita: riprova con il plugin spento (Plugin Loader spento, o enabled=0) e con spazio libero sulla scheda, e scrivimelo.
+
+10. SE QUALCOSA VA STORTO (messaggi a schermo)
+---------------------------------------------------------------------------------------------------------------------------
+  - Il gioco parte ma dopo circa 5-7 secondi NON compare la notifica "Joined room ..." (e con debug=1 non nasce nessun
+    AzaharLink.log): il plugin non e' stato caricato. Controlla, in quest'ordine: (1) Plugin Loader attivo in Rosalina (punto 0 di
+    COME SI COMINCIA: e' il caso piu' probabile, e non da' nessun messaggio); (2) il .3gx e' in SD:/luma/plugins/<ID del titolo>/ (UN solo
+    .3gx nella cartella del titolo; se la cartella esiste e ha un altro plugin non puoi usarli insieme: l'app 3DS Link lo dice, riga "other
+    plugin" in "Enable Titles for Azahar Emulator Net"; "Installation check" dice anche se manca il .3gx nella cartella dell'app o e' diverso da quello dell'app, e A lo rimette); (3) l'ini ha
+    enabled=1 e host= con l'indirizzo giusto (usa "Test the connection" nell'app 3DS Link).
+  - "No memory for the network: AzaharLink is OFF for this launch" (ripetuto ogni minuto) / log "soc: could not reserve memory": il
+    plugin resta spento per quell'avvio (la wireless vera funziona). Mandami il log (con debug=1).
+  - "The game already uses soc:U (0xC8A0700B)": il gioco usa gia' i socket da solo, il plugin resta spento per quell'avvio. Dimmi quale
+    gioco e mandami il log.
+  - "socket buffer is N KB, 64 KB asked": il servizio ha dato un anello piu' piccolo. Funziona lo stesso (con meno margine); mandami il log.
+  - "Socket buffer reduced to 64 KB: not enough free memory for 128 KB (set debug=1 for details)": il blocco da 128 KB non e' entrato e
+    il plugin ne ha preso uno da 64 KB (anello massimo 32 KB, circa mezzo secondo a 4 giocatori). Rilancia con debug=1 e mandami il log
+    (righe "soc: placement ...", "soc: WARNING only a 64 KB block ...").
+  - "Game memory almost full: N MB free": la memoria libera del gioco e' scesa sotto 5 MB dopo la prima lettura. "Memory margin low"
+    non esiste piu' (nella 0.1.15 era un falso allarme sui giochi a memoria estesa).
+  - "N frames lost, the game is not reading the network (paused?)": il gioco non chiama UDS (pausa, caricamento, coperchio);
+    "... the game reads too slowly": legge ma l'anello trabocca (con giochi a traffico alto compare spesso: vedi i limiti). Dalla
+    stessa stanza una lobby estranea puo' farlo comparire su un client.
+  - "WiFi is down: joining the room again when it is back": normale, il plugin aspetta la WiFi e rientra da solo.
+  - "Room link lost: game disconnected" / "Back in the room: reopen the lobby" / "Room closed by its host": la stanza e' caduta o chiusa;
+    il gioco deve tornare alla sua lobby da solo.
+  - "rcvbuf_kb is not 8, 16, 32 or 64: ignored": l'ini ha un valore non valido, vale 64.
+  - "out of sessions, the game uses the real wireless": il gioco non ha potuto avere la sessione finta di nwm::UDS / ndm:u (eventi del
+    kernel finiti o 32 sessioni aperte); con l'ndm:u vero la WiFi della stanza puo' cadere. Mandami il log (righe "uds: WARNING no ...").
+  - Se la rete del gioco si ferma o il gioco/la console crasha con il blocco da 128 KB: metti rcvbuf_kb=32 nell'ini e rifai la prova; se
+    non basta, vedi old/LEGGI.txt (0.1.14, blocco da 384 KB) e mandami il log e l'ora.
+  - Dopo il coperchio il gioco e' fermo o la rete non rientra: metti "End session on sleep" su Off (sleep_stop=0) e rimanda il log e
+    AzaharLink.sleep.log.
+  - Menu che non si apre: con menu_key=off non si apre mai (riga "In-game menu" dell'app); altrimenti L+R+Select (Select ne fa sempre parte).
+  - "Chiudi software" dura moltissimo, o il registro principale finisce prima di "process event EXIT" (visto nella PROVA 4 con la 0.1.16,
+    a debug=1 su una scheda SD piena e lenta: la cattura di debug non si svuotava): con la 0.1.17 la cattura ha mezzo secondo dopo
+    l'inizio dell'uscita e il registro principale va sul file per primo; la riga "shutdown: the capture was cut at the end: ..." dice
+    quanto della cattura manca. Se succede ancora: scrivimi i secondi e mandami i log. Per giocare metti debug=0.
+  - FTPD (o un altro homebrew) si pianta dopo una sessione: causa ignota (PROVA 4: sulla 2DS XL con la scheda piena). Riprova con il plugin
+    spento (Plugin Loader spento, o enabled=0 nell'ini) e con spazio libero sulla scheda; riavviare la console l'ha risolto.
+  - Titles Delivery: "Send Titles" e' spenta e scura ("needs boot9.bin"): manca boot9.bin; vai in "Settings" > "Installation check" e
+    premi A sulla sua riga (riceve lo stesso senza). "Receive Titles" dice "The local wireless could not be started": il Wi-Fi e' spento
+    (l'interruttore sul fianco della console); accendilo e riapri la pagina.
+  - "Installation check" giallo con "boot9.bin missing": e' un avviso, non un problema; boot9.bin serve solo per INVIARE titoli.
+  - "Installation check" con la riga "Luma3DS" rossa ("10.2.1 not work"): la Luma e' piu' vecchia della 13.0, il Plugin Loader non esiste e il
+    plugin non si puo' caricare; "Titles Delivery" funziona lo stesso. In 3DS Link l'interruttore "3DS Link" e' su OFF e in grigio, e le righe
+    "Azahar Emulator Room" e "Enable Titles for Azahar Emulator Net" in grigio: e' voluto, aggiorna Luma. Gialla ("13.1.0 maybe"): dovrebbe
+    funzionare, mai provata.
+  - "Titles Delivery" ricevente: "The room is full (7/7), still trying (N s)" (giallo) = la stanza c'e' ma ha gia' tutti i posti, riprova da sola;
+    "connection lost: looking for the sender... (2 min 05 s of 30)" (rosso) = cerca la stanza da 2 min 5 s, rinuncia dopo 30 minuti.
+
+11. VERSIONI VECCHIE
+---------------------------------------------------------------------------------------------------------------------------
+  dist/old/ ha la 0.1.14, la 0.1.15, la 0.1.15.1, la 0.1.16 (AzaharLink-0.1.16.3gx, AzaharLinkSetup-0.1.16.3dsx) e le vecchie app Setup
+  (anche AzaharLinkSetup-0.1.17.3dsx, quella che l'app 3DS Link ha sostituito),
+  con old/LEGGI.txt (che cosa e' ognuna e il difetto noto di ognuna). Non servono ai test. La 0.1.15 con debug=1 fa crashare Zelda Tri
+  Force Heroes alla chiusura del gioco: e' il difetto che la correzione della 0.1.15.1 (dentro la 0.1.16 e la 0.1.17) ha tolto; con la
+  0.1.16 una uscita di TFH su una console e' stata pulita (PROVA 4), ma la prova completa sono le uscite 2a e 2b sulla 0.1.17. La 0.1.16
+  ha il difetto dell'uscita su una scheda lenta e piena (vedi old/LEGGI.txt). Per un confronto: metti il .3gx vecchio al posto della
+  0.1.17 nella cartella del gioco (UN solo .3gx); l'ini a 15 chiavi va
+  bene, ma porta sleep_stop a 0 prima di usare la 0.1.15 o la 0.1.15.1 (per loro il 2 vuol dire "acceso" anche da host) e ricorda che
+  la 0.1.14 ignora rcvbuf_kb e sleep_stop e usa un blocco di socket da 384 KB.

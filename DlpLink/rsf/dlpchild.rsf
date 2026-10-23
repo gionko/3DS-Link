@@ -1,0 +1,34 @@
+# RSF del figlio Download Play di 3DS Link (installer). Variabili passate da make_dlp_child.sh con -D.
+# Con "-desc dlpchild:1" makerom IGNORA tutta la sezione AccessControlInfo e la lista Dependency (provato:
+# exheader identico cambiando priorita', SystemMode, servizi, FileSystemAccess): vengono dal template ufficiale
+# dei figli DLP. Qui contano solo identita', Option, StackSize/SaveDataSize/RemasterVersion e il RomFS.
+BasicInfo:
+  Title                   : $(CHILD_TITLE)
+  CompanyCode             : "00"
+  ProductCode             : $(CHILD_PRODUCT_CODE)
+  ContentType             : Application
+  Logo                    : Homebrew
+
+TitleInfo:
+  UniqueId                : $(CHILD_UNIQUE_ID)
+  Category                : DlpChild
+  Version                 : 0
+
+Option:
+  UseOnSD                 : false
+  FreeProductCode         : true
+  MediaFootPadding        : false
+  EnableCrypt             : false
+  EnableCompress          : true
+
+AccessControlInfo:
+  CoreVersion             : 2
+  DescVersion             : 2
+
+SystemControlInfo:
+  SaveDataSize: 0KB
+  RemasterVersion: 0
+  StackSize: 0x40000
+
+RomFs:
+  RootPath                : $(CHILD_ROMFS)

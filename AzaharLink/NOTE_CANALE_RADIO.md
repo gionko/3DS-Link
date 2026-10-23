@@ -1,0 +1,40 @@
+# Note: due mittenti insieme e il canale radio (UDS)
+
+Appunto del 2026-10-17. **Solo appunti e un piano di prova: nessuna modifica al codice** (l'utente prova ancora la build `dist/3DSLink.3dsx` 318f4f5f).
+
+## Cosa ha visto l'utente (primo test con due mittenti attivi insieme)
+
+Due New/2DS XL, ognuna con la sua stanza (*Send Titles*) e un ricevente. Con tutte e due attive ogni mittente va a circa 1,0–1,5 MiB/s invece di 2,0–2,1 da solo (il «2,9» scritto prima era un errore di trascrizione dell'audio: la velocità massima di un mittente è **2,09 MiB/s**, come nei nostri log); chiusa una stanza, l'altra salta subito a 2,9 MiB/s fissi; aprendo la seconda stanza (anche senza nessuno dentro) la prima oscilla per un momento. Il ricevente della seconda stanza entra senza problemi. Ipotesi dell'utente: **le due reti sono sullo stesso canale radio e si dividono l'aria**.
+Nei log di prima non c'è **nessuna** prova con due mittenti insieme (21 esecuzioni del mittente dal 2026-10-11 al 14, tutte una dopo l'altra): questo è il primo test, quindi l'ipotesi per ora è la sua osservazione e basta.
+
+## Cosa si è trovato (fonti: sorgenti libctru, 3dbrew, Azahar, i nostri log; controllato da un secondo verificatore)
+
+1. **Il canale lo sceglie il sistema, e cambia da una prova all'altra.** Il nostro mittente non sceglie niente (`udsGenerateDefaultNetworkStruct`, campo `channel` a 0 = automatico) e poi legge il canale con `udsGetChannel` (riga `canale UDS N` di `power.c`, nel log della consegna **solo se il Debug log è acceso**). Nei 73 log con la riga il canale è sempre **1, 6 o 11**: sul mittente A 11 in 13 prove, 1 in 7, 6 in 1; la stessa console, nello stesso posto, ha avuto 1 e 11 in due prove di seguito. Tutti i ricevitori di una prova hanno lo stesso valore del mittente (seguono la stanza). Come il sistema scelga (a caso? guarda l'aria?) **non è documentato**; la sequenza è «a strisce», non uniforme, quindi **non si può dare una probabilità di collisione**.
+2. **Esiste un modo di chiedere un canale**: `udsNetworkStruct.channel` (libctru, 3dbrew): `0` = lo sceglie il sistema, `1`/`6`/`11` = quello. **Non è mai stato provato su una console vera**, e il sistema potrebbe ignorarlo sulle console di produzione. Quindi: *forse*. Il modo di scoprirlo costa una prova: impostare il campo, creare la stanza, leggere indietro `canale UDS`. Se la creazione fallisce, si riprova con 0. `data_channel` di `udsCreateNetwork` (il nostro `TS_DATA_CHANNEL = 1`) **non è** il canale radio: è solo un'etichetta dei dati.
+3. **Vedere i canali degli altri**: la scansione che già facciamo (`udsScanBeacons`) restituisce il canale di ogni stanza trovata (campo `network.channel`) e **noi non lo leggiamo mai**. Ma vede **solo le stanze con il nostro identificatore** (3DS Link / TitleShare): cioè proprio l'altro mittente che ci interessa, non le stanze di altri giochi, né i router di casa, né il rumore. Un «filtro jolly» per vedere tutto **non è provato**: `id8 = 0` non vale come jolly (provato su hardware), `wlancommID = 0` e `0xFF` non sono mai stati provati. Un mittente in funzione probabilmente non può scansionare (la scansione va fatta **prima** di creare la stanza). Chiamate non documentate che vedono anche i router esistono, ma sono «grezze», non provate, non consigliate.
+4. **Nessuna chiamata sposta una stanza già aperta**: per cambiare canale si chiude e si ricrea, e i riceventi la ritrovano con la scansione (che copre 1, 6 e 11).
+5. **Canali diversi e console vicine**: la regola di partenza (mai verificata) era: almeno 5 canali di distanza (1, 6 e 11 sono esattamente a 5) **e** almeno circa 2 metri tra le console. **Prova dell'utente (stesso giorno): dopo aver riavviato le console (per accendere il Debug log) i due mittenti sono tornati a circa 1,9 e 2,0 MiB/s fissi, con quattro console in fila su 80 cm di scrivania**: quindi con canali diversi la distanza dei 2 metri non serve, almeno in questo caso. Il canale che il sistema ha scelto dopo il riavvio **sarà nelle righe `canale UDS N` dei due log** (l'utente pensa 1 e 11): da leggere per confermare.
+6. **La velocità**: nei nostri log il massimo di un mittente da solo è circa **2,0–2,1 MiB/s** (1.456 byte a blocco; il benchmark UDS grezzo dà 2,09): tutto torna con quello che vede l'utente (i «2,9» erano un errore di trascrizione).
+
+## Direzione indicata dall'utente (2026-10-17; da realizzare solo quando lo dirà: sta ancora provando)
+
+* **Quando si apre *Send Titles*** (c'è già la schermatina *Loading*): **ascoltare l'aria**, cioè una scansione per vedere se c'è già un altro mittente 3DS Link e su che canale (non ci si collega a niente). Se c'è, creare la stanza su **uno degli altri due canali** (1, 6, 11: «con tre scelte va benissimo»); se non c'è nessuno, **scelta automatica del sistema**. «Controlliamo solo noi stessi».
+* **Se la scelta forzata non funziona** (il sistema la ignora o la creazione fallisce) si **ripiega sul canale che sceglie la console** (automatico), come già oggi.
+* **Mostrare il canale**: scritta **«Wi-Fi CH n»** nella barra in alto, **a sinistra della batteria**, sia in *Send Titles* sia in *Receive Titles* (c'è ancora un po' di spazio; «diamoci un limite», le scritte sono già piccole), e nell'elenco delle stanze (il canale di ogni stanza trovata, già nel risultato della scansione). Il numero si conosce solo dopo che la stanza esiste / si è entrati (`udsGetChannel`): finché non si sa, la scritta non compare.
+* **Log**: il Debug log **non si sovrascrive** quando si chiude e si riapre la stanza: `3DSLink-TitleDelivery.log` si apre in aggiunta (`fopen(..., "a")` in `log.c`), ogni stanza aperta aggiunge la sua intestazione e la sua riga `sistema (avvio) … canale UDS N`, e il file ruota solo a 64 MiB (fino a 8 file). Quindi nel log di una console ci sono, una dopo l'altra, tutte le stanze della sessione, ciascuna con il suo canale.
+
+## Piano di prova, a basso costo (da fare solo quando l'utente lo dirà)
+
+| Passo | Cosa | Costo / rischio |
+| --- | --- | --- |
+| 0 | **Leggere il canale dei due mittenti del test del 17 ottobre**: riga `sistema (avvio): … | canale UDS N | …` nel `3DSLink-TitleDelivery.log` sulla SD di ciascuna console (cartella dati dell'app), **solo se il Debug log era acceso**. Stesso numero = ipotesi confermata. Diverso = il disturbo è un'altra cosa (consoles troppo vicine, vedi punto 5). | zero |
+| 1 | **Mostrare il canale** sulla schermata del mittente e nell'elenco delle stanze del ricevente (già disponibile, mai letto). | quasi zero, nessun effetto sul trasferimento |
+| 2 | **Avviso prima di aprire la stanza**: una scansione (come quella dei ricevitori) e, se c'è già un altro mittente 3DS Link in aria, dirlo e dire il canale: «un'altra stanza è già aperta (canale N): le due si divideranno la banda». | piccolo (una scansione prima di creare); non vede gli altri giochi né i router; non cambia il canale |
+| 3 | **Prova unica «canale forzato»**: `channel = 1/6/11` prima di creare, leggere `canale UDS` indietro, ripiego a 0 se la creazione fallisce. Se funziona: scegliere un canale diverso da quello visto nel passo 2. | pochissimo codice; il sistema può ignorare il valore o rifiutarlo (ripiego obbligatorio); un canale fisso può cadere su un router di casa che non vediamo |
+| 4 | Solo se il passo 3 non funziona: riprovare a creare finché esce un canale diverso (con un tetto di tentativi) oppure **solo dirlo all'utente**. | ogni tentativo manda segnali sul canale conteso: può disturbare il trasferimento in corso; inutile se la scelta è deterministica |
+
+Con tre soli canali, un terzo mittente nella stessa zona non avrebbe comunque un canale libero.
+
+## Fonti
+
+libctru `uds.h`/`uds.c` (`udsNetworkStruct.channel`, `udsGetChannel`, `udsScanBeacons`), 3dbrew «NWM_Services» (struttura di rete, offset 0x6) e «NWMUDS:CreateNetwork2», `DlpTest/log-test-app/scan_log.txt` (scansione vera: Zelda Tri Force Heroes Download Play sul canale 11; filtro 0/0 = 0 reti), i log `canale UDS` di `TitleShare/test 10-11.10.2026` e `test-14-10-2026`, Azahar `nwm_uds.cpp` (canale fisso 11 nell'emulatore).

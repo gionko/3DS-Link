@@ -1,0 +1,6 @@
+makerom v0.19.0 e ctrtool (Project_CTR, https://github.com/3DSGuy/Project_CTR, commit d52c2b0e788c2d085763d7c5dcc4b2edd9ffb7d8),
+compilati il 2026-10-13 dentro l'immagine Docker devkitpro/devkitarm (Debian 12, gcc 12.2). Sono binari LINUX: si eseguono solo dentro Docker, ad esempio
+
+  MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src devkitpro/devkitarm tools_ctr/makerom -version
+
+Sorgenti scaricati con `git clone --depth 1` in una cartella temporanea (non conservati qui).

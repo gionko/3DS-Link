@@ -1,0 +1,36 @@
+# build products
+Build/
+build/
+out/
+work/
+*.o
+*.d
+*.elf
+*.map
+*.lst
+*.smdh
+*.3dsx
+*.3gx
+*.cia
+*.bnr
+# generated resources of the app (build_all.sh makes them)
+AzaharLink/ConfigApp/data/AzaharLink.3gx
+AzaharLink/ConfigApp/data/child_model.bin
+# the tools get compiled once (tools_ctr/build_tools.sh)
+tools_ctr/makerom
+tools_ctr/ctrtool
+# registry of a local developer's releases (DlpLink/tools/version.py --register)
+DlpLink/releases.tsv
+# logs, captures, game files and keys: never
+*.log
+*.sed
+boot9.bin
+boot11.bin
+movable.sed
+analysis/
+__pycache__/
+*.pyc
+# yours, from your own console: never committed (the access descriptor of a Download Play child, the IV and the key generator constant)
+DlpLink/data/
+*.bin
+*.local.h
