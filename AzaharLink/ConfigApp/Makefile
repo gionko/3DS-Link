@@ -60,7 +60,7 @@ GRAPHICS	:=	guide/gfx
 # the rotation of its log).
 TS_COMMON	:=	aes catcache cia_front ciastream contentpath flow ncchname pace proto room runcache sched sdcrypt seed sha256 store win
 TS_SOURCE	:=	amsink catalog ctx log power receiver sender
-TS_HOST		:=	delivery hostcfg logrot
+TS_HOST		:=	delivery hostcfg logrot builtin_keys
 TS_OFILES	:=	$(addprefix ts_,$(addsuffix .o,$(TS_COMMON) $(TS_SOURCE) $(TS_HOST)))
 
 # The Download Play host of 3DS Link Delivery (dlph/, a copy of DlpLink/host; Tests/dlph_vendor_check.sh proves it against dlph/MANIFEST.md5). Plain C

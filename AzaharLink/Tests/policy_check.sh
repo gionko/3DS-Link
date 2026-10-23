@@ -262,6 +262,22 @@ need ConfigApp/titleshare_host/logrot.h "#define LOGROT_KEEP 7" "8 files at most
 need ConfigApp/titleshare_host/logrot.c '"%s/3DSLink-TitleDelivery.log"' "the delivery log's name"
 need ConfigApp/titleshare_host/logrot.c '"%s/3DSLink-TitleDelivery.%d.log"' "the older files of the delivery log"
 need ConfigApp/titleshare/source/log.c "if(logrot_due(gBytes)) {" "the log rotates when a file is due"
+# The two values 3DS Link carries and does not read from the console (the key generator's constant, the IV of the Download Play checksum) are Azahar's own
+# defaults, obfuscated in builtin_keys_blob.h and read by builtin_keys.c; no source writes either of them inline, and the library gets the IV from its caller
+need ConfigApp/titleshare_host/builtin_keys.c 'uint8_t key[16] = {0}, ctr[16] = {0};' "the built-in blob is opened with a key of zeros and a counter of zeros, like Azahar's"
+need ConfigApp/titleshare_host/builtin_keys.c 'aes_ctr_crypt(rk, ctr, 0, text, sizeof(bk_blob));' "the built-in blob is opened with the AES the app already has"
+[ "$(tr -d '' < ConfigApp/titleshare/common/sdcrypt.c | grep -c -F 'if(bk_get(BK_GENERATOR_CONSTANT, cbytes) != 0) {')" = 2 ] || fail "ConfigApp/titleshare/common/sdcrypt.c: the SD key and the NCCH key must both take the key generator's constant from the built-in values"
+if grep -rn -E 'static const u128 C |DLP_IV\[' ConfigApp --include=*.c --include=*.h --include=*.cpp --include=*.hpp; then
+  fail "a source carries the key generator's constant or the Download Play IV inline: they are only in builtin_keys_blob.h, obfuscated"
+fi
+need ConfigApp/source/pages_dlp.cpp 'bk_get(BK_DLP_CHECKSUM_IV, cfg.iv);' "the app gives the Download Play library the IV of its checksum"
+need ConfigApp/dlph/dlph.c 'ctr[i] = G.cfg.iv[i] ^ G.cfg.mac[i % 6];' "the checksum's counter is the caller's IV xor the MAC"
+need ConfigApp/dlph/dlph.c 'L("no checksum IV in the configuration (cfg.iv)"); return false;' "the library refuses to open without an IV"
+# The Download Play child carries the descriptor makerom makes itself with the wildcard programId (tried on a console, 2026-10-23): no file of Nintendo's is needed by default
+need ../DlpLink/tools/build_all.sh 'DLP_AD="${DLP_AD:-wild}" bash DlpLink/tools/build_cias.sh' "the checks and the reference child are made with the descriptor of makerom by default"
+need ../DlpLink/tools/make_dlp_child.sh 'AD_ARG=wild; if [ "${DLP_AD:-wild}" = file ]' "the reference child takes the descriptor of makerom unless a file is asked for"
+need ../DlpLink/tools/make_child_model.sh 'AD_ARG=wild; if [ "${DLP_AD:-wild}" = file ]' "the model of the child takes the descriptor of makerom unless a file is asked for"
+need ../DlpLink/tools/finalize_child.py 'struct.pack_into("<Q", ad, 0x200, 0x00040001FFFFFFFF)' "the descriptor of makerom gets the wildcard programId"
 # The Plugin Loader: the commands were checked against Luma3DS's sysmodules/rosalina/source/plugin/plgloader.c (the server), plgldr.c (its
 # client) and CTRPluginFramework's plgldr.c: port "plg:ldr", command 2 = is it enabled (answer: result in word 1, state in word 2), command 3 =
 # enable / disable (word 1 = state; answer: result in word 1). The app sends those two and nothing else, and asks only after a Yes.
@@ -347,13 +363,13 @@ if ! VENDOR_OUT=$(bash Tests/titleshare_vendor_check.sh 2>&1); then
   echo "$VENDOR_OUT"
   fail "the copy of the delivery module in ConfigApp/titleshare is not the original plus its documented patches (Tests/titleshare_vendor_check.sh)"
 fi
-need Tests/titleshare_vendor_check.sh 'ALLOWED="common/proto.c common/proto.h source/catalog.c source/ctx.c source/log.c source/log.h source/main.c source/net.h source/power.c source/receiver.c source/receiver.h source/sender.c source/sender.h"' "only these thirteen files of the module may be patched (the last six on the user's requests, 2026-10-16 and 2026-10-17)"
-need Tests/titleshare_vendor_check.sh "patch -R -p1" "the proof applies the patch backwards to the copy and compares the md5 of the originals"
+need Tests/titleshare_vendor_check.sh 'ALLOWED="common/proto.c common/proto.h common/sdcrypt.c source/catalog.c source/ctx.c source/log.c source/log.h source/main.c source/net.h source/power.c source/receiver.c source/receiver.h source/sender.c source/sender.h"' "only these fourteen files of the module may be patched (the last six on the user's requests, 2026-10-16 and 2026-10-17)"
+need Tests/titleshare_vendor_check.sh "patch --binary -R -p1" "the proof applies the patch backwards to the copy and compares the md5 of the originals"
 need Tests/titleshare_vendor_check.sh 'cmp -s "$TMP/$f" "$DIR/$f"' "where the originals are, original plus patch is compared with the copy byte for byte"
 need ConfigApp/titleshare/PATCHES.md "the thirteen patches" "the patches are documented"
 need_line ConfigApp/Makefile $'TS_COMMON\t:=\taes catcache cia_front ciastream contentpath flow ncchname pace proto room runcache sched sdcrypt seed sha256 store win' "the module files the app builds, by name (all of common/)"
 need_line ConfigApp/Makefile $'TS_SOURCE\t:=\tamsink catalog ctx log power receiver sender' "the module files the app builds, by name (all of source/ but main.c: the module's own text screens are not built)"
-need_line ConfigApp/Makefile $'TS_HOST\t\t:=\tdelivery hostcfg logrot' "the bridge to the module (the one file that includes its headers for the app), with what the app tells the module and the log's rotation"
+need_line ConfigApp/Makefile $'TS_HOST\t\t:=\tdelivery hostcfg logrot builtin_keys' "the bridge to the module (the one file that includes its headers for the app), with what the app tells the module, the log's rotation and the two built-in values (builtin_keys)"
 need_line ConfigApp/Makefile $'SOURCES\t\t:=\tsource ../Sources/azl ../Sources/enet' "TitleShare's folders are not scanned for sources: its files are built from the list only"
 
 # 3DS Link Delivery: this console as a Download Play host (pages_dlp.cpp, over the library in ConfigApp/dlph, which is DlpLink/host unchanged:

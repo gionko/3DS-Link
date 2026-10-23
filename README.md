@@ -10,7 +10,7 @@ It is made of three parts that ship as **one package** (`3DSLink.cia`, or `3DSLi
 | **3DS Link app** | A citro2d app to switch the plugin on per title, choose the room, check the installation, and run the two delivery features below. The plugin is **inside** the app, which writes it to the SD card by itself. | `AzaharLink/ConfigApp` |
 | **Deliveries** | *Titles Delivery*: send installed titles to other consoles over UDS broadcast. *3DS Link Delivery*: hand the app itself to a console that does not have it, with nothing but Download Play (the console needs only Luma3DS). | `AzaharLink/ConfigApp/titleshare*`, `dlph`, `dlpc`; `DlpLink/` |
 
-Current version: **1.0.2** (one version number for all of it: the plugin, the app, the CIA, the installer and the documents say the same `X.Y.Z`, kept in `AzaharLink/VERSION`).
+Current version: **1.0.3** (one version number for all of it: the plugin, the app, the CIA, the installer and the documents say the same `X.Y.Z`, kept in `AzaharLink/VERSION`).
 
 > **Status, honestly.** The plugin has been played on real hardware with Final Fantasy Explorers, Tri Force Heroes, Mario Party: The Top 100, Tekken 3D, Street Fighter IV, Dragon Ball Z Extreme Butōden, Tetris and others, on two New 2DS XL (Luma3DS 13.3.3) and one New 3DS XL (Luma3DS 13.0 or newer, the exact version was not recorded). **Never tried on an Old 3DS / Old 2DS.** The latest app/CIA packaging (1.0.1 and 1.0.2: plugin inside the package, new About page, banner) is built and checked on a PC but **had not been through a console test when this repository was published**. See [Known issues](#known-issues).
 
@@ -19,14 +19,14 @@ Current version: **1.0.2** (one version number for all of it: the plugin, the ap
 * A 3DS / 2DS with **Luma3DS 13.0 or newer** and the **Plugin Loader enabled** (Rosalina menu: `L + Down + Select` → *Plugin Loader*). Luma 13.3.3 is the version it was tested on. Below 13.0 there is no Plugin Loader and the Azahar side of the app switches itself off (the deliveries still work).
 * An Azahar multiplayer room you can reach (address and port, 24872 by default).
 * `boot9.bin` from **your own** console, only for *sending* titles (the app has a step-by-step guide, "How to get boot9.bin", with GodMode9). Receiving needs only Luma with the signature patches.
-* 3DS Link contains no game, no firmware image and no per-console key. It reads the `boot9.bin` of your own console, and only to *send* titles; it never uploads it. What the build needs from your own console is listed under [Build from source](#build-from-source).
+* 3DS Link contains no game, no firmware image and no per-console key. It reads the `boot9.bin` of your own console, and only to *send* titles; it never uploads it. Nothing from your own console is needed to build it.
 * It is meant for titles you own and consoles you own. Nintendo, the games and the console's firmware belong to their makers.
 
 ## Install
 
-There is no pre-built package, and none will be attached to a release: the build needs items from your own console (see [Build from source](#build-from-source)) and the package it makes carries some of them, so everybody builds their own and keeps it for themselves. Once you have `3DSLink.cia` (or `3DSLink.3dsx`):
+Download `3DSLink.cia` (or `3DSLink.3dsx`) from the [Releases](../../releases) page, or build it yourself (see [Build from source](#build-from-source)).
 
-1. Install `3DSLink.cia` with FBI (or put `3DSLink.3dsx` in `/3ds/`).
+1. Install `3DSLink.cia` with FBI (or put `3DSLink.3dsx` in `/3ds/`). A console that has no 3DS Link can get it from one that has it, with Download Play alone (*3DS Link Delivery* in the app).
 2. Open **3DS Link**. The first start scans the SD card and checks the installation. It writes `AzaharLink.3gx` to `sdmc:/3ds/3DSLink/` by itself.
 3. *Azahar Emulator Room*: add your room. *Enable Titles for Azahar Emulator Net*: switch on the titles you want (it copies the plugin to `/luma/plugins/<TitleID>/`). *3DS Link*: the main switch.
 4. Start the game. A "Joined room" notification means it works. With the main switch OFF (or a title not enabled) the game uses the real local wireless.
@@ -47,15 +47,9 @@ bash DlpLink/tools/build_all.sh
 #    add --dist to copy 3DSLink.cia / 3DSLink.3dsx to AzaharLink/dist and refresh the numbers in the documents
 ```
 
-**Three things are not in this repository, and the project keeps them out on purpose: they belong to Nintendo or to the hardware, and whoever builds brings them from their own console** (Azahar keeps the same kind of values out of its source and reads them from the user's own key file):
+**Nothing of Nintendo's is needed to build.** The Download Play child carries the access descriptor that `makerom` makes itself (`-desc dlpchild:1`, signed with its own key), with the programId turned into the wildcard `00040001FFFFFFFF` (`finalize_child.py --ad wild`, the default). This was tried on a console on 2026-10-23: a console without 3DS Link downloaded the child with Download Play and installed it. (Before 1.0.3 the child carried the descriptor that Nintendo signed; `DLP_AD=file` still takes such a 1024-byte file from `DlpLink/data/dlpchild_ad.bin`, which git ignores.)
 
-| What | Where it goes (git ignores all three) | Without it |
-|---|---|---|
-| The access descriptor of a Download Play child (1024 bytes, signed by Nintendo) | `DlpLink/data/dlpchild_ad.bin` | `build_all.sh` stops at the model of the Download Play child ("MANCA ... dlpchild_ad.bin") |
-| The 16-byte IV of the Download Play checksum | `DlpLink/host/dlph_iv.local.h`: `static const u8 DLP_IV[16] = { ... };` | the library builds with an all-zero placeholder and a `#warning`; 3DS Link Delivery does not work |
-| The 128-bit constant of the hardware's AES key generator | `AzaharLink/ConfigApp/titleshare/common/keygen_const.local.h`: `#define KEYGEN_CONSTANT {0x...ULL, 0x...ULL}` (high word first) | the app builds with a zero placeholder and a `#warning`; the keys of *Titles Delivery* come out wrong |
-
-The plugin alone (`make` in `AzaharLink`, with the `pablomk7/libctrpf` image) needs none of them. **The package a full build makes carries these values (the first two are compiled into the app), so keep it for yourself: do not publish or attach it anywhere.**
+The two other values the app needs are in the repository, carried the way Azahar carries its default keys: the constant of the hardware's AES key generator and the IV of the Download Play checksum are the values Azahar ships as `generatorConstant` and `dlpChecksumModIv` (`src/core/hw/default_keys.h`), kept here as a small text obfuscated with AES and a key of zeros (`AzaharLink/ConfigApp/titleshare_host/builtin_keys_blob.h`, read by `builtin_keys.c`). The obfuscation is no protection and is not meant as one.
 
 `build_all.sh` uses three Docker images: `devkitpro/devkitarm` (app, installer, tools), `pablomk7/libctrpf:0.8.0` (the plugin) and, for the PC tests, `azl-hle-build` (`docker build -t azl-hle-build -f AzaharLink/Tests/docker/hle-build.Dockerfile .`). The banner tool (`bannertool`) is not in the repository: `DlpLink/tools/bannertool/build.sh` fetches it (a fixed commit of a fork of Steveice10's MIT-licensed tool) and builds it in the container the first time, so that step needs `git` and network access.
 
@@ -93,7 +87,7 @@ Issues and pull requests are welcome: see [`CONTRIBUTING.md`](CONTRIBUTING.md) a
 
 3DS Link is free software, **GPL-2.0-or-later** (the UDS logic of the plugin is a port of code from Azahar, itself from Citra: "GPLv2 or any later version"); see [`LICENSE`](LICENSE). ENet (`AzaharLink/third_party/enet`) keeps its MIT license. The full list of what it uses or copied, with authors, licenses and links, is [`AzaharLink/CREDITS.md`](AzaharLink/CREDITS.md) (it is also the *Credits and thanks* page of the app): Azahar and Citra, FBI, 3dbrew, devkitPro, libctru, citro2d/citro3d, Luma3DS, CTRPluginFramework, ENet, GodMode9, makerom/ctrtool, bannertool and Pillow.
 
-**Where the public values come from.** A few constants in the code are public, not secret. The Download Play passphrase (`dlph.c`) is the one in Azahar's own source (`src/core/hle/service/dlp/dlp_base.h`). The SHA-256 digests that recognise a `boot9.bin` (`AzaharLink/ConfigApp/source/paths.cpp`) are digests of the same kind that tools such as pyctr list: they identify the file, they are not its content. The ticket skeleton (`titleshare/common/ticket_template.h`) follows the public ticket layout (3dbrew, *Ticket*), with a fake signature, no title key and no console ID, and the certificate names are the public ones. The network bytes in `AzaharLink/Tests/*.inc` are frames captured from our own play sessions, kept as test vectors.
+**Where the public values come from.** A few constants in the code are public, not secret. The key generator constant and the Download Play checksum IV are the defaults Azahar ships (see above). The Download Play passphrase (`dlph.c`) is the one in Azahar's own source (`src/core/hle/service/dlp/dlp_base.h`). The SHA-256 digests that recognise a `boot9.bin` (`AzaharLink/ConfigApp/source/paths.cpp`) are digests of the same kind that tools such as pyctr list: they identify the file, they are not its content. The ticket skeleton (`titleshare/common/ticket_template.h`) follows the public ticket layout (3dbrew, *Ticket*), with a fake signature, no title key and no console ID, and the certificate names are the public ones. The network bytes in `AzaharLink/Tests/*.inc` are frames captured from our own play sessions, kept as test vectors.
 
 **A note on third-party code.** The linker script, `types.h`, `Unicode.h` and the plugin info file come from the CTRPluginFramework BlankTemplate by Nanquitas and PabloMK7; its repository carries no license file, so they are used and credited as its authors describe (see `CREDITS.md`) and will be replaced if its authors ask. The files ported from Azahar/Citra are under their GPL-2.0-or-later; ENet has its own license next to its source in `AzaharLink/third_party/enet/LICENSE`.
 

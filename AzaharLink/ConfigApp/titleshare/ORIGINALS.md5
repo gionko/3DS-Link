@@ -24,7 +24,7 @@ ad1d862750f44467343556c5374a2d91  common/room.h
 1def3774c1c3c17dd2a35f4676412dc6  common/runcache.h
 f59c7b3eaa36d0373f25e2de22318a2b  common/sched.c
 9fd70bd4aa018764d8a04135e7349451  common/sched.h
-6bd24a887144b73250b4e174b75ef3f5  common/sdcrypt.c
+060fd71fefa95b00ebd265933ecd1677  common/sdcrypt.c
 e2bcded2f20c23a01e3901b3ed49c2a8  common/sdcrypt.h
 bb9e54a4e947a48b802b939b3533d574  common/seed.c
 3456ff7ca3876f8da7983673aef21c85  common/seed.h

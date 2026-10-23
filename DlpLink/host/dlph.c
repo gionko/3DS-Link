@@ -27,13 +27,7 @@
 #define QUARANTINE_MS   45000             // a used seat heals in 44-49 s
 #define FOREIGN_RETRY_MS 10000            // persistent room: a node that did not answer is asked again after this long (a console on a dirty seat answers once the seat is clean)
 
-static const char PASSPHRASE[] = "0km@tsa$uhmy1a0sa";                          // sent with its final NUL (18 bytes), like the real one
-#if __has_include("dlph_iv.local.h")
-#include "dlph_iv.local.h"   /* yours, from your own console (not in this repository): static const u8 DLP_IV[16] = { ... }; */
-#else
-#warning "dlph_iv.local.h is missing: PLACEHOLDER IV (all zero), 3DS Link Delivery will not work until you put your own there"
-static const u8 DLP_IV[16] = { 0 };   /* PLACEHOLDER */
-#endif
+static const char PASSPHRASE[] = "0km@tsa$uhmy1a0sa";                          // sent with its final NUL (18 bytes), like the real one; the same passphrase as Azahar's src/core/hle/service/dlp/dlp_base.h
 
 typedef enum { CS_NONE, CS_AUTH, CS_DIST_ACK, CS_CONTENT, CS_NOCONTENT, CS_DONE, CS_FINAL } CState;
 
@@ -194,7 +188,7 @@ static void publish(void)
 static bool compute_seed(void)
 {
     u8 ctr[16], zero[16] = { 0 }, ks[16] = { 0 };
-    for (unsigned i = 0; i < 16; i++) ctr[i] = DLP_IV[i] ^ G.cfg.mac[i % 6];
+    for (unsigned i = 0; i < 16; i++) ctr[i] = G.cfg.iv[i] ^ G.cfg.mac[i % 6];
     Result rc = PS_EncryptDecryptAes(16, zero, ks, PS_ALGORITHM_CTR_ENC, PS_KEYSLOT_39_DLP, ctr);
     if (R_FAILED(rc)) { L("PS_EncryptDecryptAes failed 0x%08lX", (unsigned long)rc); return false; }
     memcpy(G.seed, ks, 4);
@@ -710,6 +704,7 @@ bool dlph_open(const dlph_cfg *cfg)
     G.persistent = cfg->persistent;
     G.max_nodes = cfg->max_nodes < 2 ? 2 : cfg->max_nodes > 8 ? 8 : cfg->max_nodes;
     G.quarantine_ms = cfg->quarantine_ms ? cfg->quarantine_ms : QUARANTINE_MS;
+    { u8 any = 0; for (unsigned i = 0; i < 16; i++) any |= cfg->iv[i]; if (!any) { L("no checksum IV in the configuration (cfg.iv)"); return false; } }
     if (R_FAILED(psInit())) { L("psInit failed"); return false; }
     if (!compute_seed() || !load_child()) { psExit(); free(G.cia); G.cia = NULL; return false; }
     G.opened = true;

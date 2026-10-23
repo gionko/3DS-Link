@@ -49,6 +49,8 @@ typedef enum {
 typedef struct {
     const char *child_path;     // CIA of the DLP child, e.g. "sdmc:/3ds/3DSLink/dlp/child.cia" (see DlpLink/tools/make_dlp_child.sh)
     uint8_t mac[6];             // MAC address of THIS console: read it once with SOCU_GetNetworkOpt(NETOPT_MAC_ADDRESS)
+    uint8_t iv[16];             // the 16-byte IV of the checksum of the fragments (the library does not carry it: the caller gives it; 3DS Link takes it from
+                                // builtin_keys.h, the value Azahar ships as dlpChecksumModIv). All zeros = not given: dlph_open refuses
     uint8_t lang;               // SMDH language index for the name and description shown by the client; 0xFF = system language
     uint8_t max_nodes;          // 2..8; 0 = 2. Only for the room the library makes itself (dlph_start)
     bool persistent;            // false: ROOM OF 2, re-made after every console. true: the room stays up and a seat used by a console is

@@ -238,7 +238,7 @@ static bool run_client(const char *label, u32 permille, u32 mute, int max_iter, 
 
 static void open_lib(bool persistent, u8 nodes, u32 quarantine)
 {
-    dlph_cfg cfg; memset(&cfg, 0, sizeof(cfg));
+    dlph_cfg cfg; memset(&cfg, 0, sizeof(cfg)); memset(cfg.iv, 0x5A, 16);
     cfg.child_path = getenv("DLPH_CHILD") ? getenv("DLPH_CHILD") : "DlpLink/probe/out/ChildProbe.cia";
     cfg.lang = 1; cfg.gap_us = 3000; cfg.log = on_log; cfg.event = on_event; cfg.persistent = persistent; cfg.max_nodes = nodes; cfg.quarantine_ms = quarantine;
     static const u8 mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 } /* PLACEHOLDER MAC: to compare with a capture of a real console, set the MAC of that console here */;
@@ -268,10 +268,22 @@ int main(int argc, char **argv)
         u8 *b = malloc((size_t)n); size_t r = fread(b, 1, (size_t)n, f); (void)r; fclose(f);
         for (int i = 0x2DC0; i < 0x2DC0 + 0x400; i++) b[i] = (u8)(i * 7);          // trash the TMD, like the 2026-10-19 file
         FILE *o = fopen("damaged_child.tmp", "wb"); fwrite(b, 1, (size_t)n, o); fclose(o); free(b);
-        dlph_cfg c; memset(&c, 0, sizeof(c)); c.child_path = "damaged_child.tmp"; c.lang = 1; c.gap_us = 3000; c.log = on_log;
+        dlph_cfg c; memset(&c, 0, sizeof(c)); memset(c.iv, 0x5A, 16); c.child_path = "damaged_child.tmp"; c.lang = 1; c.gap_us = 3000; c.log = on_log;
         CHECK(!dlph_open(&c), "a damaged child.cia must be refused");
         remove("damaged_child.tmp");
         printf("damaged child refused: %s\n", failures ? "NO" : "yes");
+    }
+
+    // ---- no IV in the configuration: refused, and the library says why (it does not carry the IV itself)
+    {
+        dlph_cfg c; memset(&c, 0, sizeof(c)); c.child_path = child; c.lang = 1; c.gap_us = 3000; c.log = on_log;
+        static const u8 mac2[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+        memcpy(c.mac, mac2, 6);
+        CHECK(!dlph_open(&c), "a configuration without the IV must be refused");
+        memset(c.iv, 0x5A, 16);
+        CHECK(dlph_open(&c), "the same configuration with an IV opens");
+        dlph_close();
+        printf("no IV refused, with an IV opens: %s\n", failures ? "NO" : "yes");
     }
 
     // ---- files that are not a valid child: no crash (run with -fsanitize=address,undefined), refused, and the emulator variant is never offered
@@ -287,7 +299,7 @@ int main(int argc, char **argv)
           b[12] = (u8)tik; b[13] = (u8)(tik >> 8); b[14] = (u8)(tik >> 16); b[15] = (u8)(tik >> 24);
           b[24] = (u8)ct; b[25] = (u8)(ct >> 8); b[26] = (u8)(ct >> 16); b[27] = (u8)(ct >> 24); }
         { FILE *o = fopen("wrap_child.tmp", "wb"); fwrite(b, 1, (size_t)n, o); fclose(o); }
-        { dlph_cfg c; memset(&c, 0, sizeof(c)); c.child_path = "wrap_child.tmp"; c.lang = 1; c.log = on_log;
+        { dlph_cfg c; memset(&c, 0, sizeof(c)); memset(c.iv, 0x5A, 16); c.child_path = "wrap_child.tmp"; c.lang = 1; c.log = on_log;
           CHECK(!dlph_open(&c), "a CIA whose section sizes wrap 32 bits must be refused, not read outside the buffer"); }
         // random corruption of the 32 bytes of the header
         u32 seed = 12345;
@@ -298,7 +310,7 @@ int main(int argc, char **argv)
                 b[(seed >> 8) % 32] = (u8)(seed >> 3);
             }
             FILE *o = fopen("fuzz_child.tmp", "wb"); fwrite(b, 1, (size_t)n, o); fclose(o);
-            dlph_cfg c; memset(&c, 0, sizeof(c)); c.child_path = "fuzz_child.tmp"; c.lang = 1; c.log = NULL;
+            dlph_cfg c; memset(&c, 0, sizeof(c)); memset(c.iv, 0x5A, 16); c.child_path = "fuzz_child.tmp"; c.lang = 1; c.log = NULL;
             if (dlph_open(&c)) { accepted++; dlph_close(); } else refused++;
         }
         printf("header fuzz: 3000 corrupted headers, %d refused, %d accepted (same offsets), no crash\n", refused, accepted);
@@ -308,7 +320,7 @@ int main(int argc, char **argv)
         // the emulator variant of the real child (NoCrypto): only if the file exists next to the real one
         const char *emu = getenv("DLPH_EMU_CHILD");
         if (emu && *emu) {
-            dlph_cfg c; memset(&c, 0, sizeof(c)); c.child_path = emu; c.lang = 1; c.log = on_log;
+            dlph_cfg c; memset(&c, 0, sizeof(c)); memset(c.iv, 0x5A, 16); c.child_path = emu; c.lang = 1; c.log = on_log;
             CHECK(!dlph_open(&c), "the emulator variant (NCCH NoCrypto) of the child must be refused");
             printf("emulator variant refused: %s\n", emu);
         } else printf("emulator variant: not tested (set DLPH_EMU_CHILD)\n");

@@ -27,7 +27,7 @@ done
 # (1) the manifest: one line per file, "md5  path" relative to ConfigApp/titleshare
 (cd "$DIR" && md5sum -c --quiet MANIFEST.md5) || fail "a vendored file differs from MANIFEST.md5 (or is missing)"
 LISTED=$(awk '{print $2}' "$DIR/MANIFEST.md5" | sort)
-FOUND=$(cd "$DIR" && find common source -type f ! -name '*.local.h' | sort)
+FOUND=$(cd "$DIR" && find common source -type f | sort)
 [ "$LISTED" = "$FOUND" ] || fail "the files of $DIR are not the files of MANIFEST.md5 (an extra or a missing file)"
 [ -e "$DIR/source/main.c" ] || fail "source/main.c must stay vendored whole (it is the original's file; the app does not build it, the proof needs it)"
 [ "$(awk '{print $2}' "$DIR/ORIGINALS.md5" | sort)" = "$LISTED" ] || fail "ORIGINALS.md5 does not list the same files as MANIFEST.md5"
@@ -40,13 +40,14 @@ PATCHED=$(grep '^--- a/' "$DIR/vendor.patch" | sed 's#^--- a/##' | sort)
 for f in $PATCHED; do
   grep -F -q -- "\`$f\`" "$DIR/PATCHES.md" || fail "PATCHES.md does not describe the patch of $f"
 done
-# the patch may touch these thirteen files and no other: the key file, the log layer, the names of the cache and the park folder, the texts of the menu,
+# the patch may touch these fourteen files and no other: the key file, the log layer, the names of the cache and the park folder, the texts of the menu,
 # (the user's third hardware test, 2026-10-16) the sender's screen data and its welcome of a console that comes in (sender.c, sender.h), and
 # (the same test's second list, 2026-10-17) the trailer of the roster frame that tells every receiver who the others are and what they do
 # (common/proto.c, common/proto.h, source/receiver.c, source/receiver.h), and
 # (the second hardware test, 2026-10-17) the beacon's whole name and the dead constants (source/net.h) and the lid/periodic-line thread of the power code (source/power.c)
-# (the scheduler, the store, the CIA and the crypto, the rest of common/ and of source/, are never patched)
-ALLOWED="common/proto.c common/proto.h source/catalog.c source/ctx.c source/log.c source/log.h source/main.c source/net.h source/power.c source/receiver.c source/receiver.h source/sender.c source/sender.h"
+# (2026-10-23) the key generator's constant, which the crypto asks of the app's built-in keys instead of carrying it (common/sdcrypt.c)
+# (the scheduler, the store, the CIA and the rest of the crypto, the rest of common/ and of source/, are never patched)
+ALLOWED="common/proto.c common/proto.h common/sdcrypt.c source/catalog.c source/ctx.c source/log.c source/log.h source/main.c source/net.h source/power.c source/receiver.c source/receiver.h source/sender.c source/sender.h"
 for f in $PATCHED; do
   case " $ALLOWED " in *" $f "*) ;; *) fail "vendor.patch changes $f (only $ALLOWED may be patched)" ;; esac
 done
@@ -54,7 +55,7 @@ done
 # (3) the patch out of the copy gives the originals
 TMP=$(mktemp -d)
 cp -r "$DIR/common" "$DIR/source" "$TMP/"
-if (cd "$TMP" && patch -R -p1 -s --no-backup-if-mismatch < "$OLDPWD/$DIR/vendor.patch" > /dev/null); then
+if (cd "$TMP" && patch --binary -R -p1 -s --no-backup-if-mismatch < "$OLDPWD/$DIR/vendor.patch" > /dev/null); then
   if ! (cd "$TMP" && md5sum -c --quiet "$OLDPWD/$DIR/ORIGINALS.md5"); then
     fail "the copy minus vendor.patch is not the original files (ORIGINALS.md5)"
   fi
@@ -71,7 +72,7 @@ if [ -d "$ORIG/common" ] && [ -d "$ORIG/share/source" ]; then
   cp "$ORIG"/share/source/* "$TMP/source/"
   (cd "$TMP" && md5sum -c --quiet "$OLDPWD/$DIR/ORIGINALS.md5") || fail "a file of $ORIG is not what ORIGINALS.md5 records (the original changed: take the copy again)"
   [ "$(cd "$TMP" && find common source -type f | sort)" = "$LISTED" ] || fail "the files of $ORIG are not the files of the copy (an original is missing from it, or is new)"
-  (cd "$TMP" && patch -p1 -s --no-backup-if-mismatch < "$OLDPWD/$DIR/vendor.patch" > /dev/null) || fail "vendor.patch does not apply to the originals in $ORIG"
+  (cd "$TMP" && patch --binary -p1 -s --no-backup-if-mismatch < "$OLDPWD/$DIR/vendor.patch" > /dev/null) || fail "vendor.patch does not apply to the originals in $ORIG"
   for f in $LISTED; do
     cmp -s "$TMP/$f" "$DIR/$f" || fail "the original $f plus vendor.patch is not the copy"
   done

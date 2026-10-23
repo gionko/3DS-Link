@@ -17,3 +17,5 @@ HOME dai suoi aiuti di energia (`dl_power_*`). Il pacchetto che si consegna è `
 
 Impostazioni usate: stanza da 2 (`max_nodes = 2`, `persistent = false`: la stanza si rifà dopo ogni console), `gap_us = 3000` (misurato: ~10 s per 2,65 MB; 0 è
 più lento), `lang = 0xFF` (lingua della console).
+
+**Dalla 3DS Link 1.0.3:** la libreria non porta più l'IV del checksum: lo dà il chiamante in `dlph_cfg.iv` (l'app lo prende da `titleshare_host/builtin_keys.h`, `bk_get(BK_DLP_CHECKSUM_IV, cfg.iv)`: il valore che Azahar porta come `dlpChecksumModIv`). Con l'IV a zero `dlph_open` rifiuta e lo dice nel log. Per il resto la copia resta quella di `DlpLink/host/`.

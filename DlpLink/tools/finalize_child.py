@@ -82,7 +82,7 @@ def tmd_hashes(d, oc, hb):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cia")
-    ap.add_argument("--ad", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "dlpchild_ad.bin"))
+    ap.add_argument("--ad", help="the 0x400 bytes of the descriptor (a file), or 'wild' for the one makerom made, with the wildcard programId", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "dlpchild_ad.bin"))
     ap.add_argument("--version", type=int, help="versione titolo u16 (TMD + ticket)")
     a = ap.parse_args()
 
@@ -101,10 +101,21 @@ def main():
         sys.exit("ERRORE: titolo di sistema: la chiave fissa non e' quella di soli zeri")
     print(f"{a.cia}: Title ID {tid:016X}")
 
-    ad = open(a.ad, "rb").read()
+    e = oc + 0x200
+    if a.ad == "wild":
+        # NO descriptor of Nintendo's: the one makerom made itself (-desc dlpchild:1, signed with its own key) with the programId of the
+        # descriptor turned into the wildcard 00040001FFFFFFFF, the only field that the real descriptor of a Download Play child has otherwise
+        # (the rest differs in the signature, the public key and the order of the kernel capabilities). Only a console test says whether a Download Play
+        # client accepts it (the signature checks that Luma skips already cover the other signatures of the child).
+        ad = bytearray(d[e + 0x400:e + 0x800])
+        if (struct.unpack_from("<Q", ad, 0x200)[0] >> 32) != 0x00040001:
+            sys.exit("ERRORE: il descrittore di makerom non e' quello di un figlio DLP (0004 0001 ...)")
+        struct.pack_into("<Q", ad, 0x200, 0x00040001FFFFFFFF)
+        ad = bytes(ad)
+    else:
+        ad = open(a.ad, "rb").read()
     if len(ad) != 0x400 or struct.unpack_from("<Q", ad, 0x200)[0] != 0x00040001FFFFFFFF:
         sys.exit("ERRORE: --ad non e' l'Access Descriptor jolly dei figli DLP (0x400 byte, programId 00040001FFFFFFFF)")
-    e = oc + 0x200
     d[e + 0x400:e + 0x800] = ad                                  # 1. AD firmato Nintendo (la ACI di makerom -desc dlpchild:1 e' gia' quella giusta)
 
     if a.version is not None:                                    # 2. versione

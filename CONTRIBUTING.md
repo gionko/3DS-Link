@@ -12,7 +12,7 @@ Open an issue and say: the **3DS Link version** (About page, or `AzaharLink/VERS
 * The tests run in Docker; see the README. At least run `AzaharLink/Tests/policy_check.sh` (it reads the sources and fails when a rule that decides what the plugin does changes by accident) and `AzaharLink/Tests/run.sh`. A new rule gets a pin in `policy_check.sh` and a mutant in `policy_mutants.py`.
 * **One version number for everything** (`AzaharLink/VERSION`): `python AzaharLink/Tests/set_version.py X.Y.Z` rewrites every point that carries it; do not bump it by hand and do not bump it for a change that is not a release.
 * The plugin runs inside someone else's game with a few kilobytes of stack on some threads: read the "game-thread code" markers before touching `Sources/ctr/hook.cpp`.
-* **Never add** game files, firmware or system dumps, `boot9.bin`/`boot11.bin`/`movable.sed`, encryption keys, IVs, key-generator constants, signed blobs, text of Nintendo's SDK documents, or logs and captures with real MAC addresses or names. Anything of Nintendo's stays Nintendo's; whoever builds brings it from their own console.
+* **Never add** game files, firmware or system dumps, `boot9.bin`/`boot11.bin`/`movable.sed`, encryption keys of your own console, signed blobs (the only key material in the repository is the two default values that Azahar carries too, in `builtin_keys_blob.h`: do not add others), text of Nintendo's SDK documents, or logs and captures with real MAC addresses or names. Anything of Nintendo's stays Nintendo's; whoever builds brings it from their own console.
 
 ## License
 

@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 
 #include "dlph.h"
+#include "../../../../AzaharLink/ConfigApp/titleshare_host/builtin_keys.h"   // the IV of the checksum, as the app takes it (keys_glue.c compiles the module here)
 
 static FILE *g_log;
 static PrintConsole g_top, g_bot;
@@ -112,6 +113,7 @@ int main(void)
     cfg.log = logline;
     cfg.event = on_event;
     bool ok = read_mac(cfg.mac);
+    bk_get(BK_DLP_CHECKSUM_IV, cfg.iv);
     if (!ok) logline("cannot read the MAC address", NULL);
     if (ok) ok = R_SUCCEEDED(udsInit(0x4000, NULL));
     if (ok) ok = dlph_open(&cfg);

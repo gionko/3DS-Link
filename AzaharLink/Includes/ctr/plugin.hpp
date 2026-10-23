@@ -26,7 +26,7 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.0.2"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.2: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.0.3"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.3: Tests/set_version.py writes all of them)
 
 struct Config {
     bool enabled = true;                  ///< false: the plugin stays completely out of the game

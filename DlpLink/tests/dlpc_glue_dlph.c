@@ -30,6 +30,7 @@ int dlpc_glue_dlph(const char *path, char *name, size_t name_size, unsigned *ver
     dlph_cfg cfg;
     static const u8 mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 } /* PLACEHOLDER MAC: to compare with a capture of a real console, set the MAC of that console here */;
     memset(&cfg, 0, sizeof(cfg));
+    memset(cfg.iv, 0x5A, 16);                                 // a made-up IV: the acceptance conditions do not use it
     cfg.child_path = path;
     cfg.lang = 1;                                             // English: the name that the Download Play list shows
     cfg.gap_us = 3000;

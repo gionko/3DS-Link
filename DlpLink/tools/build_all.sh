@@ -98,7 +98,7 @@ test -s DlpLink/child/child.elf
 
 echo "== 2. il modello del figlio (senza l'app: non ne dipende)"
 model_log="$(mktemp)"; model_rc=0
-docker_run . bash DlpLink/tools/make_child_model.sh >"$model_log" 2>&1 || model_rc=$?
+docker_run . env DLP_AD="${DLP_AD:-wild}" bash DlpLink/tools/make_child_model.sh >"$model_log" 2>&1 || model_rc=$?
 grep -E "RIEPILOGO|^OK|VALIDO|^FAIL|ERRORE|MANCA" "$model_log" | grep -v 'DigitalSignature\|Signature' || true
 if [ "$model_rc" -ne 0 ]; then
   echo "ERRORE: il modello del figlio non e' riuscito (exit $model_rc). Fine del suo output:" >&2
@@ -133,7 +133,7 @@ python DlpLink/tools/check_version_in_binary.py "$(python AzaharLink/Tests/set_v
 
 echo "== 4. i CIA e i controlli"
 GUARD=check; [ "$REGISTER" = 1 ] && GUARD=register
-docker_run . env GUARD="$GUARD" NO_APP="$((1 - APP))" bash DlpLink/tools/build_cias.sh
+docker_run . env GUARD="$GUARD" NO_APP="$((1 - APP))" DLP_AD="${DLP_AD:-wild}" bash DlpLink/tools/build_cias.sh
 
 if [ "$DIST" = 1 ]; then
   echo "== 5. AzaharLink/dist"

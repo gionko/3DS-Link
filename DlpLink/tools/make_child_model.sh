@@ -10,7 +10,7 @@
 # reference child (made with the real app inside) is the same model outside the few fields that makerom draws at random in every run.
 # The seed child is not a deliverable and is not kept as one: it stays in $OUT/model_seed/ to be looked at, and every run makes it again.
 . "$(dirname "$0")/common.sh"
-need "$ELF_CHILD" "compilare DlpLink/child"; need "$SMDH_CHILD" "SMDH del figlio"; need "$PKG/data/dlpchild_ad.bin" "the access descriptor of a Download Play child (1024 bytes): not in this repository, take it from your own console"; need "$PLUGIN_3GX" "plugin .3gx"
+need "$ELF_CHILD" "compilare DlpLink/child"; need "$SMDH_CHILD" "SMDH del figlio"; AD_ARG=wild; if [ "${DLP_AD:-wild}" = file ]; then AD_ARG="$PKG/data/dlpchild_ad.bin"; need "$PKG/data/dlpchild_ad.bin" "DLP_AD=file takes the 1024 bytes of an access descriptor of a Download Play child from your own console (the default, DLP_AD=wild, needs no file)"; fi; need "$PLUGIN_3GX" "plugin .3gx"
 need "$PKG/rsf/dlpchild.rsf" "template"
 # the same pair check as the reference child: the plugin that the child will carry is the one of the app's version
 python3 "$TOOLS/check_plugin_pair.py" "$ROOT/AzaharLink/ConfigApp/source/settings.hpp" "$PLUGIN_3GX" "$VERSION"
@@ -30,7 +30,7 @@ cp "$SEED/seed.cia" "$SEED/seed.emu.cia"
 python3 "$TOOLS/version.py" patch "$SEED/seed.emu.cia"
 python3 "$TOOLS/verify_cia.py" "$SEED/seed.emu.cia" --kind child --emu --tid "$TID" --version "$VER16" --romfs-dir "$STAGE" \
   --expect-strings "$CHILD_NAME" "$CHILD_DESC" "$CHILD_AUTHOR" | tail -1
-python3 "$TOOLS/finalize_child.py" "$SEED/seed.cia" --ad "$PKG/data/dlpchild_ad.bin" --version "$VER16"
+python3 "$TOOLS/finalize_child.py" "$SEED/seed.cia" --ad "$AD_ARG" --version "$VER16"
 python3 "$TOOLS/verify_cia.py" "$SEED/seed.cia" --kind child --tid "$TID" --version "$VER16" --romfs-dir "$STAGE" --elf "$ELF_CHILD" \
   --expect-strings "$CHILD_NAME" "$CHILD_DESC" "$CHILD_AUTHOR" | tail -1
 python3 "$TOOLS/make_model.py" "$SEED/seed.cia" "$OUT/child_model.bin"

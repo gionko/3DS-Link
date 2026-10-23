@@ -84,6 +84,9 @@ g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/
 for f in aes sdcrypt sha256 contentpath ncchname; do
   gcc -O1 -g -w -c ConfigApp/titleshare/common/$f.c -o "$OUT/ts_$f.o"
 done
+# the two values 3DS Link carries (the key generator's constant and the IV of the Download Play checksum): builtin_keys.c, which sdcrypt.c asks
+gcc -O1 -g -w -c ConfigApp/titleshare_host/builtin_keys.c -o "$OUT/ts_builtin_keys.o"
+g++ $CXXFLAGS -pthread Tests/settings_test/builtin_keys_test.cpp "$OUT"/ts_aes.o "$OUT"/ts_sdcrypt.o "$OUT"/ts_sha256.o "$OUT"/ts_builtin_keys.o -o "$OUT/builtin_keys_test"
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/games_test.cpp ConfigApp/source/games.cpp ConfigApp/source/status.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_sha256.o -o "$OUT/games_test"
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/paths_test.cpp ConfigApp/source/paths.cpp ConfigApp/source/appcfg.cpp ConfigApp/source/fileio.cpp ConfigApp/source/search.cpp ConfigApp/source/games.cpp "$OUT"/ts_sha256.o -o "$OUT/paths_test"
 # plugin_install_test: the plugin that 3DS Link carries and puts on the card by itself (plugin_install.hpp with its .cpp, plain C++; paths.cpp makes the folders): what the file on the card
@@ -150,5 +153,6 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/logrot_test"
   "$OUT/log_module_test"
   "$OUT/ncch_icon_test"
+  "$OUT/builtin_keys_test"
   "$OUT/reloc_test" $RELOC_GAME_CODE   # RELOC_GAME_CODE=<decompressed .code> adds the game sweep
 fi

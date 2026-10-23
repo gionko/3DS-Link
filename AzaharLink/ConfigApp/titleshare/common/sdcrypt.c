@@ -4,22 +4,11 @@
 #include <string.h>
 
 #include "sha256.h"
+#include "../../titleshare_host/builtin_keys.h"
 
 typedef struct {
     uint64_t hi, lo;
 } u128;
-
-// The 128-bit constant of the console's AES key generator is not in this repository, like the keys: make keygen_const.local.h next to this file (git
-// ignores it) with
-//     #define KEYGEN_CONSTANT {0x...ULL, 0x...ULL}     // the two 64-bit words, high one first (the order of the u128 above), as other 3DS tools carry them
-// Without it the build goes on with a PLACEHOLDER (zero) and the keys come out wrong.
-#if __has_include("keygen_const.local.h")
-#include "keygen_const.local.h"
-#else
-#warning "keygen_const.local.h is missing: PLACEHOLDER constant (zero), the SD and title keys will be wrong until you put your own there"
-#define KEYGEN_CONSTANT {0, 0}
-#endif
-
 
 static u128 load_be(const uint8_t* p) {
     u128 r = {0, 0};
@@ -72,8 +61,12 @@ int sd_derive_key(const uint8_t* boot9, size_t boot9Size, const uint8_t* movable
     u128 x = load_be(boot9 + keyblob + 0x170 + 0x20);
     u128 y = load_be(movable + 0x110);
 
-    // Scrambler hardware AES del 3DS: rol((rol(X, 2) ^ Y) + C, 87). C e' la costante del generatore di chiavi dell'hardware: non e' in questo repository (keygen_const.local.h).
-    static const u128 C = KEYGEN_CONSTANT;
+    // Scrambler hardware AES del 3DS: rol((rol(X, 2) ^ Y) + C, 87). C e' la costante del generatore di chiavi (i valori di default di Azahar: builtin_keys.h).
+    uint8_t cbytes[16];
+    if(bk_get(BK_GENERATOR_CONSTANT, cbytes) != 0) {
+        return -9;
+    }
+    const u128 C = load_be(cbytes);
     u128 t = rol128(x, 2);
     t.hi ^= y.hi;
     t.lo ^= y.lo;
@@ -138,7 +131,12 @@ int sd_ncch_keyx(const uint8_t* boot9, size_t boot9Size, uint8_t x[16]) {
 }
 
 void ncch_scramble(const uint8_t x[16], const uint8_t y[16], uint8_t key[16]) {
-    static const u128 C = KEYGEN_CONSTANT;
+    uint8_t cbytes[16];
+    if(bk_get(BK_GENERATOR_CONSTANT, cbytes) != 0) {
+        memset(key, 0, 16);
+        return;
+    }
+    const u128 C = load_be(cbytes);
     u128 t = rol128(load_be(x), 2);
     u128 yy = load_be(y);
     t.hi ^= yy.hi;

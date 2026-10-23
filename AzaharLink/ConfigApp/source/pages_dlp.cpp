@@ -27,6 +27,7 @@
 #include <memory>
 
 #include "../dlph/dlph.h"
+#include "../titleshare_host/builtin_keys.h"
 #include "../guide/guide.hpp"
 #include "delivery.hpp"
 #include "dlp_prepare.hpp"
@@ -853,6 +854,7 @@ private:
         std::memset(&cfg, 0, sizeof(cfg));
         cfg.child_path = radio_->child_path.c_str();
         std::memcpy(cfg.mac, mac, 6);
+        bk_get(BK_DLP_CHECKSUM_IV, cfg.iv); // the IV of the checksum (Azahar's default): without it (zeros) dlph_open refuses, and the page says so like any child it cannot use
         cfg.lang = kChildLanguage;
         cfg.max_nodes = 2;     // this console and ONE seat: the room is made again after every console
         cfg.persistent = false;

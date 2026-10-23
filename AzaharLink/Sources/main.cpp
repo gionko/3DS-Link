@@ -394,7 +394,7 @@ int main(void) {
     g_menu_off = plugin.menu_off();
     g_menu_keys = ParseKeys(cfg.menu_key) | Key::Select;
 
-    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 0, 2,
+    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 0, 3,
                                       "Plays 3DS local wireless games over the internet with\n"
                                       "Azahar emulator players and other 3DS consoles.\n\n"
                                       "1. Set the room address (and nickname).\n"

@@ -30,7 +30,7 @@ movable.sed
 analysis/
 __pycache__/
 *.pyc
-# yours, from your own console: never committed (the access descriptor of a Download Play child, the IV and the key generator constant)
+# yours, from your own console: never committed (the access descriptor of a Download Play child)
 DlpLink/data/
 *.bin
 *.local.h
