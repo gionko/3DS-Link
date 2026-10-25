@@ -14,7 +14,7 @@
 
 namespace setup {
 
-constexpr const char* kVersion = "1.0.3";
+constexpr const char* kVersion = "1.0.4";
 // The places that are not the app's to choose: Luma3DS loads plugins from this folder (a title's copy of the plugin goes to
 // sdmc:/luma/plugins/<title id>/, games.hpp), and the plugin reads its settings and writes its logs in sdmc:/3ds/3DSLink, whatever folder
 // the app itself is in (kIniPath and the folder are in paths.hpp with the other fixed places). Until 2026-10-19 the settings were in
@@ -38,7 +38,7 @@ struct Settings {
     int radio_like = 1; // 0 off, 1 broadcast data without retries, 2 unicast too (twice) and the room's stream as it arrives
     bool socket_buffers = true;
     int net_core = -1; // ini key net_thread_core, -1..3 as the plugin takes it (the old net_core=1 written by 0.1.3 is ignored)
-    std::string menu_key = azl::ini::kDefaultMenuKey; // the chord that opens the in-game menu, or "off"
+    std::string menu_key = azl::ini::kMenuKeyOff; // the chord that opens the in-game menu, or "off" (the default)
     std::string menu_chord = azl::ini::kDefaultMenuKey; // not in the file: the chord to come back to when the menu goes on again
     std::string game_name;
     int debug = 0; // 0 no log at all (no file is written), 1 everything (AzaharLink.log + AzaharLink.debug.log); a 2 reads as 1

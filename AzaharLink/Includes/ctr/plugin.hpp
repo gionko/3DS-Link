@@ -26,7 +26,7 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.0.3"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.3: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.0.4"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.4: Tests/set_version.py writes all of them)
 
 struct Config {
     bool enabled = true;                  ///< false: the plugin stays completely out of the game
@@ -39,7 +39,7 @@ struct Config {
     int radio_like = 1;                   ///< 0 all reliable, 1 broadcast game data unreliably like the real radio, 2 unicast too, twice (ini::ParseRadioLike)
     bool socket_buffers = true;           ///< ask the soc service for bigger UDP buffers
     int net_core = -1;                    ///< core of the network thread (-1 any, 0 game core, 1 syscore)
-    std::string menu_key = ini::kDefaultMenuKey; ///< chord that opens the in-game menu; "off" (or "none"): it never opens
+    std::string menu_key = ini::kMenuKeyOff; ///< chord that opens the in-game menu; "off" (or "none", the default): it never opens
     std::string game_name;                ///< empty: read it from the game, shown in the room
     int debug = 0;                        ///< 0 no log at all (no file is written), 1 everything (an old 2 reads as 1)
     int rcvbuf_kb = ini::kRcvbufKbDefault; ///< ini key rcvbuf_kb: 8, 16, 32 or 64; it can only LOWER the receive ring

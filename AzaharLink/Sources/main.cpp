@@ -13,6 +13,14 @@
 #include "azl/text_wrap.hpp"
 #include "ctr/plugin.hpp"
 
+// libctru's hidInit() also opens the ir:rst service on a New 3DS (C-stick, ZL, ZR), and the framework calls it inside the
+// game's own process. ir:rst only has two sessions (Rosalina's menu redefines this for the same reason): the plugin took one
+// and the game, which reads its C-stick from ir:rst, was left without (Monster Hunter 4 Ultimate: dead C-stick whenever the
+// plugin was in the game's folder, even with the main switch off). The plugin needs neither the C-stick nor ZL/ZR.
+extern "C" bool hidShouldUseIrrst(void) {
+    return false;
+}
+
 namespace CTRPluginFramework {
 
 using azl::ctr::Config;
@@ -57,8 +65,6 @@ static u32 ParseKeys(const std::string& text) {
         else if (t == "y") keys |= Key::Y;
         else if (t == "l") keys |= Key::L;
         else if (t == "r") keys |= Key::R;
-        else if (t == "zl") keys |= Key::ZL;
-        else if (t == "zr") keys |= Key::ZR;
         else if (t == "up") keys |= Key::DPadUp;
         else if (t == "down") keys |= Key::DPadDown;
         else if (t == "left") keys |= Key::DPadLeft;
@@ -394,7 +400,7 @@ int main(void) {
     g_menu_off = plugin.menu_off();
     g_menu_keys = ParseKeys(cfg.menu_key) | Key::Select;
 
-    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 0, 3,
+    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 0, 4,
                                       "Plays 3DS local wireless games over the internet with\n"
                                       "Azahar emulator players and other 3DS consoles.\n\n"
                                       "1. Set the room address (and nickname).\n"

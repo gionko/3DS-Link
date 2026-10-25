@@ -66,8 +66,8 @@ static void TestDebug() {
         fs::remove_all("sdmc:");
         setup::LoadSettings(d);
         CHECK(d.debug == 0);
-        CHECK(setup::MenuOn(d));
-        CHECK(d.menu_key == "L+R+Select");
+        CHECK(!setup::MenuOn(d)); // the in-game menu is off until the user switches it on
+        CHECK(d.menu_key == "off");
     }
     struct Case {
         const char* value;
@@ -129,9 +129,9 @@ static void TestMenuKey() {
 
     // an empty menu_key is not a value: the default stays, and is what a save writes
     setup::Settings empty = LoadFrom("menu_key=\nhost=h\n");
-    CHECK(setup::MenuOn(empty) && empty.menu_key == "L+R+Select");
+    CHECK(!setup::MenuOn(empty) && empty.menu_key == "off");
     CHECK(setup::SaveSettings(empty));
-    CHECK(Has(ReadIni(), "menu_key=L+R+Select"));
+    CHECK(Has(ReadIni(), "menu_key=off"));
     // a line in another case or with spaces around the word still reads as off (the plugin's rule)
     CHECK(!setup::MenuOn(LoadFrom("menu_key= Off \n")));
 }
@@ -181,7 +181,7 @@ static void TestUnknownKeysAndRoundTrip() {
 
 static const char* const kGoldenDefault =
     "enabled=1\nhost=\nport=24872\nnickname=\npassword=\ntunnel=1\nautoconnect=1\nradio_like=1\nsocket_buffers=1\n"
-    "net_thread_core=-1\nmenu_key=L+R+Select\ngame_name=\ndebug=0\nrcvbuf_kb=64\nsleep_stop=0\n";
+    "net_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\nsleep_stop=0\n";
 
 // The file of PROVA 1 as it was on the card: the 13 keys of 0.1.14, written by the Setup app (LF), and a last line that
 // was typed by hand over FTP (no line end).
@@ -201,9 +201,9 @@ static void TestFirstRunAndDefaults() {
     CHECK(setup::SaveSettings(d));
     CHECK(fs::is_directory("sdmc:/3ds/3DSLink")); // a save creates the folder of the file (the plugin's folder, /luma/plugins, is Luma's to have)
     CHECK(!setup::PluginsDirExists());
-    CHECK(ReadIni() == kGoldenDefault);                       // 184 bytes, LF, the 15 keys in the order of azl::ini::kKeyNames
+    CHECK(ReadIni() == kGoldenDefault);                       // 177 bytes, LF, the 15 keys in the order of azl::ini::kKeyNames
     CHECK(ReadIni() == azl::ini::Render(azl::ini::Fields())); // the app's defaults are the shared defaults
-    CHECK(ReadIni().size() == 184);
+    CHECK(ReadIni().size() == 177);
     CHECK(ReadIni().find('\r') == std::string::npos);
     setup::Settings back;
     CHECK(setup::LoadSettings(back) == setup::LoadResult::Loaded);

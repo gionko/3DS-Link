@@ -9,7 +9,7 @@
 namespace azl {
 namespace ini {
 
-/// The chord that opens the in-game menu when the ini does not say (Select is always part of any chord).
+/// The chord the in-game menu opens with when it is switched on and no chord of the user is known (Select is always part of any chord).
 constexpr const char* kDefaultMenuKey = "L+R+Select";
 /// What menu_key holds when the in-game menu is switched off.
 constexpr const char* kMenuKeyOff = "off";
@@ -168,7 +168,7 @@ struct Fields {
     int radio_like = 1; // 0, 1, 2 (ParseRadioLike)
     bool socket_buffers = true;
     int net_thread_core = -1;
-    std::string menu_key = kDefaultMenuKey;
+    std::string menu_key = kMenuKeyOff; // the in-game menu is off until the user switches it on
     std::string game_name;
     int debug = 0;
     int rcvbuf_kb = kRcvbufKbDefault;

@@ -275,9 +275,9 @@ static void TestIniValues() {
         const std::string text = ini::Render(ini::Fields());
         CHECK_EQ(text,
                  std::string("enabled=1\nhost=\nport=24872\nnickname=\npassword=\ntunnel=1\nautoconnect=1\nradio_like=1\n"
-                             "socket_buffers=1\nnet_thread_core=-1\nmenu_key=L+R+Select\ngame_name=\ndebug=0\nrcvbuf_kb=64\n"
+                             "socket_buffers=1\nnet_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\n"
                              "sleep_stop=0\n"));
-        CHECK_EQ(text.size(), 184u);
+        CHECK_EQ(text.size(), 177u);
         CHECK(text.find('\r') == std::string::npos);
         std::size_t at = 0;
         for (int i = 0; i < ini::kKeyCount; ++i) {

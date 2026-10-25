@@ -6,7 +6,7 @@
 
 **Connect, share, play together.** 3DS Link is an application for the Nintendo 3DS family that carries local wireless games over the internet, and moves software between consoles without a PC.
 
-Current version: **1.0.3**. Download it from the [Releases](../../releases/latest) page.
+Current version: **1.0.4**. Download it from the [Releases](../../releases/latest) page.
 
 A player on a PC with Azahar, a player on a tablet with Azahar and a player on a real Nintendo 3DS can all be in the same match of the same game, over the internet.
 
