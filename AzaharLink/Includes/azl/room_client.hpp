@@ -219,6 +219,20 @@ inline u32 ServiceTimeoutFor(bool queued, u32 now_ms, u32 last_enqueue_ms) {
     return now_ms - last_enqueue_ms < kQuickPollWindowMs ? kQuickPollMs : kServiceTimeoutMs;
 }
 
+/// The room link's probe, the answer to a silence the link has already left behind. ENet doubles the timer of a packet that gets no
+/// answer, and gives the peer up at the first check that finds the oldest such packet 5 s old with six tries behind it: a WiFi that is
+/// away for 3 to 4 s and comes back is declared lost anyway when the next try - seconds apart by then - falls past those 5 s (checked before
+/// the try, which the link would have answered). Any answer to a packet of ours restarts that count, so when the room speaks (a datagram
+/// came) while the oldest packet of ours it has not answered has waited kSilentPeerMs (`earliest_timeout`: ENet's, 0 = none; `service_time`:
+/// ENet's clock, both in its 32-bit ms), a ping gets that answer at once. At most one in kProbeGapMs (`now_ms`, `last_probe_ms`: one clock).
+/// There is no upper bound on the age: the model (Tests/vsim) keeps the room through silences of 5.5 s in a game that sends a frame in
+/// every round, and a bound at 4.5 s loses them.
+inline constexpr u32 kSilentPeerMs = 500;
+inline constexpr u32 kProbeGapMs = 250;
+inline bool ShouldProbeRoom(u32 service_time, u32 earliest_timeout, u64 now_ms, u64 last_probe_ms) {
+    return earliest_timeout != 0 && service_time - earliest_timeout >= kSilentPeerMs && now_ms - last_probe_ms >= kProbeGapMs;
+}
+
 /// How a frame of the room goes out at a radio-like level (SetFastData): `reliable` = ENet retries it, `duplicate` = it is
 /// sent a second time a round later. The handshake (anything but a beacon or game data) is always reliable and never
 /// doubled; at level 0 so is everything. A unicast game frame is doubled only at level 2 and only when its destination
@@ -227,6 +241,13 @@ struct FrameDelivery {
     bool reliable = true;
     bool duplicate = false;
 };
+/// Does the frame go out the way a broadcast does (unreliable, never doubled)? One sent to the broadcast MAC (not a host's relayed copy, a
+/// unicast frame of the radio), and one the game sent with the broadcast flag, which the radio sends once and does not retry whatever MAC
+/// it is addressed to (UdsEngine::GetSendAddress puts the destination node's own MAC on it when the room has that node).
+inline bool IsBroadcastDelivery(const WifiPacket& p) {
+    return (p.destination_address == kBroadcastMac && !p.relayed) || p.broadcast_flag;
+}
+
 inline FrameDelivery DeliveryFor(int level, bool beacon, bool game_data, bool broadcast, bool peer_numbers) {
     FrameDelivery d;
     if (level <= 0 || (!beacon && !game_data)) {

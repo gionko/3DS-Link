@@ -14,6 +14,10 @@ namespace azl {
 namespace {
 
 constexpr u32 kConnectionTimeoutMs = 5000;
+// The round-trip estimate the connection starts from (ENet: 500 ms, until the room's first answer teaches it the real one). It is what the
+// CONNECT is resent after: 500, 1500, 3500 ms. The room answers a LAN in 8 ms and the internet in 50: 100 ms resends it after 100, 300, 700,
+// 1500, 3100 ms, and a slower link only costs the room a CONNECT it ignores (the same connection is already there).
+constexpr u32 kConnectRttMs = 100;
 // (How long the loop waits for the socket before looking at the outgoing queue again is ServiceTimeoutFor in
 // room_client.hpp: 3 ms at rest, 1 ms for 10 ms after the game queued a frame, none when one is waiting.)
 constexpr u32 kLinkStatsIntervalMs = 1000;
@@ -320,7 +324,7 @@ void RoomClient::SendWifiPacket(const WifiPacket& packet) {
     // (so they stay reliable here at level 1; at level 2 they go twice instead: DeliveryFor).
     // (a host's relayed copy goes to the broadcast MAC of the room but is a unicast frame of the radio: retried, or doubled)
     const FrameDelivery delivery = DeliveryFor(fast_level_.load(), packet.type == WifiPacket::Type::Beacon, secure_data,
-                                               packet.destination_address == kBroadcastMac && !packet.relayed, packet.peer_numbers);
+                                               IsBroadcastDelivery(packet), packet.peer_numbers);
     const u32 type_index = static_cast<u32>(packet.type);
     DebugWifi("tx", packet);
     TxQueue::Item item;
@@ -434,6 +438,8 @@ void RoomClient::Run(Config config, u32 generation) {
         enet_deinitialize();
         return;
     }
+    server->roundTripTime = kConnectRttMs;
+    server->roundTripTimeVariance = 0;
     // Wait for the ENet-level connection (in slices so that Stop() stays responsive). A socket that fails at once does
     // not turn this into a spin: the pauses of the main loop apply (ServiceErrorPauseMs), and the errno is kept.
     bool connected = false;
@@ -512,6 +518,8 @@ void RoomClient::Run(Config config, u32 generation) {
     // next round's start, and a round that did nothing reads the clock only twice.
     u64 round_start = platform::NowTicks();
     bool pause_noted = false; // the pause of this round is already known (it was in the service call)
+    u32 datagrams_seen = client->totalReceivedPackets; // (for the probe below: has the room said anything since the last round?)
+    u64 last_probe_ms = 0;
     u32 errors_in_a_row = 0;     // socket errors of enet_host_service() since the last call that worked ...
     u64 error_episode_ms = 0;    // ... and when the first of them was
     int error_episode_errno = 0;
@@ -568,6 +576,30 @@ void RoomClient::Run(Config config, u32 generation) {
             throttled_seen = throttled;
             skipped_seen = skipped;
             early_seen = early;
+            // (the host's own counters of the room's reliable stream: taken and cleared here, the window adds them up)
+            ENetAzlCounters c;
+            enet_azl_counters_take(client, &c);
+            StatsAdd(g_stats.enet_ooo, c.oooCommands);
+            StatsAdd(g_stats.enet_dup_rx, c.dupCommands);
+            StatsAdd(g_stats.enet_ack_only, c.ackOnlyDatagrams);
+            StatsAdd(g_stats.enet_ack_data, c.ackDataDatagrams);
+            StatsAdd(g_stats.enet_passes, c.passes);
+            StatsAdd(g_stats.enet_recv_skipped, c.recvSkipped);
+            StatsAdd(g_stats.enet_passes_capped, c.passesCapped);
+            StatsAdd(g_stats.enet_events_before_ack, c.eventsBeforeAck);
+            StatsAdd(g_stats.enet_ack_limit_hits, c.ackHoldLimitHits);
+            if (c.ackHoldMaxMs > g_stats.enet_ack_hold_max_ms) {
+                g_stats.enet_ack_hold_max_ms = c.ackHoldMaxMs;
+            }
+            if (c.holWaitMaxMs > g_stats.enet_hol_max_ms) {
+                g_stats.enet_hol_max_ms = c.holWaitMaxMs;
+            }
+            if (c.passDatagramsMax > g_stats.enet_pass_dgrams_max) {
+                g_stats.enet_pass_dgrams_max = c.passDatagramsMax;
+            }
+            if (c.passMsMax > g_stats.enet_pass_ms_max) {
+                g_stats.enet_pass_ms_max = c.passMsMax;
+            }
         }
         cut(g_stats.t_net_service, service_end - round_start);
         if (!Live(generation)) {
@@ -613,6 +645,19 @@ void RoomClient::Run(Config config, u32 generation) {
                     static_cast<unsigned long>(azl_ticks_to_ms(service_end) - error_episode_ms), error_episode_errno);
             }
             errors_in_a_row = 0;
+        }
+        if (client->totalReceivedPackets != datagrams_seen) {
+            // The room spoke. If packets of ours have gone unanswered for a while (ShouldProbeRoom: ENet's earliestTimeout is set, and
+            // nothing has been acknowledged since) the link has just come back - the room's retransmissions got through before our own
+            // retry did - and a ping the room answers stops ENet's count of the silence before its next check gives the room up.
+            datagrams_seen = client->totalReceivedPackets;
+            const u64 now_ms = azl_ticks_to_ms(service_end);
+            if (server->state == ENET_PEER_STATE_CONNECTED &&
+                ShouldProbeRoom(client->serviceTime, server->earliestTimeout, now_ms, last_probe_ms)) {
+                enet_peer_ping(server);
+                last_probe_ms = now_ms;
+                StatsAdd(g_stats.enet_silence_probes);
+            }
         }
         if (service_result > 0) {
             switch (event.type) {

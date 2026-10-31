@@ -32,12 +32,10 @@
 
 static enet_uint32 timeBase = 0;
 
-/* Set when poll() timed out: nothing was readable at that moment, so the recvfrom() that ENet issues
-   first thing in the next enet_host_service() would only return EWOULDBLOCK -- a full round trip to the
-   soc service for nothing (about a third of all the network thread's soc calls). Skipping it loses
-   nothing: a datagram that arrived meanwhile makes the poll() that follows return at once. It is a
-   one-shot flag, and ANY send clears it: a sendto() takes milliseconds, so what the poll() saw is old. */
-static int pollFoundNothing = 0;
+/* (The recvfrom() that only says EWOULDBLOCK -- a full round trip to the soc service for nothing, a third of all the network thread's
+   soc calls and more -- is left out by ENet itself, which knows whether a poll() follows: ENetHost::azlSkipEmptyRecv. This file used
+   to guess it from the last poll() and any sendto() cleared the guess, so the probe after every acknowledgement was made: two
+   EWOULDBLOCK answers for each datagram read.) */
 
 /* Every soc call is timed (two clock reads, a microsecond or so each against the hundreds a call takes): the time the
    thread spent inside a call is time it waited for the soc process, which is not CPU, and the CPU of the loop is what is
@@ -429,7 +427,6 @@ enet_socket_send (ENetSocket socket,
         total += buffers [i].dataLength;
     }
 
-    pollFoundNothing = 0; /* the send takes milliseconds: what the last poll() saw is old */
     startTick = svcGetSystemTick ();
 
     if (address != NULL)
@@ -470,12 +467,6 @@ enet_socket_receive (ENetSocket socket,
     socklen_t sinLength = sizeof (struct sockaddr_in);
     int recvLength, savedErrno;
     unsigned long long startTick, now;
-
-    if (pollFoundNothing)
-    {
-        pollFoundNothing = 0;
-        return 0;
-    }
 
     startTick = svcGetSystemTick ();
 
@@ -571,8 +562,6 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
         azl_c_soc_call (3, svcGetSystemTick () - startTick);
         errno = savedErrno;
     }
-    pollFoundNothing = pollCount == 0 && (pollSocket.events & POLLIN) != 0;
-
     if (pollCount < 0)
     {
         if (errno == EINTR && * condition & ENET_SOCKET_WAIT_INTERRUPT)

@@ -11,7 +11,7 @@ this test runs the compiled plugin (the ELF the 3gx is made of) in the Unicorn A
   * the static initialisers of the plugin run (so every mutex, std::function and table has its real state), the
     capture ring is the real DebugInit() one, the sink of the log is the real LogFiles::Append behind a real
     std::function, the HLE front-end is a real UdsHle (its engine is not built: only the commands that do not reach it
-    are run) and the game's Nintendo-SDK thread object is laid out like Tri Force Heroes' (a 512-byte stack inside a
+    are run) and the game's Nintendo-SDK thread object is laid out like the smallest thread seen (a 512-byte stack inside a
     0x228-byte object, SP of the dispatcher at obj+0x1F8, a 16-byte wrapper frame and the 4-byte trampoline push);
   * every scenario enters azl_svc32_entry / azl_svc23_entry exactly like the per-site trampoline does and the test
     measures how deep the plugin went below the entry SP (the stack under the entry is canary-filled; the object
@@ -29,30 +29,39 @@ this test runs the compiled plugin (the ELF the 3gx is made of) in the Unicorn A
   * one call of Log() / DebugEvent() with a format - which the HLE proper makes in every command that logs, on the
     game's UDS thread, at every debug level - must cost a few words at debug 0 (they cost 440 / 256 bytes in 0.1.15 and
     in the first cut of 0.1.15.1, the line buffer being in their own frame ahead of the test of the level).
+The Download Play hub (phase 3, DESIGN-FASE3.md): the COMPILED DlpHub, DlpService and DlpLobby are built by the plugin's own constructor
+in the emulator and driven through the hook with the headers the games send (scenario_hub_*). The emulator has one thread, so when the
+game thread waits on a kernel event or sleeps, the other thread - the network thread, DlpHub::Tick - runs in its place (Sim.on_yield).
+Two kinds of rig: a SPY LobbyNet (the adapter's vtable replaced by thunks the sim answers and writes down: the inline commands must
+call nothing of it but the clock, and the engine is an unmapped address, so a touch fails loudly) for the commands, the waits, the
+join, the closes and the commands that succeed in every state when nobody can serve them (scenario_hub_always_succeeds: Finalize,
+StopScan, StopSession, EndAccepting answered with success, the hub object compared word by word before and after); and the REAL engine under the lobby, with a transport that drops the frames or queues them in a RoomClient, for
+what a game thread pays when it gives the engine back itself (OnGameUdsStarting with no network thread). The depth of one function is
+read with a window (Sim.window_begin). `--hub-only` runs these scenarios alone.
 What this does not run: the observers' own code (Plugin::OnSleepEnter / OnHomeButton / NoteSleepEvent: stubbed here, the
-last one with a check of what it is told and when) and an engine with a session up (the sim has none); Tests/callgraph_check.py
+last one with a check of what it is told and when) and an engine with a game's session up (the only engine the sim builds is the hub scenarios' one, under the lobby); Tests/callgraph_check.py
 follows both statically. 0.1.16 adds: the APT observer of the sleep protocol (what it is told, and that the replies are
 told BEFORE their call), and 60 failing replies in a row on a fake session (the throttle of a polling game thread: the
 sleeps happen, the replies do not change).
 """
 import os
+import re
 import struct
 import sys
 
 from unicorn import (UC_ARCH_ARM, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_ARM, Uc, UcError)
 from unicorn.arm_const import *
 
-# ---- the game's thread, laid out like Tri Force Heroes' srv-notification thread ------------------------------------------
+# ---- the game's thread: a 512-byte stack with 464 bytes free below the srv call (as measured on a console) -----------------
 OBJ = 0x00800800                 # the SDK object: header 0x28 bytes, then the 512-byte stack
 STACK_LO = OBJ + 0x28
 STACK_TOP = OBJ + 0x228
 DISPATCHER_SP = OBJ + 0x1F8      # SP in the watcher function when it calls the srv wrapper
-WRAPPER_FRAME = 16               # `bl 0x108a24`: push {r4, r5, r6, lr}
+WRAPPER_FRAME = 16               # the game's srv wrapper pushes four registers (r4-r6, lr)
 TRAMPOLINE_PUSH = 4              # the per-site trampoline: push {lr}
 ENTRY_SP = DISPATCHER_SP - WRAPPER_FRAME - TRAMPOLINE_PUSH   # SP at azl_svc32_entry
 FREE_BELOW_DISPATCHER = DISPATCHER_SP - STACK_LO             # 464
-HEADER = {0x00: 0xAAAA0000, 0x04: 0xAAAA0004, 0x08: 0xAAAA0008, 0x0C: 0x00140021, 0x10: 0x00140025,
-          0x14: 0x00000000, 0x18: 0x0080B900, 0x1C: 0x00000001, 0x20: 0x00000000, 0x24: 0x00000000}
+HEADER = {off: 0xAAAA0000 + off for off in range(0, 0x28, 4)}   # ten distinct marks: the test only needs a header that must come back unchanged
 ROOMY_LO = 0x00802000            # a thread with a big stack, for the HLE proper
 ROOMY_TOP = 0x00804000
 ROOMY_ENTRY_SP = ROOMY_TOP - 0x100
@@ -65,6 +74,12 @@ HEAP_SIZE = 0x400000
 REENT = 0x08280000
 CANARY = 0xA5
 BELOW = 0xEE
+# What the stubbed kernel answers to the two questions the first-call lines ask (NoteCommand's "uds: command 0x.. is first called by thread N
+# at priority 0x..", and the first command of each dlp service, "... carried by the room (thread N, priority 0x..)"): the thread id is printed in
+# decimal, the priority in hex. Distinct numbers, so that a line which swaps them (or prints the handle the call was made with, as the
+# unstubbed svc did: 4294934528 = 0xFFFF8000) cannot read as right.
+SIM_THREAD_ID = 42
+SIM_THREAD_PRIORITY = 0x30
 
 # What the pure path WRITES below the entry SP (the canary of the emulator measures that): the hotfix's 108 / 176 less the
 # 20 bytes of the game's wrapper and the trampoline
@@ -77,6 +92,10 @@ BUDGET_PURE = 300                # bytes below the entry SP, pure pass-through p
 # (azl/printf_lite.hpp) and the capture takes the raw words of a command, so the printf family does not run in the HLE
 # proper at all (checked below: `hle_formatter_hits`).
 HLE_CEILING = {0: 320, 1: 520}
+# What the game's nwm::UDS threads pay today for a command that reaches the engine (DESIGN-FASE2.md sez. 7: ~1196 / 1260 bytes in the
+# chain, the room client's queue included): the room a lobby give-back that runs on such a thread (DlpHub::OnGameUdsStarting with no
+# network thread alive) has. The ceilings above are for the paths that have no engine.
+UDS_ENGINE_CALL = {0: 1196, 1: 1260}
 # What ONE call of Log() / DebugEvent() with a format costs the thread that makes it (the HLE proper calls them in every
 # command that logs, at every debug level): at debug 0 they return at once and must cost a few words (they cost 440 / 256
 # bytes in 0.1.15, the line buffer being in their own frame ahead of the test of the level); at debug 1 they were 1456 / 1272
@@ -198,6 +217,7 @@ class Sim:
         self.svc_log = []
         self.kernel = None          # callable(sim, number) -> sets the reply, returns r0
         self.min_sp = 0xFFFFFFFF
+        self.min_pc = 0
         self.measuring = False
         self.log_lines = []         # every line handed to the sink (LogLine and Log())
         self.calls = []             # observer calls
@@ -206,6 +226,22 @@ class Sim:
         self.next_handle = 0x00200000
         self.hooks = {}
         self.sink_thunk = None
+        # The other thread (the Download Play hub scenarios): the emulator runs ONE thread, so when the game thread blocks - a wait on a
+        # kernel event (svc 0x24) or a sleep (svc 0x0A) - and `on_yield` is set, the emulation stops there, `on_yield(sim)` runs (the
+        # network thread's work: DlpHub::Tick, on the plugin's own stack, with the game thread's registers saved) and the game thread
+        # goes on at the instruction after the svc.
+        self.on_yield = None
+        self.clear_event_fails = False
+        self.yields = 0
+        self.yield_pending = False
+        self.win_entry = None       # the depth of ONE function (see window_begin)
+        self.win_entry_sp = None
+        self.win = None
+        self.spy_calls = []         # LobbyNet methods the spy vtable saw on the GAME thread (a name per call)
+        self.observed = []          # ... and the real ones that were watched (the clock; the adapter's when the engine is real)
+        self.net_calls = []         # the same two lists for the calls the network thread (DlpHub::Tick) made
+        self.spy_group = None       # the HeardGroup the spy's ScanRead reports (36 bytes)
+        self.join_polls = 0         # ConnectPoll calls so far (the spy answers "joining" twice, then "failed")
         uc.hook_add(UC_HOOK_CODE, self.on_code)
         uc.hook_add(UC_HOOK_INTR, self.on_svc)
         # malloc & friends: a bump allocator (the allocator's own stack use is not what is being measured here)
@@ -292,12 +328,16 @@ class Sim:
         p32(uc, dirstr + 4, 1)
         uc.mem_write(dirstr + 8, b'/\0')
         limits = self.alloc(32)
-        uc.mem_write(limits, struct.pack('<QQiII4x', 1 << 20, 64 << 20, 7, 64 * 1024, 500))   # (LogFileLimits: 32 bytes since 0.1.17, exit_capture_ms)
+        # (LogFileLimits on ARM32, 40 bytes: u64 log_rotate_bytes, u64 debug_rotate_bytes, int keep, u32 max_pending, u32 exit_capture_ms,
+        #  u32 capture_every_ms, u32 capture_ring_high, 4 bytes of padding for the u64 alignment)
+        uc.mem_write(limits, struct.pack('<QQiIIII4x', 1 << 20, 64 << 20, 7, 64 * 1024, 500, 2000, 160 * 1024))
         self.call(ctor, [obj, 0, dirstr, 0], stack_args=[0, 0, limits])   # (the u64 start_ms is the first stack argument, limits the next)
-        # pending_ is the std::string at +84 (+76 until 0.1.16: LogFileLimits grew by 8 bytes with exit_capture_ms); give it the
+        # pending_ is the std::string at +92 (offsetof on ARM32 with -D__3DS__, where a Mutex is a 4-byte LightLock: +84 until 0.1.16, +76
+        # before; LogFileLimits grew with exit_capture_ms, capture_every_ms and capture_ring_high); give it the
         # capacity Flush() leaves it with (reserve(16 KB)), so that the lines of the scenarios do not allocate, as in the steady
-        # state of the plugin
-        pend = obj + 84
+        # state of the plugin. The check below reads the std::string it finds there (a short string: its pointer is its own buffer):
+        # a layout change that moves pending_ again is a failure here, not a test that quietly measures an allocation.
+        pend = obj + 92
         check(r32(uc, pend) == pend + 8 and r32(uc, pend + 4) == 0, 'LogFiles::pending_ is where Append() expects it')
         buf = self.alloc(16 * 1024 + 1)
         p32(uc, pend, buf)
@@ -366,11 +406,63 @@ class Sim:
                 self.lines_at_call.append((h[1], len(self.log_lines)))   # what the main log held when the observer ran
                 uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
                 return
+            if kind == 'spy':          # a LobbyNet method of the spy vtable: the answer is made here, the method does not run
+                self.spy_calls.append(h[1])
+                uc.reg_write(UC_ARM_REG_R0, self.spy_answer(h[1]) & 0xFFFFFFFF)
+                uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+                return
+            if kind == 'watch':        # a real LobbyNet method that only gets written down (it runs as it is)
+                self.observed.append(h[1])
+            if kind == 'mac':          # the transport's get_mac: a std::array<u8, 6> through the hidden result pointer in r0
+                uc.mem_write(uc.reg_read(UC_ARM_REG_R0), OWN_MAC)
+                uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+                return
         if self.measuring:
             sp = uc.reg_read(UC_ARM_REG_SP)
             if sp < self.min_sp:
                 self.min_sp = sp
+                self.min_pc = address
+            if self.win is not None:
+                self.window_step(address, sp)
+            elif self.win_entry is not None and address == self.win_entry:
+                self.win = [uc.reg_read(UC_ARM_REG_LR) & ~1, sp, sp]     # [where it returns to, SP at its entry, lowest SP so far]
         self.pc = address
+
+    # ---- the depth of ONE function (the part of a long call that belongs to the hub) ----
+    def window_begin(self, address):
+        """From the next entry to the function at `address` until it returns, the lowest SP is kept apart: `window_depth(entry_sp)`."""
+        self.win_entry = address & ~1
+        self.win = None
+        self.win_low = None
+
+    def window_step(self, address, sp):
+        ret, sp_entry, low = self.win
+        if sp < low:
+            self.win[2] = low = sp
+        if address == ret and sp >= sp_entry:
+            self.win_low = low
+            self.win_entry_sp = sp_entry      # (a function that pushed nothing has win_low == win_entry_sp)
+            self.win = None
+            self.win_entry = None
+
+    def window_depth(self, entry_sp):
+        return None if self.win_low is None else entry_sp - self.win_low
+
+    def spy_answer(self, name):
+        """What the spy LobbyNet says. `this` is r0, the arguments r1.."""
+        uc = self.uc
+        r1, r2 = uc.reg_read(UC_ARM_REG_R1), uc.reg_read(UC_ARM_REG_R2)
+        if name == 'ScanRead':
+            if self.spy_group is not None and r1 == 0:
+                uc.mem_write(r2, self.spy_group)
+                return 1
+            return 0
+        if name in ('HostOpen', 'ScanOpen', 'ConnectBegin', 'Send'):
+            return 1
+        if name == 'ConnectPoll':
+            self.join_polls += 1
+            return 0 if self.join_polls <= 2 else 0xFFFFFFFF      # joining, joining, failed
+        return 0
 
     def on_svc(self, uc, intno, user):
         pc = uc.reg_read(UC_ARM_REG_PC)
@@ -387,11 +479,20 @@ class Sim:
             uc.reg_write(UC_ARM_REG_R1, self.next_handle)
             self.next_handle += 0x1000
             uc.reg_write(UC_ARM_REG_R0, 0)
+        elif num == 0x19 and self.clear_event_fails:    # ClearEvent on a handle that now names something else: the fake session is found dead
+            uc.reg_write(UC_ARM_REG_R0, 0xD8E007F7)
+        elif num in (0x24, 0x0A) and self.on_yield is not None and self.measuring:    # the game thread waits or sleeps
+            uc.reg_write(UC_ARM_REG_R0, 0)     # (signalled / woken)
+            self.yield_pending = True
+            uc.emu_stop()
         elif num == 0x35:     # GetProcessId: result in r0, the id in r1
             uc.reg_write(UC_ARM_REG_R1, 0x1D)
             uc.reg_write(UC_ARM_REG_R0, 0)
         elif num == 0x0B:     # GetThreadPriority: result in r0, the priority in r1
-            uc.reg_write(UC_ARM_REG_R1, 0x30)
+            uc.reg_write(UC_ARM_REG_R1, SIM_THREAD_PRIORITY)
+            uc.reg_write(UC_ARM_REG_R0, 0)
+        elif num == 0x37:     # GetThreadId: result in r0, the id in r1 (it was left to the default branch, which leaves r1 as the call put it: the handle)
+            uc.reg_write(UC_ARM_REG_R1, SIM_THREAD_ID)
             uc.reg_write(UC_ARM_REG_R0, 0)
         else:
             uc.reg_write(UC_ARM_REG_R0, 0)
@@ -414,6 +515,29 @@ class Sim:
         uc.mem_write(STACK_LO, bytes([CANARY]) * (STACK_TOP - STACK_LO))
         for off, v in HEADER.items():
             p32(uc, OBJ + off, v)
+
+    def run_game(self, begin):
+        """Runs the game thread from `begin` until it returns to the trampoline. When it waits or sleeps and `on_yield` is set, the other
+        thread runs in its place (the registers of the game thread are saved and put back)."""
+        uc = self.uc
+        pc = begin
+        while True:
+            uc.emu_start(pc, STUB_RET, count=5_000_000)
+            if not self.yield_pending:
+                return
+            self.yield_pending = False
+            self.yields += 1
+            ctx = uc.context_save()
+            was = self.measuring
+            self.measuring = False
+            try:
+                self.on_yield(self)
+            finally:
+                self.measuring = was
+            uc.context_restore(ctx)
+            pc = uc.reg_read(UC_ARM_REG_PC)
+            if uc.reg_read(UC_ARM_REG_CPSR) & 0x20:     # (Thumb)
+                pc |= 1
 
     def enter(self, entry_symbol, handle, name, roomy=False):
         """The game's thread calls the hooked svc through the per-site trampoline. Returns (r0, depth, ok).
@@ -440,11 +564,12 @@ class Sim:
         uc.reg_write(UC_ARM_REG_CPSR, flags_in)
         self.min_sp = entry_sp
         self.measuring = True
+        self.entry_sp = entry_sp
         try:
-            uc.emu_start(self.elf.sym(entry_symbol), STUB_RET, count=5_000_000)
+            self.run_game(self.elf.sym(entry_symbol))
         except UcError as e:
             self.measuring = False
-            check(False, '%s: emulation error %s at pc=%08x' % (name, e, self.pc))
+            check(False, '%s: emulation error %s at pc=%08x (%s)' % (name, e, self.pc, self.where(self.pc)))
             return 0, 0, False
         self.measuring = False
         ok = True
@@ -494,6 +619,7 @@ class Sim:
         depth = max(depth_sp, depth_written)
         self.last_sp_depth = depth_sp
         self.last_written = depth_written
+        self.last_deepest = self.where(self.min_pc)
         return uc.reg_read(UC_ARM_REG_R0), depth, ok
 
     # ---- what the capture holds ----
@@ -573,6 +699,9 @@ results = []   # (scenario, level, depth, budget, kind)
 def record(scenario, level, depth, budget, kind):
     results.append((scenario, level, depth, budget, kind))
     check(depth <= budget, '%s at debug %d: used %d bytes below the entry SP, budget %d' % (scenario, level, depth, budget))
+    if kind == 'hub':      # a dlp command of the hub: run on the 512-byte thread, so it must also fit what is left of the smallest thread seen
+        check(depth <= BUDGET_THREAD, '%s at debug %d: %d bytes do not fit the %d below the entry SP of the smallest thread seen' % (
+            scenario, level, depth, BUDGET_THREAD))
 
 
 def name12(s):
@@ -874,6 +1003,10 @@ def scenario_hle_front(elf, level):
         check(len(sim.log_lines) == 2 and sim.log_lines[0].startswith('uds: command 0x23 is first called by thread ') and
               ' at priority 0x' in sim.log_lines[0] and sim.log_lines[1] == 'uds: command 0x23 -> 0x00000000 (first call)',
               'HLE: the log lines (%r)' % (sim.log_lines,))
+        # ... and the numbers are the kernel's (the stub answers SIM_THREAD_ID and SIM_THREAD_PRIORITY: GetThreadId was not stubbed once,
+        # and the line printed the handle the call was made with, 4294934528)
+        check(sim.log_lines[0] == 'uds: command 0x23 is first called by thread %d at priority 0x%02x' % (SIM_THREAD_ID, SIM_THREAD_PRIORITY),
+              'HLE: the first-caller line carries the thread id and the priority the kernel answered (%r)' % (sim.log_lines[:1],))
     record('HLE: UdsHle::Dispatch of a command that needs no engine', level, depth, HLE_CEILING[level], 'hle')
     # closing them (azl_svc23_entry -> azl_hook_CloseHandle -> NoteHandleClosed)
     sim.log_lines.clear()
@@ -975,6 +1108,807 @@ def scenario_log_cost(elf, level):
             check(sim.log_lines == ['uds: role idle -> host (node 1)'], 'Log(): the line reaches the sink (%r)' % (sim.log_lines,))
 
 
+# =================================================================================================================
+# the Download Play hub (phase 3): the COMPILED DlpHub, DlpService and DlpLobby, on the game's thread
+# =================================================================================================================
+# The plugin's hub is built by its own constructor in the emulator. Two kinds of rig:
+#   spy    the hub's LobbyNet (the adapter on the UDS engine) is replaced by a vtable of the emulator's: every method but the two
+#          clocks is a thunk that the sim answers (and writes down), so a command that reaches the network is SEEN doing it, and the
+#          engine is not there at all (its pointer is an unmapped address: a touch is a loud failure). Used for the commands and the
+#          waits, where the game thread is the object of the measure.
+#   engine the real UdsEngine and the real adapter, a transport that drops the frames (a plugin with no room) or hands them to the room
+#          client. Used where the game thread itself runs the lobby's network side (DlpHub::RunHere: no network thread alive).
+# The network thread is the sim's other thread: whenever the game thread waits or sleeps, DlpHub::Tick runs in its place.
+LOBBYNET_SLOTS = ('NowMs', 'NowTicks', 'HostOpen', 'HostUpdate', 'HostClose', 'Kick', 'ScanOpen', 'ScanClose', 'ScanRead',
+                  'ConnectBegin', 'ConnectPoll', 'Disconnect', 'MyNode', 'Members', 'ReadNode', 'Send', 'Receive')
+CLOCK_SLOTS = ('NowMs', 'NowTicks')
+TD_TID = 0x000400000010C000          # Kirby Triple Deluxe
+HOST_MAC = bytes([0x02, 0x00, 0x00, 0x00, 0xAB, 0xCD])
+OWN_MAC = bytes([0x02, 0x00, 0x00, 0x00, 0x12, 0x34])
+DLP_FAILURE = 0xC940AC04             # DlpHub::kResultWirelessOff
+NOT_FOUND = 0xC880AC05
+WRONG_STATE = 0xC8A113EA
+# The request headers of the services as the games send them (SPEC-DLP.md sez. 2 and 3): id << 16 | normal words << 6 | translate words
+FK_INIT_NAME, FK_FINALIZE, FK_GET_EVENT, FK_CHANNELS = 0x00110203, 0x00020000, 0x00030000, 0x00040000
+FK_START_SCAN, FK_STOP_SCAN, FK_SERVER_INFO, FK_TITLE_INFO = 0x00050180, 0x00060000, 0x00070080, 0x00080100
+FK_IN_ORDER, FK_START_FAKE, FK_MY_STATUS, FK_NODES = 0x00090040, 0x000B0100, 0x000C0000, 0x000D0040
+SV_INIT, SV_INIT_NAME, SV_START_ACCEPT = 0x00010183, 0x000F0303, 0x00050080
+FK_STOP_SESSION, SV_FINALIZE, SV_END_ACCEPT = 0x00100000, 0x00020000, 0x00060000     # (the commands that succeed in every state, with FK_FINALIZE / FK_STOP_SCAN)
+HUB_BYTES = 416                      # sizeof(DlpHub) on ARM32 is at most 408 (Tests/dlp_stack_probe.cpp holds that)
+
+
+def hdr(cmd_id, normal, translate=0):
+    return (cmd_id << 16) | (normal << 6) | translate
+
+
+class HubRig:
+    """A DlpHub built by the plugin's constructor, with the other thread (Tick) and, optionally, the spy LobbyNet or a real engine."""
+
+    def __init__(self, sim, elf, engine='spy', room=False):
+        self.sim, self.elf, self.kind = sim, elf, engine
+        uc = sim.uc
+        self.kernel = sim.alloc(16)
+        p32(uc, self.kernel, elf.sym('_ZTVN3azl3ctr12CtrKernelOpsE') + 8)
+        self.engine = 0x0F000000 if engine == 'spy' else self.make_engine(room)
+        cfg = sim.alloc(48)
+        uc.mem_write(cfg, struct.pack('<QQ20s', TD_TID, 0x1122334455667788, 'Link'.encode('utf-16-le').ljust(20, b'\0')))
+        res = sim.alloc(8)
+        p32(uc, res, 0)
+        p32(uc, res + 4, elf.sym('_ZN3azl3ctr12_GLOBAL__N_1L14MapGameAddressEPvmm'))
+        self.hub = sim.alloc(512)
+        sim.call(elf.sym('_ZN3azl6DlpHubC1EPNS_9UdsEngineEPNS_9KernelOpsERKNS_11LobbyConfigERKNS_11IpcResolverE'),
+                 [self.hub, self.engine, self.kernel, cfg], stack_args=[res])
+        vt = elf.sym('_ZTVN3azl14EngineLobbyNetE')
+        check(r32(uc, self.hub) == vt + 8, 'the lobby adapter is the first member of the hub (its vtable pointer is at +0)')
+        if engine == 'spy':
+            self.install_spy(vt)
+        else:
+            self.install_watch(vt)
+        sim.on_yield = self.net_thread
+        self.dead = False       # True: the other thread does not run (the network thread is gone)
+
+    # ---- the engine ----
+    def make_engine(self, room):
+        sim, uc, elf = self.sim, self.sim.uc, self.elf
+        eng = sim.alloc(0x40000, 8)
+        tr = sim.alloc(32, 4)
+        send = sim.alloc(16, 4)
+        if room:
+            self.room = self.make_room()
+            uc.mem_write(send, struct.pack('<IIII', 0xE5900000, 0xE51FF004, elf.sym('_ZN3azl10RoomClient14SendWifiPacketERKNS_10WifiPacketE'), 0))
+            p32(uc, tr + 0, self.room)            # (the "lambda" is a pointer to the room client: ldr r0, [r0]; b SendWifiPacket)
+        else:
+            uc.mem_write(send, struct.pack('<I', 0xE12FFF1E))     # bx lr: the plugin's lambda drops the frame when no room is joined
+        mac = sim.alloc(16, 4)
+        uc.mem_write(mac, struct.pack('<I', 0xE12FFF1E))
+        sim.hooks[mac] = ('mac', None)
+        p32(uc, tr + 8, 0x07000004)
+        p32(uc, tr + 12, send)
+        p32(uc, tr + 16 + 8, 0x07000004)
+        p32(uc, tr + 16 + 12, mac)
+        sim.call(elf.sym('_ZN3azl9UdsEngineC1EPNS_9KernelOpsENS0_9TransportE'), [eng, self.kernel, tr])
+        return eng
+
+    def make_room(self):
+        """A RoomClient built by its own constructor and put in the Joined state (state_ is its first member: state() is `ldr r0, [r0]`), so that
+        the plugin's transport lambda - here a jump to SendWifiPacket - queues the frames as it does in a room."""
+        sim, uc, elf = self.sim, self.sim.uc, self.elf
+        room = sim.alloc(16 * 1024, 8)
+        sim.call(elf.sym('_ZN3azl10RoomClientC1Ev'), [room])
+        p32(uc, room, 3)           # State::Joined
+        return room
+
+    # ---- the network seen by the hub ----
+    def install_spy(self, vt):
+        sim, uc = self.sim, self.sim.uc
+        new_vt = sim.alloc(4 * (2 + len(LOBBYNET_SLOTS)), 4)
+        p32(uc, new_vt, 0)
+        p32(uc, new_vt + 4, 0)
+        for i, name in enumerate(LOBBYNET_SLOTS):
+            orig = r32(uc, vt + 8 + 4 * i)
+            if name in CLOCK_SLOTS:
+                sim.hooks[orig & ~1] = ('watch', name)       # the real clock, written down
+                p32(uc, new_vt + 8 + 4 * i, orig)
+            else:
+                thunk = sim.alloc(16, 4)
+                uc.mem_write(thunk, struct.pack('<I', 0xE12FFF1E))
+                sim.hooks[thunk] = ('spy', name)
+                p32(uc, new_vt + 8 + 4 * i, thunk)
+        p32(uc, self.hub, new_vt + 8)
+
+    def install_watch(self, vt):
+        sim, uc = self.sim, self.sim.uc
+        for i, name in enumerate(LOBBYNET_SLOTS):
+            sim.hooks[r32(uc, vt + 8 + 4 * i) & ~1] = ('watch', name)
+
+    def net_thread(self, sim):
+        """The network thread's turn: the game thread is waiting or sleeping (a sleep of the join wait is 10 ms of the clock)."""
+        if self.dead:
+            return
+        if self.pending_sleep:
+            sim.ticks += 10 * 268112
+        self.run_tick()
+
+    pending_sleep = True
+
+    def run_tick(self):
+        """DlpHub::Tick on the plugin's own stack; what it calls of the adapter is written down apart from the game thread's calls."""
+        sim = self.sim
+        n_spy, n_obs = len(sim.spy_calls), len(sim.observed)
+        sim.call(self.elf.sym('_ZN3azl6DlpHub4TickEv'), [self.hub])
+        sim.net_calls += sim.spy_calls[n_spy:] + sim.observed[n_obs:]
+        del sim.spy_calls[n_spy:]
+        del sim.observed[n_obs:]
+
+    def tick(self, ms=25):
+        """A round of the network thread outside any wait (the clock moves on first: the lobby's pump runs once per 20 ms)."""
+        self.sim.ticks += ms * 268112
+        self.run_tick()
+
+
+def hle_for_hub(sim, elf, rig):
+    """A UdsHle whose hub is the rig's (UdsHle::SetDlpHub is inline: the member is found where RunDlp loads it)."""
+    uc = sim.uc
+    obj = sim.alloc(64 * 1024)
+    sim.call(elf.sym('_ZN3azl3ctr6UdsHleC1EPNS_9UdsEngineE'), [obj, rig.engine])
+    run = elf.sym('_ZN3azl3ctr6UdsHle6RunDlpEhmPm') & ~1
+    off = None
+    for i in range(8):
+        ins = r32(uc, run + 4 * i)
+        if (ins & 0xFFF00000) == 0xE5900000:      # ldr rd, [r0, #imm12]  (cond always, load word, immediate offset up, base r0)
+            off = ins & 0xFFF
+            break
+    check(off is not None, 'UdsHle::RunDlp loads the hub from a member of UdsHle (the first ldr [r0, #n] of its prologue)')
+    p32(uc, obj + off, rig.hub)
+    p32(uc, elf.find('g_hle'), obj)
+    sim.hle = obj
+    return obj
+
+
+def open_session(sim, name):
+    words = struct.unpack('<2I', name12(name))
+    sim.kernel = lambda s, n: (_ for _ in ()).throw(AssertionError('the real kernel was called'))
+    sim.set_request([0x00050100, words[0], words[1], len(name), 0])
+    sim.enter('azl_svc32_entry', 0x14801F, 'open ' + name, roomy=True)
+    return r32(sim.uc, sim.cmd() + 12)
+
+
+def static_buffer(sim, size):
+    """Static buffer 0 of the game thread: [descriptor, address], the address a block of the emulator's heap."""
+    buf = sim.alloc(size + 16)
+    p32(sim.uc, TLS + 0x180, (size << 14) | 2)
+    p32(sim.uc, TLS + 0x184, buf)
+    return buf
+
+
+def reply(sim, n=4):
+    return [r32(sim.uc, sim.cmd() + 4 * i) for i in range(n)]
+
+
+def mac_words(mac):
+    return struct.unpack('<IH', mac)
+
+
+def dlp_call(sim, handle, header, words, name, roomy=False):
+    sim.set_request([header] + list(words))
+    return sim.enter('azl_svc32_entry', handle, name, roomy=roomy)
+
+
+def hub_words(rig):
+    """The words of the DlpHub object (the emulator's memory): a game thread's call is checked by what it changed in it."""
+    return struct.unpack('<%dI' % (HUB_BYTES // 4), bytes(rig.sim.uc.mem_read(rig.hub, HUB_BYTES)))
+
+
+def hub_diff(before, after):
+    """{byte offset: (before, after)} of the words that differ"""
+    return {4 * i: (b, a) for i, (b, a) in enumerate(zip(before, after)) if b != a}
+
+
+def scenario_hub_commands(elf, level):
+    """dlp:FKCL as the game sends it: Initialize, StartScan (posted: the network thread runs them), the pump finds a host, then the commands
+    a game thread serves ITSELF (GetServerInfo and GetTitleInfo with a record written into the game's static buffer, GetTitleInfoInOrder,
+    GetMyStatus ...) - and on those the spy sees no LobbyNet method but the clock -, then StartFakeSession and the wait for the join."""
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    sim.hle_rig = rig
+    ceiling = HLE_CEILING[level]
+    h = open_session(sim, 'dlp:FKCL')
+    check(h != 0, 'the hub opens a fake dlp:FKCL session')
+    rig.tick()                                         # (the network thread is alive: a Tick has been seen)
+    # InitializeWithName (posted)
+    name_words = list(struct.unpack('<5I', 'Kirby'.encode('utf-16-le').ljust(20, b'\0')))
+    y0 = sim.yields
+    r0, depth, ok = dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName')
+    check(reply(sim, 2) == [hdr(0x11, 1), 0], 'FKCL InitializeWithName is answered by the network thread: %r' % (reply(sim, 2),))
+    check(sim.yields > y0, 'FKCL InitializeWithName waited for the network thread (it is a posted command)')
+    record('hub: posted command (FKCL InitializeWithName), the network thread serves it', level, depth, ceiling, 'hub')
+    # StartScan (posted); the group is then heard by the network thread's pump
+    sim.spy_group = struct.pack('<6sBBI20sBB2x', HOST_MAC, 1, 3, (TD_TID & 0xFFFFFF00) | 0, 'Host'.encode('utf-16-le').ljust(20, b'\0'), 4, 1)
+    r0, depth, ok = dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan')
+    check(reply(sim, 2) == [hdr(0x05, 1), 0], 'FKCL StartScan is answered: %r' % (reply(sim, 2),))
+    check('ScanOpen' in sim.net_calls, 'StartScan opened the scan on the network thread (the spy saw ScanOpen there)')
+    check('ScanOpen' not in sim.spy_calls, 'StartScan did not open the scan on the game thread')
+    rig.tick()
+    check('ScanRead' in sim.net_calls, 'the pump of the network thread read the scan (the spy saw ScanRead there)')
+    # the inline commands: the spy must see the clock and nothing else
+    mlo, mhi = mac_words(HOST_MAC)
+    worst = {}
+    for header, size, label, words, mac_at in (
+            (FK_SERVER_INFO, 0x298, 'GetServerInfo (the 0x298-byte record)', [mlo, mhi], 0),
+            (FK_TITLE_INFO, 0x13A8, 'GetTitleInfo (the 0x13A8-byte record)', [mlo, mhi, 0, 0], 8),
+            (FK_IN_ORDER, 0x13A8, 'GetTitleInfoInOrder (the next record)', [1], 8),
+            (FK_MY_STATUS, 0, 'GetMyStatus', [], 0),
+            (FK_NODES, 0, 'GetConnectingNodes', [4], 0),
+            (FK_GET_EVENT, 0, 'GetEventDesc', [], 0),
+            (FK_CHANNELS, 0, 'GetChannels', [], 0)):
+        cmd_id = header >> 16
+        sim.spy_calls.clear()
+        sim.observed.clear()
+        buf = static_buffer(sim, size) if size else 0
+        y0 = sim.yields
+        # The trace of the commands (debug only, DESIGN-FASE3 sez. 6; the 'dlpc: ' lines): two of the commands are read with a window on the
+        # trace function they enter - GetEventDesc on DlpTraceRequest (every command), GetChannels on DlpTraceReply (the first call of a
+        # command is always a line). Both test the debug level first thing (a test in RunDlp itself cost its frame 8 bytes at every level): at
+        # debug 0 they are entered and leave at once, pushing nothing (the window's lowest SP is the SP it was entered with) and writing nothing;
+        # at debug 1 the window is the depth of the trace alone (the hook's frames, RunDlp, the function and the whole of the line's path down
+        # to the sink), a sibling of NoteCommand's chain, which must be no deeper than it.
+        trace_fn = {'GetEventDesc': 'DlpTraceRequest', 'GetChannels': 'DlpTraceReply'}.get(label)
+        if trace_fn is not None:
+            sim.window_begin(elf.find(trace_fn))
+        sim.log_lines.clear()
+        r0, depth, ok = dlp_call(sim, h, header, words, 'fkcl ' + label)
+        rep = reply(sim, 4)
+        if trace_fn is not None:
+            w = sim.window_depth(ENTRY_SP)
+            trace_lines = [l for l in sim.log_lines if l.startswith('dlpc: ')]
+            if level == 0:
+                check(w is not None and sim.win_low == sim.win_entry_sp and trace_lines == [],
+                      'debug 0: %s leaves at once, pushes nothing and writes no trace line (window %r, entered at %r, %r)' % (
+                          trace_fn, w, None if sim.win_entry_sp is None else ENTRY_SP - sim.win_entry_sp, trace_lines))
+            else:
+                check(w is not None, 'debug 1: %s was entered by FKCL %s' % (trace_fn, label))
+                if trace_fn == 'DlpTraceReply':
+                    check(len(trace_lines) == 1 and re.fullmatch(r'dlpc: dlp:FKCL 0x04 req( 00000000){6} -> 0x00000000 rep 00000421 \(\d+ ms\)', trace_lines[0]) is not None,
+                          'debug 1: the trace line of GetChannels (%r)' % (trace_lines,))
+                if w is not None:
+                    record('hub: the trace of a command (window: %s down)' % trace_fn, level, w, ceiling, 'hub')
+        check(sim.yields == y0, 'inline FKCL %s did not wait for the network thread' % label)
+        check(sim.spy_calls == [], 'inline FKCL %s called no LobbyNet method of the adapter on the game thread (%r)' % (label, sim.spy_calls))
+        check(all(o in CLOCK_SLOTS for o in sim.observed), 'inline FKCL %s called only the clock (%r)' % (label, sim.observed))
+        if size:
+            check(rep[0] >> 16 == cmd_id and rep[1] == 0, 'inline FKCL %s: the record was written (%r)' % (label, [hex(x) for x in rep]))
+            check(bytes(sim.uc.mem_read(buf + mac_at, 6)) == HOST_MAC, 'inline FKCL %s: the record holds the host\'s MAC (at +%d)' % (label, mac_at))
+        worst[label] = depth
+        record('hub: inline FKCL ' + label, level, depth, ceiling, 'hub')
+    # the posted commands that leave a request and finish (Finalize), and the join
+    r0, depth, ok = dlp_call(sim, h, FK_FINALIZE, [], 'fkcl Finalize')
+    check(reply(sim, 2) == [hdr(0x02, 1), 0], 'FKCL Finalize is answered')
+    record('hub: posted command (FKCL Finalize)', level, depth, ceiling, 'hub')
+    # a join: Initialize, StartScan, the host is heard, StartFakeSession (posted: JoinPending), the wait loop sleeps 10 ms at a time and
+    # the network thread's pump polls the (spy) engine, which says "joining" twice and then "failed"
+    dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName')
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan')
+    rig.tick()
+    dlp_call(sim, h, FK_STOP_SCAN, [], 'fkcl StopScan')
+    sim.spy_calls.clear()
+    sim.join_polls = 0
+    y0 = sim.yields
+    sleeps0 = sim.svc_log.count(0x0A)
+    r0, depth, ok = dlp_call(sim, h, FK_START_FAKE, [mlo, mhi, 0, 0], 'fkcl StartFakeSession')
+    check('ConnectBegin' in sim.net_calls and 'ConnectBegin' not in sim.spy_calls,
+          'StartFakeSession began the join on the network thread (the spy saw ConnectBegin there, not on the game thread)')
+    check(sim.svc_log.count(0x0A) > sleeps0, 'the game thread slept in the join wait (WaitForJoin)')
+    check(reply(sim, 2)[0] == hdr(0x0B, 1) and reply(sim, 2)[1] == NOT_FOUND,
+          'the join the spy engine failed ends the wait with "server not found": %r' % ([hex(x) for x in reply(sim, 2)],))
+    record('hub: FKCL StartFakeSession (the request, then the join wait with the network thread polling)', level, depth, ceiling, 'hub')
+    return sim
+
+
+def scenario_hub_trace_dedupe(elf, level):
+    """The trace of the commands (DlpTraceReply) as the target's compiler built it: a reply the command has already given in the last 2 s is
+    counted and not written, a NEW reply is a line at once, one command remembers up to 6 replies per window, a seventh distinct one is
+    written every time (loud, never silent), and after the window the next call is written again with the count of the calls it left out.
+    The same rules as L15 of Tests/ipc_test/dlp_lobby_hle_test.cpp, but over the machine code of the plugin (the 16-bit fold of the reply, the
+    array of six, the 2 s window with the clock of the simulated kernel). GetTitleInfoInOrder is the command: its reply echoes the address
+    of the game's buffer, so a call into another buffer is another reply, and (1) then (0) is a group and then "no data", as Triple
+    Deluxe polls it. At debug 0 the same calls write no line at all."""
+    sim = Sim(elf, level, hle=False)
+    sim.tick_step = 268                    # 1 us per read of the clock: the calls below are a fraction of the 2 s window
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    sim.hle_rig = rig
+    h = open_session(sim, 'dlp:FKCL')
+    rig.tick()
+    name_words = list(struct.unpack('<5I', 'Kirby'.encode('utf-16-le').ljust(20, b'\0')))
+    dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName')
+    sim.spy_group = struct.pack('<6sBBI20sBB2x', HOST_MAC, 1, 3, (TD_TID & 0xFFFFFF00) | 0, 'Host'.encode('utf-16-le').ljust(20, b'\0'), 4, 1)
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan')
+    rig.tick()
+    rig.tick()
+    bufs = [sim.alloc(0x13A8 + 16) for _ in range(8)]         # eight buffers of the game: eight different replies
+
+    def poll(buf, restart):
+        p32(sim.uc, TLS + 0x180, (0x13A8 << 14) | 2)
+        p32(sim.uc, TLS + 0x184, buf)
+        dlp_call(sim, h, FK_IN_ORDER, [restart], 'fkcl GetTitleInfoInOrder(%d)' % restart)
+        return reply(sim, 4)
+
+    def lines():
+        return [l for l in sim.log_lines if l.startswith('dlpc: dlp:FKCL 0x09 ')]
+
+    group = poll(bufs[0], 1)
+    nodata = poll(bufs[0], 0)
+    if level == 0:
+        for i in range(20):
+            poll(bufs[0], 1 if i % 2 == 0 else 0)
+        check(lines() == [] and not [l for l in sim.log_lines if l.startswith('dlpc: ')],
+              'debug 0: the trace writes no line for a poll that alternates between two replies (%r)' % (sim.log_lines[-3:],))
+        return sim
+    check(group[0] >> 16 == 0x09 and group[1] == 0 and group[3] == bufs[0], 'GetTitleInfoInOrder(1) gives the group and echoes the game\'s buffer: %r' % ([hex(x) for x in group],))
+    check(nodata == [hdr(0x09, 1), 0xC880AFEF, nodata[2], nodata[3]], 'GetTitleInfoInOrder(0) after the group is "no data": %r' % ([hex(x) for x in nodata],))
+    check(len(lines()) == 2, 'the first call of each of the two replies is a line (%r)' % (lines(),))
+    # (a) 18 more calls that alternate between the same two replies: not one line, 18 counted
+    for i in range(2, 20):
+        poll(bufs[0], 1 if i % 2 == 0 else 0)
+    check(len(lines()) == 2, 'a command that alternates between two replies writes two lines, not one per call (%d lines)' % len(lines()))
+    # (b) a NEW reply inside the window is written at once, with nothing counted before it that it should not have (the last line was at the nodata)
+    poll(bufs[1], 1)
+    check(len(lines()) == 3 and lines()[2].endswith(' ms, 18 more like it since the last line)'),
+          'a new reply in the window is a line at its call, with the 18 calls left out before it (%r)' % (lines()[2:],))
+    # ... and the replies already seen are still counted, not written, after it
+    poll(bufs[0], 1)
+    poll(bufs[0], 0)
+    poll(bufs[1], 1)
+    check(len(lines()) == 3, 'the replies the window already holds stay silent (%d lines)' % len(lines()))
+    # (c) 1.5 s into the window the same reply is still only counted; after the 2 s the next call is written again, with the calls it left out:
+    # 4 (the last three polls and the one at 1.5 s)
+    sim.ticks += 1500 * 268112
+    poll(bufs[0], 1)
+    check(len(lines()) == 3, 'inside the 2 s of the window (1.5 s) a reply the window holds is still only counted (%d lines)' % len(lines()))
+    sim.ticks += 600 * 268112
+    poll(bufs[0], 1)
+    check(len(lines()) == 4 and lines()[3].endswith(' ms, 4 more like it since the last line)'),
+          'after the window the same reply is written again, with the count of the calls left out (%r)' % (lines()[3:],))
+    poll(bufs[0], 0)
+    check(len(lines()) == 5 and 'more like it' not in lines()[4], 'the new window starts empty: the "no data" is news again, and nothing was left out (%r)' % (lines()[4:],))
+    # (d) six replies are remembered in a window (the group in bufs[0], "no data", and the groups in bufs[1..4]); a seventh is written EVERY time
+    for k in (1, 2, 3, 4):
+        poll(bufs[k], 1)
+    check(len(lines()) == 9, 'four more replies: four more lines, the sixth reply of the window is the last the command remembers (%d lines)' % len(lines()))
+    poll(bufs[5], 1)
+    poll(bufs[5], 1)
+    poll(bufs[5], 1)
+    check(len(lines()) == 12, 'a seventh distinct reply in one window is written at every call, never silent (%d lines)' % len(lines()))
+    poll(bufs[0], 1)
+    poll(bufs[4], 1)
+    poll(bufs[1], 1)
+    check(len(lines()) == 12, 'the six that were remembered are still counted, not written (%d lines)' % len(lines()))
+    poll(bufs[6], 1)
+    check(len(lines()) == 13 and lines()[12].endswith(' ms, 3 more like it since the last line)'),
+          'another seventh reply is a line too, with the calls the remembered ones left out (%r)' % (lines()[12:],))
+    # (e) replies that differ in the RESULT alone: the same header, no reply word. A posted command (StartScan) with no network thread to take it is
+    # refused at once ("wireless off"); once the network thread has been seen it is served, and a console that has not initialised the client
+    # role answers "invalid state" - another result, the same words. A fold that left the result out would call them one reply.
+    sim = Sim(elf, level, hle=False)
+    sim.tick_step = 268
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    h = open_session(sim, 'dlp:FKCL')
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan, no network thread')
+    check(reply(sim, 2) == [hdr(0x05, 1), DLP_FAILURE], 'StartScan with no network thread is "wireless off": %r' % ([hex(x) for x in reply(sim, 2)],))
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan, no network thread (again)')
+    rig.tick()
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan, served')
+    served = reply(sim, 2)
+    check(served[0] == hdr(0x05, 1) and served[1] != DLP_FAILURE and served[1] != 0, 'StartScan served by the network thread before Initialize is an error of its own: %r' % ([hex(x) for x in served],))
+    scan_lines = [l for l in sim.log_lines if l.startswith('dlpc: dlp:FKCL 0x05 ')]
+    check(len(scan_lines) == 2 and '-> 0x%08x rep (' % DLP_FAILURE in scan_lines[0] and '-> 0x%08x rep (' % served[1] in scan_lines[1] and
+          scan_lines[1].endswith(' ms, 1 more like it since the last line)'),
+          'a reply that differs in the result alone is a line of its own, with the call the first reply left out (%r)' % (scan_lines,))
+    return sim
+
+
+def scenario_hub_no_network_thread(elf, level):
+    """The network thread is not there. A posted command is answered at once with the module's "wireless off" (nobody takes the request),
+    and one that is taken too late is cancelled after 2 s and answered the same way; the 8 s cap of the join wait ends the join."""
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    ceiling = HLE_CEILING[level]
+    h = open_session(sim, 'dlp:FKCL')
+    name_words = list(struct.unpack('<5I', 'Kirby'.encode('utf-16-le').ljust(20, b'\0')))
+    # (1) no Tick has ever been seen: refused at once
+    y0 = sim.yields
+    r0, depth, ok = dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName, no network thread')
+    check(reply(sim, 2) == [(0x11 << 16) | 0x40, DLP_FAILURE],
+          'no network thread: the command is answered "wireless off" at once: %r' % ([hex(x) for x in reply(sim, 2)],))
+    check(sim.yields == y0, 'no network thread: the game thread did not wait')
+    if level > 0:
+        check(any('answered "wireless off"' in l for l in sim.log_lines), 'no network thread: the log says so (%r)' % (sim.log_lines[-2:],))
+    record('hub: posted command with no network thread (answered "wireless off" at once)', level, depth, ceiling, 'hub')
+    # (2) a Tick has been seen but nobody serves the request: it is cancelled after 2 s (the other thread is alive and does nothing)
+    rig.tick()
+    rig.dead = True
+    sim.log_lines.clear()
+    r0, depth, ok = dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan, request not served')
+    check(reply(sim, 2) == [(0x05 << 16) | 0x40, DLP_FAILURE], 'a request nobody serves is cancelled and answered "wireless off": %r' % ([hex(x) for x in reply(sim, 2)],))
+    check(sim.yields > 0, 'the game thread waited for the network thread (in slices) before giving up')
+    record('hub: posted command nobody serves (cancelled after 2 s)', level, depth, ceiling, 'hub')
+    return sim
+
+
+def scenario_hub_always_succeeds(elf, level):
+    """The commands that succeed in every state - dlp:FKCL Finalize / StopScan / StopSession and dlp:SRVR Finalize / EndAccepting - are
+    answered with SUCCESS when no network thread can serve them (Triple Deluxe and Planet Robobot treat a negative Finalize as fatal):
+    the new branch of DlpHub::Serve, run here in the compiled plugin on the 512-byte thread. Five flavours:
+      A  no Tick was ever seen: answered at once (no wait), the role-ending ones leave their bit (closing_) and count (deferred_)
+         for the next Tick, nothing else is touched; a command that can fail (StartScan) is still answered "wireless off"
+      B  the network thread was there and is gone (its last Tick is older than kAliveMs) with a scan open: the same, and the next Tick
+         of the returning network thread closes the scan (the end of the role the Finalize had left for it)
+      C  a Tick was seen a moment ago but nobody takes the request: it waits kQueuedMs, is cancelled and answered with success
+      D  the same for dlp:SRVR (Finalize ends the role, EndAccepting does not), over a host that was opened
+      E  the plugin is going away: DlpHub::Stop() before the call, and Stop() while the call waits for a request that was queued
+    The depth is read on the 512-byte thread, the log lines (debug 1) must not say "wireless off" for a success, and the hub object
+    is compared word by word before and after the call: the counters and the closing bit are the ONLY words the game thread changed."""
+    ceiling = HLE_CEILING[level]
+    name_words = list(struct.unpack('<5I', 'Kirby'.encode('utf-16-le').ljust(20, b'\0')))
+    srv_init = [0x1000, 3, 0x1D, 0, 0x1000, 1] + list(struct.unpack('<6I', 'Link'.encode('utf-16-le').ljust(24, b'\0'))) + [0x04000000, 0x1000, 0]
+    success = lambda cmd_id: [(cmd_id << 16) | 0x40, 0]
+    wireless_off = lambda cmd_id: [(cmd_id << 16) | 0x40, DLP_FAILURE]
+
+    def call(sim, rig, h, header, words, what, want, waits=False):
+        """One call on a dlp session whose network thread cannot serve it. -> (depth, {offset: (before, after)} of the hub object)"""
+        before = hub_words(rig)
+        sim.spy_calls.clear()
+        sim.observed.clear()
+        sim.log_lines.clear()
+        y0 = sim.yields
+        t0 = sim.ticks
+        r0, depth, ok = dlp_call(sim, h, header, words, what)
+        rep = reply(sim, 2)
+        check(rep == want, '%s: answered %s, expected %s' % (what, [hex(x) for x in rep], [hex(x) for x in want]))
+        check((sim.yields > y0) == waits, '%s: the game thread %s for the network thread' % (what, 'did not wait' if waits else 'waited'))
+        check(sim.spy_calls == [] and sim.observed == [],
+              '%s: the game thread called no method of the adapter (%r, %r)' % (what, sim.spy_calls, sim.observed))
+        if level > 0:
+            said = any('answered "wireless off"' in l for l in sim.log_lines)
+            check(said == (want[1] == DLP_FAILURE), '%s: the log %s "wireless off" (%r)' % (
+                what, 'says' if want[1] == DLP_FAILURE else 'does not say', sim.log_lines))
+        else:
+            check(sim.log_lines == [], '%s: nothing is logged at debug 0 (%r)' % (what, sim.log_lines))
+        call.waited_ms = (sim.ticks - t0) // 268112
+        return depth, hub_diff(before, hub_words(rig))
+
+    # ---- A: no Tick was ever seen -----------------------------------------------------------------------------------------------
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    h = open_session(sim, 'dlp:FKCL')
+    depth, d = call(sim, rig, h, FK_FINALIZE, [], 'fkcl Finalize, no network thread', success(0x02))
+    worst = depth
+    offs = sorted(d)
+    check(len(offs) == 3 and all(d[o] == (0, 1) for o in offs),
+          'FKCL Finalize, no network thread: failed_fast_, closing_ and deferred_ went 0 -> 1 and nothing else changed (%r)' % (d,))
+    failed = offs[0]                      # failed_fast_; the atomics are declared in a row: ..., cancelled_, failed_fast_, missed_, ran_here_, closing_, deferred_
+    closing, deferred, cancelled = failed + 12, failed + 16, failed - 4
+    check(offs == [failed, closing, deferred], 'the hub object keeps failed_fast_, closing_ and deferred_ at +0, +12, +16 (%r)' % (offs,))
+    if level > 0:
+        # the lines of a command that succeeded: the first command of the service, the trace of the command (DlpTraceReply, before NoteCommand: a
+        # sibling call keeps the chain of the first-call line as short as it was) and the first-call line of the pair. The trace line has the six
+        # words of the request (all zero for Finalize), the result and no reply word, and the duration of the simulated clock. The first line
+        # names the thread that made the call (decimal) and its priority (hex): the hub's threads wait for each other's locks, and the console
+        # test reads from this line how the game's dlp threads stand against the network thread's 0x2F.
+        check(len(sim.log_lines) == 3 and sim.log_lines[0] == 'dlp: the first command of dlp:FKCL is 0x02: the Download Play lobby is carried by the room'
+              ' (thread %d, priority 0x%x)' % (SIM_THREAD_ID, SIM_THREAD_PRIORITY)
+              and re.fullmatch(r'dlpc: dlp:FKCL 0x02 req( 00000000){6} -> 0x00000000 rep \(\d+ ms\)', sim.log_lines[1]) is not None
+              and sim.log_lines[2] == 'dlp:FKCL: command 0x02 -> 0x00000000 (first call)',
+              'FKCL Finalize, no network thread: the lines of a command that succeeded (%r)' % (sim.log_lines,))
+    depth, d = call(sim, rig, h, FK_STOP_SCAN, [], 'fkcl StopScan, no network thread', success(0x06))
+    worst = max(worst, depth)
+    check(d == {failed: (1, 2)}, 'FKCL StopScan, no network thread: only the count of refused requests moved (%r)' % (d,))
+    depth, d = call(sim, rig, h, FK_STOP_SESSION, [], 'fkcl StopSession, no network thread', success(0x10))
+    worst = max(worst, depth)
+    check(d == {failed: (2, 3), deferred: (1, 2)}, 'FKCL StopSession, no network thread: it ends the role too (the bit was set already) (%r)' % (d,))
+    depth, d = call(sim, rig, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan, no network thread', wireless_off(0x05))
+    check(d == {failed: (3, 4)}, 'FKCL StartScan (a command that can fail), no network thread: "wireless off", no bit left (%r)' % (d,))
+    record('hub: FKCL Finalize / StopScan / StopSession with no network thread (answered with success)', level, worst, ceiling, 'hub')
+    before = hub_words(rig)
+    rig.tick()
+    check(hub_diff(before, hub_words(rig)).get(closing) == (1, 0), 'the next Tick of the network thread took the bit the closes had left')
+    check(hub_words(rig)[deferred // 4] == 2, 'the count of deferred closes is the Finalize and the StopSession')
+
+    # ---- B: the network thread was there and is gone, a scan is open --------------------------------------------------------------
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    h = open_session(sim, 'dlp:FKCL')
+    rig.tick()
+    dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName')
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan')
+    rig.tick()
+    check('ScanOpen' in sim.net_calls, 'the scan is open (the network thread ran StartScan)')
+    sim.ticks += 1200 * 268112         # (more than kAliveMs since the last Tick)
+    rig.dead = True
+    depth, d = call(sim, rig, h, FK_FINALIZE, [], 'fkcl Finalize, network thread gone', success(0x02))
+    check(set(d) == {failed, closing, deferred} and d[closing] == (0, 1) and d[deferred] == (0, 1),
+          'FKCL Finalize, network thread gone: a refused request, the bit and the count (%r)' % (d,))
+    record('hub: FKCL Finalize, network thread gone with a scan open (answered with success)', level, depth, ceiling, 'hub')
+    sim.net_calls.clear()
+    rig.dead = False
+    rig.tick()
+    check('ScanClose' in sim.net_calls, 'the returning network thread closed the scan the Finalize had left open (the adapter saw %r)' % (sim.net_calls,))
+    r0, depth, ok = dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName after the return')
+    check(reply(sim, 2) == success(0x11), 'the hub serves again once the network thread is back: %r' % ([hex(x) for x in reply(sim, 2)],))
+
+    # ---- C: a Tick was seen a moment ago and nobody takes the request: cancelled after kQueuedMs --------------------------------
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    h = open_session(sim, 'dlp:FKCL')
+    rig.tick()
+    rig.dead = True
+    depth, d = call(sim, rig, h, FK_FINALIZE, [], 'fkcl Finalize, request not served', success(0x02), waits=True)
+    check(2000 <= call.waited_ms <= 2400, 'the request waited about kQueuedMs (2 s) of the clock before it was given up (%d ms)' % call.waited_ms)
+    check(d.get(cancelled) == (0, 1) and d.get(closing) == (0, 1) and d.get(deferred) == (0, 1) and failed not in d,
+          'FKCL Finalize, not served: counted as cancelled (not refused at once), the bit and the count are left (%r)' % (d,))
+    record('hub: FKCL Finalize nobody serves (cancelled after 2 s, answered with success)', level, depth, ceiling, 'hub')
+    rig.dead = False
+    before = hub_words(rig)
+    rig.tick()
+    check(hub_diff(before, hub_words(rig)).get(closing) == (1, 0), 'the next Tick took the bit (and did not run the request that was given up)')
+
+    # ---- D: dlp:SRVR over an opened host ----------------------------------------------------------------------------------------
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    h = open_session(sim, 'dlp:SRVR')
+    rig.tick()
+    dlp_call(sim, h, SV_INIT_NAME, srv_init, 'srvr InitializeWithName')
+    check(reply(sim, 2) == success(0x0F), 'SRVR InitializeWithName was served by the network thread: %r' % ([hex(x) for x in reply(sim, 2)],))
+    if level > 0:
+        # the first command of dlp:SRVR: its own line, once, with the thread and the priority the kernel answered (dlp:FKCL's is checked in A)
+        first = [l for l in sim.log_lines if l.startswith('dlp: the first command of ')]
+        check(first == ['dlp: the first command of dlp:SRVR is 0x0f: the Download Play lobby is carried by the room (thread %d, priority 0x%x)' % (
+            SIM_THREAD_ID, SIM_THREAD_PRIORITY)], 'dlp:SRVR: the first-command line names the thread and its priority (%r)' % (first,))
+    dlp_call(sim, h, SV_START_ACCEPT, [0, 0], 'srvr StartAccepting')
+    check(reply(sim, 2) == success(0x05), 'SRVR StartAccepting was served by the network thread: %r' % ([hex(x) for x in reply(sim, 2)],))
+    check('HostOpen' in sim.net_calls, 'the host is open (the network thread ran StartAccepting)')
+    sim.ticks += 1200 * 268112
+    rig.dead = True
+    depth, d = call(sim, rig, h, SV_END_ACCEPT, [], 'srvr EndAccepting, network thread gone', success(0x06))
+    worst = depth
+    check(d == {failed: (0, 1)}, 'SRVR EndAccepting, network thread gone: it does not end the role (%r)' % (d,))
+    depth, d = call(sim, rig, h, SV_FINALIZE, [], 'srvr Finalize, network thread gone', success(0x02))
+    worst = max(worst, depth)
+    check(d == {failed: (1, 2), closing: (0, 2), deferred: (0, 1)}, 'SRVR Finalize, network thread gone: it ends the creator\'s role (bit 2) (%r)' % (d,))
+    depth, d = call(sim, rig, h, SV_INIT, [0x1000, 3, 0x1D, 0, 0x1000, 1, 0x04000000, 0, 0], 'srvr Initialize, network thread gone', wireless_off(0x01))
+    check(d == {failed: (2, 3)}, 'SRVR Initialize (a command that can fail), network thread gone: "wireless off", no bit left (%r)' % (d,))
+    record('hub: SRVR Finalize / EndAccepting, network thread gone (answered with success)', level, worst, ceiling, 'hub')
+    sim.net_calls.clear()
+    rig.dead = False
+    rig.tick()
+    check('HostClose' in sim.net_calls, 'the returning network thread closed the host the Finalize had left open (the adapter saw %r)' % (sim.net_calls,))
+
+    # ---- E: the plugin is going away (DlpHub::Stop): before the call, and while the call waits ------------------------------------
+    stop = elf.sym('_ZN3azl6DlpHub4StopEv')
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    h = open_session(sim, 'dlp:FKCL')
+    rig.tick()
+    sim.call(stop, [rig.hub])
+    depth, d = call(sim, rig, h, FK_FINALIZE, [], 'fkcl Finalize after Stop()', success(0x02))
+    check(d == {failed: (0, 1), closing: (0, 1), deferred: (0, 1)}, 'FKCL Finalize after Stop(): refused at once, the bit and the count are left (%r)' % (d,))
+    record('hub: FKCL Finalize after Stop() (answered with success)', level, depth, ceiling, 'hub')
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    h = open_session(sim, 'dlp:FKCL')
+    rig.tick()
+    stopped = []
+
+    def stop_while_waiting(s):         # the plugin ends while the game thread waits for a request that was queued: Stop() takes it to Done with ok == false
+        if not stopped:
+            stopped.append(1)
+            s.call(stop, [rig.hub])
+    sim.on_yield = stop_while_waiting
+    depth, d = call(sim, rig, h, FK_FINALIZE, [], 'fkcl Finalize, Stop() while it waits', success(0x02), waits=True)
+    check(d.get(closing) == (0, 1) and d.get(deferred) == (0, 1) and failed not in d and cancelled not in d,
+          'FKCL Finalize, Stop() while it waits: neither refused at once nor cancelled, the bit and the count are left (%r)' % (d,))
+    check(call.waited_ms < 100, 'Stop() released the wait at once (%d ms of the clock)' % call.waited_ms)
+    record('hub: FKCL Finalize, Stop() while it waits (answered with success)', level, depth, ceiling, 'hub')
+    return sim
+
+
+def scenario_hub_join_cap(elf, level):
+    """The join wait ends by itself after 8 s when the network thread is gone: the reply is "server not found", and the end of the client
+    role is left for the network thread's next Tick (nothing of the lobby's network side runs on the waiting thread)."""
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    ceiling = HLE_CEILING[level]
+    h = open_session(sim, 'dlp:FKCL')
+    name_words = list(struct.unpack('<5I', 'Kirby'.encode('utf-16-le').ljust(20, b'\0')))
+    sim.spy_group = struct.pack('<6sBBI20sBB2x', HOST_MAC, 1, 3, (TD_TID & 0xFFFFFF00) | 0, 'Host'.encode('utf-16-le').ljust(20, b'\0'), 4, 1)
+    rig.tick()
+    dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName')
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan')
+    rig.tick()
+    dlp_call(sim, h, FK_STOP_SCAN, [], 'fkcl StopScan')
+    mlo, mhi = mac_words(HOST_MAC)
+    # the network thread serves StartFakeSession and is gone from then on: the join is never polled
+    orig_net_thread = rig.net_thread
+
+    def one_round_then_gone(s):
+        if getattr(rig, 'gone', False):
+            s.ticks += 10 * 268112
+            return
+        orig_net_thread(s)
+        rig.gone = True
+    sim.on_yield = one_round_then_gone
+    sim.log_lines.clear()
+    sim.spy_calls.clear()
+    t0 = sim.ticks
+    r0, depth, ok = dlp_call(sim, h, FK_START_FAKE, [mlo, mhi, 0, 0], 'fkcl StartFakeSession, the network thread gone')
+    waited_ms = (sim.ticks - t0) // 268112
+    check(reply(sim, 2) == [(0x0B << 16) | 0x40, NOT_FOUND], 'the cap: "server not found": %r' % ([hex(x) for x in reply(sim, 2)],))
+    check(8000 <= waited_ms <= 8400, 'the cap came after about 8 s of the clock (%d ms)' % waited_ms)
+    if level > 0:
+        check(any('the join did not end in 8 s' in l for l in sim.log_lines), 'the cap is logged (%r)' % (sim.log_lines[-1:],))
+    check(sim.spy_calls == [], 'the cap: the waiting thread called no method of the adapter (%r)' % (sim.spy_calls,))
+    sim.net_calls.clear()
+    rig.gone = False
+    rig.tick()                                           # the network thread is back: the end of the client role is its Tick's
+    check('Disconnect' in sim.net_calls or 'HostClose' in sim.net_calls, 'the next Tick of the network thread ended the join (the adapter saw %r)' % (sim.net_calls,))
+    record('hub: StartFakeSession, the 8 s cap of the join wait (the end of the role is left for the next Tick)', level, depth, ceiling, 'hub')
+    return sim
+
+
+def scenario_hub_close(elf, level):
+    """The game closes its dlp:SRVR session without Finalize: the role ends (a posted request when the network thread is alive; on the
+    calling thread when it is not), through the CloseHandle hook. Twice: over the spy network (the lobby's own part) and over the REAL
+    engine with the lobby holding it (SRVR StartAccepting): there the game thread that runs the end itself pays for the engine's
+    Shutdown as well."""
+    for engine, dead, room in (('spy', False, False), ('spy', True, False), ('engine', False, False), ('engine', True, False),
+                               ('engine', True, True)):
+        if True:
+            sim = Sim(elf, level, hle=False)
+            rig = HubRig(sim, elf, engine=engine, room=room)
+            hle_for_hub(sim, elf, rig)
+            h = open_session(sim, 'dlp:SRVR')
+            rig.tick()
+            # (SRVR InitializeWithName is the biggest request of the service: 15 words declared by its header)
+            r0, depth, ok = dlp_call(sim, h, SV_INIT_NAME, [0x1000, 3, 0x1D, 0, 0x1000, 1] + list(struct.unpack('<6I', 'Link'.encode('utf-16-le').ljust(24, b'\0')))
+                                     + [0x04000000, 0x1000, 0], 'srvr InitializeWithName')
+            check(reply(sim, 2) == [hdr(0x0F, 1), 0], 'SRVR InitializeWithName is answered by the network thread: %r' % ([hex(x) for x in reply(sim, 2)],))
+            record('hub: posted command (SRVR InitializeWithName, 15 words declared), the network thread serves it', level, depth,
+                   HLE_CEILING[level], 'hub')
+            if engine == 'engine':
+                dlp_call(sim, h, SV_START_ACCEPT, [0, 0], 'srvr StartAccepting')
+                check(reply(sim, 2) == [hdr(0x05, 1), 0], 'SRVR StartAccepting opened the lobby on the real engine')
+            sim.log_lines.clear()
+            sim.spy_calls.clear()
+            sim.observed.clear()
+            if dead:
+                sim.ticks += 1200 * 268112     # (more than kAliveMs without a Tick)
+                rig.dead = True
+            y0 = sim.yields
+            r0, depth, ok = sim.enter('azl_svc23_entry', h, 'close dlp:SRVR' + (' (network thread gone)' if dead else ''))
+            if level > 0:
+                check(any('had called Initialize' in l for l in sim.log_lines), 'the close says the role ends with the session (%r)' % (sim.log_lines,))
+            if dead:
+                # nothing of the lobby's network side runs on the closing thread: the close is left for the network thread's next Tick
+                check(sim.yields == y0, 'network thread gone: the game thread did not wait')
+                check(sim.observed == [] and sim.spy_calls == [],
+                      'network thread gone: the game thread called no method of the adapter (%r, %r)' % (sim.observed, sim.spy_calls))
+                if engine == 'engine':
+                    sim.net_calls.clear()
+                    rig.dead = False                     # the network thread is back: its next Tick ends the role
+                    rig.tick()
+                    check(any(m in sim.net_calls for m in ('HostClose', 'Disconnect')),
+                          'the next Tick of the network thread ended the role and gave the engine back (the adapter saw %r)' % (sim.net_calls,))
+            else:
+                check(sim.yields > y0, 'network thread alive: the close left a request and waited')
+                check(sim.observed == [], 'network thread alive: the game thread called no method of the adapter (%r)' % (sim.observed,))
+            what = '%s%s' % ('real engine' if engine == 'engine' else 'spy network',
+                             (', network thread gone, ' + ('room joined' if room else 'no room') + ': the close is left for the next Tick') if dead
+                             else ', network thread alive')
+            record('hub: closing a dlp:SRVR session that called Initialize (%s)' % what, level, depth, BUDGET_LOG, 'log')
+    return sim
+
+
+def scenario_hub_found_dead(elf, level):
+    """The game's handle value was reused by another object (a close the hook did not see): the next call on it fails svcClearEvent, the fake
+    session is forgotten, and the role it had begun ends - a posted request, or, with no network thread, a bit for the next Tick. The call
+    then goes on to the real kernel (the sim's kernel answers an error)."""
+    for dead in (False, True):
+        sim = Sim(elf, level, hle=False)
+        rig = HubRig(sim, elf, engine='engine')
+        hle_for_hub(sim, elf, rig)
+        h = open_session(sim, 'dlp:SRVR')
+        rig.tick()
+        dlp_call(sim, h, SV_INIT, [0x1000, 3, 0x1D, 0, 0x1000, 1, 0x04000000, 0, 0], 'srvr Initialize')
+        dlp_call(sim, h, SV_START_ACCEPT, [0, 0], 'srvr StartAccepting')
+        sim.observed.clear()
+        sim.net_calls.clear()
+        if dead:
+            sim.ticks += 1200 * 268112
+            rig.dead = True
+        sim.kernel = lambda s, n: 0xD8E007F7
+        sim.clear_event_fails = True
+        y0 = sim.yields
+        sim.set_request([0x000C0000])
+        r0, depth, ok = sim.enter('azl_svc32_entry', h, 'call on a dlp:SRVR session found dead' + (' (network thread gone)' if dead else ''))
+        sim.clear_event_fails = False
+        check(r0 == 0xD8E007F7, 'the call on a session found dead goes on to the real kernel (its result comes back)')
+        if dead:
+            check(sim.yields == y0 and sim.observed == [], 'network thread gone: the game thread neither waited nor called the adapter (%r)' % (sim.observed,))
+            rig.dead = False
+            rig.tick()
+        check(any(m in sim.net_calls for m in ('HostClose', 'Disconnect')), 'the network thread ended the role of the forgotten session (%r)' % (sim.net_calls,))
+        record('hub: a call on a dlp:SRVR session found dead%s' % (', network thread gone' if dead else ''), level, depth, BUDGET_LOG, 'log')
+    return sim
+
+
+def scenario_hub_engine(elf, level):
+    """The real engine under the lobby: the lobby holds it (SRVR Initialize + StartAccepting), then the game starts its own nwm::UDS
+    (InitializeWithVersion, 0x1B): OnGameUdsStarting gives the engine back first. With the network thread alive the request is posted;
+    with it gone the game thread does the lobby's network side itself (RunHere), with no room (the transport drops the frames) or in a
+    room (the frames are queued by the room client). The depth of DlpHub::OnGameUdsStarting alone is read with a window (everything
+    below that call, from the entry SP). The same Initialize with NOTHING held is the base: the UDS thread pays for it anyway."""
+    base = None
+    for flavour, hold, dead, room in (('nothing held (the base)', False, False, False), ('alive', True, False, False),
+                                      ('gone, no room', True, True, False), ('gone, room joined', True, True, True)):
+        sim = Sim(elf, level, hle=False)
+        rig = HubRig(sim, elf, engine='engine', room=room)
+        hle_for_hub(sim, elf, rig)
+        words = struct.unpack('<2I', name12('nwm::UDS'))
+        sim.set_request([0x00050100, words[0], words[1], 8, 0])
+        sim.enter('azl_svc32_entry', 0x14801F, 'open nwm::UDS', roomy=True)
+        uds = r32(sim.uc, sim.cmd() + 12)
+        rig.tick()
+        if hold:
+            srvr = open_session(sim, 'dlp:SRVR')
+            dlp_call(sim, srvr, SV_INIT, [0x1000, 3, 0x1D, 0, 0x1000, 1, 0x04000000, 0, 0], 'srvr Initialize')
+            dlp_call(sim, srvr, SV_START_ACCEPT, [0, 0], 'srvr StartAccepting')
+            check(reply(sim, 2) == [hdr(0x05, 1), 0], 'SRVR StartAccepting opened the lobby on the real engine: %r' % ([hex(x) for x in reply(sim, 2)],))
+            # while the lobby holds the engine the game's own UDS commands are "wrong state" (UdsHle::Dispatch's gate)
+            sim.set_request([0x00020000])
+            sim.enter('azl_svc32_entry', uds, 'uds command 0x02 while the lobby holds the engine', roomy=True)
+            check(reply(sim, 2)[1] == WRONG_STATE, 'while the lobby holds the engine a nwm::UDS command answers "wrong state": %r' % (reply(sim, 2),))
+        if dead:
+            sim.ticks += 1200 * 268112
+            rig.dead = True
+        sim.observed.clear()
+        sim.net_calls.clear()
+        sim.window_begin(elf.sym('_ZN3azl6DlpHub17OnGameUdsStartingEv'))
+        # InitializeWithVersion as libctru sends it: 12 normal words (the shared memory size, the NodeInfo, the version), 2 translate
+        sim.set_request([(0x1B << 16) | (12 << 6) | 2, 0x1000] + [0] * 10 + [0x0400, 0, 0])
+        r0, depth, ok = sim.enter('azl_svc32_entry', uds, 'nwm::UDS Initialize, %s' % flavour, roomy=True)
+        w = sim.window_depth(ROOMY_ENTRY_SP)
+        if not hold:
+            base = depth
+            record('hub: nwm::UDS Initialize with nothing held (the UDS thread pays this whole call anyway)', level, depth, 4096, 'dead')
+            continue
+        check(w is not None, 'DlpHub::OnGameUdsStarting was entered and left (%s)' % flavour)
+        if flavour == 'alive':
+            check(sim.observed == [], 'network thread alive: the game thread called no method of the adapter (%r)' % (sim.observed,))
+            check('HostClose' in sim.net_calls or 'Disconnect' in sim.net_calls,
+                  'network thread alive: the network thread gave the engine back (%r)' % (sim.net_calls,))
+        else:
+            check(any(m in sim.observed for m in ('HostClose', 'Disconnect')),
+                  'network thread gone: the game thread gave the engine back itself (RunHere; the adapter saw %r)' % (sim.observed,))
+        if w is not None:
+            if flavour == 'alive':
+                record('hub: OnGameUdsStarting, network thread alive (window: DlpHub::OnGameUdsStarting down)', level, w, HLE_CEILING[level], 'hle')
+            else:
+                # the thread is the game's nwm::UDS thread: it runs the engine's Initialize right after, and its engine calls need UDS_ENGINE_CALL
+                record('hub: OnGameUdsStarting, network thread %s (window: DlpHub::OnGameUdsStarting down; Initialize alone is %s)' % (
+                    flavour, base), level, w, UDS_ENGINE_CALL[level], 'dead')
+    return sim
+
+
 def main():
     # --pass-through-only: the scenarios that exist in every version of the plugin (to run an older ELF and see what
     # the gate says about it: the 0.1.15 build must FAIL it). The two older ELFs are in analysis/baseline/ (outside git, like
@@ -982,9 +1916,20 @@ def main():
     # AzaharLink-0.1.15.1.elf passes (100 / 148 bytes, 24 checks).
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     only_pass_through = '--pass-through-only' in sys.argv
+    only_hub = '--hub-only' in sys.argv       # (while working on the hub scenarios: they alone)
     elf = Elf(args[0])
     for level in (0, 1):
         print('== debug %d' % level)
+        if only_hub:
+            scenario_hub_commands(elf, level)
+            scenario_hub_trace_dedupe(elf, level)
+            scenario_hub_no_network_thread(elf, level)
+            scenario_hub_always_succeeds(elf, level)
+            scenario_hub_join_cap(elf, level)
+            scenario_hub_close(elf, level)
+            scenario_hub_found_dead(elf, level)
+            scenario_hub_engine(elf, level)
+            continue
         scenario_pure(elf, level)
         if only_pass_through:
             continue
@@ -995,6 +1940,15 @@ def main():
         scenario_hle_front(elf, level)
         scenario_throttle(elf, level)
         scenario_log_cost(elf, level)
+        if only_hub or not only_pass_through:
+            scenario_hub_commands(elf, level)
+            scenario_hub_trace_dedupe(elf, level)
+            scenario_hub_no_network_thread(elf, level)
+            scenario_hub_always_succeeds(elf, level)
+            scenario_hub_join_cap(elf, level)
+            scenario_hub_close(elf, level)
+            scenario_hub_found_dead(elf, level)
+            scenario_hub_engine(elf, level)
     print()
     print('%-72s %5s %7s %7s' % ('path (bytes below the SP at azl_svc32_entry)', 'debug', 'used', 'budget'))
     for scenario, level, depth, budget, kind in results:

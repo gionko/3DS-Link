@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <new>
 
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
@@ -355,9 +356,59 @@ void UdsEngine::FlushRingsLocked() {
     }
 }
 
-bool UdsEngine::GetSendAddress(u16 dest_node_id, u8 flags, Mac* out) {
-    if ((flags & kBroadcastFlag) || dest_node_id == kBroadcastNetworkNodeId) {
+bool UdsEngine::NodeMacLocked(u16 node_id, Mac* out) const {
+    if (node_id == kHostDestNodeId) {
+        *out = network_info_.host_mac_address;
+        return true;
+    }
+    const Mac* found = nullptr;
+    for (const auto& node : node_map_) {
+        if (node.second.node_id == node_id && node.second.connected) {
+            if (found) {
+                return false; // two MACs claim the node (a stale table of a host that was in another lobby): which one is right is not known
+            }
+            found = &node.first;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    *out = *found;
+    return true;
+}
+
+bool UdsEngine::InRoomLocked(const Mac& mac) const {
+    if (std::find(present_.begin(), present_.end(), mac) == present_.end()) {
+        return false; // (no member list yet, or not in it)
+    }
+    for (const Absent& a : absent_) {
+        if (a.mac == mac) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool UdsEngine::GetSendAddress(u16 dest_node_id, u8 flags, Mac* out, bool* addressed) {
+    *addressed = false;
+    if (dest_node_id == kBroadcastNetworkNodeId) {
         *out = kBroadcastMac;
+        return true;
+    }
+    if (flags & kBroadcastFlag) {
+        // The game asked for a broadcast with a node in mind (Heroes of Ruin, FFE): on the radio the frame goes out once, unretried, and every
+        // node but the one in the header drops it. Through the room that is a datagram, a receive and an acknowledgement for EVERY member (half
+        // of what a console in a lobby of three receives); addressed to the node's own MAC the room delivers it to that member alone. The
+        // frame's header is the same - the node ids are what a receiver reads. Not when the room does not have the node (a member that
+        // left, no member list yet): the room would answer an error for every frame, and the broadcast reaches whoever is there; and not
+        // when the node table gives the node two MACs (a stale one: NodeMacLocked), for the same reason.
+        Mac mac;
+        if (NodeMacLocked(dest_node_id, &mac) && InRoomLocked(mac)) {
+            *out = mac;
+            *addressed = true;
+        } else {
+            *out = kBroadcastMac;
+        }
         return true;
     }
     if (dest_node_id == kHostDestNodeId) {
@@ -501,6 +552,12 @@ bool UdsEngine::RemoveNodeLocked(std::map<Mac, Node>::iterator it, RemovedBy cau
         }
     }
     node_it->Reset();
+    if (lobby_inbox_) {
+        PurgeLobbyMessagesLocked(node.node_id);
+        if (connection_status_.status == static_cast<u32>(NetworkStatus::ConnectedAsHost)) {
+            RefreshClientsLocked();
+        }
+    }
     return true;
 }
 
@@ -612,7 +669,7 @@ bool UdsEngine::RefuseForeignLocked(const WifiPacket& packet, NetworkStatus stat
     if (host_only ? from == network_info_.host_mac_address : IsNetworkMemberLocked(from, status)) {
         return false;
     }
-    const bool refuse = status == NetworkStatus::ConnectedAsHost || client_foreign_filter_enforced_;
+    const bool refuse = status == NetworkStatus::ConnectedAsHost || client_foreign_filter_enforced_ || lobby_inbox_;
     ++(refuse ? g_stats.drop_foreign : g_stats.foreign_shadow);
     // The first few, then one in 1024: a second lobby in the room sends a hundred of these a second.
     if (++foreign_logged_ <= 8 || (foreign_logged_ & 0x3FF) == 0) {
@@ -705,6 +762,7 @@ void UdsEngine::HandleBeaconFrame(const WifiPacket& packet) {
         }
         received_beacons_.push_back({packet, now});
     }
+    NoteLobbyBeaconLocked(packet, now);
     // How often the host of the network we are in is heard (a real client watches for this; the
     // stats only report it for now).
     if ((connection_status_.status == static_cast<u32>(NetworkStatus::ConnectedAsClient) ||
@@ -853,6 +911,11 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
     } else if (status == NetworkStatus::Connecting) {
         EapolLogoff logoff;
         if (!ParseEapolLogoffFrame(packet.data, &logoff)) {
+            return;
+        }
+        // (a Logoff answers our Start, which goes out when the host's AssociationResponse arrives: in a lobby the host also sends one
+        // when a fellow leaves, and a console that is Connecting again while the host still holds its old node must not take it)
+        if (lobby_inbox_ && !associated_) {
             return;
         }
         // (the Logoff that admits us comes from the host we asked: another lobby's host admitting somebody else is not it)
@@ -1022,6 +1085,12 @@ void UdsEngine::HandleSecureDataPacket(const WifiPacket& packet) {
         return; // management frames are neither sent nor handled
     }
 
+    // The fake lobby's own channel (SetLobbyInbox): its messages never reach a bind, and whoever they come from is checked here.
+    if (lobby_inbox_ && secure_data.data_channel == kLobbyChannel) {
+        HandleLobbyFrameLocked(packet, secure_data);
+        return;
+    }
+
     // The same for a client or spectator: a frame of another lobby in this room that is addressed to our node id (or to
     // everybody). Counted and logged always; dropped only when the filter is switched on.
     if (status != NetworkStatus::ConnectedAsHost &&
@@ -1183,9 +1252,10 @@ void UdsEngine::HandleAuthenticationFrame(const WifiPacket& packet) {
     auth_response.type = WifiPacket::Type::Authentication;
     Node& entry = node_map_[packet.transmitter_address];
     entry.connected = false;
-    // A node that left a moment ago and is back: the second copy of its goodbye may still arrive (Node::deauth_guard).
+    // A node that left a moment ago and is back: the second copy of its goodbye may still arrive (Node::deauth_guard). Only Azahar's
+    // guests say goodbye twice; the plugins of a lobby say it once, and a guard there would swallow the real goodbye of a rejoin.
     const u64 now = platform::NowMs();
-    entry.deauth_guard = entry.deauth_guard || LeftRecentlyLocked(packet.transmitter_address, now);
+    entry.deauth_guard = entry.deauth_guard || (!lobby_inbox_ && LeftRecentlyLocked(packet.transmitter_address, now));
     entry.auth_ms = now;
     SendPacket(auth_response);
 
@@ -1565,6 +1635,13 @@ u32 UdsEngine::Initialize(const NodeInfo& node, u32 shared_memory_size, u16 vers
     }
 
     current_node_ = node;
+    BeginServiceLocked(shared_memory_size);
+
+    *game_status_event = kernel_->DuplicateForGame(connection_status_event_);
+    return res::kSuccess;
+}
+
+void UdsEngine::BeginServiceLocked(u32 shared_memory_size) {
     shared_memory_size_ = shared_memory_size;
     deauth_on_destroy_ = true;
     initialized_ = true;
@@ -1580,14 +1657,32 @@ u32 UdsEngine::Initialize(const NodeInfo& node, u32 shared_memory_size, u16 vers
     node_map_.clear();
     node_map_text_.clear();
     kernel_->ClearEvent(connection_status_event_); // the real service makes a new event
+}
 
-    *game_status_event = kernel_->DuplicateForGame(connection_status_event_);
+u32 UdsEngine::InitializeForLobby(u64 friend_code_seed, const u16* username) {
+    Guard lock(this);
+    RoleTrace trace(this);
+    if (initialized_ || service_state_ != kServiceRunning) {
+        return res::kWrongState; // a game's session (or the lobby's own) is up: nothing of it is touched
+    }
+    version_ = kMaxVersion; // (a host sends the Deauthentications of its goodbye from version 0x200 on)
+    current_node_.Reset();
+    current_node_.friend_code_seed = friend_code_seed;
+    for (int i = 0; i < 10; ++i) {
+        current_node_.username[i] = username[i];
+    }
+    BeginServiceLocked(0);
     return res::kSuccess;
 }
 
 u32 UdsEngine::Shutdown() {
     Guard lock(this);
     RoleTrace trace(this);
+    lobby_inbox_ = false; // (the lobby's end, or a game's: nothing unread is kept for whoever has the service next)
+    if (lobby_) {
+        lobby_->rx_first = 0;
+        lobby_->rx_count = 0;
+    }
     if (!initialized_) {
         return res::kSuccess; // never initialised, or already shut down
     }
@@ -1656,6 +1751,50 @@ u32 UdsEngine::BeginHostingNetwork(const u8* network_info, std::size_t size) {
     }
     std::memset(&network_info_, 0, sizeof(network_info_));
     std::memcpy(&network_info_, network_info, std::min(size, sizeof(network_info_)));
+    StartHostingLocked();
+    return res::kSuccess;
+}
+
+u32 UdsEngine::BeginHostingLobby(u32 wlan_comm_id, u8 id8, u8 channel, u8 max_nodes, const u8* app_data, u32 app_size) {
+    Guard lock(this);
+    RoleTrace trace(this);
+    if (const u32 r = Gate(kIdle)) {
+        return r;
+    }
+    if (max_nodes < 2 || max_nodes > kUdsMaxNodes) {
+        return res::kBadId;
+    }
+    if (app_size > kApplicationDataSize) {
+        return res::kTooLarge;
+    }
+    if (!EnsureLobbyLocked()) {
+        return res::kOutOfMemory;
+    }
+    lobby_inbox_ = true;
+    lobby_->rx_first = 0;
+    lobby_->rx_count = 0;
+    std::memset(&network_info_, 0, sizeof(network_info_));
+    network_info_.channel = channel;
+    network_info_.initialized = 1;
+    StoreBE32(network_info_.wlan_comm_id_be, wlan_comm_id);
+    network_info_.id = id8;
+    // The network id of a real host is random; ours is the hash of our MAC (FNV-1a), the same for every lobby this console hosts.
+    const Mac mac = GetMacAddress();
+    u32 network_id = 2166136261u;
+    for (u8 byte : mac) {
+        network_id = (network_id ^ byte) * 16777619u;
+    }
+    StoreBE32(network_info_.network_id_be, network_id | 1u);
+    network_info_.max_nodes = max_nodes;
+    network_info_.application_data_size = static_cast<u8>(app_size);
+    if (app_size != 0) {
+        std::memcpy(network_info_.application_data, app_data, app_size);
+    }
+    StartHostingLocked();
+    return res::kSuccess;
+}
+
+void UdsEngine::StartHostingLocked() {
     node_map_.clear();
     node_map_text_.clear();
     // The attribute word the game gave is advertised in the beacon but the host does not enforce it
@@ -1705,7 +1844,6 @@ u32 UdsEngine::BeginHostingNetwork(const u8* network_info, std::size_t size) {
     }
     Log("uds: hosting network (max %u nodes, channel %u)", network_info_.max_nodes,
         network_channel_);
-    return res::kSuccess;
 }
 
 u32 UdsEngine::EjectClient(u16 network_node_id) {
@@ -1791,34 +1929,88 @@ u32 UdsEngine::DestroyNetwork() {
     return res::kSuccess;
 }
 
+u32 UdsEngine::ConnectBegin(const u8* network_info, std::size_t size, u8 connection_type, u32* attempt) {
+    Guard lock(this);
+    RoleTrace trace(this);
+    if (const u32 r = Gate(kIdle)) {
+        return r; // (before the NetworkInfo of a host that is up is overwritten)
+    }
+    if (connection_type != static_cast<u8>(ConnectionType::Client) &&
+        connection_type != static_cast<u8>(ConnectionType::Spectator)) {
+        Log("uds: ConnectToNetwork with connection type %u", connection_type);
+        return res::kBadArgument;
+    }
+    std::memset(&network_info_, 0, sizeof(network_info_));
+    std::memcpy(&network_info_, network_info, std::min(size, sizeof(network_info_)));
+    StartConnectLocked(static_cast<ConnectionType>(connection_type), attempt);
+    return res::kSuccess;
+}
+
+u32 UdsEngine::ConnectBeginLobby(const Mac& host) {
+    Guard lock(this);
+    RoleTrace trace(this);
+    if (const u32 r = Gate(kIdle)) {
+        return r;
+    }
+    // The channel is the one its beacon was heard on (the lobby's table keeps the host's MAC and nothing else).
+    const HeardLobbySlot* heard = nullptr;
+    if (lobby_) {
+        const u32 now = static_cast<u32>(platform::NowMs());
+        for (const HeardLobbySlot& slot : lobby_->heard) {
+            if (slot.used && slot.lobby.host == host && static_cast<u32>(now - slot.rx_ms) <= kBeaconKeepMs) {
+                heard = &slot;
+                break;
+            }
+        }
+    }
+    if (!heard) {
+        return res::kNoHostFound;
+    }
+    lobby_inbox_ = true; // (before the first frame of the handshake: another lobby's Logoff must not be taken for ours)
+    lobby_->rx_first = 0;
+    lobby_->rx_count = 0;
+    std::memset(&network_info_, 0, sizeof(network_info_));
+    network_info_.host_mac_address = host;
+    network_info_.channel = heard->lobby.channel;
+    StartConnectLocked(ConnectionType::Client, nullptr);
+    return res::kSuccess;
+}
+
+void UdsEngine::StartConnectLocked(ConnectionType type, u32* attempt) {
+    conn_type_ = type;
+    if (network_info_.channel != 0) {
+        network_channel_ = network_info_.channel;
+    }
+
+    kernel_->ClearEvent(connect_event_);
+    connect_pending_ = true;
+    ++connect_gen_;
+    if (attempt) {
+        *attempt = connect_gen_;
+    }
+    StartConnectionSequenceLocked(network_info_.host_mac_address);
+    Log("uds: connecting to host %02X:%02X:%02X:%02X:%02X:%02X", network_info_.host_mac_address[0],
+        network_info_.host_mac_address[1], network_info_.host_mac_address[2],
+        network_info_.host_mac_address[3], network_info_.host_mac_address[4],
+        network_info_.host_mac_address[5]);
+}
+
+int UdsEngine::ConnectPoll() const {
+    Guard lock(this);
+    if (connect_pending_) {
+        return 0;
+    }
+    const u32 status = connection_status_.status;
+    return initialized_ && (status == static_cast<u32>(NetworkStatus::ConnectedAsClient) ||
+                            status == static_cast<u32>(NetworkStatus::ConnectedAsSpectator))
+               ? 1
+               : -1;
+}
+
 u32 UdsEngine::ConnectToNetwork(const u8* network_info, std::size_t size, u8 connection_type) {
     u32 gen = 0;
-    {
-        Guard lock(this);
-        RoleTrace trace(this);
-        if (const u32 r = Gate(kIdle)) {
-            return r; // (before the NetworkInfo of a host that is up is overwritten)
-        }
-        if (connection_type != static_cast<u8>(ConnectionType::Client) &&
-            connection_type != static_cast<u8>(ConnectionType::Spectator)) {
-            Log("uds: ConnectToNetwork with connection type %u", connection_type);
-            return res::kBadArgument;
-        }
-        std::memset(&network_info_, 0, sizeof(network_info_));
-        std::memcpy(&network_info_, network_info, std::min(size, sizeof(network_info_)));
-        conn_type_ = static_cast<ConnectionType>(connection_type);
-        if (network_info_.channel != 0) {
-            network_channel_ = network_info_.channel;
-        }
-
-        kernel_->ClearEvent(connect_event_);
-        connect_pending_ = true;
-        gen = ++connect_gen_;
-        StartConnectionSequenceLocked(network_info_.host_mac_address);
-        Log("uds: connecting to host %02X:%02X:%02X:%02X:%02X:%02X", network_info_.host_mac_address[0],
-            network_info_.host_mac_address[1], network_info_.host_mac_address[2],
-            network_info_.host_mac_address[3], network_info_.host_mac_address[4],
-            network_info_.host_mac_address[5]);
+    if (const u32 r = ConnectBegin(network_info, size, connection_type, &gen)) {
+        return r;
     }
 
     // Block like the real service does (outside the lock: the room thread needs it). Whoever ends
@@ -2347,7 +2539,7 @@ u32 UdsEngine::SendTo(u16 dest_node_id, u8 data_channel, u32 data_size, u8 flags
     u16 own_node_id = 0;
     u8 channel = 0;
     u16 sequence = 0;
-    bool peer_numbers = false;
+    bool peer_numbers = false, addressed = false;
     {
         Guard lock(this);
         ++g_stats.sendto_calls;
@@ -2373,10 +2565,11 @@ u32 UdsEngine::SendTo(u16 dest_node_id, u8 data_channel, u32 data_size, u8 flags
         }
 
         // A node that is not in the network is not an error: the radio sends the frame and nobody takes it.
-        if (!GetSendAddress(dest_node_id, flags, &dest_address)) {
+        if (!GetSendAddress(dest_node_id, flags, &dest_address, &addressed)) {
             return res::kSuccess;
         }
         g_stats.sendto_bytes += data_size;
+        g_stats.sendto_addressed += addressed ? 1u : 0u;
         own_node_id = connection_status_.network_node_id;
         channel = network_channel_;
         // The real nwm numbers its frames; Azahar sends 0 and reads nothing of it. The number is what lets the plugin on the
@@ -2397,6 +2590,7 @@ u32 UdsEngine::SendTo(u16 dest_node_id, u8 data_channel, u32 data_size, u8 flags
     packet.data = GenerateDataPayload(data, data_size, data_channel, dest_node_id, own_node_id, sequence);
     packet.type = WifiPacket::Type::Data;
     packet.peer_numbers = peer_numbers;
+    packet.broadcast_flag = (flags & kBroadcastFlag) != 0;
     SendPacket(packet);
     return res::kSuccess;
 }
@@ -2445,6 +2639,212 @@ u32 UdsEngine::DecryptBeaconData(const NetworkInfo& net_info, const u8* tag0, st
         node.Store(out->data() + i * kNodeInfoSize);
     }
     return res::kSuccess;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fake Download Play lobby: what the adapter reads and writes (no allocation, no log but a refused frame)
+// ---------------------------------------------------------------------------------------------
+
+bool UdsEngine::EnsureLobbyLocked() {
+    if (!lobby_) {
+        lobby_.reset(new (std::nothrow) LobbyState());
+    }
+    return lobby_ != nullptr;
+}
+
+bool UdsEngine::PrepareLobby() {
+    Guard lock(this);
+    return EnsureLobbyLocked();
+}
+
+void UdsEngine::NoteLobbyBeaconLocked(const WifiPacket& packet, u64 now) {
+    if (!lobby_) {
+        return; // (no lobby is in use: a game's beacons are not even parsed)
+    }
+    // In the tag (from the OUI on): wlancommid BE32 at +4, id8 at +8, total_nodes at +0x10, max_nodes at +0x11.
+    constexpr std::size_t kTotalAt = offsetof(NetworkInfo, total_nodes) - offsetof(NetworkInfo, oui_value);
+    constexpr std::size_t kMaxAt = offsetof(NetworkInfo, max_nodes) - offsetof(NetworkInfo, oui_value);
+    const u32 stamp = static_cast<u32>(now);
+    for (HeardLobbySlot& slot : lobby_->heard) {
+        if (slot.used && static_cast<u32>(stamp - slot.rx_ms) > kBeaconKeepMs) {
+            slot.used = false; // silent for too long: the host has gone
+        }
+    }
+    const BeaconTags tags = FindBeaconTags(packet.data);
+    const u8* data = nullptr;
+    u32 size = 0;
+    if (!GetBeaconApplicationData(tags, &data, &size) || size == 0 || tags.network_size <= kMaxAt ||
+        LoadBE32(tags.network + 4) != kLobbyWlanCommId || tags.network[8] != kLobbyId8) {
+        // (not a lobby: a game's network, or a beacon with no application data. A host that WAS a lobby and now beacons its game's
+        //  network is no lobby any more: a searcher that still has it in a list must not be able to join the game's network)
+        for (HeardLobbySlot& slot : lobby_->heard) {
+            if (slot.used && slot.lobby.host == packet.transmitter_address) {
+                slot.used = false;
+            }
+        }
+        return;
+    }
+    // Its own slot if it has one, else a free one, else the one heard longest ago.
+    HeardLobbySlot* slot = nullptr;
+    for (HeardLobbySlot& candidate : lobby_->heard) {
+        if (candidate.used && candidate.lobby.host == packet.transmitter_address) {
+            slot = &candidate;
+            break;
+        }
+    }
+    for (HeardLobbySlot& candidate : lobby_->heard) {
+        if (!slot && !candidate.used) {
+            slot = &candidate;
+        }
+    }
+    if (!slot) {
+        slot = &lobby_->heard[0];
+        for (HeardLobbySlot& candidate : lobby_->heard) {
+            if (static_cast<u32>(stamp - candidate.rx_ms) > static_cast<u32>(stamp - slot->rx_ms)) {
+                slot = &candidate;
+            }
+        }
+    }
+    const u32 copied = size < kHeardDataMax ? size : kHeardDataMax;
+    slot->used = true;
+    slot->rx_ms = stamp;
+    slot->lobby.host = packet.transmitter_address;
+    slot->lobby.channel = packet.channel;
+    slot->lobby.total_nodes = tags.network[kTotalAt];
+    slot->lobby.max_nodes = tags.network[kMaxAt];
+    slot->lobby.size = static_cast<u8>(copied);
+    std::memset(slot->lobby.data, 0, sizeof(slot->lobby.data));
+    std::memcpy(slot->lobby.data, data, copied);
+}
+
+bool UdsEngine::HeardLobbyAt(u32 index, u32 max_age_ms, HeardLobby* out) const {
+    Guard lock(this);
+    if (!lobby_) {
+        return false;
+    }
+    const u32 now = static_cast<u32>(platform::NowMs());
+    for (const HeardLobbySlot& slot : lobby_->heard) {
+        if (!slot.used || static_cast<u32>(now - slot.rx_ms) > max_age_ms) {
+            continue;
+        }
+        if (index-- == 0) {
+            *out = slot.lobby;
+            return true;
+        }
+    }
+    return false;
+}
+
+void UdsEngine::HandleLobbyFrameLocked(const WifiPacket& packet, const SecureDataHeader& secure_data) {
+    if (!lobby_) {
+        return;
+    }
+    const NetworkStatus status = static_cast<NetworkStatus>(connection_status_.status);
+    // The lobby speaks to one node at a time: a broadcast is not its. The sender is who the TRANSMITTER is (the room does not
+    // let one console speak with another's MAC): the host of our network for a client, the node that has that MAC for a host.
+    bool ok = secure_data.dest_node_id == connection_status_.network_node_id;
+    if (ok && status == NetworkStatus::ConnectedAsHost) {
+        const auto it = node_map_.find(packet.transmitter_address);
+        ok = it != node_map_.end() && it->second.connected && !it->second.spec &&
+             it->second.node_id == secure_data.src_node_id;
+    } else if (ok) {
+        ok = status == NetworkStatus::ConnectedAsClient && secure_data.src_node_id == kHostDestNodeId &&
+             packet.transmitter_address == network_info_.host_mac_address;
+    }
+    constexpr std::size_t kPayloadAt = kLlcHeaderSize + kSecureDataHeaderSize;
+    const std::size_t have = packet.data.size() > kPayloadAt ? packet.data.size() - kPayloadAt : 0;
+    const std::size_t n = std::min<std::size_t>(secure_data.ActualDataSize(), have);
+    if (!ok || n == 0 || n > kLobbyMessageMax) {
+        if (++lobby_->refused <= 8 || (lobby_->refused & 0x3FF) == 0) {
+            Log("uds: a lobby frame (node %u>%u, %lu bytes) from %02X:%02X:%02X:%02X:%02X:%02X is refused (%lu so far)",
+                secure_data.src_node_id, secure_data.dest_node_id, static_cast<unsigned long>(n),
+                packet.transmitter_address[0], packet.transmitter_address[1], packet.transmitter_address[2],
+                packet.transmitter_address[3], packet.transmitter_address[4], packet.transmitter_address[5],
+                static_cast<unsigned long>(lobby_->refused));
+        }
+        return;
+    }
+    if (copy_dedupe_.Seen(secure_data.src_node_id, secure_data.sequence_number)) {
+        ++g_stats.drop_dup_copy; // (the copy a radio_like=2 sender adds)
+        return;
+    }
+    DebugSecure(kDirRx, packet, secure_data); // (the capture of a lobby shows what came in as well as what went out)
+    u8 at;
+    if (lobby_->rx_count == kLobbyInbox) {
+        at = lobby_->rx_first; // full: the oldest message makes room
+        lobby_->rx_first = static_cast<u8>((lobby_->rx_first + 1) % kLobbyInbox);
+    } else {
+        at = static_cast<u8>((lobby_->rx_first + lobby_->rx_count) % kLobbyInbox);
+        ++lobby_->rx_count;
+    }
+    lobby_->rx[at].from = static_cast<u8>(secure_data.src_node_id);
+    lobby_->rx[at].size = static_cast<u8>(n);
+    std::memcpy(lobby_->rx[at].data, packet.data.data() + kPayloadAt, n);
+}
+
+void UdsEngine::PurgeLobbyMessagesLocked(u16 node) {
+    if (!lobby_) {
+        return;
+    }
+    u8 kept = 0;
+    for (u8 i = 0; i < lobby_->rx_count; ++i) {
+        const LobbyMessage& message = lobby_->rx[(lobby_->rx_first + i) % kLobbyInbox];
+        if (message.from != node) {
+            lobby_->rx[(lobby_->rx_first + kept) % kLobbyInbox] = message;
+            ++kept;
+        }
+    }
+    lobby_->rx_count = kept;
+}
+
+void UdsEngine::RefreshClientsLocked() {
+    for (const auto& entry : node_map_) {
+        if (entry.second.connected && !entry.second.spec) {
+            SendEapolLogoffLocked(entry.first, entry.second.node_id);
+        }
+    }
+}
+
+void UdsEngine::SetLobbyInbox(bool on) {
+    Guard lock(this);
+    if (on && !EnsureLobbyLocked()) {
+        return;
+    }
+    lobby_inbox_ = on;
+    if (lobby_) {
+        lobby_->rx_first = 0;
+        lobby_->rx_count = 0;
+    }
+}
+
+bool UdsEngine::PopLobbyMessage(u8* from_node, u8* data, u32 capacity, u32* size) {
+    Guard lock(this);
+    if (!lobby_ || lobby_->rx_count == 0) {
+        return false;
+    }
+    const LobbyMessage& message = lobby_->rx[lobby_->rx_first];
+    const u32 n = message.size < capacity ? message.size : capacity;
+    *from_node = message.from;
+    std::memcpy(data, message.data, n);
+    *size = n;
+    lobby_->rx_first = static_cast<u8>((lobby_->rx_first + 1) % kLobbyInbox);
+    --lobby_->rx_count;
+    return true;
+}
+
+bool UdsEngine::NodeSnapshot(u16* my_node, u16* node_bitmask) const {
+    Guard lock(this);
+    const u32 status = connection_status_.status;
+    if (!initialized_ || (status != static_cast<u32>(NetworkStatus::ConnectedAsHost) &&
+                          status != static_cast<u32>(NetworkStatus::ConnectedAsClient) &&
+                          status != static_cast<u32>(NetworkStatus::ConnectedAsSpectator))) {
+        *my_node = 0;
+        *node_bitmask = 0;
+        return false;
+    }
+    *my_node = connection_status_.network_node_id;
+    *node_bitmask = connection_status_.node_bitmask;
+    return true;
 }
 
 NetworkStatus UdsEngine::status() const {

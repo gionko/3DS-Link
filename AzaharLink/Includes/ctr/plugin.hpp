@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "azl/dlp_hub.hpp"
 #include "azl/ini_values.hpp"
 #include "azl/link_policy.hpp"
 #include "azl/log_files.hpp"
@@ -26,7 +27,13 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.0.4"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.4: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.0.10"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.10: Tests/set_version.py writes all of them)
+
+/// "Mon DD YYYY HH:MM:SS" of the last build that changed any object: Sources/ctr/build_id.cpp, which the Makefile recompiles
+/// after every other object. The log header prints it instead of plugin.cpp's own __DATE__ / __TIME__, which stay as old as
+/// plugin.cpp: the first C-stick build of 2026-10-25 had a new main.cpp and a plugin.cpp of 10-23, and its logs said
+/// "1.0.3 (built Oct 23 ...)" like the build without the fix (the logs could not tell the two apart).
+extern const char kBuildStamp[];
 
 struct Config {
     bool enabled = true;                  ///< false: the plugin stays completely out of the game
@@ -240,6 +247,12 @@ private:
     std::unique_ptr<RoomClient> room_;
     std::unique_ptr<UdsEngine> engine_;
     std::unique_ptr<UdsHle> hle_;
+    /// The fake Download Play lobby (azl/dlp_hub.hpp): only for the games in Lobby mode (kDlpGames in plugin.cpp), null for the others.
+    /// Made once in EarlyInit before the room can start and the hooks are installed, and never replaced; stopped at the end of
+    /// the plugin (Shutdown) and never destroyed - like the engine and the HLE, which the game's threads keep using. (The members
+    /// would be destroyed in the reverse of this order, the hub before the HLE and the engine it points to, but the plugin
+    /// is a leaked singleton.)
+    std::unique_ptr<DlpHub> dlp_hub_;
     HookStats hook_stats_;
 
     std::unique_ptr<FileLayer> file_layer_;

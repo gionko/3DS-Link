@@ -114,7 +114,9 @@ struct App {
     // The copies of the plugin in the games' folders are looked at once a start (after an update of the app a game would start the old plugin): see
     // QueuePluginCopyRefresh.
     bool plugin_copies_checked = false;
-    std::string plugin_stamp_pending; // the size and date of the plugin file the quiet looks are being made for: written to 3DSLink.cfg when they are done
+    std::string plugin_stamp_pending; // the stamp (size and bytes, setup::PluginContentStamp) of the plugin the quiet looks are being made for: written to 3DSLink.cfg when they are done
+    int plugin_pass_total = 0;        // how many folders that pass looked at (the main page says how many are done)
+    bool plugin_pass_open = false;    // a pass of quiet looks was queued and the main page has not told yet that it is over (how many folders are left, then the result)
     bool plugin_ready = false; // the plugin file of 3DS Link is there and is, byte for byte, the plugin inside the app (plugin_card == Same)
     // The plugin of 3DS Link: ONE package. The app carries AzaharLink.3gx (plugin_resource.hpp) and puts it on the card by itself (plugin_install.hpp, plugin_ensure.cpp).
     setup::PluginCard plugin_card = setup::PluginCard::Missing; // what the card holds at paths.plugin_file, against the plugin inside the app (as of the last look)
@@ -189,8 +191,9 @@ struct App {
     void LookAtPlugin(bool full);
     // Why the switch is shut for the plugin, in one sentence ("" when it is not): setup::PluginLockText made from what the app knows.
     std::string PluginLockText() const;
-    // Once per start: every game folder of sd:/luma/plugins that holds our plugin (and nothing else) gets a quiet look in the thread of the copies; a copy that
-    // is not the plugin file next to the app (an older version, or another build of the same size) is made again. Folders with another plugin are never touched.
+    // Once per start, AT ONCE (it does not wait for the scan of the titles): every game folder of sd:/luma/plugins that holds our plugin (and nothing else) gets a quiet look in the
+    // thread of the copies; a copy that is not the plugin file next to the app (an older version, or another build of the same size) is made again. Folders with another plugin
+    // are never touched.
     void QueuePluginCopyRefresh();
 };
 
@@ -444,8 +447,11 @@ protected:
     virtual bool StartButton() const {
         return true;
     }
-    // Whether START does anything now: not while the plugin is being copied into the folders of the titles (leaving then would cut the copies).
+    // Whether START does anything now: not while the plugin is being copied into the folders of the titles by the user's own choice (Enable, Disable: leaving then would cut
+    // the copies). During the pass over the games that follows an update (plugin_pass_open) START works but asks first (AskLeaveDuringPluginPass).
     virtual bool StartEnabled() const;
+    // "The plugin is still being put in your games: leave anyway?": Leave drops the looks that wait (CopyWorker::CancelRefreshes) and does what START does (OnStart).
+    void AskLeaveDuringPluginPass();
     // Buttons after A (X, Y...): fills `out` and says how many. A page that has some has no START button.
     virtual int ExtraKeys(FooterKey* out) const {
         (void)out;

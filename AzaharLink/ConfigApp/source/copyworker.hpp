@@ -35,6 +35,10 @@ public:
     void SubmitRefresh(u64 tid, const std::string& source);
     // How many copies the quiet looks made since the last call.
     int TakeRefreshedCount();
+    // Drops the quiet looks that are still waiting in the queue (the one that runs is finished: a copy is never cut in the middle). The user leaves in the
+    // middle of a pass over many games: nothing more is made, and 3DSLink.cfg does not remember the plugin, so the next start makes the pass again.
+    // Returns how many were dropped. Copies the user asked for (enable, disable) are left.
+    int CancelRefreshes();
     // Is a job for this title waiting or running? `kind` says which.
     bool Pending(u64 tid, CopyKind* kind) const;
     int PendingCount() const;

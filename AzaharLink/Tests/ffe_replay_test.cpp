@@ -256,7 +256,7 @@ static void TestFfeReplay(bool foreign_lobby) {
     CHECK_EQ(g_stats.scan_id_differs, 0u);
     CHECK_EQ(g_stats.scan_odd_input, 0u);
     CHECK_EQ(LogLines("uds: scan 0x0f: type 1 mode 2 channels 0x0421 x 110 ms = 330 ms, bssid ff:ff:ff:ff:ff:ff, "
-                      "asks wlancommid 0x0016ed10 id8 0x01 -> 1 network(s), 0 with other ids (only counted)"),
+                      "asks wlancommid 0x0016ed10 id8 0x01 -> 1 network(s), 0 with other ids (left out)"),
              2);
     // A scan whose cancel event is signalled already ends at once (the event is the game's: not closed)
     kernel.SignalEvent(cancel);

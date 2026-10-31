@@ -14,6 +14,13 @@ enet_uint32 enet_azl_throttled_packets = 0;
 enet_uint32 enet_azl_ack_samples_skipped = 0;
 enet_uint32 enet_azl_early_dispatched = 0;
 
+void
+enet_azl_counters_take (ENetHost * host, ENetAzlCounters * out)
+{
+    * out = host -> azlCounters;
+    memset (& host -> azlCounters, 0, sizeof (host -> azlCounters));
+}
+
 static const size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
 {
     0,
@@ -1248,9 +1255,13 @@ commandError:
 }
  
 static int
-enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
+enet_protocol_receive_pass (ENetHost * host, ENetEvent * event, int * datagramsRead, enet_uint32 * passStart)
 {
     int packets;
+    const int maxDatagrams = host -> azlMaxDatagrams != 0 && host -> azlMaxDatagrams < 256 ? (int) host -> azlMaxDatagrams : 256;
+
+    host -> azlSocketEmpty = 0;
+    host -> azlReadCapped = 0;
 
     for (packets = 0; packets < 256; ++ packets)
     {
@@ -1272,13 +1283,17 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
          return -1;
 
        if (receivedLength == 0)
-         return 0;
+       {
+          host -> azlSocketEmpty = 1; /* AzaharLink: this is what an empty socket looks like (see azlSkipEmptyRecv) */
+          return 0;
+       }
 
        host -> receivedData = host -> packetData [0];
        host -> receivedDataLength = receivedLength;
       
        host -> totalReceivedData += receivedLength;
        host -> totalReceivedPackets ++;
+       ++ * datagramsRead;
 
        if (host -> intercept != NULL)
        {
@@ -1309,9 +1324,47 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
        default:
           break;
        }
+
+       /* AzaharLink: enough for one pass (see ENetHost::azlMaxDatagrams): what was read is handed over before more is read. The clock is
+          read only in a pass that has a second datagram (one datagram is one receive call, which the soc statistics time), to time the
+          pass for the counters: it runs from the end of its second datagram. */
+       if (* datagramsRead >= maxDatagrams)
+       {
+          host -> azlReadCapped = 1;
+          ++ host -> azlCounters.passesCapped;
+          return 0;
+       }
+       if (* datagramsRead == 2)
+         * passStart = enet_time_get ();
     }
 
     return 0;
+}
+
+static int
+enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
+{
+    int datagramsRead = 0, result;
+    enet_uint32 passStart = 0;
+
+    result = enet_protocol_receive_pass (host, event, & datagramsRead, & passStart);
+
+    if (datagramsRead > 0)
+    {
+       /* AzaharLink: what a pass cost (see ENetAzlCounters): the lengths of the passes are where a read at a stretch delays the first frame */
+       ++ host -> azlCounters.passes;
+       if ((enet_uint32) datagramsRead > host -> azlCounters.passDatagramsMax)
+         host -> azlCounters.passDatagramsMax = (enet_uint32) datagramsRead;
+       if (datagramsRead >= 2)
+       {
+          const enet_uint32 ms = ENET_TIME_DIFFERENCE (enet_time_get (), passStart);
+
+          if (ms < 0x7FFFFFFFu && ms > host -> azlCounters.passMsMax)
+            host -> azlCounters.passMsMax = ms;
+       }
+    }
+
+    return result;
 }
 
 static void
@@ -1616,16 +1669,88 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetLis
     return canPing;
 }
 
+/* AzaharLink: is the timer of a packet of ours due (the condition under which the send pass checks the timeouts)? Then the socket is read BEFORE
+   the check, as ENet does: the acknowledgement that stops the timer may be in it (a thread that was away, a socket that failed for a while) and
+   a packet whose timer is past 5 s is given up with its peer. See ENetHost::azlSkipEmptyRecv. */
+static int
+enet_protocol_timers_due (ENetHost * host)
+{
+    ENetPeer * currentPeer;
+
+    for (currentPeer = host -> peers;
+         currentPeer < & host -> peers [host -> peerCount];
+         ++ currentPeer)
+    {
+       if (currentPeer -> state != ENET_PEER_STATE_DISCONNECTED && currentPeer -> state != ENET_PEER_STATE_ZOMBIE &&
+           ! enet_list_empty (& currentPeer -> sentReliableCommands) &&
+           ENET_TIME_GREATER_EQUAL (host -> serviceTime, currentPeer -> nextTimeout))
+         return 1;
+    }
+
+    return 0;
+}
+
+/* AzaharLink: what to do with the acknowledgements that wait when a packet is ready to be handed over (see ENetHost::azlAckHoldEvents).
+   0: none waits, or the feature is off: nothing is held back, ENet's order. 1: the packet may go ahead of them. -1: they have waited
+   long enough (the number of packets or the time): they are sent first. The limit being hit is counted. */
+static int
+enet_protocol_ack_hold (ENetHost * host, int * clockRead)
+{
+    enet_uint32 limitMs;
+
+    /* nothing waits, or nothing is ready to hand over (then there is nothing to decide): no clock read either */
+    if (host -> azlAckHoldEvents == 0 || host -> azlAckSince == 0 || enet_list_empty (& host -> dispatchQueue))
+      return 0;
+
+    if (host -> azlAckEvents >= host -> azlAckHoldEvents)
+    {
+       ++ host -> azlCounters.ackHoldLimitHits;
+       return -1;
+    }
+
+    /* the age of the oldest acknowledgement is measured on the call's own clock, read here and kept as the call's (host -> serviceTime;
+       the caller reads it again only when this has not) */
+    host -> serviceTime = enet_time_get ();
+    * clockRead = 1;
+
+    limitMs = host -> azlAckHoldMs;
+    if (limitMs != 0 && host -> peerCount == 1 && host -> peers [0].state == ENET_PEER_STATE_CONNECTED)
+    {
+       /* a third of the retransmission timeout (rtt + 4 variance: what the other side waits for an acknowledgement, as far as this
+          side can tell) at the most, for a link faster than a WiFi one (the datagram took half a round trip to get here and the
+          acknowledgement takes the other half); never below 2 ms, the host's clock steps by 1 */
+       const enet_uint32 fraction = (host -> peers [0].roundTripTime + 4 * host -> peers [0].roundTripTimeVariance) / 3;
+       if (fraction < limitMs)
+         limitMs = fraction < 2 ? 2 : fraction;
+    }
+
+    if (limitMs != 0 && ENET_TIME_DIFFERENCE (host -> serviceTime, host -> azlAckSince) >= limitMs)
+    {
+       ++ host -> azlCounters.ackHoldLimitHits;
+       return -1;
+    }
+
+    return 1;
+}
+
 static int
 enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int checkForTimeouts)
 {
     enet_uint8 headerData [sizeof (ENetProtocolHeader) + sizeof (enet_uint32)];
     ENetProtocolHeader * header = (ENetProtocolHeader *) headerData;
     int sentLength = 0;
-    size_t shouldCompress = 0;
+    size_t shouldCompress = 0, azlAckCommands = 0;
     ENetList sentUnreliableCommands;
 
     enet_list_clear (& sentUnreliableCommands);
+
+    if (host -> azlAckSince != 0)
+    {
+       /* AzaharLink: how long the acknowledgements that go out now have waited since they were queued (on the call's clock) */
+       const enet_uint32 held = ENET_TIME_DIFFERENCE (host -> serviceTime, host -> azlAckSince);
+       if (held < 0x7FFFFFFFu && held > host -> azlCounters.ackHoldMaxMs)
+         host -> azlCounters.ackHoldMaxMs = held;
+    }
 
     for (int sendPass = 0, continueSending = 0; sendPass <= continueSending; ++ sendPass)
     for (ENetPeer * currentPeer = host -> peers;
@@ -1646,6 +1771,7 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
 
         if (! enet_list_empty (& currentPeer -> acknowledgements))
           enet_protocol_send_acknowledgements (host, currentPeer);
+        azlAckCommands = host -> commandCount;
 
         if (checkForTimeouts != 0 &&
             ! enet_list_empty (& currentPeer -> sentReliableCommands) &&
@@ -1754,10 +1880,22 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
         host -> totalSentData += sentLength;
         host -> totalSentPackets ++;
 
+        if (azlAckCommands > 0)
+        {
+           /* AzaharLink: a datagram with acknowledgements: alone (a send to the soc service for nothing else) or riding on data */
+           if (host -> commandCount == azlAckCommands)
+             ++ host -> azlCounters.ackOnlyDatagrams;
+           else
+             ++ host -> azlCounters.ackDataDatagrams;
+        }
+
     nextPeer:
         if (currentPeer -> flags & ENET_PEER_FLAG_CONTINUE_SENDING)
           continueSending = sendPass + 1;
     }
+
+    host -> azlAckSince = 0; /* AzaharLink: every acknowledgement that waited is out */
+    host -> azlAckEvents = 0;
    
     return 0;
 }
@@ -1814,6 +1952,7 @@ int
 enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
 {
     enet_uint32 waitCondition;
+    int azlSkipped = 0, azlClockRead = 0, hold;
 
     if (event != NULL)
     {
@@ -1821,24 +1960,36 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
         event -> peer = NULL;
         event -> packet = NULL;
 
-        switch (enet_protocol_dispatch_incoming_commands (host, event))
+        /* AzaharLink: packets that are ready are handed over, one a call, as ever - unless the acknowledgements that wait for them have
+           waited long enough (enet_protocol_ack_hold): then the call goes on to send them, and hands the packet over afterwards. */
+        hold = enet_protocol_ack_hold (host, & azlClockRead);
+        if (hold >= 0)
         {
-        case 1:
-            return 1;
+           switch (enet_protocol_dispatch_incoming_commands (host, event))
+           {
+           case 1:
+               if (hold > 0)
+               {
+                  ++ host -> azlAckEvents;
+                  ++ host -> azlCounters.eventsBeforeAck;
+               }
+               return 1;
 
-        case -1:
+           case -1:
 #ifdef ENET_DEBUG
-            perror ("Error dispatching incoming packets");
+               perror ("Error dispatching incoming packets");
 #endif
 
-            return -1;
+               return -1;
 
-        default:
-            break;
+           default:
+               break;
+           }
         }
     }
 
-    host -> serviceTime = enet_time_get ();
+    if (! azlClockRead)
+      host -> serviceTime = enet_time_get ();
     /* AzaharLink: how long since the previous service (see ENetHost). */
     host -> azlServiceGap = host -> azlLastServiceTime != 0 ? ENET_TIME_DIFFERENCE (host -> serviceTime, host -> azlLastServiceTime) : 0;
     host -> azlLastServiceTime = host -> serviceTime != 0 ? host -> serviceTime : 1;
@@ -1869,23 +2020,60 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
           break;
        }
 
-       switch (enet_protocol_receive_incoming_commands (host, event))
+       /* AzaharLink: the socket was found empty and this call is going to poll (the timeout has not run out): the receive that would
+          only say "nothing" again is left out, the poll below reports a datagram that is there (see ENetHost::azlSkipEmptyRecv) -
+          unless a timer is due: then the socket is read first, as ENet does, for the acknowledgement may be in it. */
+       if (host -> azlSkipEmptyRecv && host -> azlSocketEmpty && ENET_TIME_LESS (host -> serviceTime, timeout) && ! enet_protocol_timers_due (host))
        {
-       case 1:
-          return 1;
+          azlSkipped = 1;
+          ++ host -> azlCounters.recvSkipped;
+       }
+       else
+       {
+          switch (enet_protocol_receive_incoming_commands (host, event))
+          {
+          case 1:
+             return 1;
 
-       case -1:
+          case -1:
 #ifdef ENET_DEBUG
-          perror ("Error receiving incoming packets");
+             perror ("Error receiving incoming packets");
 #endif
 
-          return -1;
+             return -1;
 
-       default:
-          break;
+          default:
+             break;
+          }
        }
 
-       switch (enet_protocol_send_outgoing_commands (host, event, 1))
+       /* AzaharLink: the packets that were just read go to the caller BEFORE the acknowledgements are sent (the send is a call to the soc
+          service in front of every frame); the acknowledgements follow in the next call, with whatever the caller queues meanwhile. */
+       if (event != NULL && enet_protocol_ack_hold (host, & azlClockRead) > 0)
+       {
+          switch (enet_protocol_dispatch_incoming_commands (host, event))
+          {
+          case 1:
+             ++ host -> azlAckEvents;
+             ++ host -> azlCounters.eventsBeforeAck;
+             return 1;
+
+          case -1:
+#ifdef ENET_DEBUG
+             perror ("Error dispatching incoming packets");
+#endif
+
+             return -1;
+
+          default:
+             break;
+          }
+       }
+
+       /* AzaharLink: the timers are checked once the socket has been read to its end (the first pass above does not check them for the same
+          reason): a pass that stopped at the limit of datagrams leaves some in the socket, and an acknowledgement among them is not a timeout.
+          The call goes on reading below, so the check is made by the call that finds the socket empty. */
+       switch (enet_protocol_send_outgoing_commands (host, event, ! host -> azlReadCapped))
        {
        case 1:
           return 1;
@@ -1920,6 +2108,21 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
           }
        }
 
+       if (host -> azlReadCapped)
+       {
+          /* AzaharLink: the last pass stopped with datagrams still in the socket and nothing was handed over (they were not packets for
+             the caller): no poll to learn what is known, read on. A call whose time is up returns, the caller's loop comes back at once. */
+          host -> azlReadCapped = 0;
+          host -> serviceTime = enet_time_get ();
+          if (ENET_TIME_LESS (host -> serviceTime, timeout))
+          {
+             azlSkipped = 0;
+             waitCondition = ENET_SOCKET_WAIT_RECEIVE;
+             continue;
+          }
+          return 0;
+       }
+
        if (ENET_TIME_GREATER_EQUAL (host -> serviceTime, timeout))
          return 0;
 
@@ -1928,7 +2131,11 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
           host -> serviceTime = enet_time_get ();
 
           if (ENET_TIME_GREATER_EQUAL (host -> serviceTime, timeout))
+          {
+            if (azlSkipped)
+              host -> azlSocketEmpty = 0; /* AzaharLink: no poll followed the skipped receive (the sends took the time): the next call looks */
             return 0;
+          }
 
           waitCondition = ENET_SOCKET_WAIT_RECEIVE | ENET_SOCKET_WAIT_INTERRUPT;
 
@@ -1938,6 +2145,13 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
        while (waitCondition & ENET_SOCKET_WAIT_INTERRUPT);
 
        host -> serviceTime = enet_time_get ();
+
+       /* AzaharLink: what the poll found: a datagram (the next receive is real), or nothing within the whole time given (the socket is empty).
+          A poll that came back before its time with nothing readable says nothing about the socket: the soc service reports a socket in
+          trouble that way (the revents hold an error, not POLLIN), and the receive of the next call is where the error is reported - it is
+          not left out. (One millisecond of slack: the clock steps by 1; a doubt costs one receive, never a datagram.) */
+       host -> azlSocketEmpty = (waitCondition & ENET_SOCKET_WAIT_RECEIVE) ? 0 : ENET_TIME_GREATER_EQUAL (host -> serviceTime + 1, timeout);
+       azlSkipped = 0;
     } while (waitCondition & ENET_SOCKET_WAIT_RECEIVE);
 
     return 0; 

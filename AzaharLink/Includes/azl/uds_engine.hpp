@@ -9,6 +9,7 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -177,6 +178,81 @@ public:
     /// Drives the beacon timer; call every ~10 ms.
     void Tick(u64 now_ms);
 
+    // ---- The fake Download Play lobby (azl/dlp_lobby_net.hpp) ------------------------------------------------------------
+    // The lobby is a UDS network of its own that two plugins host and join for the games that find their group with
+    // dlp:FKCL / dlp:SRVR (design: analysis/dlp-lobby-fake-2026-10-28/DESIGN-FASE2.md). These are the pieces its adapter needs
+    // and the game's commands do not give. None of them blocks or is a nwm::UDS command: they are short enough to be called from a
+    // game's thread, with the engine's lock and nothing else. What they keep (the lobbies heard, the ring of messages: LobbyState,
+    // about 350 bytes) is allocated the first time a lobby is used (PrepareLobby, which the adapter's ScanOpen / HostOpen /
+    // ConnectBegin call): a game that never uses one pays a pointer, and the engine does not even look at the beacons for it.
+
+    /// BeginHostingNetwork with a NetworkInfo the engine composes itself (no 264-byte structure on the caller's stack):
+    /// `channel` 0 = the default, the network id comes from our MAC, the attribute word is empty (UpdateNetworkAttribute
+    /// closes the lobby). Answers what BeginHostingNetwork answers; on success the lobby's inbox is on (see SetLobbyInbox) and so is
+    /// the foreign-lobby filter of its clients (RefuseForeignLocked), in the same breath as the network begins.
+    u32 BeginHostingLobby(u32 wlan_comm_id, u8 id8, u8 channel, u8 max_nodes, const u8* app_data, u32 app_size);
+
+    /// The Download Play's network ids: the lobby's virtual network is the network of no game, and these are the ones its beacons carry.
+    static constexpr u32 kLobbyWlanCommId = 0x00002810;
+    static constexpr u8 kLobbyId8 = 0x55;
+
+    /// One lobby heard lately: whose beacon it is, on which channel, how many nodes it says it has and the first bytes of its
+    /// application data (`size` counts what is copied, at most kHeardDataMax).
+    static constexpr u32 kHeardDataMax = 32;
+    static constexpr u32 kHeardLobbies = 4; ///< a room of 4 players holds at most 4 hosts: the engine keeps the 4 newest
+    struct HeardLobby {
+        Mac host;
+        u8 channel;
+        u8 total_nodes;
+        u8 max_nodes;
+        u8 size;
+        u8 data[kHeardDataMax];
+    };
+    /// The `index`-th (0..) lobby - a beacon of kLobbyWlanCommId / kLobbyId8 with application data - whose last beacon was heard
+    /// at most `max_age_ms` ago, in the order the engine keeps them (stable between two calls: a lobby keeps its place). The
+    /// network thread files the beacons as they come, so this is a copy under the lock and nothing more; it needs no Initialize
+    /// (beacons are heard in any state) but PrepareLobby (before it nothing is filed). A lobby whose host now beacons under other ids
+    /// (its game's network) is forgotten at that beacon, and any beacon heard sweeps the ones silent for more than kBeaconKeepMs.
+    /// False = there is no such lobby.
+    bool HeardLobbyAt(u32 index, u32 max_age_ms, HeardLobby* out) const;
+
+    /// The service for a lobby when no game has it: Initialize without a game's block, version or status event (nothing is handed
+    /// out, so nothing needs closing). kWrongState = it is initialised already (the game's, or the lobby's own): nothing is touched.
+    /// `username` is 10 UTF-16 units.
+    u32 InitializeForLobby(u64 friend_code_seed, const u16* username);
+
+    /// The first half of ConnectToNetwork, without the wait (ConnectToNetwork is this and a wait for the answer): 0 = the
+    /// connection sequence began, else what ConnectToNetwork answers when it refuses. `*attempt` is the number of the attempt.
+    u32 ConnectBegin(const u8* network_info, std::size_t size, u8 connection_type, u32* attempt = nullptr);
+    /// ConnectBegin as a client of the lobby whose beacon was heard from `host` (3 s at most ago): the channel is the beacon's, so
+    /// the caller needs no NetworkInfo. kNoHostFound = no such beacon. On success the lobby's inbox is on (see BeginHostingLobby).
+    u32 ConnectBeginLobby(const Mac& host);
+    /// How the attempt goes: 0 = the host has not answered yet, 1 = this node is a client (spectator) of its network, -1 = the
+    /// attempt ended without a connection (or there never was one). Whoever waits ends it with DisconnectNetwork / Shutdown.
+    int ConnectPoll() const;
+
+    /// The lobby's messages: frames of this data channel, addressed to this node, from the node that the engine knows to be the
+    /// MAC they came from (the host for a client, the node of that MAC for a host - a stranger's frame is dropped, whatever
+    /// node id it claims) are kept in a small ring of the engine and never reach a bind. Off by default; BeginHostingLobby and
+    /// ConnectBeginLobby switch it on, Shutdown off; SetLobbyInbox(true) empties the ring (and allocates the lobby's state if need
+    /// be), (false) too. The oldest message goes when the ring is full, and a node that leaves takes its unread messages with it.
+    /// While it is on, a client also drops the frames, node maps and Logoffs of any other network (a second lobby of the game in the
+    /// same room has the same node ids and would rewrite its roster).
+    static constexpr u8 kLobbyChannel = 0xD1;
+    static constexpr u32 kLobbyMessageMax = 16;
+    static constexpr u32 kLobbyInbox = 8;
+    void SetLobbyInbox(bool on);
+    /// Allocates what a lobby keeps (the lobbies heard, the ring) if it is not there yet; false = no memory. Idempotent.
+    bool PrepareLobby();
+    /// Takes the oldest message out: `*from_node` is the node that sent it, `*size` its length (at most `capacity`: a longer
+    /// message is cut). False = none.
+    bool PopLobbyMessage(u8* from_node, u8* data, u32 capacity, u32* size);
+
+    /// A picture of the session that GetConnectionStatus does not spoil (it clears the changed-nodes word and logs): our node id
+    /// and the mask of the nodes present (bit n-1 = node n). False, with both 0, when we are not in a network (a host, a client or
+    /// a spectator).
+    bool NodeSnapshot(u16* my_node, u16* node_bitmask) const;
+
     /// The foreign-lobby filter of a CLIENT (or spectator): a data frame, a node map or a Logoff whose transmitter is
     /// neither the host nor a node the host announced belongs to another network in the same room (a second lobby of
     /// the game has the same node ids). Off (the default), such frames are only counted and logged, as the scan filter
@@ -214,8 +290,13 @@ private:
     void SendPacket(WifiPacket& packet);
     u16 GetNextAvailableNodeId();
     void BroadcastNodeMap();
-    /// Where a SendTo to `dest_node_id` goes: false = nowhere (the node is not in the network).
-    bool GetSendAddress(u16 dest_node_id, u8 flags, Mac* out);
+    /// Where a SendTo to `dest_node_id` goes: false = nowhere (the node is not in the network). `*addressed`: a frame the game sent with the
+    /// broadcast flag to a node the room has is addressed to that node's own MAC (the room then delivers it to that member alone).
+    bool GetSendAddress(u16 dest_node_id, u8 flags, Mac* out, bool* addressed);
+    /// The MAC of a node of this network (the host's for node 1), false if it is not known.
+    bool NodeMacLocked(u16 node_id, Mac* out) const;
+    /// True if the room's member list has `mac` and it has not left it (a member that left is in the list for the debounce time, `absent_`).
+    bool InRoomLocked(const Mac& mac) const;
     Mac GetMacAddress();
     /// The bind a frame of `src` on `channel` goes to: an exact source match first (table order), else the
     /// LAST bind that takes every node; null if there is none (`*channel_bound` says whether the channel has
@@ -307,6 +388,44 @@ private:
     void HandleDataFrame(const WifiPacket& packet);
 
     void StartConnectionSequenceLocked(const Mac& server);
+    /// What both BeginHosting* do once network_info_ holds the network: the host is node 1, the beacons begin.
+    void StartHostingLocked();
+    /// What both ConnectBegin* do once network_info_ holds the host's address: the connection sequence begins.
+    void StartConnectLocked(ConnectionType type, u32* attempt);
+    /// The service becomes initialised for a node that current_node_ already is (Initialize and InitializeForLobby).
+    void BeginServiceLocked(u32 shared_memory_size);
+    /// A beacon of the lobby's ids is filed in lobby_->heard (the network thread, mu_ held); one of other ids from a MAC that has a
+    /// slot clears it; any beacon sweeps the slots silent for more than kBeaconKeepMs. Nothing at all while lobby_ is null.
+    void NoteLobbyBeaconLocked(const WifiPacket& packet, u64 now);
+    /// A data frame on kLobbyChannel for this node (mu_ held): kept in the lobby ring if its sender is who it says it is.
+    void HandleLobbyFrameLocked(const WifiPacket& packet, const SecureDataHeader& secure_data);
+    /// The lobby's state exists (allocated if need be); false = no memory.
+    bool EnsureLobbyLocked();
+    /// A node left: its unread lobby messages go with it.
+    void PurgeLobbyMessagesLocked(u16 node);
+    /// The creator's remaining clients are told who is left, with the unicast Logoff of the admission handshake (the engine's hosts
+    /// send no other news of a departure, and a client's roster would show the one that left until the next admission).
+    void RefreshClientsLocked();
+    struct LobbyMessage {
+        u8 from;
+        u8 size;
+        u8 data[kLobbyMessageMax];
+    };
+    struct HeardLobbySlot {
+        HeardLobby lobby;
+        bool used;
+        u32 rx_ms; ///< the low 32 bits of the clock when its last beacon was heard
+    };
+    static_assert(sizeof(HeardLobbySlot) == 48, "a lobby heard is 48 bytes: 4 of them are 192");
+    struct LobbyState {
+        HeardLobbySlot heard[kHeardLobbies];
+        LobbyMessage rx[kLobbyInbox];
+        u8 rx_first;
+        u8 rx_count;
+        u32 refused;
+    };
+    std::unique_ptr<LobbyState> lobby_; ///< null until a lobby is used (PrepareLobby)
+    bool lobby_inbox_ = false;
     /// The one place connection_status_.status changes (the mirror Tick reads without the lock follows it).
     void SetStatusLocked(NetworkStatus status);
     /// After the node table was rebuilt from the host's Logoff: a slot that emptied or holds another console now loses the

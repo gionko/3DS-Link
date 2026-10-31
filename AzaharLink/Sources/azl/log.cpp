@@ -966,6 +966,10 @@ void DebugFormat(const DebugRecord& rec, const u8* payload, u32 start_ms, std::s
     }
 }
 
+u32 DebugRingUsedBytes() {
+    return __atomic_load_n(&g_dbg_used, __ATOMIC_RELAXED);
+}
+
 u32 DebugTakeDropped() {
     platform::LockGuard lock(g_dbg_mutex);
     if (__atomic_load_n(&g_dbg_miss_any, __ATOMIC_RELAXED) != 0) {

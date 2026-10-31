@@ -125,6 +125,20 @@ WriteResult WritePluginFile(const std::string& dest, const std::uint8_t* data, s
     return WriteResult::Ok;
 }
 
+std::string PluginContentStamp(const std::uint8_t* data, std::size_t size) {
+    if (!data || size == 0) {
+        return std::string();
+    }
+    std::uint64_t h = 14695981039346656037ull; // FNV-1a, 64 bit
+    for (std::size_t i = 0; i < size; ++i) {
+        h ^= data[i];
+        h *= 1099511628211ull;
+    }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%llu:h%016llx", static_cast<unsigned long long>(size), static_cast<unsigned long long>(h));
+    return buf;
+}
+
 PluginEnsure EnsurePluginFile(const std::string& dest, const std::uint8_t* data, std::size_t size, bool usable, std::uint32_t wanted_version_word) {
     PluginEnsure result;
     if (!IsFile(dest) && IsFile(dest + ".old")) {

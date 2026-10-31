@@ -101,6 +101,21 @@ void CopyWorker::SubmitRefresh(u64 tid, const std::string& source) {
     Submit(tid, CopyKind::Update, source, true);
 }
 
+int CopyWorker::CancelRefreshes() {
+    LightLock_Lock(&impl_->lock);
+    int dropped = 0;
+    for (std::deque<Job>::iterator it = impl_->queue.begin(); it != impl_->queue.end();) {
+        if (it->refresh) {
+            it = impl_->queue.erase(it);
+            ++dropped;
+        } else {
+            ++it;
+        }
+    }
+    LightLock_Unlock(&impl_->lock);
+    return dropped;
+}
+
 int CopyWorker::TakeRefreshedCount() {
     LightLock_Lock(&impl_->lock);
     const int n = impl_->refreshed;

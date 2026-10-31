@@ -90,7 +90,7 @@ Righe nuove da cercare dopo una prova (se non ci sono, il punto corrispondente n
 - **Aggiornare Luma dall'app**: parcheggiato. **Download and Play**: fuori da questo elenco.
 - **Build diverse nella stessa stanza**: non interessa all'utente. **Idea per più avanti**: entrando in un server controllare la versione e, se è diversa, aggiornarsi con Download Play (o dire al server di aggiornarsi).
 - ~~**Angoli trasparenti dell'icona**~~ non fattibili (SMDH senza alfa): **risolto il 21-10** con un quadrato opaco a tutto campo (angoli grigi, non neri); da vedere su HOME e sull'Homebrew Launcher.
-- **Kirby Battle Royale**: usa Download Play (`dlp:FKCL`) per il gioco locale, non `nwm::UDS`: non supportato dal plugin (servirebbe emulare il DLP).
+- **Kirby Battle Royale**: usa Download Play (`dlp:FKCL`) per il gioco locale, non `nwm::UDS`: non supportato dal plugin (servirebbe emulare il DLP). (Situazione del 2026-10-21: dalla 1.0.6 il plugin risponde al controllo «wireless acceso» di `dlp:FKCL` e Battle Royale passa al wireless normale; vedi «Novità 1.0.10» nel README.)
 - **Balloon Fight (Virtual Console)**: abort dentro CTRPluginFramework prima del nostro codice (gancio sulla memoria condivisa non installabile nei titoli VC): non è nostro.
 - **Tekken, Azahar come client di una console vera**: difetto di `GetApplicationData` in Azahar (il nostro è corretto): da segnalare; intanto la stanza del gioco la crea l'emulatore.
 

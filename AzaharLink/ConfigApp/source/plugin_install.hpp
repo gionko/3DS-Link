@@ -209,6 +209,12 @@ inline std::uint64_t ToastMsToRead(std::size_t letters, std::uint64_t given_ms) 
 // The file work (plugin_install.cpp: POSIX calls on the paths and the bytes handed in)
 // ---------------------------------------------------------------------------------------------
 
+// The stamp of a plugin: "<size>:h<FNV-1a 64 bit of its bytes, 16 hex digits>", "" for no bytes. 3DSLink.cfg keeps it for the copies in the titles' folders (plugin_stamp=): the
+// quiet look at them is skipped while the plugin is the one they were brought up to. The size and the date of the FILE are not enough for that: the card gives every file the date 0,
+// and two builds of the plugin can have the same size (the stamp of the build is a string of fixed length). Made from the bytes the app carries, which are the bytes of the file
+// on the card whenever the look is made (plugin_card == Same), so that no megabyte is read for it.
+std::string PluginContentStamp(const std::uint8_t* data, std::size_t size);
+
 // Measures the file at `path` against `data` (the plugin inside the app): exists, readable, size, header and, when the size is the same, every byte.
 PluginProbe InspectPluginFile(const std::string& path, const std::uint8_t* data, std::size_t size);
 

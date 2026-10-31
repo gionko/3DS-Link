@@ -14,7 +14,7 @@
 
 namespace setup {
 
-constexpr const char* kVersion = "1.0.4";
+constexpr const char* kVersion = "1.0.10";
 // The places that are not the app's to choose: Luma3DS loads plugins from this folder (a title's copy of the plugin goes to
 // sdmc:/luma/plugins/<title id>/, games.hpp), and the plugin reads its settings and writes its logs in sdmc:/3ds/3DSLink, whatever folder
 // the app itself is in (kIniPath and the folder are in paths.hpp with the other fixed places). Until 2026-10-19 the settings were in

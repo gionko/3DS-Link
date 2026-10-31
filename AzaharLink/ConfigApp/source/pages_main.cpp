@@ -143,9 +143,30 @@ public:
             g.ShowToast(g.plugin_notice, g.plugin_notice_color, 7000);
             g.plugin_notice.clear();
         }
-        const int refreshed = setup::CopyWorker::Get().TakeRefreshedCount();
+        // The quiet look at the copies of the plugin in the titles' folders starts with the app (it does not wait for the scan): while it runs the toast says how many folders
+        // are left, and when it is over it says the result, so that whoever has just installed an update knows when it is done and the app can be closed.
+        int refreshed = 0;
+        if (g.plugin_pass_open) {
+            const int left = setup::CopyWorker::Get().PendingCount();
+            if (left > 0) {
+                if (left != pass_left_shown_) {
+                    pass_left_shown_ = left;
+                    g.ShowToast(Fmt("Updating the plugin in your games: %d of %d folders done. Please wait.", g.plugin_pass_total > left ? g.plugin_pass_total - left : 0, g.plugin_pass_total), col::kWarn, 3000);
+                }
+                return;
+            }
+            g.plugin_pass_open = false;
+            pass_left_shown_ = 0;
+            refreshed = setup::CopyWorker::Get().TakeRefreshedCount();
+            if (refreshed == 0) {
+                g.ShowToast("The plugin is up to date in all your games. You can close 3DS Link.", col::kOn, 8000);
+                return;
+            }
+        } else {
+            refreshed = setup::CopyWorker::Get().TakeRefreshedCount();
+        }
         if (refreshed > 0) {
-            g.ShowToast(Fmt("Plugin updated in %d title%s.", refreshed, refreshed == 1 ? "" : "s"), col::kOn, 4000);
+            g.ShowToast(Fmt("Plugin updated in %d title%s. You can close 3DS Link.", refreshed, refreshed == 1 ? "" : "s"), col::kOn, 8000);
         }
     }
 
@@ -327,6 +348,8 @@ protected:
 
 private:
     enum Id { kPower = 1, kRoom, kEnableGame, kGameDelivery, kDlpDelivery, kSettings };
+
+    int pass_left_shown_ = 0; // the number of folders of the pass of quiet looks the toast last said (so that it is said again only when it changes)
 
     static setup::SwitchLock SwitchLockNow() {
         return setup::LockOfSwitch(g.luma_too_old, g.plugin_ready);

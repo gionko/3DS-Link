@@ -26,6 +26,7 @@ struct WifiPacket {
     u8 channel = 0;
     bool relayed = false; ///< a host's copy of a frame for another node (not on the wire: the room client's delivery rule treats it as unicast)
     bool peer_numbers = false; ///< the destination node numbers its frames (it runs this plugin: it drops a copy); not on the wire
+    bool broadcast_flag = false; ///< the game sent it with the broadcast flag (SendTo flags & 2): the radio does not retry it, whatever MAC it is addressed to; not on the wire
 };
 
 enum class EtherType : u16 { SecureData = 0x876D, EAPoL = 0x888E };

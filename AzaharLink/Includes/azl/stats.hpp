@@ -34,6 +34,21 @@ struct Stats {
     u32 rx_early;             ///< reliable packets of the room handed over out of order, ahead of a hole (radio_like=2: ENet's azlDeliverOutOfOrder)
     u32 tx_throttled;         ///< unreliable packets ENet's packet throttle destroyed at the sender (0 since the throttle no longer decelerates)
     u32 ack_samples_skipped;  ///< acknowledgements whose round-trip sample was not taken (the thread had been away: a pause, not the link)
+    // The room's reliable stream as ENet sees it (ENetAzlCounters; the plugin takes them once per network round):
+    u32 enet_ooo;             ///< reliable packets of the room that arrived behind a hole (an earlier datagram was lost or late)
+    u32 enet_hol_max_ms;      ///< ... the longest one waited behind the hole (ms; a maximum): the head-of-line blocking
+    u32 enet_dup_rx;          ///< reliable packets the room sent again after they had been handled: its retransmissions that reached us
+    u32 enet_ack_only;        ///< datagrams sent to the room that held acknowledgements and nothing else (a soc call for nothing)
+    u32 enet_ack_data;        ///< ... that held acknowledgements and data: the acknowledgement rode along
+    u32 enet_passes;          ///< receive passes that read at least one datagram
+    u32 enet_pass_dgrams_max; ///< most datagrams one pass read
+    u32 enet_pass_ms_max;     ///< longest pass (ms)
+    u32 enet_recv_skipped;    ///< receives not made because the socket was known empty and a poll followed (each is a soc call saved)
+    u32 enet_passes_capped;   ///< read passes that stopped at the limit of datagrams or of time with the socket not empty (the backlog was handed over in pieces)
+    u32 enet_silence_probes;  ///< pings sent because the room spoke while packets of ours had gone unanswered for 0.5 s or more (the link came back)
+    u32 enet_events_before_ack; ///< packets of the room handed to the game's code before the acknowledgement of their datagram was sent
+    u32 enet_ack_limit_hits;  ///< times the acknowledgements were sent because they had waited for 8 packets or 8 ms
+    u32 enet_ack_hold_max_ms; ///< the longest an acknowledgement waited between being queued and being sent (ms; a maximum)
     u32 loop_iters;    ///< iterations of the network loop
     u32 loop_gap_max;  ///< longest pause between two iterations (ms): thread starvation
     u32 delay_max;     ///< longest time a frame waited before being handed to ENet (ms)
@@ -88,6 +103,7 @@ struct Stats {
     u32 sendto_calls;
     u32 sendto_errors;
     u32 sendto_bytes;
+    u32 sendto_addressed;     ///< ... of which sent with the broadcast flag to a node the room has: addressed to its MAC, so that the room delivers it to that member alone
 
     // Where the plugin's time goes (the 64-bit sums are at the end of the struct).
     u32 net_slow_rounds;   ///< network rounds longer than 50 ms
@@ -325,6 +341,8 @@ bool DebugOldestMs(u32* ms);
 void DebugFormat(const DebugRecord& rec, const u8* payload, u32 start_ms, std::string* out);
 /// Records dropped (ring without room for them, or the ring's lock busy) since the last call.
 u32 DebugTakeDropped();
+/// How many bytes the capture ring holds now (an approximate read, with no lock: the writer uses it to decide whether a pass is due).
+u32 DebugRingUsedBytes();
 /// Lines of the main log that a thread gave up on because the log's lock was busy (azl/log.cpp LockLogBriefly: a thread
 /// above the writer never waits for it), since the last call; the writer says the count in the log (LogFiles::Flush).
 u32 LogTakeBusyDrops();

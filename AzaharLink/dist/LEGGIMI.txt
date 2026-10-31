@@ -1,7 +1,7 @@
-AzaharLink 1.0.4 - LEGGIMI
-==========================
+AzaharLink 1.0.10 - LEGGIMI
+===========================
 
-Questa cartella (dist/) contiene UNA SOLA versione da installare e da provare: la 1.0.4. Le build vecchie sono in dist/old/
+Questa cartella (dist/) contiene UNA SOLA versione da installare e da provare: la 1.0.10. Le build vecchie sono in dist/old/
 e NON servono ai test. La documentazione lunga e' nel repository: README.md (cosa fa, come e' fatto, che cosa e' stato provato)
 e PROVE_HARDWARE.md (il piano di prove completo, con i criteri, e lo storico delle prove vecchie). Questo file e' la forma breve.
 
@@ -161,7 +161,7 @@ dentro l'app: installa la 3DSLink.cia nuova, apri l'app, e' lei a riscrivere il 
 Dopo i test del 19-10-2026 (tappa L) i log e l'ini del plugin stanno con i file dell'app, in SD:/3ds/3DSLink/ (sezione 5): l'app
 sposta da sola un AzaharLink.ini trovato in SD:/luma/plugins/ e lo dice con un avviso; il plugin legge ancora il posto vecchio finche'
 il file nuovo manca. I log non si azzerano piu' a un avvio e crescono in blocchi da 64 MB numerati in ordine (fino a 50 per log).
-Dai log: Kirby Battle Royale non usa nwm::UDS ma Download Play (dlp) per il gioco locale, che gira nel modulo di sistema con la radio
+Dai log: Kirby Battle Royale non usa nwm::UDS ma Download Play (dlp) per il gioco locale, che gira nel modulo di sistema con la radio (Situazione del 2026-10-21: dalla 1.0.6 il plugin risponde al controllo "wireless acceso" di dlp:FKCL e Battle Royale passa al wireless normale; vedi "Novita' 1.0.10" nel README.)
 vera: "attiva il WiFi" e' il suo modo di dire che dlp non parte; il plugin non c'entra. Balloon Fight (Virtual Console): l'abort e'
 dentro CTRPluginFramework, prima del nostro codice (il suo gancio sulla memoria condivisa del gioco non trova la sequenza nei titoli
 VC). Tekken con Azahar come client: e' lo stesso difetto di GetApplicationData corretto nel plugin, ma in Azahar (da segnalare; intanto
@@ -292,17 +292,17 @@ sessioni, anche con l'host Azahar). Si comincia dalla serata TFH (passo 2: le us
 
 1. I FILE DI QUESTA CARTELLA
 ---------------------------------------------------------------------------------------------------------------------------
-  3DSLink.cia             1.715.136 byte   md5 38c3426a72f42ad11d7cee36497c3125    3DS Link come app installabile (FBI): Title ID 000400000F83D100, versione 1.0.4,
+  3DSLink.cia             1.744.832 byte   md5 1f6469b4fd7d9409f8cb46e7930e2665    3DS Link come app installabile (FBI): Title ID 000400000F83D100, versione 1.0.10,
                                                                              costruita dallo stesso 3DSLink.elf del .3dsx (DlpLink/tools/build_all.sh). E' il PACCHETTO
                                                                              UNICO: il plugin e' dentro, e l'app lo scrive in SD:/3ds/3DSLink/AzaharLink.3gx da sola. E' l'UNICO
                                                                              file da consegnare per condividere 3DS Link: il figlio per il Download Play (child.cia) NON si
                                                                              consegna, lo compone l'app (SD:/3ds/3DSLink/dlp/child.cia)
-  3DSLink.3dsx            2.375.452 byte   md5 019804be05f151909bbd7e407898f162    l'app 3DS Link (mostra v1.0.4; la stessa del CIA, per l'Homebrew Launcher; identica a
+  3DSLink.3dsx            2.423.468 byte   md5 ec044841eb59c17d54c867bab59b2aab    l'app 3DS Link (mostra v1.0.10; la stessa del CIA, per l'Homebrew Launcher; identica a
                                                                              ConfigApp/3DSLink.3dsx del repository; porta dentro lo stesso plugin e non vuole nessun altro file;
                                                                              contiene anche il modulo di consegna dei titoli, Titles Delivery, e l'host Download Play, 3DS Link Delivery)
-  AzaharLink.3gx          1.011.465 byte   md5 5bc7c39245a0884d5dc0d026e5b6a5e3    NON e' un file di questa cartella: e' DENTRO i due file sopra (la risorsa che l'app
+  AzaharLink.3gx          1.053.133 byte   md5 73e09d5a8ab0ff93ee515e081dba86ab    NON e' un file di questa cartella: e' DENTRO i due file sopra (la risorsa che l'app
                                                                              scrive in SD:/3ds/3DSLink/AzaharLink.3gx: questa dimensione e questo md5 sono quelli del file che deve
-                                                                             comparire sulla SD, per controllarlo; intestazione 3gx: versione 1.0.4, memoria condivisa, non privata)
+                                                                             comparire sulla SD, per controllarlo; intestazione 3gx: versione 1.0.10, memoria condivisa, non privata)
   default.3gx             non c'e' piu': 3DS Link abilita il plugin titolo per titolo e non lo usa (vedi sezione 2)
   LEGGIMI.txt             questo file
   test-1android-23ds/     i registri grezzi della PROVA 3 (2dsxl/ = New 2DS XL, 3dsxl/ = New 3DS XL): non servono all'installazione
@@ -455,7 +455,7 @@ sessioni, anche con l'host Azahar). Si comincia dalla serata TFH (passo 2: le us
   3. In gioco, L+R+Select apre il menu del plugin (Status, Room address [la voce del plugin: nell'app la riga si chiama "Azahar Emulator Room"], Nickname, Password, Connect to room, Radio-like
      broadcast data, AzaharLink at game start, Debug log). Status -> A mostra i numeri dell'ultima finestra di 5 s.
   4. CONTROLLO DELL'AVVIO, in ogni log (con debug=1), prima di tutto il resto:
-         ==== AzaharLink 1.0.4 (built ...), console clock 2026-10-14 hh:mm:ss.mmm ====
+         ==== AzaharLink 1.0.10 (built ...), console clock 2026-10-14 hh:mm:ss.mmm ====
          console: application memory region 124 MiB (New 3DS memory layout)
          soc: reserved a 128 KB buffer at 0x0dfe0000, ... SO_RCVBUF limited to 64 KB      (TFH: 0x0ffa0000)
          soc: sockets ready (128 KB buffer at 0x0dfe0000, now state 11 perm 0)
@@ -590,7 +590,7 @@ sessioni, anche con l'host Azahar). Si comincia dalla serata TFH (passo 2: le us
      boot9.bin in un posto strano (una sottocartella); per un secondo giro facoltativo del punto 3 la stessa app in SD:/3ds/3DSLink/ con
      boot9.bin li' (il plugin lo scrive l'app). Per il punto 4: un servers.txt di una build precedente (nella cartella 3DSLink dell'app: una stanza
      con nome e senza password) e, nell'ini, host, port e password di quella stanza.
-     1. App 3DS Link e ini (circa 10 minuti): l'app nuova riscrive l'ini vecchio con le 15 chiavi senza cambiare i valori e mostra v1.0.4;
+     1. App 3DS Link e ini (circa 10 minuti): l'app nuova riscrive l'ini vecchio con le 15 chiavi senza cambiare i valori e mostra v1.0.10;
         la pagina principale ha la barra "Options" e le righe 3DS Link, Azahar Emulator Room, Enable Titles for Azahar Emulator Net, Titles Delivery, Settings
         (niente "Nickname" ne' "Password"), e sullo schermo alto la versione, la batteria e lo spazio libero della SD nella barra e le righe
         WiFi, Plugin Loader, Name, Join, Room, Installation; in "Settings" la prima riga e' "Nickname" (4-20 caratteri; vuoto = il nome

@@ -3,18 +3,27 @@
 # The hooked svc 0x32 runs the plugin's C++ on whatever stack the thread that made the IPC call has, and the SDK threads
 # of some games have very little: Tri Force Heroes' srv-notification thread has 464 bytes below its call (a 512-byte
 # stack inside its own object), and 0.1.15 at debug=1 ran a printf chain of 1.3 KB there - the game crashed on exit
-# (hardware, 2026-10-10). Three checks:
+# (hardware, 2026-10-10). Four checks:
 #   1. the frames of the functions a game thread runs through (-fstack-usage on a COPY of the tree with the shipped
 #      flags): fails when a frame is over its budget (the measured size plus a margin). This sees one frame at a time,
 #      not the libc functions below it;
 #   2. the call graph (Tests/callgraph_check.py): the built ELF is disassembled and every function a game thread can
 #      reach from the entries of the hook - and from the callbacks it reaches through a pointer - is followed; the printf
 #      family, Log() and DebugEvent() must not be among them (the HLE proper, past UdsHle::Run, is the one cut);
-#   3. the WHOLE chain (Tests/chain_sim/chain_sim.py): the real code of the built plugin, libc included, run in an ARM
+#   3. the chains of the Download Play hub (Tests/dlp_chain_report.py, phase 3): the frames and the call edges of every unit
+#      of THIS build joined by symbol, the libraries' frames read from the machine code, and for every way a game thread
+#      enters the hub - a command served inline, a command posted to the network thread, the wait for a join, OnGameUdsStarting,
+#      OnSessionClosed - the deepest chain against the ceilings of the chain test; plus the proofs that an inline command reaches
+#      no LobbyNet method but the clock, that the end of a session reaches nothing of the lobby, that no row reaches Log() with a
+#      format and that a hub session does not go through RunTraced;
+#   4. the WHOLE chain (Tests/chain_sim/chain_sim.py): the real code of the built plugin, libc included, run in an ARM
 #      emulator on a 512-byte game stack, entered like the per-site trampoline does: the pure pass-through path must stay
 #      within 300 bytes at debug 0 and at debug 1, the other paths of the hook within their budgets, nothing of the
 #      game's thread object may change, the printf family must not run at all outside the HLE proper, one Log() or
-#      DebugEvent() call must cost a few words at debug 0, and the log lines must read as they did.
+#      DebugEvent() call must cost a few words at debug 0, and the log lines must read as they did. With the hub: the compiled
+#      DlpHub, DlpService and DlpLobby run commands, waits and closes with a spy LobbyNet (no method but the clock on the game
+#      thread) and over the real engine, the commands that succeed in every state with no network thread to serve them (Finalize,
+#      StopScan, StopSession, EndAccepting: answered with success, the hub object compared word by word), and the deepest SP is read.
 #   bash Tests/stack_usage.sh        (Git Bash, from anywhere; Docker running, pablomk7/libctrpf:0.8.0 available;
 #                                      the chain test needs Python 3 with the `unicorn` package: pip install unicorn;
 #                                      CHAIN_SIM=skip leaves it out, KEEP_WORK=1 keeps the build copy)
@@ -22,10 +31,12 @@ set -e
 cd "$(dirname "$0")/.."
 WORK=$(mktemp -d)
 if [ -z "$KEEP_WORK" ]; then trap 'rm -rf "$WORK"' EXIT; else echo "stack usage: build copy kept in $WORK"; fi
-tar --exclude=Build --exclude=analysis --exclude='*.elf' --exclude='*.3gx' --exclude=dist --exclude=Tests \
-    --exclude=ConfigApp -cf - . | tar -xf - -C "$WORK"
-# (the Makefile's flags + -fstack-usage; the elf and 3gx are not needed, only the objects)
-sed -i 's/-fno-strict-aliasing/-fno-strict-aliasing -fstack-usage/' "$WORK/Makefile"
+# (only what the Makefile builds from: the project folder also holds gigabytes of console logs, captures and installers, and a copy of
+#  all of it took minutes and 12 GB of the disk for a build that needs 2 MB)
+tar -cf - Makefile 3gx.ld CTRPluginFramework.plgInfo Includes Sources third_party | tar -xf - -C "$WORK"
+# (the Makefile's flags + -fstack-usage and the call graph of every unit, which Tests/dlp_chain_report.py joins; the build makes the ELF
+#  that the checks below read)
+sed -i 's/-fno-strict-aliasing/-fno-strict-aliasing -fstack-usage -fcallgraph-info=su/' "$WORK/Makefile"
 (cd "$WORK" && MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W 2>/dev/null || pwd):/src" -w /src \
     pablomk7/libctrpf:0.8.0 make >"$WORK/build.log" 2>&1) || { tail -20 "$WORK/build.log"; exit 1; }
 
@@ -114,6 +125,60 @@ budget log "azl::{anonymous}::PushAggregateLocked" 72
 # (the marker of a hole is written by whichever producer finds the hole, Tri Force Heroes' 464-byte thread among them: 8 bytes)
 budget log "azl::{anonymous}::EmitLostLocked" 16
 budget log "azl::{anonymous}::FoldMissesLocked" 24
+# The Download Play hub (phase 3, DESIGN-FASE3.md sez. 1 and 4): what a game thread pays on a dlp:FKCL / dlp:SRVR call. RunDlp is the
+# frame the hook's chain enters the hub with (Serve and the log lines are called from it; RunDlpHub is inlined in it); the functions
+# of the hub are in their own unit. The chains they add up to are held below (Tests/dlp_chain_report.py), and the whole path in the
+# emulator by Tests/chain_sim.
+# (RunDlp is 32 bytes. It was 40 once, for one release of the code: the trace of the commands (debug only, "dlpc: " lines) tested the debug level
+#  in RunDlp itself, which made the compiler keep the address of g_debug_level in a register across the function: 8 bytes more at EVERY debug
+#  level, in the frame of every hub command. The two trace functions test the level themselves, first thing, and leave at once at debug 0.
+#  So the budget is 32: the growth is a decision, and Tests/chain_sim holds the chains (296 / 412 for the tightest inline command).)
+budget uds_hle "azl::ctr::UdsHle::RunDlp" 32
+budget uds_hle "azl::ctr::UdsHle::EndInitializedSession" 16
+# (NoteDlpFirst is 48 - it was 32: its line names the thread that made the first call of the service and its priority - the hub's threads
+#  wait for each other's locks and a LightLock has no priority inheritance, so the game's dlp threads against the network thread's 0x2F is
+#  what the console test reads from it - and the two svc calls (svcGetThreadPriority, svcGetThreadId) take two locals and the registers that
+#  hold the service and the id across them. It runs once per service, at the first command, and it is not the tightest chain: RunDlp >
+#  NoteDlpFirst is 192 / 340 bytes in Tests/dlp_chain_report.py against 320 / 520, and the tightest chain of the hub is untouched.)
+budget uds_hle "azl::ctr::{anonymous}::NoteDlpFirst" 48
+budget uds_hle "azl::ctr::{anonymous}::NoteDlpTrouble" 40
+# The trace of the hub's commands: the request words and the clock (DlpTraceRequest), the line (DlpTraceReply: a LogLine and a handful of
+# locals; its chain is a sibling of NoteCommand's and Tests/chain_sim reads it with a window). Both are called by RunDlp before it calls
+# NoteCommand, which must stay its last call (a tail call: RunDlp's frame is gone when NoteCommand's Log() runs). DlpTraceReply remembers
+# up to six replies per command and window (an array of u16 in the static table, not on the stack): its frame stayed at 64.
+budget uds_hle "azl::ctr::{anonymous}::DlpTraceRequest" 24
+budget uds_hle "azl::ctr::{anonymous}::DlpTraceReply" 72
+budget uds_hle "azl::ctr::{anonymous}::WaitForJoin" 48
+# (The answer to a request nobody could serve - success for the commands that cannot fail, the failure for the others - is AnswerUnserved, and the test
+#  that a request is in flight before OnGameUdsStarting returns is RequestInFlight: both out of line, so that Serve (40) and OnGameUdsStarting (24) keep the
+#  frames they had before those branches, which the tightest chain of the 512-byte thread pays: a growth is a decision, and the chain test pins what they cost)
+budget dlp_hub "azl::DlpHub::Serve" 40
+budget dlp_hub "azl::DlpHub::Post" 40
+budget dlp_hub "azl::DlpHub::PollPending" 32
+budget dlp_hub "azl::DlpHub::OnGameUdsStarting" 24
+budget dlp_hub "azl::DlpHub::AnswerUnserved" 32
+budget dlp_hub "azl::DlpHub::RequestInFlight" 24
+budget dlp_hub "azl::DlpHub::OnSessionClosed" 40
+budget dlp_hub "azl::DlpHub::RunHere" 32
+# The small functions behind them. AlwaysSucceeds and EndsRole are the two tables of the Serve branch above (a game thread calls them), Stamp is the
+# network thread's liveness stamp (Tick, at its start and at its end: a long Tick must not make the next requester find the thread dead), and
+# SetPlayerName is the plugin's own call at start (the console's profile name for every list): none of the four may grow a frame.
+budget dlp_hub "azl::DlpHub::AlwaysSucceeds" 8
+budget dlp_hub "azl::DlpHub::EndsRole" 8
+budget dlp_hub "azl::DlpHub::Stamp" 16
+budget dlp_hub "azl::DlpHub::SetPlayerName" 24
+# The IpcResolver of the lobby: the address of a buffer of the game is mapped by a range test with no local and no call (it runs inside
+# every command that has a buffer, under Serve; DESIGN-FASE3 sez. 5.3: at most 76 bytes, 0 measured)
+budget plugin "azl::ctr::{anonymous}::MapGameAddress" 76
+# Every function of the hub's unit - the hub itself and the lobby's headers compiled into it - has a static frame of 64 bytes at the
+# most (Tests/dlp_stack_check.sh holds 48 on the headers alone; PollScan, which holds the lobby heard, is the one 64)
+if [ -f "$WORK/Build/dlp_hub.su" ]; then
+  awk -F'\t' '($2 + 0 > 64) || ($3 !~ /static/) { print "stack usage FAILED: a function of the hub unit has a frame over 64 bytes or a dynamic one: " $1 " " $2 " " $3; bad = 1 } END { exit bad }' \
+      "$WORK/Build/dlp_hub.su" || FAILED=1
+else
+  echo "stack usage FAILED: no stack listing for Sources/azl/dlp_hub.cpp"
+  FAILED=1
+fi
 [ "$FAILED" = 0 ] && echo "stack usage: all frames within budget"
 
 # ---- which Python: the call graph check needs any Python 3, the chain test one with `unicorn` too ---------------------------
@@ -144,6 +209,22 @@ else
   if [ -f "$WORK/cg.dis" ]; then
     "$PY_ANY" Tests/callgraph_check.py "$WORK/cg" || FAILED=1
   fi
+fi
+
+# ---- the chains of the Download Play hub: every way a game thread enters it, added up over the call graph of this build ---------
+# (Tests/dlp_chain_report.py: the frames and the call edges of every unit - the .ci files of this build - joined by symbol, the
+#  libraries' frames read from the machine code of the ELF, tail calls honoured, against the ceilings of Tests/chain_sim/chain_sim.py;
+#  and the proofs that an inline command reaches nothing of LobbyNet but the clock and that no row reaches Log() with a format.
+#  It runs in the build's own container: it needs the demangler of the toolchain.)
+if [ ! -f "$WORK/cg.dis" ]; then
+  echo "stack usage FAILED: no disassembly of the plugin for Tests/dlp_chain_report.py"
+  FAILED=1
+else
+  REPO_WIN="$(pwd -W 2>/dev/null || pwd)"
+  WORK_WIN="$(cd "$WORK" && (pwd -W 2>/dev/null || pwd))"
+  MSYS_NO_PATHCONV=1 docker run --rm -v "$WORK_WIN:/src" -v "$REPO_WIN:/repo:ro" -w /src pablomk7/libctrpf:0.8.0 bash -c \
+      'python3 /repo/Tests/dlp_chain_report.py --selftest && python3 /repo/Tests/dlp_chain_report.py /src/Build --src /src --repo /repo --path-map /src=/src --dis /src/cg.dis --gate' \
+      || FAILED=1
 fi
 
 # ---- the whole chain, libc included ------------------------------------------------------------------------------

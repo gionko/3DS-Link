@@ -48,6 +48,24 @@
 # Log() / DebugEvent() (azl/printf_lite.hpp) against newlib's, and the formats of every Log() call in the sources.
 # screen_text_test covers what the screen says about the game's memory (the reading, the mode, the limits, when a warning is told and
 # told again) and about frames lost (too slow a reader or no reader at all, from the game's UDS calls).
+# dlp_lobby_test, dlp_ipc_test, dlp_lobby_sim_test, dlp_adv_lobby_test and dlp_adv_ipc_test cover the fake Download Play lobby (azl/dlp_types.hpp, dlp_lobby.hpp and
+# dlp_ipc.hpp: pure headers, no engine, no kernel, never more than 4 players, no heap): the searcher's and the creator's logic over an in-memory virtual network
+# (every command x state, the four messages lost, doubled and late, the timers on a clock that wraps), the IPC front-end (the words of every command, the records
+# byte by byte, the game's buffers with canaries, ProbeOnly against DlpFkclHle), whole rooms of 2 to 4 consoles running the command sequences of Battle Royale and
+# Triple Deluxe, and the same modules attacked (the ambiguities, a faulty engine, bad pointers, threads). They stop at the first undefined behaviour.
+# dlp_net_adv_test is its adversarial half (the engine a game has, failures and stale lobbies, the ring, six nodes, a spectator, the beacons the engine files, another lobby of the game in the room, a peer
+# that leaves or is kicked, the room's member lists, a service that stops, admissions closed and never accepted); both use Tests/dlp_net_rig.hpp.
+# dlp_net_churn_test is the third (2026-10-29, the second review round: a console that is Connecting again when a fellow's departure refresh arrives, a leave / rejoin / leave inside 3 s,
+# the guards of the refresh, a lobby closed to new players, and a churn fuzz of random joins, leaves, kicks and rejoins after which every roster and every message must agree).
+# dlp_net_extra_test is the fourth: what the second mutation round showed missing (the table of lobbies heard, an engine no lobby used, the ring, who gets the departure's Logoff,
+# a game's host and a lobby client staying silent, foreign Logoffs and node maps, the creator's goodbye, the game's own connect path, the debug capture, 24.8 days of silence, no memory).
+# dlp_net_test covers the same lobby over the REAL UDS engine (phase 2: azl/dlp_lobby_net.hpp, the adapter, and the pieces the engine got for it): consoles that are engines joined by the in-memory room, the
+# lobby heard and joined, the whole sequence of Triple Deluxe and then the game's own UDS on the same engines (clean), an admission closed or full, four players, a client that leaves and a creator that goes,
+# the game that starts nwm::UDS under the lobby, two lobbies in one room, the messages of strangers and copies, the ring of 8, and the calls that must allocate nothing. dlp_room_probe is the same against a
+# real room server (Tests/integration.sh). Tests/dlp_net_stack_check.sh builds the adapter and the engine for the plugin's target and holds the frames and the static storage.
+# Tests/dlp_stack_check.sh (with Tests/dlp_stack_probe.cpp) builds the same three headers for the plugin's own target, with arm-none-eabi-g++ and the flags of the Makefile, and holds what the x86-64
+# tests cannot see: the frame of every function (48 bytes, PollScan and Dispatch 64), the frames added up from each function down to its deepest call out of the module (160), no recursion, no dynamic
+# frame, the sizes on ARM32 (the lobby 272 bytes, the service 40) and a wrapper for every public function. It looks for the compiler in /opt/devkitpro/devkitARM/bin too, and is skipped aloud where there is none.
 # Tests/policy_check.sh (run first) reads the sources for the defaults and switches that must not change by accident:
 # sleep_stop off, debug 0, rcvbuf_kb 64, the ini keys the plugin knows, the scan filter that only counts, the one
 # place where a log file is opened and the level check in front of it.
@@ -72,13 +90,50 @@ g++ $CXXFLAGS Tests/test_main.cpp $CORE "$OUT"/enet_*.o -o "$OUT/test_main"
 g++ $CXXFLAGS Tests/ring_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/ring_test"
 g++ $CXXFLAGS Tests/dedupe_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dedupe_test"
 g++ $CXXFLAGS Tests/link_policy_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/link_policy_test"
+# enet_path_test: the ENet client's data path (what a service call reads, when the acknowledgements go, the counters); the link wraps
+# the platform layer's three socket calls so that the test can count them, and ENet's clock so that it can hold it
+g++ $CXXFLAGS Tests/enet_path_test.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_wait -Wl,--wrap=enet_time_get -o "$OUT/enet_path_test"
 g++ $CXXFLAGS Tests/reloc_test.cpp Sources/azl/arm_reloc.cpp -o "$OUT/reloc_test"
 g++ $CXXFLAGS Tests/soc_plan_test.cpp -o "$OUT/soc_plan_test"
+g++ $CXXFLAGS Tests/text_search_guard_test.cpp Sources/ctr/text_search_guard.cpp -o "$OUT/text_search_guard_test"
+g++ $CXXFLAGS Tests/plugin_compare_test.cpp -o "$OUT/plugin_compare_test"
 g++ $CXXFLAGS Tests/screen_text_test.cpp -o "$OUT/screen_text_test"
 g++ $CXXFLAGS Tests/log_files_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/log_files_test"
 g++ $CXXFLAGS Tests/line_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/line_test"
 g++ $CXXFLAGS Tests/sleep_crumbs_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/sleep_crumbs_test"
 g++ $CXXFLAGS Tests/capture_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/capture_test"
+# The fake Download Play lobby: header-only modules (Includes/azl/dlp_*.hpp) and the in-memory network of the tests (Tests/dlp_fakenet.hpp, found beside the
+# tests), so there is nothing to link. ASan/UBSan like the rest: each of these tests defines __ubsan_default_options (halt_on_error=1) and so stops at the
+# first undefined behaviour. dlp_lobby_sim_test takes about 35 s.
+g++ $CXXFLAGS Tests/dlp_lobby_test.cpp -o "$OUT/dlp_lobby_test"
+g++ $CXXFLAGS Tests/dlp_ipc_test.cpp -o "$OUT/dlp_ipc_test"
+g++ $CXXFLAGS Tests/dlp_lobby_sim_test.cpp -o "$OUT/dlp_lobby_sim_test"
+g++ $CXXFLAGS Tests/dlp_adv_lobby_test.cpp -o "$OUT/dlp_adv_lobby_test"
+g++ $CXXFLAGS Tests/dlp_adv_ipc_test.cpp -o "$OUT/dlp_adv_ipc_test"
+# The fake lobby on the REAL engine (Tests/dlp_net_test.cpp: engines joined by the in-memory room, an EngineLobbyNet and a DlpLobby on each; real time, about 40 s):
+# the adapter is one more source, like the core.
+g++ $CXXFLAGS Tests/dlp_net_test.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dlp_net_test"
+g++ $CXXFLAGS Tests/dlp_net_adv_test.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dlp_net_adv_test"
+g++ $CXXFLAGS Tests/dlp_net_churn_test.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dlp_net_churn_test"
+# (dlp_net_extra_test moves the clock by 2^31 ms and fails an allocation, both through the linker: --wrap of platform::NowMs and of malloc)
+g++ $CXXFLAGS Tests/dlp_net_extra_test.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=_ZN3azl8platform5NowMsEv -Wl,--wrap=malloc -o "$OUT/dlp_net_extra_test"
+# The hub of the plugin (phase 3, Tests/dlp_hub_test.cpp: real threads, real engines, about 65 s). Its thread spy is the linker's: every UdsEngine member the adapter
+# calls is wrapped (the mangled names; the test header says how they were got), and the same source is built a second time with ThreadSanitizer (no ASan: the two cannot be
+# combined; the CORE sources are compiled with it too) because some synchronisation mutants are visible only there.
+HUB_WRAP="-Wl,--wrap=_ZN3azl9UdsEngine18InitializeForLobbyEmPKt -Wl,--wrap=_ZN3azl9UdsEngine17BeginHostingLobbyEjhhhPKhj
+  -Wl,--wrap=_ZN3azl9UdsEngine17ConnectBeginLobbyERKSt5arrayIhLm6EE -Wl,--wrap=_ZNK3azl9UdsEngine11ConnectPollEv
+  -Wl,--wrap=_ZNK3azl9UdsEngine12HeardLobbyAtEjjPNS0_10HeardLobbyE -Wl,--wrap=_ZN3azl9UdsEngine12PrepareLobbyEv
+  -Wl,--wrap=_ZNK3azl9UdsEngine12NodeSnapshotEPtS1_ -Wl,--wrap=_ZN3azl9UdsEngine18GetNodeInformationEtPNS_8NodeInfoE
+  -Wl,--wrap=_ZN3azl9UdsEngine15PopLobbyMessageEPhS1_jPj -Wl,--wrap=_ZN3azl9UdsEngine6SendToEthjhPKhm
+  -Wl,--wrap=_ZN3azl9UdsEngine11EjectClientEt -Wl,--wrap=_ZN3azl9UdsEngine8ShutdownEv
+  -Wl,--wrap=_ZN3azl9UdsEngine18SetApplicationDataEPKhj -Wl,--wrap=_ZN3azl9UdsEngine22UpdateNetworkAttributeEth
+  -Wl,--wrap=_ZNK3azl9UdsEngine11initializedEv"
+g++ $CXXFLAGS Tests/dlp_hub_test.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_hub.cpp $CORE "$OUT"/enet_*.o $HUB_WRAP -o "$OUT/dlp_hub_test"
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/dlp_hub_test.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_hub.cpp $CORE "$OUT"/enet_*.o $HUB_WRAP -o "$OUT/dlp_hub_test_tsan"
+# The Download Play wiring of plugin.cpp (the table of games, the seed, the resolver of the game's buffers, the hub's configuration) cannot be built on the PC (libctrpf): the
+# test compiles that text, cut out of plugin.cpp unchanged.
+python3 Tests/plugin_dlp_extract.py Sources/ctr/plugin.cpp "$OUT/plugin_dlp_slice.inc"
+g++ $CXXFLAGS -I"$OUT" Tests/plugin_dlp_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -o "$OUT/plugin_dlp_test"
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/settings_test.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp -o "$OUT/settings_test"
 # TitleShare's own C files (the vendored copies): the app's keyed reading of a game's icon (ncch_icon_test) and its SHA-256 (paths.cpp) use them
 for f in aes sdcrypt sha256 contentpath ncchname; do
@@ -125,22 +180,45 @@ gcc -O1 -g -Wall -DLOGROT_MAX_BYTES=4096 -c ConfigApp/titleshare_host/logrot.c -
 g++ $CXXFLAGS -DLOGROT_MAX_BYTES=4096 -IConfigApp/titleshare/source -IConfigApp/titleshare_host Tests/settings_test/log_module_test.cpp "$OUT"/lm_log.o "$OUT"/lm_logrot.o "$OUT"/th_hostcfg.o -o "$OUT/log_module_test"
 # ncch_icon_test: the app's keyed reading of a game's icon file against a made-up title
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/ncch_icon_test.cpp ConfigApp/source/ncch_icon.cpp ConfigApp/source/games.cpp "$OUT"/ts_*.o -o "$OUT/ncch_icon_test"
-g++ $CXXFLAGS Tests/room_integration.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_integration"
+# (room_integration and room_ack_probe talk to a real room and read ENet's clock: a monotonic one, Tests/mono_clock.cpp - the wall clock of a VM steps by seconds)
+g++ $CXXFLAGS Tests/room_integration.cpp Tests/mono_clock.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/room_integration"
 g++ $CXXFLAGS Tests/room_probe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_probe"
+# dlp_room_probe: the fake lobby over a real room (Tests/integration.sh runs it; it needs the monotonic clock like room_integration)
+g++ $CXXFLAGS Tests/dlp_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_room_probe"
 g++ $CXXFLAGS Tests/room_routing_probe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_routing_probe"
 g++ $CXXFLAGS Tests/room_observe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_observe"
+# room_ack_probe: the data path against the real room with a LAN-like wire (Tests/room_ack.sh runs it); the link wraps the send to classify the datagrams and the receive to count the empty ones
+g++ $CXXFLAGS -DP5A_COUNTERS=1 Tests/room_ack_probe.cpp Tests/mono_clock.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_time_get -o "$OUT/room_ack_probe"
 
 if [ -z "$BUILD_ONLY" ]; then
   "$OUT/test_main"
   "$OUT/ring_test"
   "$OUT/dedupe_test" $DEDUPE_TRACES
   "$OUT/link_policy_test"
+  "$OUT/enet_path_test"
   "$OUT/soc_plan_test"
+  "$OUT/text_search_guard_test"
+  "$OUT/plugin_compare_test"
   "$OUT/screen_text_test"
   "$OUT/log_files_test"
   "$OUT/line_test"
   "$OUT/sleep_crumbs_test"
   "$OUT/capture_test"
+  timeout 1200 "$OUT/dlp_lobby_test"
+  timeout 1200 "$OUT/dlp_ipc_test"
+  timeout 1200 "$OUT/dlp_lobby_sim_test"
+  timeout 1200 "$OUT/dlp_adv_lobby_test"
+  timeout 1200 "$OUT/dlp_adv_ipc_test"
+  timeout 1200 "$OUT/dlp_net_test"
+  timeout 1200 "$OUT/dlp_net_adv_test"
+  timeout 1200 "$OUT/dlp_net_churn_test"
+  timeout 1200 "$OUT/dlp_net_extra_test"
+  timeout 1200 "$OUT/dlp_hub_test"
+  timeout 1200 "$OUT/dlp_hub_test_tsan"
+  timeout 1200 "$OUT/plugin_dlp_test"
+  python3 Tests/dlp_chain_report.py --selftest
+  bash Tests/dlp_stack_check.sh
+  bash Tests/dlp_net_stack_check.sh
   "$OUT/settings_test"
   "$OUT/games_test"
   "$OUT/paths_test"

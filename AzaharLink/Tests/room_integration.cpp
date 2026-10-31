@@ -356,12 +356,32 @@ namespace {
 // (type and the sequence number the test put in the first two bytes of the data). Stall(true) makes it
 // stop servicing its socket altogether: no acknowledgements, nothing read, like a server whose link to
 // us died.
+std::atomic<int> g_stub_drop_connects{0};
+std::atomic<int> g_stub_dropped{0};
+ENetHost* g_stub_drop_host = nullptr;
+// ENet's intercept of the stub's host: the datagram whose first command is a CONNECT (ENet command 2) is swallowed while the count lasts.
+int StubInterceptConnect(ENetHost* host, ENetEvent*) {
+    if (host != g_stub_drop_host || g_stub_drop_connects.load() <= 0 || host->receivedDataLength < 3) {
+        return 0;
+    }
+    const u16 peer_id = static_cast<u16>((host->receivedData[0] << 8) | host->receivedData[1]);
+    const std::size_t head = (peer_id & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME) ? 4 : 2;
+    if (host->receivedDataLength > head && (host->receivedData[head] & ENET_PROTOCOL_COMMAND_MASK) == ENET_PROTOCOL_COMMAND_CONNECT) {
+        --g_stub_drop_connects;
+        ++g_stub_dropped;
+        return 1;
+    }
+    return 0;
+}
+
 class StubRoom {
 public:
     struct Got {
         u8 type;
         u16 seq;
         const void* peer = nullptr; // the connection it came through (the server's end: one per client session)
+        bool unsequenced = false;   // it came as an ENet UNSEQUENCED packet (not retried, not held behind a reliable one)
+        Mac destination{};          // the 802.11 destination of the frame
     };
     StubRoom() {
         ENetAddress address{};
@@ -430,6 +450,19 @@ public:
         std::lock_guard<std::mutex> l(m_);
         outbox_.push_back(std::move(message));
     }
+    /// The next `n` ENet CONNECT datagrams are swallowed (the room that is not there yet, or a datagram lost): ENet sees nothing of them.
+    void DropConnects(int n) {
+        g_stub_drop_host = host_;
+        g_stub_dropped = 0;
+        g_stub_drop_connects = n;
+        if (host_) {
+            host_->intercept = StubInterceptConnect;
+        }
+    }
+    /// How many of them were swallowed so far.
+    int DroppedConnects() const {
+        return g_stub_dropped.load();
+    }
 
 private:
     void Loop() {
@@ -465,13 +498,13 @@ private:
                     peer_ = event.peer;
                     ++connects_;
                 } else if (event.type == ENET_EVENT_TYPE_RECEIVE) {
-                    OnMessage(event.peer, event.packet->data, event.packet->dataLength);
+                    OnMessage(event.peer, event.packet->data, event.packet->dataLength, event.packet->flags);
                     enet_packet_destroy(event.packet);
                 }
             }
         }
     }
-    void OnMessage(ENetPeer* peer, const u8* data, std::size_t size) {
+    void OnMessage(ENetPeer* peer, const u8* data, std::size_t size, enet_uint32 flags) {
         if (size == 0) {
             return;
         }
@@ -482,6 +515,10 @@ private:
         } else if (data[0] == room::IdWifiPacket) {
             constexpr std::size_t kSeqAt = 19 + kLlcHeaderSize + kSecureDataHeaderSize; // first data byte
             Got g{size > 1 ? data[1] : u8(0xFF), 0, peer};
+            g.unsequenced = (flags & ENET_PACKET_FLAG_UNSEQUENCED) != 0;
+            if (size >= 15) {
+                std::memcpy(g.destination.data(), data + 9, 6); // (room::EncodeWifiPacket: id, type, channel, two MACs)
+            }
             if (g.type == static_cast<u8>(WifiPacket::Type::Data) && size >= kSeqAt + 2) {
                 g.seq = LoadBE16(data + kSeqAt);
             }
@@ -608,6 +645,55 @@ static void TestEnetPacketLimit() {
         CHECK_EQ(sizes[1], std::size_t(50000));
     }
     CHECK(client.room.joined()); // (no abort, no crash; the sanitizers watch the rest)
+}
+
+// LAT-14, the first half: ENet starts a connection with a round-trip estimate of 500 ms, and a CONNECT that is lost is resent after 500,
+// then 1000 more, then 2000: three joins in 62 took 1.5 to 3.6 s because the room was not there at the first attempt. With 100 ms the
+// resends are at 100, 300, 700, 1500.
+static void TestConnectRetry() {
+    std::printf("join: a CONNECT that is lost is resent after 100 ms, 200 more, 400 more (not 500, 1000, 2000)\n");
+    for (int lost = 1; lost <= 2; ++lost) {
+        StubRoom server;
+        server.DropConnects(lost);
+        TxClient client(server, false);
+        const auto began = std::chrono::steady_clock::now();
+        const bool joined = client.Join();
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+        std::printf("  %d CONNECT swallowed: joined after %.2f s\n", lost, seconds);
+        CHECK(joined);
+        CHECK_EQ(server.DroppedConnects(), lost);
+        CHECK(seconds >= 0.09);                     // (the first one was lost: not at once)
+        CHECK(seconds < (lost == 1 ? 0.45 : 0.9));  // (before: 0.5 s and 1.5 s)
+    }
+}
+
+// LAT-5: a frame the game sent with the broadcast flag to a node the room has is addressed to that node's MAC and still goes out the way a
+// broadcast does: an ENet UNSEQUENCED packet (the room must never hold it behind a reliable one, and the radio does not retry it). A frame
+// without the flag to the same MAC is reliable, as ever.
+static void TestAddressedFrameIsUnreliable() {
+    std::printf("the room client: a broadcast-flag frame addressed to a member goes UNSEQUENCED, a unicast one reliable\n");
+    StubRoom server;
+    TxClient client(server, true); // radio_like = 1
+    CHECK(client.Join());
+    server.Forget();
+    const Mac member = {0x00, 0x1F, 0x32, 0x00, 0x00, 0x05};
+    WifiPacket flagged = TxFrame(1, 100);
+    flagged.destination_address = member;
+    flagged.broadcast_flag = true;
+    WifiPacket plain = TxFrame(2, 100);
+    plain.destination_address = member;
+    WifiPacket broadcast = TxFrame(3, 100);
+    client.room.SendWifiPacket(flagged);
+    client.room.SendWifiPacket(plain);
+    client.room.SendWifiPacket(broadcast);
+    CHECK(WaitFor([&] { return server.Count() >= 3; }));
+    const auto got = server.Frames();
+    CHECK_EQ(got.size(), std::size_t(3));
+    if (got.size() == 3) {
+        CHECK(got[0].seq == 1 && got[0].unsequenced && got[0].destination == member);   // (before: reliable)
+        CHECK(got[1].seq == 2 && !got[1].unsequenced && got[1].destination == member);
+        CHECK(got[2].seq == 3 && got[2].unsequenced && got[2].destination == kBroadcastMac);
+    }
 }
 
 static void TestTxQueueStalledServer() {
@@ -1863,9 +1949,141 @@ static void TestWifiGate(const std::string& host, u16 port, const std::string& h
     CHECK_RULES();
 }
 
+// The datagram sockets of this process (the room clients' sockets and the stub's).
+static std::set<int> DatagramSockets() {
+    std::set<int> fds;
+    for (int f = 3; f < 256; ++f) {
+        struct stat st;
+        int type = 0;
+        socklen_t length = sizeof(type);
+        if (fstat(f, &st) == 0 && S_ISSOCK(st.st_mode) && getsockopt(f, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_DGRAM) {
+            fds.insert(f);
+        }
+    }
+    return fds;
+}
+
+// LAT-14, the second half: the WiFi goes away for a few seconds and comes back. ENet counts the silence meanwhile: the packets it
+// sent are not answered, each retry waits twice as long as the one before (a retry that comes seconds after the link is back), and the
+// 5 s it allows an unanswered packet run out although the link is fine - on the console the room was declared lost 4 s after the socket
+// worked again (21 Oct). When the room speaks again while packets of ours have gone unanswered for half a second, the client pings it;
+// the answer restarts that count. A second member keeps sending frames through the room, as a game does. The outage is silent: the
+// client's socket is swapped for another one that nobody answers (what a WiFi that is away does before the console notices it).
+// One attempt. `last`: a lost room link is a failure of the test (the first attempt only reports it, see TestWifiGlitchKeepsTheRoom). Returns whether the link was kept.
+static bool WifiGlitchAttempt(const std::string& host, u16 port, bool last) {
+    std::printf("the WiFi goes away for 3.7 s (datagrams vanish) and comes back: the room link is kept (a ping when the room speaks again restarts ENet's count of the silence)\n");
+    auto config = [&](const char* nick, const char* id) {
+        RoomClient::Config c;
+        c.host = host;
+        c.port = port;
+        c.nickname = nick;
+        c.console_id_hash = id;
+        c.game_name = "Test Game";
+        c.game_id = 0x0004000000164800ULL;
+        return c;
+    };
+    const std::set<int> before = DatagramSockets();
+    RoomClient a, b;
+    std::atomic<u32> got{0};
+    std::atomic<int> a_error{0};
+    a.SetWifiCallback([&](const WifiPacket& p) {
+        if (p.type == WifiPacket::Type::Data) {
+            ++got;
+        }
+    });
+    a.SetStateCallback([&](RoomClient::State, RoomClient::Error e) {
+        if (e != RoomClient::Error::None) {
+            a_error = static_cast<int>(e);
+        }
+    });
+    CHECK(a.Start(config("GlitchA001", "3ds-glitch-a")));
+    CHECK(WaitFor([&] { return a.joined(); }, 10000));
+    const std::set<int> with_a = DatagramSockets();
+    CHECK(b.Start(config("GlitchB001", "3ds-glitch-b")));
+    CHECK(WaitFor([&] { return b.joined(); }, 10000));
+    int fd = -1;
+    for (const int f : with_a) {
+        if (!before.count(f)) {
+            fd = f;
+        }
+    }
+    CHECK(fd >= 0);
+    if (fd < 0) {
+        return false;
+    }
+    std::atomic<bool> sending{true};
+    std::thread sender([&] {
+        for (u16 seq = 0; sending.load(); ++seq) {
+            b.SendWifiPacket(TxFrame(seq, 100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
+    });
+    CHECK(WaitFor([&] { return got.load() >= 20; }, 5000));
+    const int hole = socket(AF_INET, SOCK_DGRAM, 0);     // a socket nobody talks to: what the client sends from it, the room ignores
+    int one = 1;
+    setsockopt(hole, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    fcntl(hole, F_SETFL, fcntl(hole, F_GETFL) | O_NONBLOCK);
+    const int saved = dup(fd);
+    dup2(hole, fd);                                      // the client's datagrams go nowhere, nothing comes in
+    std::this_thread::sleep_for(std::chrono::milliseconds(3700));
+    dup2(saved, fd);                                     // ... and back
+    close(saved);
+    close(hole);
+    const auto restored_at = std::chrono::steady_clock::now();
+    const u32 got_at_restore = got.load();
+    // ENet gave up on the room 4 s after the socket worked again, on the console: wait for longer than that
+    double lost_after = -1;
+    for (int i = 0; i < 80; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!a.joined()) {
+            lost_after = std::chrono::duration<double>(std::chrono::steady_clock::now() - restored_at).count();
+            break;
+        }
+    }
+    sending = false;
+    sender.join();
+    std::printf("  8 s after the WiFi was back: %s (frames received since: %u)\n",
+                lost_after < 0 ? "still in the room" : "the room link was declared lost", got.load() - got_at_restore);
+    if (lost_after >= 0) {
+        std::printf("  declared lost %.1f s after the link came back, error %s\n", lost_after,
+                    RoomClient::ErrorName(static_cast<RoomClient::Error>(a_error.load())));
+    }
+    if (last || lost_after < 0) {
+        CHECK(lost_after < 0);
+        CHECK(a_error.load() == 0);
+        CHECK(got.load() - got_at_restore >= 50); // (the frames flow again)
+    }
+    a.Stop();
+    b.Stop();
+    return lost_after < 0;
+}
+
+// The room runs on the wall clock of the machine, and that of a VM (Docker Desktop on Windows) steps by +3.3 s about every 30 s: a step inside the 3.7 s of the outage
+// and the ROOM gives up the silent client itself (its own 5 s rule), whatever the client does (seen with a packet capture: in every lost run the room stopped sending
+// to the client, and its clock had stepped; with the room's clock made monotonic 30 runs of 30 kept the link). The client's bug of 1.0.4 loses the link every time, so
+// it loses it in the second attempt too; a step of the room's clock in both attempts is rare (1 in 70).
+static void TestWifiGlitchKeepsTheRoom(const std::string& host, u16 port) {
+    if (!WifiGlitchAttempt(host, port, false)) {
+        std::printf("  (the room link was lost: once more - if the room's own clock stepped meanwhile, the second attempt is the real one)\n");
+        WifiGlitchAttempt(host, port, true);
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc == 4 && (std::string(argv[1]) == "--wifi-glitch" || std::string(argv[1]) == "--wifi-glitch-once")) { // (only this test, against one room: <host> <port>; -once: one attempt)
+        SetLogSink([](const char*) {});
+        if (std::string(argv[1]) == "--wifi-glitch-once") {
+            WifiGlitchAttempt(argv[2], static_cast<u16>(std::atoi(argv[3])), true);
+        } else {
+            TestWifiGlitchKeepsTheRoom(argv[2], static_cast<u16>(std::atoi(argv[3])));
+        }
+        std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
+        return g_failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--tx-queue") { // (no room server needed)
         SetLogSink([](const char*) {});
+        TestConnectRetry();
+        TestAddressedFrameIsUnreliable();
         TestTxQueueStalledServer();
         TestEnetPacketLimit();
         TestPauseIsRemembered();
@@ -1890,6 +2108,8 @@ int main(int argc, char** argv) {
     const u16 port1 = static_cast<u16>(std::atoi(argv[2])), port2 = static_cast<u16>(std::atoi(argv[4]));
     TestRoomBasics(host1, port1, host2, port2);
     TestUdsOverRealRoom(host1, port1);
+    TestConnectRetry();
+    TestAddressedFrameIsUnreliable();
     TestTxQueueStalledServer();
     TestEnetPacketLimit();
     TestPauseIsRemembered();
@@ -1906,6 +2126,7 @@ int main(int argc, char** argv) {
     TestLinkLoss(host1, port1);
     TestOldLinkStillListed(host1, port1);
     TestOwnPause(host1, port1);
+    TestWifiGlitchKeepsTheRoom(host1, port1);
     TestWifiGate(host1, port1, host2, port2);
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

@@ -334,6 +334,15 @@ void LogFiles::BeginShutdown() {
     __atomic_store_n(&shutdown_deadline_ms_, platform::NowMs() + limits_.exit_capture_ms, __ATOMIC_RELAXED);
 }
 
+bool LogFiles::CaptureDue(u64 now_ms, u32 ring_used, bool early) const {
+    const u64 last = __atomic_load_n(&last_capture_ms_, __ATOMIC_RELAXED);
+    return early || last == 0 || ring_used >= limits_.capture_ring_high || now_ms - last >= limits_.capture_every_ms;
+}
+
+void LogFiles::NoteCapturePass(u64 now_ms) {
+    __atomic_store_n(&last_capture_ms_, now_ms == 0 ? 1 : now_ms, __ATOMIC_RELAXED);
+}
+
 bool LogFiles::DrainDebug(bool final) {
     // One pass at a time: the writer thread and a switch-off (menu thread) may both come here.
     platform::LockGuard drain_lock(drain_mutex_);
@@ -352,6 +361,7 @@ bool LogFiles::DrainDebug(bool final) {
     // nothing). A pass writes what it formatted every 64 KB, so the buffer stays at 68 KB (heap, and only with the log
     // on). Until 2026-10-20 the writes were 16 KB and each was flushed: four times the calls into the file system, and a
     // flush costs the card as much as a small write.
+    NoteCapturePass(platform::NowMs());
     constexpr std::size_t kWriteBytes = 64 * 1024;   // one write to the card: the most a "service call" of this pass is
     constexpr std::size_t kPassBytes = 256 * 1024;   // ... and the most text one pass of the writer puts on the card
     constexpr u64 kPassMs = 200;

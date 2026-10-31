@@ -111,6 +111,11 @@ enet_host_create (const ENetAddress * address, size_t peerCount, size_t channelL
 
     host -> intercept = NULL;
 
+    host -> azlSkipEmptyRecv = 1;
+    host -> azlMaxDatagrams = ENET_AZL_READ_MAX_DATAGRAMS;
+    host -> azlAckHoldEvents = ENET_AZL_ACK_HOLD_EVENTS;
+    host -> azlAckHoldMs = ENET_AZL_ACK_HOLD_MS;
+
     enet_list_clear (& host -> dispatchQueue);
 
     for (currentPeer = host -> peers;

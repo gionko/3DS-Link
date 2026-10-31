@@ -118,6 +118,26 @@ int main(int argc, char** argv) {
         CHECK_EQ(got[0].data[9], 10);
         CHECK_EQ(got[1].data[9], 11);
     }
+    // (6) LAT-5: a frame the game sent with the broadcast flag to ONE node goes out addressed to that node's MAC and as an ENet UNSEQUENCED
+    //     packet (radio_like >= 1: IsBroadcastDelivery); the real room hands it to that member alone, exactly as it does a reliable one. Twenty
+    //     in a row, and one to an unknown MAC (what the engine never sends: the room drops it, nobody gets it, the sender stays).
+    for (Member* m : all) {
+        m->Take(); // (the two broadcasts of (5) are still in the lists of B and C)
+    }
+    A.client.SetFastData(1);
+    for (u8 i = 0; i < 20; ++i) {
+        WifiPacket f = Frame(ma, mb, static_cast<u8>(30 + i));
+        f.broadcast_flag = true;
+        A.client.SendWifiPacket(f);
+    }
+    r = count("A -> B's MAC, broadcast flag (unsequenced) x20");
+    CHECK(r == std::vector<int>({0, 20, 0, 0}));
+    WifiPacket stray = Frame(ma, nobody, 60);
+    stray.broadcast_flag = true;
+    A.client.SendWifiPacket(stray);
+    r = count("A -> unknown MAC, broadcast flag (unsequenced)");
+    CHECK(r == std::vector<int>({0, 0, 0, 0}));
+    CHECK(A.client.joined());
     for (Member* m : all) {
         m->client.Stop();
     }

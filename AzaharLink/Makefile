@@ -32,8 +32,11 @@ ASFLAGS		:=	$(ARCH)
 # --wrap=srvGetServiceHandle lets ctr/soc.cpp hand libctru's socInit() a soc:U session even when the
 # game's exheader does not allow it (see soc.cpp). --wrap=free lets ctr/teardown.cpp stop
 # CTRPluginFramework's exit sequence from freeing memory that worker threads still use.
+# --wrap=...GetTextSize (Process::GetTextSize()) lets ctr/text_search_guard.cpp keep the framework's
+# startup search for the GSP call inside the game's code (Kirby Triple Deluxe / Planet Robobot).
 LDFLAGS		:= -T $(TOPDIR)/3gx.ld $(ARCH) -Os -Wl,--gc-sections,--strip-discarded,--strip-debug \
-				-Wl,--wrap=srvGetServiceHandle -Wl,--wrap=free
+				-Wl,--wrap=srvGetServiceHandle -Wl,--wrap=free \
+				-Wl,--wrap=_ZN18CTRPluginFramework7Process11GetTextSizeEv
 
 LIBS		:= -lctrpf -lctru
 LIBDIRS		:= 	$(CTRPFLIB) $(CTRULIB) $(PORTLIBS)
@@ -94,6 +97,10 @@ DEPENDS	:=	$(OFILES:.o=.d)
 # and shipped a stale plugin (it cost two hardware test rounds).
 $(OUTPUT).3gx : $(OUTPUT).elf $(TOPDIR)/$(PLGINFO)
 $(OUTPUT).elf : $(OFILES) $(TOPDIR)/3gx.ld $(TOPDIR)/Makefile
+
+# The build stamp of the log header (Sources/ctr/build_id.cpp) is made again whenever any other object was: the stamp says when the code
+# last changed. (The first C-stick build had a new main.cpp over a plugin.cpp of two days before, and its log said "1.0.3 (built Oct 23)".)
+build_id.o : $(filter-out build_id.o,$(OFILES))
 
 #---------------------------------------------------------------------------------
 # you need a rule like this for each extension you use as binary data

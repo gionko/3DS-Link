@@ -1047,6 +1047,47 @@ static void TestFlushes() {
     fs::remove_all(dir);
 }
 
+// The capture goes to the card in few, large passes (LogFileLimits::capture_every_ms): a pass is due when the time has gone by, when the ring
+// holds capture_ring_high bytes, or when something asks at once (the HOME button); a pass notes itself and takes the ring back to nothing.
+static void TestCaptureCadence() {
+    std::printf("the capture is written every capture_every_ms, or when the ring is high, or at once on request\n");
+    const fs::path dir = MakeTempDir("cadence");
+    DirFiles files;
+    LogFileLimits limits;
+    limits.capture_every_ms = 2000;
+    limits.capture_ring_high = 160 * 1024;
+    LogFiles log(&files, dir.string() + "/", platform::NowMs(), limits);
+    SetLogSink([&log](const char* line) { log.Append(line); });
+    CHECK(log.SetLevel(1, true));
+    DebugReset();
+    // no pass yet: the first is due at once
+    CHECK(log.CaptureDue(10000, 0, false));
+    log.NoteCapturePass(10000);
+    CHECK(!log.CaptureDue(10000, 0, false));
+    CHECK(!log.CaptureDue(11999, 0, false)); // 1999 ms later: not yet
+    CHECK(log.CaptureDue(12000, 0, false));  // 2000 ms later
+    // a ring that holds 160 KB is not left for the rest of the interval; one that holds a little less is
+    CHECK(!log.CaptureDue(10500, 160 * 1024 - 1, false));
+    CHECK(log.CaptureDue(10500, 160 * 1024, false));
+    // a request is at once
+    CHECK(log.CaptureDue(10500, 0, true));
+    // the ring's fill is readable, and a pass takes it back to nothing and notes itself
+    const std::vector<u8> payload(1500, 7);
+    for (int i = 0; i < 10; ++i) {
+        DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
+    }
+    CHECK(DebugRingUsedBytes() >= 10 * 1500);
+    const int flushes0 = files.flushes;
+    CHECK(!log.DrainDebug(false));
+    CHECK_EQ(files.flushes - flushes0, 1);
+    CHECK_EQ(DebugRingUsedBytes(), 0u);
+    CHECK(!log.CaptureDue(platform::NowMs(), 0, false)); // (it noted itself: the next is due in capture_every_ms)
+    CHECK(log.CaptureDue(platform::NowMs() + 2000, 0, false));
+    CHECK(log.SetLevel(0, false));
+    SetLogSink([](const char*) {});
+    fs::remove_all(dir);
+}
+
 // A thread above the writer never waits for a lock of the log (Tekken stuck at the publisher's screen with the log on,
 // 2026-10-20): while a LogLine of another thread holds the log's lock, Log() gives the line up at once and counts it; the
 // writer thread (marked) waits and writes; the writer says in the log how many lines were given up.
@@ -1725,6 +1766,7 @@ int main() {
     TestCaptureFileHeader();
     TestDrainIsBounded();
     TestFlushes();
+    TestCaptureCadence();
     TestNobodyWaitsForTheWriter();
     TestTheEndOfALaunchIsBounded();
     TestCaptureFileHasTheDietAndTheMarkers();

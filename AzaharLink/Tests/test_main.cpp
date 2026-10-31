@@ -24,6 +24,7 @@
 #include "azl/crypto.hpp"
 #include "azl/log.hpp"
 #include "azl/ndm_hle.hpp"
+#include "azl/room_members.hpp"
 #include "azl/room_proto.hpp"
 #include "azl/ticks.h"
 #include "azl/tx_queue.hpp"
@@ -4872,6 +4873,77 @@ static void TestRoomPresence() {
     CHECK_RULES();
 }
 
+// A player that stays in the room but tells it that it plays nothing (Azahar closed its emulation: no goodbye on the air) is
+// counted out of the game's session like one that left (Kirby Battle Royale 2026-10-28: the 3DS host waited 30 s for it).
+static void TestRoomMemberStopsPlaying() {
+    std::printf("room members: a player that plays nothing any more is taken out of the session after 3 s, like one that left\n");
+    g_rules.Reset();
+    std::memset(&g_stats, 0, sizeof(g_stats));
+    MockRoom room;
+    Bench host(room, 1), alice(room, 2), bob(room, 3);
+    for (Bench* b : {&host, &alice, &bob}) {
+        CHECK_EQ(b->Init(), 0u);
+    }
+    CHECK_EQ(host.BeginHosting(4), 0u);
+    CHECK_EQ(JoinBench(room, alice, host), 0u);
+    CHECK_EQ(JoinBench(room, bob, host), 0u);
+    host.Status();
+    // What Plugin::OnRoomInfo gives the engine: the MACs of the members that play something.
+    struct Seen {
+        const Bench* bench;
+        const char* game;
+        u64 id;
+    };
+    const auto playing = [](std::initializer_list<Seen> seen) {
+        std::vector<Mac> macs;
+        for (const Seen& s : seen) {
+            if (RoomMemberPlays(s.game, s.id)) {
+                macs.push_back(s.bench->console.mac);
+            }
+        }
+        return macs;
+    };
+    const u64 kGame = 0x00040000001C2100ull;
+    host.sent.Clear();
+    const u32 events = host.Signals(host.status_event);
+    host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "Kirby Battle Royale", kGame}, {&bob, "Kirby Battle Royale", kGame}}));
+    host.e().Tick(In(10000));
+    CHECK_EQ(host.Status().total_nodes, 3);
+    // Bob stops playing but stays in the room: listed with no title and no id. Within the debounce nothing happens ...
+    host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "Kirby Battle Royale", kGame}, {&bob, "", 0}}));
+    host.e().Tick(In(2500));
+    CHECK_EQ(host.Status().total_nodes, 3);
+    // ... and after it his node goes: once, the game told once, nothing on the wire.
+    host.e().Tick(In(4000));
+    ConnectionStatus st = host.Status();
+    CHECK_EQ(st.total_nodes, 2);
+    CHECK_EQ(st.node_bitmask, 3);
+    CHECK_EQ(st.changed_nodes, 0x0004);
+    CHECK_EQ(host.Signals(host.status_event), events + 1);
+    CHECK_EQ(NonBeacons(host), std::size_t(0));
+    CHECK_EQ(g_stats.node_removed[3], 1u);
+    // Alice stops playing and plays again within 2 s (a game started over): she stays.
+    host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "", 0}}));
+    host.e().Tick(In(2000));
+    host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "Kirby Battle Royale", kGame}}));
+    host.e().Tick(In(10000));
+    CHECK_EQ(host.Status().total_nodes, 2);
+    CHECK_EQ(host.Signals(host.status_event), events + 1);
+    // A member with another game's id is a member that plays: it is NOT counted out (cross-region lobbies stay as they were).
+    host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "Kirby Battle Royale", 0x0004000000AAAA00ull}}));
+    host.e().Tick(In(10000));
+    CHECK_EQ(host.Status().total_nodes, 2);
+    // ... and so is one with an id and no title, or a title and no id (a console that only knows its process name).
+    host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "", kGame}}));
+    host.e().Tick(In(10000));
+    CHECK_EQ(host.Status().total_nodes, 2);
+    host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "IbizaCit", 0}}));
+    host.e().Tick(In(10000));
+    CHECK_EQ(host.Status().total_nodes, 2);
+    CHECK_EQ(host.Signals(host.status_event), events + 1);
+    CHECK_RULES();
+}
+
 // ---------------------------------------------------------------------------------------------
 // The link (0.1.16): the beacon timer, the late second Deauthentication, the frames of another lobby in the room
 // ---------------------------------------------------------------------------------------------
@@ -5292,6 +5364,149 @@ static void TestForeignLobbyClient() {
     room.WaitIdle();
     CHECK_EQ(g_stats.foreign_shadow, 1u);
     CHECK_EQ(Drain(alice.e(), 2).foreign, 1);
+    CHECK_RULES();
+}
+
+// LAT-5: a SendTo with the broadcast flag (2) and a node in mind (Heroes of Ruin, FFE) went to the broadcast MAC: through the room that is a
+// datagram, a receive and an acknowledgement for every member, and in a lobby of three half of what a console receives is "not for me".
+// With the node's own MAC the room delivers it to that member alone; the header is the same (the node ids are what a receiver reads), the
+// frame stays unreliable (the radio does not retry a broadcast), and when the room does not have the node the broadcast is kept.
+static void TestAddressedBroadcastFlag() {
+    std::printf("SendTo with the broadcast flag and a node: addressed to that node's MAC when the room has it, still unreliable; broadcast when not\n");
+    g_rules.Reset();
+    MockRoom room;
+    Bench host(room, 1), alice(room, 2), bob(room, 3);
+    for (Bench* b : {&host, &alice, &bob}) {
+        CHECK_EQ(b->Init(), 0u);
+    }
+    CHECK_EQ(host.BeginHosting(4), 0u);
+    CHECK_EQ(JoinBench(room, alice, host), 0u);
+    CHECK_EQ(JoinBench(room, bob, host), 0u);
+    u32 ev = 0;
+    for (Bench* b : {&host, &alice, &bob}) {
+        CHECK_EQ(b->e().Bind(2, 0x2E30, 1, kBroadcastNetworkNodeId, &ev), 0u);
+    }
+    const u16 alice_id = alice.Status().network_node_id, bob_id = bob.Status().network_node_id;
+    CHECK(alice_id >= 2 && bob_id >= 2 && alice_id != bob_id);
+    const u8 msg[] = "to one node";
+    const auto last_data = [](Bench& b) {
+        const std::vector<WifiPacket> all = b.sent.All();
+        for (auto it = all.rbegin(); it != all.rend(); ++it) {
+            EtherType t;
+            if (it->type == WifiPacket::Type::Data && GetFrameEtherType(it->data, &t) && t == EtherType::SecureData) {
+                return *it;
+            }
+        }
+        return WifiPacket();
+    };
+
+    // 0. The room's member list is not known yet (the plugin gets it from the room's messages): the broadcast, as before.
+    room.WaitIdle();
+    std::memset(&g_stats, 0, sizeof(g_stats));
+    CHECK_EQ(alice.e().SendTo(bob_id, 1, sizeof(msg), 2, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    CHECK(last_data(alice).destination_address == kBroadcastMac);
+    CHECK_EQ(g_stats.sendto_addressed, 0u);
+    CHECK_EQ(Drain(bob.e(), 2).frames, 1);
+    CHECK_EQ(Drain(host.e(), 2).frames, 0);
+
+    for (Bench* b : {&host, &alice, &bob}) {
+        b->e().OnRoomMembers(Members({&host, &alice, &bob}));
+    }
+    std::memset(&g_stats, 0, sizeof(g_stats));
+
+    // 1. Alice -> Bob with the flag: Bob's MAC, the flag kept on the packet; Bob has the frame, the host never sees it.
+    CHECK_EQ(alice.e().SendTo(bob_id, 1, sizeof(msg), 2, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    WifiPacket p = last_data(alice);
+    CHECK(p.destination_address == bob.console.mac);   // (before: the broadcast MAC)
+    CHECK(p.broadcast_flag && !p.relayed);
+    CHECK(IsBroadcastDelivery(p));                      // ... and unreliable, like a broadcast
+    SecureDataHeader h;
+    CHECK(ParseSecureDataHeader(p.data, &h) && h.dest_node_id == bob_id && h.src_node_id == alice_id);
+    CHECK_EQ(g_stats.sendto_addressed, 1u);
+    CHECK_EQ(Drain(bob.e(), 2).frames, 1);
+    CHECK_EQ(Drain(host.e(), 2).frames, 0);
+    CHECK_EQ(g_stats.drop_not_for_me, 0u);              // (before: the host received it and dropped it, one "not for me")
+
+    // 2. Alice -> the host (node 1) with the flag: the host's MAC.
+    CHECK_EQ(alice.e().SendTo(1, 1, sizeof(msg), 2, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    CHECK(last_data(alice).destination_address == host.console.mac);
+    CHECK_EQ(Drain(host.e(), 2).frames, 1);
+    CHECK_EQ(Drain(bob.e(), 2).frames, 0);
+
+    // 3. Everybody (0xFFFF) with the flag: the broadcast, as ever. Without the flag, a node: its MAC and reliable, as ever.
+    CHECK_EQ(alice.e().SendTo(kBroadcastNetworkNodeId, 1, sizeof(msg), 2, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    CHECK(last_data(alice).destination_address == kBroadcastMac);
+    CHECK_EQ(Drain(host.e(), 2).frames, 1);
+    CHECK_EQ(Drain(bob.e(), 2).frames, 1);
+    CHECK_EQ(alice.e().SendTo(bob_id, 1, sizeof(msg), 0, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    p = last_data(alice);
+    CHECK(p.destination_address == bob.console.mac && !p.broadcast_flag && !IsBroadcastDelivery(p));
+    CHECK_EQ(Drain(bob.e(), 2).frames, 1);
+    CHECK_EQ(g_stats.sendto_addressed, 2u);
+
+    // 4. Bob has left the room (the list says so; its node is still in the network for a while): the broadcast, no frame for a MAC the
+    //    room would answer with an error.
+    for (Bench* b : {&host, &alice}) {
+        b->e().OnRoomMembers(Members({&host, &alice}));
+    }
+    const u32 addressed = g_stats.sendto_addressed;
+    CHECK_EQ(alice.e().SendTo(bob_id, 1, sizeof(msg), 2, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    CHECK(last_data(alice).destination_address == kBroadcastMac);
+    CHECK_EQ(g_stats.sendto_addressed, addressed);
+
+    // 5. The delivery class, as the room client decides it: a broadcast-flag frame addressed to a member goes out like a broadcast at the
+    //    radio-like levels (unreliable, once), a unicast one is reliable (level 1) or doubled (level 2, to a plugin that numbers its frames).
+    WifiPacket addressed_flag, unicast, relay, broadcast;
+    addressed_flag.destination_address = bob.console.mac;
+    addressed_flag.broadcast_flag = true;
+    unicast.destination_address = bob.console.mac;
+    relay.destination_address = kBroadcastMac;
+    relay.relayed = true;
+    broadcast.destination_address = kBroadcastMac;
+    CHECK(IsBroadcastDelivery(addressed_flag) && IsBroadcastDelivery(broadcast) && !IsBroadcastDelivery(unicast) && !IsBroadcastDelivery(relay));
+    for (int level = 0; level <= 2; ++level) {
+        const FrameDelivery flagged = DeliveryFor(level, false, true, IsBroadcastDelivery(addressed_flag), true);
+        const FrameDelivery plain = DeliveryFor(level, false, true, IsBroadcastDelivery(unicast), true);
+        CHECK_EQ(flagged.reliable, level == 0);
+        CHECK(!flagged.duplicate);
+        CHECK_EQ(plain.reliable, level < 2);
+        CHECK_EQ(plain.duplicate, level == 2);
+    }
+
+    // 6. The node table gives a node two MACs (a host that was in another lobby leaves a stale entry in the node map it sends: the D2 case):
+    //    which one is right is not known, so the broadcast, as before. With a clean table (the same packet, one MAC per node) the frame is
+    //    addressed again - which also shows that the injected node map is the one the client works from.
+    for (Bench* b : {&host, &alice, &bob}) {
+        b->e().OnRoomMembers(Members({&host, &alice, &bob}));
+    }
+    const auto host_node_map = [&](const std::vector<NodeMapEntry>& entries) { // (what the host of the network sends to the room)
+        WifiPacket p;
+        p.type = WifiPacket::Type::NodeMap;
+        p.channel = 11;
+        p.transmitter_address = host.console.mac;
+        p.destination_address = kBroadcastMac;
+        p.data = GenerateNodeMapPacket(entries);
+        room.Send(host.console.index, p);
+        room.WaitIdle();
+    };
+    host_node_map({{host.console.mac, 1}, {alice.console.mac, alice_id}, {bob.console.mac, bob_id}});
+    std::memset(&g_stats, 0, sizeof(g_stats));
+    CHECK_EQ(alice.e().SendTo(bob_id, 1, sizeof(msg), 2, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    CHECK(last_data(alice).destination_address == bob.console.mac);
+    CHECK_EQ(g_stats.sendto_addressed, 1u);
+    host_node_map({{host.console.mac, 1}, {alice.console.mac, bob_id}, {bob.console.mac, bob_id}});
+    std::memset(&g_stats, 0, sizeof(g_stats));
+    CHECK_EQ(alice.e().SendTo(bob_id, 1, sizeof(msg), 2, msg, sizeof(msg)), 0u);
+    room.WaitIdle();
+    CHECK(last_data(alice).destination_address == kBroadcastMac);   // (before the guard: whichever MAC the table listed first)
+    CHECK_EQ(g_stats.sendto_addressed, 0u);
     CHECK_RULES();
 }
 
@@ -6197,11 +6412,13 @@ int main() {
     TestOwnNodeInfoSeed();
     TestTransportDown();
     TestRoomPresence();
+    TestRoomMemberStopsPlaying();
     TestBeaconSchedule();
     TestLateSecondDeauth();
     TestForeignLobbyHost();
     TestForeignLobbyClient();
     TestForeignLobbyLegit();
+    TestAddressedBroadcastFlag();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

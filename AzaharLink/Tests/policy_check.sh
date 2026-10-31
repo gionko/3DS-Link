@@ -24,6 +24,13 @@ need_line() {
 need_after() {
   tr -d '\r' < "$1" | grep -F -A3 -- "$2" | grep -F -q -- "$3" || fail "$1: '$2' is no longer followed by '$3' ($4)"
 }
+# $1 = file, $2 = a fixed string, $3 = another that must come LATER in the file (the first line that has $2 is above the first line that has $3), $4 = why
+need_order() {
+  local a b
+  a=$(tr -d '\r' < "$1" | grep -F -n -m1 -- "$2" | cut -d: -f1)
+  b=$(tr -d '\r' < "$1" | grep -F -n -m1 -- "$3" | cut -d: -f1)
+  { [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fail "$1: '$2' does not come before '$3' ($4)"
+}
 
 # The ini defaults: the sleep action is off until the lid test, the receive ring is the 64 KB the soc service grants, and
 # these two live in ONE place (Includes/azl/ini_values.hpp) that the plugin's Config and the Setup app's Settings both take
@@ -447,7 +454,11 @@ need ConfigApp/source/pages_delivery.cpp "g.HoldHome();" "HOME is off while the 
 # loading popup, the receivers' names and their details, the join of a console to a room that is already sending, and the plain words of the screens
 [ "$(grep -rn 'DrawTitleBar(gfx::kTopW' ConfigApp/source --include=*.cpp | wc -l)" = "0" ] || fail "a top screen has its own bar again (the version only, no battery and card): they all use DrawTitleBarStatus"
 need ConfigApp/source/ui.cpp "limit = bx - 8.0f;" "the title of the top bar keeps to the left of the battery and the card (a long title is cut, the version goes when it does not fit)"
-need ConfigApp/source/ui.cpp "return setup::CopyWorker::Get().PendingCount() == 0;" "START does nothing while the plugin is being copied"
+need ConfigApp/source/ui.cpp "return setup::CopyWorker::Get().PendingCount() == 0 || g.plugin_pass_open;" "START does nothing while the user's own copies are being made, and works (after asking) during the pass over the games that follows an update"
+need ConfigApp/source/ui.cpp "AskLeaveDuringPluginPass(); // (the pass over the games is not over: say so, and let the user choose)" "START during the pass over the games asks before it leaves"
+need ConfigApp/source/ui.cpp "setup::CopyWorker::Get().CancelRefreshes();" "leaving in the middle of the pass drops the looks that wait (the one that runs is finished)"
+need ConfigApp/source/copyworker.cpp "int CopyWorker::CancelRefreshes() {" "the worker can drop the quiet looks that wait"
+need ConfigApp/source/ui.cpp "plugin_pass_total = submitted;" "the pass knows how many folders it looks at (the main page says how many are done)"
 need ConfigApp/source/ui.cpp "aptSetHomeAllowed(home_holds == 0);" "HOME is given back only when the last page that switched it off lets go"
 need ConfigApp/source/main.cpp "g.HoldHome();" "HOME is off while the plugin is being copied into the folders of the titles"
 need ConfigApp/source/pages_enable.cpp 'Fmt("%d / %d ON", on, static_cast<int>(entries_.size()))' "the bar of the page of the titles says how many are ON"
@@ -616,7 +627,7 @@ need Sources/azl/log_files.cpp "if (debug_file_ || g_debug_level <= 0 || !DebugR
 need Sources/azl/log_files.cpp "if (crumb_file_ || g_debug_level <= 0) {" "the trail of a sleep (AzaharLink.sleep.log) is never opened with the log off"
 # (the capture, the main log, and the trail's file: opened and, for the trail, reopened after the old one is removed)
 [ "$(grep -c 'OpenAppend(' Sources/azl/log_files.cpp)" = "4" ] || fail "Sources/azl/log_files.cpp opens a file in a place that is not behind the level check"
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -o 'File::Open(' | wc -l)" = "5" ] || fail "Sources/ctr/plugin.cpp opens a file besides the log layer, the ini read, the ini write and the memory record (read and write)"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -o 'File::Open(' | wc -l)" = "8" ] || fail "Sources/ctr/plugin.cpp opens a file besides the log layer, the ini read, the ini write, the memory record (read and write) and the three read-only openings of the comparison of this game's plugin with 3DS Link's (ReadPluginHead, PluginFilesAreEqual)"
 need_after Sources/ctr/plugin.cpp "void Plugin::CompareMemoryWithLastLaunch() {" "if (g_debug_level <= 0) {" "the memory record is read and written with the log on only (debug=0 leaves the card alone)"
 need Sources/ctr/plugin.cpp "mem against the last launch of this title:" "two launches of a title are compared (2026-10-20: the proof that an exit leaves nothing)"
 need Sources/ctr/plugin.cpp "    CompareMemoryWithLastLaunch();" "... at the start, after the memory line"
@@ -694,7 +705,7 @@ need Includes/azl/uds_engine.hpp "bool client_foreign_filter_enforced_ = false;"
 if grep -rn "SetClientForeignFilterEnforced" Sources/ctr Sources/main.cpp >/dev/null 2>&1; then
   fail "the plugin turns the client's foreign-lobby filter on: that waits for a hardware session with zero would-be drops"
 fi
-need Sources/azl/uds_engine.cpp "const bool refuse = status == NetworkStatus::ConnectedAsHost || client_foreign_filter_enforced_;" "a host refuses the frames of another lobby always, a client when its filter is on"
+need Sources/azl/uds_engine.cpp "const bool refuse = status == NetworkStatus::ConnectedAsHost || client_foreign_filter_enforced_ || lobby_inbox_;" "a host refuses the frames of another lobby always, a client when its filter is on or when it is in a lobby (a second lobby of the game in the room has the same node ids and would rewrite its roster)"
 # - the beacon timer is an absolute schedule on the exact period, and the late second Deauthentication is swallowed
 need Sources/azl/uds_engine.cpp "next_beacon_tenths_ += kBeaconPeriodTenths;" "the host's beacon is due a period after the last one was DUE (105.5 ms per beacon on hardware before)"
 need Sources/azl/uds_engine.cpp "constexpr u64 kBeaconPeriodTenths = 1024;" "100 TU = 102.4 ms"
@@ -957,6 +968,10 @@ game_thread_file Includes/azl/link_policy.hpp 1
 game_thread_file Includes/azl/sleep_crumbs.hpp 1
 game_thread_file Sources/azl/ndm_hle.cpp 1
 game_thread_file Sources/azl/platform.cpp 1
+# ... and the three headers of the fake Download Play lobby (pure, header only: one region each, which is all of the code in them)
+game_thread_file Includes/azl/dlp_types.hpp 1
+game_thread_file Includes/azl/dlp_lobby.hpp 1
+game_thread_file Includes/azl/dlp_ipc.hpp 1
 # ... and the code on the game's threads does call the printf-free lines (the scan above would also pass if the lines were
 # simply dropped): the two pass-through lines are stored raw, the others are built piece by piece
 need Sources/ctr/hook.cpp "DebugIpc(handle, header, arg," "the pass-through line of every IPC call is stored as raw words"
@@ -984,11 +999,11 @@ need_line Tests/stack_usage.sh 'budget hook "azl::ctr::PassThrough" 32' "the hot
 # Test hygiene. A test that no script runs is a gate that is not there: every test source is built AND run by the script
 # that owns it (the host tests by Tests/run.sh, the 32-bit ones, which drive UdsHle, by Tests/ipc_test/build.sh and then
 # Tests/hle_tests.sh and Tests/integration.sh), and a new *_test.cpp that is in none of them fails here
-for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test logrot_test log_module_test ncch_icon_test reloc_test; do
-  tr -d '\r' < Tests/run.sh | grep -q -E "^  \"\\\$OUT/$t\"( |\$)" || fail "Tests/run.sh does not run the unit test $t (a line of its own that calls \"\$OUT/$t\")"
+for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test logrot_test log_module_test ncch_icon_test reloc_test; do
+  tr -d '\r' < Tests/run.sh | grep -q -E "^  (timeout 1200 )?\"\\\$OUT/$t\"( |\$)" || fail "Tests/run.sh does not run the unit test $t (a line of its own that calls \"\$OUT/$t\")"
   need Tests/run.sh "-o \"\$OUT/$t\"" "the unit test $t is built by Tests/run.sh"
 done
-for t in ffe_replay_test trace_replay_test result_closure_test command_matrix_test ndm_wiring_test; do
+for t in ffe_replay_test trace_replay_test result_closure_test command_matrix_test ndm_wiring_test dlp_fkcl_test dlp_lobby_hle_test; do
   need Tests/ipc_test/build.sh "$t" "the 32-bit test $t is built by Tests/ipc_test/build.sh"
   need Tests/hle_tests.sh "\"\$OUT/$t\"" "the 32-bit test $t is run by Tests/hle_tests.sh"
   need Tests/integration.sh "/tmp/azl_tests32/$t" "the 32-bit test $t is run by Tests/integration.sh"
@@ -1045,6 +1060,15 @@ need Sources/azl/room_client.cpp "                    : static_cast<u32>(ENET_PA
 need Sources/enet/protocol.c "switch (enet_protocol_send_outgoing_commands (host, event, 0))" "the socket is read before the timeouts are looked at (an acknowledgement that waited is not a loss)"
 need Sources/enet/protocol.c "if (peer -> lastReceiveTime > 0 && host -> azlServiceGap >= ENET_AZL_PAUSE_MS &&" "a round-trip sample taken after a pause of the thread is not taken"
 need Sources/enet/protocol.c "++ enet_azl_throttled_packets;" "the frames the throttle destroys are counted"
+# The data path of the ENet client (the series of 2026-10-27): the defaults of its three switches and the two guards that make them safe
+need Sources/enet/host.c "    host -> azlSkipEmptyRecv = 1;" "ENet leaves out the receive that only says nothing when a poll follows (on by default)"
+need Sources/enet/protocol.c "&& ! enet_protocol_timers_due (host))" "... but never when a timer of ours is due: the acknowledgement that stops it may be in the socket"
+need Sources/enet/host.c "    host -> azlAckHoldEvents = ENET_AZL_ACK_HOLD_EVENTS;" "a packet is handed over before the acknowledgement of its datagram (on by default)"
+need Includes/enet/enet.h "#define ENET_AZL_ACK_HOLD_EVENTS 8" "... and the acknowledgement waits for 8 packets at the most"
+need Includes/enet/enet.h "#define ENET_AZL_ACK_HOLD_MS 8" "... or 8 ms (less on a link that answers faster: a third of the room's timeout)"
+need Includes/enet/enet.h "#define ENET_AZL_READ_MAX_DATAGRAMS 32" "a read pass stops after 32 datagrams and hands over what it has"
+need Sources/enet/protocol.c "enet_protocol_send_outgoing_commands (host, event, ! host -> azlReadCapped)" "... and the timers are looked at only once the socket has been read to its end"
+need Sources/enet/protocol.c "? 0 : ENET_TIME_GREATER_EQUAL (host -> serviceTime + 1, timeout);" "the socket counts as empty only after a poll that waited its whole time: a poll that came back early with nothing readable is a socket in trouble, and the receive of the next call is where the error shows"
 need Sources/ctr/plugin.cpp "if (core >= -1 && core <= 3) {" "net_thread_core accepts the extra cores of a New 3DS"
 need Sources/ctr/plugin.cpp ', rtt samples skipped %lu |' "the link line says how many samples were left out"
 need Sources/ctr/plugin.cpp 'dropped: stale %lu cap %lu throttled %lu |' "the link line says how many frames the throttle destroyed"
@@ -1080,7 +1104,13 @@ need ConfigApp/source/games.cpp "const bool same_size = FileSize(GamePluginPath(
 need ConfigApp/source/delivery_run.cpp "if (run.result.start_ms != 0) {" "the titles are read again only after a receiving that began"
 need ConfigApp/source/ui.cpp "setup::RemoveParkFiles(paths.park_dir);" "the block files a cut-off receiving left are removed when the app starts"
 need ConfigApp/source/paths.cpp 'if (name.size() > 4 && name.compare(name.size() - 4, 4, ".blk") == 0) {' "only the block files go from park/"
-need ConfigApp/source/ui.cpp "if (plugin_copies_checked || !plugin_ready || !titles::Scan().done()) {" "the quiet look at the copies of the plugin waits for the scan of the titles"
+need ConfigApp/source/ui.cpp "if (plugin_copies_checked || !plugin_ready) {" "the quiet look at the copies of the plugin starts at once: it does not wait for the scan of the titles (whoever installed an update waits for it)"
+need ConfigApp/source/ui.cpp "const std::string stamp = setup::PluginContentStamp(setup::EmbeddedPluginData(), setup::EmbeddedPluginSize());" "the stamp of the copies is made from the BYTES of the plugin (the card gives every file the date 0; two builds can have the same size)"
+need ConfigApp/source/ui.cpp "plugin_pass_open = submitted > 0;" "a pass of quiet looks is open while there are folders to look at (the main page tells how it goes)"
+need ConfigApp/source/plugin_install.cpp '"%llu:h%016llx"' "the stamp of a plugin is its size and the hash of its bytes"
+need ConfigApp/source/pages_main.cpp 'Updating the plugin in your games: %d of %d folders done. Please wait.' "the main page says how many folders are done while the copies of the plugin are looked at"
+need ConfigApp/source/pages_main.cpp 'The plugin is up to date in all your games.' "... and that it is over when nothing had to be made again"
+need Tests/settings_test/plugin_install_test.cpp "    TestContentStamp();" "the test of the stamp of the plugin runs"
 need ConfigApp/source/ui.cpp "if (!stamp.empty() && stamp == app_cfg.plugin_stamp) {" "the copies are not read again while the plugin file is the one they were brought up to"
 need ConfigApp/source/main.cpp "g.app_cfg.plugin_stamp = g.plugin_stamp_pending;" "the stamp of the plugin file is remembered when the looks are done"
 need ConfigApp/source/appcfg.cpp '} else if (key == "plugin_stamp") {' "3DSLink.cfg holds the stamp"
@@ -1133,7 +1163,14 @@ need Sources/azl/uds_engine.cpp "            copy_dedupe_.ForgetNode(logoff.assi
 need Sources/azl/uds_engine.cpp "    kernel_->SignalEvent(connect_event_);" "the connect event is signalled under the lock (a deferred one could follow the next attempt's ClearEvent)"
 need Sources/azl/uds_engine.cpp "        DrainPendingSignalLocked(bind.event); // (a teardown queued one: given before the close, as before the round)" "a signal queued for an event is given before the event is closed"
 need Sources/azl/uds_engine.cpp "            out_packet.relayed = true; // (for the room client: a unicast frame of the radio, retried, not a broadcast)" "a relayed frame is unicast for the delivery rule"
-need Sources/azl/room_client.cpp "                                               packet.destination_address == kBroadcastMac && !packet.relayed, packet.peer_numbers);" "... and the room client treats it so, and gives the copy only to a peer that numbers"
+need Sources/azl/room_client.cpp "                                               IsBroadcastDelivery(packet), packet.peer_numbers);" "... and the room client treats it so, and gives the copy only to a peer that numbers"
+need Includes/azl/room_client.hpp "    return (p.destination_address == kBroadcastMac && !p.relayed) || p.broadcast_flag;" "a relayed copy is not a broadcast, and a frame the game sent with the broadcast flag is, whatever MAC it is addressed to"
+need Sources/azl/uds_engine.cpp "    packet.broadcast_flag = (flags & kBroadcastFlag) != 0;" "the engine marks a frame the game sent with the broadcast flag, so that it stays unreliable when it is addressed to a node's own MAC"
+need Sources/azl/uds_engine.cpp "                return false; // two MACs claim the node (a stale table of a host that was in another lobby): which one is right is not known" "a frame is addressed to a node's MAC only when the node table gives the node ONE MAC (a stale second entry makes it the broadcast, as before)"
+need Sources/azl/room_client.cpp "constexpr u32 kConnectRttMs = 100;" "the CONNECT starts from a round trip of 100 ms, not ENet's 500: a lost CONNECT is resent after 100, 300, 700 ms"
+need Sources/azl/room_client.cpp "    server->roundTripTime = kConnectRttMs;" "... and the connection is given that estimate before the first CONNECT goes out"
+need Sources/azl/room_client.cpp "                ShouldProbeRoom(client->serviceTime, server->earliestTimeout, now_ms, last_probe_ms)) {" "the room is pinged when it speaks after our packets have gone unanswered for half a second (the link came back before ENet's check gave the room up)"
+need Includes/azl/room_client.hpp "inline constexpr u32 kSilentPeerMs = 500;" "... after half a second of silence and no oftener than every 250 ms"
 need Sources/azl/room_client.cpp "    client->azlEarlyFilter = EarlyFilter;" "only game frames and beacons go ahead of a hole"
 need Sources/azl/room_client.cpp "    return ether == static_cast<u16>(EtherType::SecureData) ? 1 : 0;" "... the handshake and the room's messages keep their order"
 need Sources/enet/peer.c "          if (peer -> host -> azlEarlyFilter != NULL &&" "ENet asks the filter before the early hand-over"
@@ -1643,6 +1680,521 @@ if [ -d ../DlpLink ]; then
   need ../DlpLink/docs/COMPOSITORE.md 'è la **risorsa** che l'"'"'app porta' "the design of the composer says that the plugin is the resource of the app (no file of the card)"
   need ../DlpLink/test/PROVA-INSTALLATORE.md 'croce su / giù' "the test of the installer says that the guide's keys are the D-pad's up and down"
 fi
+
+# The log header says when the CODE last changed (P10-0001): kBuildStamp comes from build_id.cpp, which the Makefile compiles again after every other
+# object; plugin.cpp's own __DATE__ / __TIME__ stayed as old as plugin.cpp (the first C-stick build said "1.0.3 (built Oct 23)"). Tests/build_id_test.sh builds
+# twice (Docker) and requires the stamp to move with a change to main.cpp alone.
+need Includes/ctr/plugin.hpp "extern const char kBuildStamp[];" "the build stamp of the log header is declared in one place"
+need Sources/ctr/build_id.cpp 'extern const char kBuildStamp[] = __DATE__ " " __TIME__;' "the stamp is made by a file the Makefile compiles after every other object"
+need_line Makefile 'build_id.o : $(filter-out build_id.o,$(OFILES))' "build_id.cpp is compiled again whenever any other object was (the whole line: a commented-out copy does not count)"
+need Sources/ctr/plugin.cpp 'kVersion, kBuildStamp, stamp);' "the log header prints that stamp, not plugin.cpp's own date"
+! grep -q '__DATE__' Sources/ctr/plugin.cpp || fail "Sources/ctr/plugin.cpp uses __DATE__ again: the header's build date would be as old as plugin.cpp"
+need Sources/ctr/plugin.cpp 'Log("hid: the plugin %s ir:rst' "the log says whether the plugin holds ir:rst (the C-stick fix of 1.0.4) so that a log tells the two builds apart"
+need Sources/main.cpp 'extern "C" bool hidShouldUseIrrst(void) {' "the plugin overrides libctru's hidShouldUseIrrst (no ir:rst: the game keeps its C-stick)"
+need Tests/build_id_test.sh "build id test: OK" "the build stamp test exists"
+
+# The plugin that runs in a game against the plugin of 3DS Link's folder (2026-10-28): once, 25 s after the start, on the writer thread; it says "open 3DS Link" when the folder has a later
+# version or another build of the same one, and the log says what it found. The first join of a launch also says the version on the screen.
+need Includes/azl/plugin_compare.hpp "inline MasterPlugin RelateMaster(u32 own, u32 master, bool bytes_equal) {" "the decision is a pure function (tested on a PC)"
+need Sources/ctr/plugin.cpp 'constexpr const char* kMasterPluginPath = "/3ds/3DSLink/AzaharLink.3gx";' "the plugin of 3DS Link's folder is the one the app puts there"
+need Sources/ctr/plugin.cpp "constexpr u64 kMasterCheckAfterMs = 25000;" "the look is made a while after the start (the game loads from the same card before)"
+need Sources/ctr/plugin.cpp "const MasterPlugin relation = LookAtMasterPlugin(game_id_, &detail);" "the writer thread makes the look, once"
+need Sources/ctr/plugin.cpp "if (MasterPluginWarns(relation)) {" "only a later version or another build of the same one warns"
+need Sources/ctr/plugin.cpp 'PostNotification(std::string("AzaharLink ") + kVersion + " (built " + kBuildStamp + ")");' "the first join of a launch says the version of the plugin on the screen"
+need Tests/run.sh "Tests/plugin_compare_test.cpp" "the PC test of the comparison is built by the suite"
+need Sources/ctr/plugin.cpp "constexpr u64 kAppTitleId = 0x000400000F83D100ull;" "the probe asks about 3DS Link's title id"
+need ../DlpLink/tools/common.sh 'UNIQUE_ID="${UNIQUE_ID:-0x0F83D1}"' "... which is the app's unique id in the build chain (000400000F83D100): the two change together"
+need Sources/ctr/plugin.cpp "ProbeInstalledApp(kVersion); // (log only)" "the probe of the installed 3DS Link only logs, and only with the log on"
+need_line Tests/run.sh '  "$OUT/plugin_compare_test"' "... and run (the whole line: the build line has the same words)"
+# A player that stays in the room but tells it that it plays nothing (Azahar closed, no goodbye on the air) is counted out of the game's session like one that left
+# (2026-10-28, Kirby Battle Royale: the 3DS host waited 30 s for a client that was gone, and the game froze for that long).
+need Sources/ctr/plugin.cpp "if (RoomMemberPlays(member.game_name, member.game_id)) {" "the engine is given only the members that play: one that stays in the room but plays nothing is counted out of the session"
+need Includes/azl/room_members.hpp "return !game_name.empty() || game_id != 0;" "a member plays unless it has neither a title nor an id (an id alone, or a name alone, is a game: a lobby of two regions stays whole)"
+need Sources/ctr/plugin.cpp "RoomMemberStoppedLines(room_members_, now)" "the log says which player stopped playing"
+need Tests/test_main.cpp "    TestRoomMemberStopsPlaying();" "the chain from the list of members to the engine is tested"
+# The capture goes to the card in few, large passes (2026-10-28: the writer spent 63-77% of its time in the SD card with a pass every 250 ms, and the music of Kirby Battle
+# Royale stuttered at debug=1): a pass is due every 2 s, or when the ring holds 160 KB, or at once on request; the writer still wakes every 250 ms for the main log and the statistics.
+need Includes/azl/log_files.hpp "u32 capture_every_ms = 2000;" "the capture is written every 2 s (not four times a second)"
+need Includes/azl/log_files.hpp "u32 capture_ring_high = 160 * 1024;" "... or at once when the ring holds 160 KB"
+need Sources/azl/log_files.cpp "return early || last == 0 || ring_used >= limits_.capture_ring_high || now_ms - last >= limits_.capture_every_ms;" "a pass is due on request, the first time, when the ring is high, or when the interval is over"
+need Sources/azl/log_files.cpp "    NoteCapturePass(platform::NowMs());" "a pass of the capture notes when it began"
+need Sources/ctr/plugin.cpp "if (backlog || log_files_->CaptureDue(platform::NowMs(), DebugRingUsedBytes(), capture_early)) {" "the writer only passes when the capture is due (or the last pass was cut short)"
+need Tests/log_files_test.cpp "    TestCaptureCadence();" "the test of the capture's cadence runs"
+# Kirby Triple Deluxe and Kirby Planet Robobot died at start (a data abort inside CTRPluginFramework's startup search, before the plugin ran a line): Process::GetTextSize() goes through a
+# guard that cuts the size of THAT search to what is left of the code (text_search_guard.cpp; the PC test and the check of the call in the built .elf), and the log says when it did.
+need Makefile '-Wl,--wrap=_ZN18CTRPluginFramework7Process11GetTextSizeEv' "the framework's Process::GetTextSize() goes through the guard of the startup search"
+need Sources/ctr/text_search_guard.cpp 'constexpr u32 kMovR7R0 = 0xe1a07000;' "the guard knows the call in KeepThreadMain (mov r7, r0 ...)"
+need Sources/ctr/text_search_guard.cpp 'constexpr u32 kAddR6R6Imm4 = 0xe2866004;' "... (... add r6, r6, #4)"
+need Sources/ctr/text_search_guard.cpp 'if (return_address[0] != kMovR7R0 || return_address[1] != kAddR6R6Imm4) {' "every other caller of GetTextSize() gets the real value"
+need_line Sources/ctr/text_search_guard_entry.s '    b    azl_text_size_guard' "the stub of the guard hands over to the C++ function by a plain branch (lr is left alone)"
+need Sources/ctr/hook.cpp 'if (TextSearchTrims() != 0) {' "the log says when the startup search was cut to the game's code"
+need Tests/run.sh 'Tests/text_search_guard_test.cpp' "the PC test of the guard is built by the suite"
+need_line Tests/run.sh '  "$OUT/text_search_guard_test"' "... and run (the whole line: the build line has the same words)"
+need Tests/text_search_guard_elf_check.sh 'text search guard: OK' "the check of the call in the built .elf exists"
+# Kirby Battle Royale asks dlp:FKCL (Initialize / InitializeWithName, Finalize 1 ms later) only to know whether the wireless is on, and then plays over nwm::UDS: the real module says
+# "wireless off" because the console stays on its access point for the tunnel. For the titles in the list the plugin answers that probe itself (azl/dlp_fkcl_hle.hpp); for every other
+# title dlp:FKCL is the real service.
+need Sources/ctr/plugin.cpp 'hle_->SetDlpProbeFake(AsksDlpOnlyForTheWireless(game_id_));' "the fake dlp:FKCL is switched on per title, from the list"
+need Sources/ctr/plugin.cpp '0x00040000001C2100ull' "Kirby Battle Royale is in the list of the titles whose dlp:FKCL is answered by the plugin"
+# Phase 3: the table of games is {title id, mode}. Kirby Triple Deluxe and Planet Robobot are NOT in the probe's list (their wireless mode needs the Download Play client -
+# GetChannels, scan, join - and the probe answers 'invalid state' to it, so the game shows an error screen, 0xE0A0AC01, seen 2026-10-28): they are Lobby games, whose
+# Download Play the room carries (azl/dlp_hub.hpp). Every title id of these games is on a line with its mode, and Battle Royale keeps the probe.
+need Sources/ctr/plugin.cpp '{0x000400000010C000ull, DlpGameMode::Lobby}' "Kirby Triple Deluxe is a Lobby game: the room carries its Download Play lobby"
+need Sources/ctr/plugin.cpp '{0x000400000010BF00ull, DlpGameMode::Lobby}' "Kirby Triple Deluxe, the other region's id, is a Lobby game"
+need Sources/ctr/plugin.cpp '{0x0004000000183600ull, DlpGameMode::Lobby}' "Kirby Planet Robobot is a Lobby game"
+need Sources/ctr/plugin.cpp '{0x00040000001C2100ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale answers the wireless check only (the probe)"
+need Sources/ctr/plugin.cpp '{0x00040000001C2000ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale, the other region's id, answers the wireless check only"
+hit=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -i -E '0x000400000010C000|0x000400000010BF00|0x0004000000183600|0x00040000001C2100|0x00040000001C2000' | grep -v 'DlpGameMode::' | head -3)
+[ -z "$hit" ] || fail "a title id of Triple Deluxe, Planet Robobot or Battle Royale is in Sources/ctr/plugin.cpp outside the table of games (a mode must stay next to it): $hit"
+need Sources/ctr/plugin.cpp 'constexpr DlpGame kDlpGames[] = {' "the table of games of the Download Play wiring"
+need Sources/ctr/plugin.cpp 'return DlpModeOf(title_id) == DlpGameMode::ProbeOnly;' "the probe is for the ProbeOnly games and nobody else"
+need Sources/ctr/plugin.cpp 'if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {' "the hub exists only for a Lobby game, and only when the plugin is active"
+need Sources/ctr/plugin.cpp 'new (std::nothrow) DlpHub(engine, kernel, config, resolver)' "the hub is the one allocation of the lobby and a refusal leaves the real services"
+need Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' "the HLE is given the hub"
+need_order Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' 'hook_stats_ = InstallSvcHooks(hle_.get());' "the hub is set before the hooks are installed (a game's first call finds it)"
+need_after Sources/ctr/plugin.cpp 'engine_->Tick(now_ms);' 'dlp_hub_->Tick();' "the hub serves after the engine's own Tick, on the network thread"
+need_order Sources/ctr/plugin.cpp 'dlp_hub_->Stop();' 'room_->StopWithin(kNetStopTimeoutMs)' "the hub is stopped before the room: no request waits for a network thread that is going away"
+need Sources/ctr/plugin.cpp 'dlp_hub_->SetPlayerName(name);' "the console's profile name is the name the lobby shows (the games send Initialize with no name)"
+need Sources/ctr/plugin.cpp 'static const char kDefaultName[] = "3DS Link";' "the name before the profile name is known"
+need Sources/ctr/plugin.cpp 'u64 hash = 0xCBF29CE484222325ull;' "the friend code seed is FNV-1a-64 of the console's MAC (unique per console)"
+need Sources/ctr/plugin.cpp 'hash *= 0x100000001B3ull;' "... FNV-1a-64's prime"
+need Sources/ctr/plugin.cpp 'constexpr u32 kLow = 0x00100000;' "the resolver of the game's buffers refuses an address below the code"
+need Sources/ctr/plugin.cpp 'constexpr u32 kHigh = 0x40000000;' "... and one at or past the end of the application's range"
+need Sources/ctr/plugin.cpp 'if (address < kLow || address >= kHigh || size > kHigh - address) {' "... or a range that wraps"
+need Sources/ctr/uds_hle.cpp '} else if ((dlp_hub_ != nullptr || dlp_probe_fake_) && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:FKCL", 8) == 0) {' "dlp:FKCL is intercepted only for a Lobby game (the hub) or when the title asked for the probe (otherwise the real service answers)"
+need Sources/ctr/uds_hle.cpp '} else if (dlp_hub_ != nullptr && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:SRVR", 8) == 0) {' "dlp:SRVR is intercepted only for a Lobby game (the probe leaves it to the real service, as Battle Royale always had)"
+# The front-end of the hub's services (DESIGN-FASE3 sez. 4.1).
+need Includes/ctr/uds_hle.hpp 'enum Kind : u8 { kKindUds = 1, kKindNdm = 2, kKindDlp = 3, kKindDlpSrvr = 4 };' "the session kinds: nwm::UDS, ndm:u, dlp:FKCL and dlp:SRVR"
+need Sources/ctr/uds_hle.cpp 'constexpr u32 kDlpJoinCapMs = 8000;' "the join wait of StartFakeSession gives up after 8 s (the lobby's own timeout is 3 s: the network thread is gone if this one runs out)"
+need Sources/ctr/uds_hle.cpp 'constexpr s64 kDlpJoinSleepNs = 10 * 1000 * 1000;' "the join wait polls every 10 ms"
+need Sources/ctr/uds_hle.cpp 'while (!hub.PollPending(cmd)) {' "the join wait asks the hub, outside every lock"
+need Sources/ctr/uds_hle.cpp 'cmd[0] = (DlpService::kFkStartFakeSession << 16) | 0x40;' "the join that outlives its cap is answered as StartFakeSession ..."
+need Sources/ctr/uds_hle.cpp 'cmd[1] = kNotFound;' "... with 'server not found'"
+need Sources/ctr/uds_hle.cpp '} else if (kind >= kKindDlp && dlp_hub_ != nullptr && (id == 0x01 || id == (kind == kKindDlp ? 0x11u : 0x0Fu))) {' "a Download Play session that called Initialize (FKCL 0x01 / 0x11, SRVR 0x01 / 0x0F, with a hub only: the probe's session ends nothing) is marked, so that closing it without Finalize ends its role"
+need Sources/ctr/uds_hle.cpp 'if (g_debug_level > 0 && (kind < kKindDlp || dlp_hub_ == nullptr)) {' "the hub's sessions skip the debug capture's copy of the request (a variable array under the hub's chain: 536 bytes at debug 1 against 520)"
+need_after Sources/ctr/uds_hle.cpp 'if (kind < kKindDlp || dlp_hub_ == nullptr) {' 'AccountCall(id, cmd, started);' "the hub's sessions are not counted in the latency statistics and not throttled (they wait for the network thread; the end of a list is a normal result)"
+need Sources/ctr/uds_hle.cpp 'if (dlp_hub_ != nullptr && id != 0x01 && id != 0x1B && id >= 0x02 && id <= kUdsLastCommand && dlp_hub_->EngineHeld()) {' "while the lobby holds the engine every nwm::UDS command but Initialize answers 'wrong state' (the lobby's own state does not leak to the game)"
+need Sources/ctr/uds_hle.cpp 'Reply(cmd, id, id == 0x03 ? res::kSuccess : res::kWrongState);' "... and Shutdown answers success WITHOUT touching the engine (it is the lobby's network)"
+need Sources/ctr/uds_hle.cpp 'constexpr u32 kUdsLastCommand = 0x23;' "the last command of nwm::UDS the gate knows (an id past it is the dispatcher's own answer)"
+need_order Sources/ctr/uds_hle.cpp 'dlp_hub_->OnGameUdsStarting();' 'engine_->Initialize(node, cmd[1], version, &event);' "the lobby gives the engine back BEFORE the game's nwm::UDS Initialize reaches it (otherwise the Initialize changes nothing and the game inherits the lobby's node, name and seed)"
+need Sources/ctr/uds_hle.cpp 'if (dlp_hub_ == nullptr || !dlp_hub_->EngineHeld()) {' "closing an initialised nwm::UDS session does not shut the engine down while the lobby holds it"
+need Sources/ctr/uds_hle.cpp 'dlp_hub_->OnSessionClosed(kind == kKindDlpSrvr ? DlpKind::Srvr : DlpKind::Fkcl);' "the end of a Download Play session that had called Initialize is the hub's OnSessionClosed of its own service"
+need Sources/ctr/uds_hle.cpp 'RunDlpHub(*dlp_hub_, kind == kKindDlpSrvr, id, cmd);' "a request of a fake dlp session goes to the hub with its service"
+need Sources/ctr/uds_hle.cpp 'dlp_.Dispatch(cmd);' "the probe (Battle Royale) is DlpFkclHle as it always was"
+need Sources/ctr/uds_hle.cpp 'if (hub.failed_fast() + hub.cancelled() != refusals && cmd[1] == DlpHub::kResultWirelessOff) {' "the 'answered wireless off' line is for the commands that were really answered so (a Finalize that could not be served is a success)"
+need_after Sources/ctr/uds_hle.cpp 'NoteDlpTrouble(hub, srvr, id);' 'WaitForJoin(hub, cmd);' "the trouble of a command is decided before the join wait (the wait asks the hub to end the role, which a dead network refuses: not the answer of this command)"
+need Sources/ctr/uds_hle.cpp 'constexpr int kPlainSeen = 48;' "the first-call table of nwm::UDS, ndm:u and the probe keeps its 48 pairs (a game without a hub logs what it always did) ..."
+need Sources/ctr/uds_hle.cpp 'constexpr int kMaxSeen = kPlainSeen + 32;' "... and the hub's two services have 32 pairs of their own"
+# The hub itself (DESIGN-FASE3 sez. 1 and 2).
+game_thread_file Sources/azl/dlp_hub.cpp 1
+need Includes/azl/dlp_hub.hpp 'static constexpr u32 kQueuedMs = 2000;' "a request nobody takes is cancelled after 2 s"
+need Includes/azl/dlp_hub.hpp 'static constexpr u32 kAliveMs = 1000;' "the network thread is alive for 1 s after its last Tick"
+need Includes/azl/dlp_hub.hpp 'static constexpr u32 kResultWirelessOff = 0xC940AC04;' "what a request that cannot be served is answered: the DLP module's 'wireless off'"
+need Includes/azl/dlp_hub.hpp 'static constexpr u32 kSliceMs = 100;' "the wait of a game thread is cut in slices of 100 ms"
+need Sources/azl/dlp_hub.cpp 'lobby_.SetExternalPoll(true);' "the lobby's network work is the network thread's (Poll does nothing on a game thread)"
+need Sources/azl/dlp_hub.cpp 'if (!platform::TryLockBriefly(dlp_mutex_)) {' "the network thread never waits for dlp_mutex_ (a LightLock has no priority inheritance)"
+need Sources/azl/dlp_hub.cpp 'lobby_.SetOnNet(true);' "the network thread says it is the network thread before it pumps or serves"
+need_order Sources/azl/dlp_hub.cpp 'lobby_.SetOnNet(true);' 'lobby_.SetOnNet(false);' "... and takes it back before it lets go of the lock"
+need Sources/azl/dlp_hub.cpp 'if (state_.compare_exchange_strong(expected, kFree, std::memory_order_acq_rel)) {' "a request not taken in time is taken back with the CAS that the network thread's Running also needs: it either ran or never will"
+need_after Sources/azl/dlp_hub.cpp 'Execute();' 'state_.store(kDone, std::memory_order_release);' "the answer is published after the work"
+need_after Sources/azl/dlp_hub.cpp 'Refresh();  // (BEFORE the answer is published' 'state_.store(kDone, std::memory_order_release);' "the hints (EngineHeld, active) are refreshed BEFORE the answer is published: the game may ask the moment it has it"
+need Sources/azl/dlp_hub.cpp 'state_.store(kQueued, std::memory_order_seq_cst);' "a request is queued with a sequentially consistent store, paired with Stop()'s (a request posted just after Stop() fails at once)"
+need Sources/azl/dlp_hub.cpp 'stopped_.store(true, std::memory_order_seq_cst);' "Stop() sets its flag with the matching sequentially consistent store"
+need Sources/azl/dlp_hub.cpp 'if (post_mutex_.try_lock()) {' "OnGameUdsStarting does not return early while a request is in flight (post_mutex_ is its requester's)"
+need Sources/azl/dlp_hub.cpp 'return id == DlpService::kFkFinalize || id == DlpService::kFkStopScan || id == DlpService::kFkStopSession;' "the commands that succeed in every state (FKCL): Triple Deluxe and Planet Robobot throw a fatal error at a negative Finalize"
+need Sources/azl/dlp_hub.cpp 'return id == DlpService::kSvFinalize || id == DlpService::kSvEndAccepting;' "... (SRVR)"
+need Sources/azl/dlp_hub.cpp 'return id == DlpService::kFkFinalize || id == DlpService::kFkStopSession;' "the ones that end the FKCL role"
+need Sources/azl/dlp_hub.cpp 'return id == DlpService::kSvFinalize;' "the one that ends the SRVR role"
+need Sources/azl/dlp_hub.cpp 'closing_.fetch_or(kind == DlpKind::Fkcl ? kClosingFkcl : kClosingSrvr, std::memory_order_release);' "a session closed while no network thread serves is ended by the next Tick (nothing of the lobby's network runs on the closing thread)"
+need Sources/azl/dlp_hub.cpp 'if (EndsRole(kind, id)) {' "an unserved Finalize / StopSession leaves the role it ends to the next Tick"
+need Sources/azl/dlp_hub.cpp 'if (!Post(kOpClosed, kind, nullptr, nullptr, &unused)) {' "a session closed while no network thread takes the request is remembered, not lost"
+need_order Sources/azl/dlp_hub.cpp 'RunDeferred();  // (the roles whose sessions' 'Execute();' "the deferred ends run before the request that follows them (a new session is not ended by an old close)"
+need Sources/azl/dlp_hub.cpp 'Stamp();  // (a Tick that took long' "the liveness stamp is also taken at the end of Tick"
+need Sources/azl/dlp_hub.cpp 'last_tick_ms_.store(now != 0 ? now : 1u, std::memory_order_relaxed);' "the stamp is never 0 (no Tick yet) and never ahead of the clock (NetAlive's age is unsigned)"
+need Includes/azl/dlp_lobby.hpp 'if (use_ == kUseNone || (flags2_ & (kF2External | kF2OnNet)) == kF2External || !Due(force)) {' "Poll does nothing on a thread that is not the network thread's when the lobby is in the external mode"
+need Includes/azl/dlp_lobby.hpp 'flags2_ = static_cast<u8>(flags2_ & ~kF2FinalRoster);' "ClientReset clears the searcher's bit only: the mode bits are the hub's (they were cleared once, and the lobby polled on game threads again)"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u8 kF2External = 2;' "the external-poll bit"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u8 kF2OnNet = 4;' "the on-the-network-thread bit"
+need Tests/run.sh 'python3 Tests/dlp_chain_report.py --selftest' "the suite runs the self-test of the chain tool (it needs no Docker)"
+need Tests/run.sh 'python3 Tests/plugin_dlp_extract.py Sources/ctr/plugin.cpp "$OUT/plugin_dlp_slice.inc"' "the test of the plugin's Download Play wiring compiles the text of plugin.cpp (it cannot be built on the PC)"
+need Tests/run.sh '$HUB_WRAP -o "$OUT/dlp_hub_test"' "the hub test is linked with the thread spy's wraps (without them H2 fails on 'every wrapper fired')"
+need Tests/run.sh '-fsanitize=thread Tests/dlp_hub_test.cpp' "the hub test is also built with ThreadSanitizer (some synchronisation mutants are visible only there)"
+# The scenarios of the hub test (its table) and of the 32-bit front-end test (main), and the harness hooks that make some of them real.
+for s in H1 H2a H2b H3 H3b H4 H5 H6 H7 H8 H9 X1 X2 X3 X4 X5 X6 X7 X8 X9 X10 X11 X12 F1a F1b F1c F1d F2 F3 F4 F4b F5; do
+  need Tests/dlp_hub_test.cpp "{\"$s\", $s, " "the scenario $s of the hub test is in its table"
+done
+need Tests/dlp_hub_test.cpp 'a.kernel.SetOnClear([hub, net] {' "F2 makes the Stop()/Post race real: Stop() runs inside Post's ClearEvent"
+need Tests/dlp_hub_test.cpp 'g_exec_slow_ms.store(600);' "F3 stalls the request so that it is RUNNING when OnGameUdsStarting arrives"
+need Tests/dlp_hub_test.cpp 'a.hub.SetPlayerName(zoe);' "F5 gives the hub a player name"
+need Tests/dlp_adv_lobby_test.cpp '    T_default_name();' "DlpLobby::SetDefaultName is the name of an Initialize that gives none"
+need Tests/dlp_adv_lobby_test.cpp '    T_external_poll();' "the lobby's external-poll mode is tested"
+need Tests/dlp_adv_lobby_test.cpp '    T_external_go();' "... also after the GO of a session"
+for s in L1 L2 L3 L4 L5 L6 L7 L8 L9 L10 L11 L12 L13 L14; do
+  need Tests/ipc_test/dlp_lobby_hle_test.cpp "    $s();" "the scenario $s of the 32-bit front-end test of the hub runs in main()"
+done
+need Tests/ipc_test/dlp_lobby_hle_test.cpp '    L12One(true, true);' "L12: a UDS session found dead while the lobby holds the engine shuts nothing down"
+need Tests/ipc_test/dlp_lobby_hle_test.cpp '    L12One(false, false);' "L12's control: with no lobby the same close still shuts the service down"
+need Tests/ipc_test/dlp_lobby_hle_test.cpp 'TCHECK(RunChild("--l13", nullptr));' "L13 runs in a fresh process (the trouble lines are the first eight events of one)"
+need Tests/ipc_test/dlp_lobby_hle_test.cpp 'TCHECK(RunChild("--l14", "hub-first"));' "L14 runs in both orders, each in a fresh process"
+need Tests/ipc_test/dlp_lobby_hle_test.cpp 'TCHECK_EQ(plain_logged, 48);' "L14: the plain first-call table is 48 pairs, written out in the test"
+need Tests/ipc_test/dlp_lobby_hle_test.cpp 'TCHECK_EQ(hub_logged, 32);' "L14: the hub's two services have 32"
+need Sources/ctr/uds_hle.cpp 'a DELIBERATE choice, not a copy of the real' "the gate's wrong state for every id is a deliberate choice (the real service before Initialize answers 0x02, 0x0B, 0x13, 0x23 differently)"
+need Sources/azl/dlp_hub.cpp 'return AnswerUnserved(kind, cmd);' "the answer to an unserved request has a frame of its own (Serve keeps the frame the tightest chain of the 512-byte thread pays)"
+need Sources/azl/dlp_hub.cpp '__attribute__((noinline)) bool DlpHub::RequestInFlight() {' "the in-flight test has a frame of its own too"
+need_order Sources/azl/dlp_hub.cpp 'Stamp();    // (a request that stalled the engine' 'state_.store(kDone, std::memory_order_release);' "the stamp is taken before the answer is published: the requester it releases finds the thread alive"
+need Tests/chain_sim/chain_sim.py 'def scenario_hub_always_succeeds(elf, level):' "the chain test runs the commands that succeed in every state with no network thread to serve them, at both log levels"
+need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::Serve" 40' "Serve keeps its 40 bytes"
+need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::OnGameUdsStarting" 24' "OnGameUdsStarting keeps its 24 bytes"
+need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::AnswerUnserved" 32' "the unserved branch has its own budget"
+need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::RequestInFlight" 24' "... and the in-flight test"
+need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::AlwaysSucceeds" 8' "the table of the commands that cannot fail"
+need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::EndsRole" 8' "the table of the ones that end a role"
+need Tests/dlp_net_stack_check.sh 'FRAME_HUB=40 ' "no function of the hub has a frame over 40 bytes on ARM32 (the code a game thread runs to serve a dlp command)"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpHub) <= 408,' "the hub is 408 bytes on ARM32: a growth is a decision"
+# The debug trace of the hub's commands (Phase 4, DESIGN-FASE3 sez. 6): the log of the console test is the only record of what the game asked.
+need Sources/ctr/uds_hle.cpp 'constexpr u32 kDlpTraceWords = 6;' "the trace shows 6 words of a request and of a reply"
+need Sources/ctr/uds_hle.cpp 'constexpr u32 kDlpTraceEveryMs = 2000;' "a reply the command already gave is counted, not written again, for 2 s"
+need Sources/ctr/uds_hle.cpp 'constexpr u32 kDlpTraceSigs = 6;' "... and the trace remembers 6 replies per command in that window (4 groups, 'no data', one more: the games poll a command that alternates between a few replies)"
+need Sources/ctr/uds_hle.cpp 'line.Str("dlpc: ").Str(DlpServiceName(srvr))' "the trace's lines start with dlpc: (the reader of the console test reads them)"
+need Sources/ctr/uds_hle.cpp ' more like it since the last line' "the trace says how many calls it left out (the reader counts them)"
+need Sources/ctr/uds_hle.cpp 'DlpTraceRequest(srvr, cmd); // (debug only; before the reply replaces the request words)' "the request is taken before the reply replaces its words"
+need_after Sources/ctr/uds_hle.cpp 'DlpTraceReply(srvr, id, cmd); // (debug only)' 'NoteCommand(DlpServiceName(srvr), id, cmd[1]);' "the trace line comes before NoteCommand, which stays the LAST call of RunDlpHub (a tail call: RunDlp's frame is gone when its Log() runs)"
+need Sources/ctr/uds_hle.cpp 'if (g_debug_level <= 0 || id >= kDlpTraceIds) {' "the trace does nothing without the debug level (the test is inside the function: outside it the compiler kept g_debug_level in a register across RunDlp, 8 bytes more at every level)"
+need Sources/ctr/uds_hle.cpp '.Str(": the Download Play lobby is carried by the room (thread ").Dec(thread_id).Str(", priority 0x")' "the first command of each dlp service says which thread made it and its priority (the hub's threads wait for each other's locks; the network thread is at 0x2F)"
+need Tests/ipc_test/dlp_lobby_hle_test.cpp '    L15();' "the trace is tested in the 32-bit front-end test (L15, in fresh processes)"
+need Tests/ipc_test/dlp_lobby_hle_test.cpp 'std::strcmp(argv[1], "--l15") == 0' "... in its five-six parts"
+need Tests/chain_sim/chain_sim.py 'def scenario_hub_trace_dedupe(elf, level):' "the chain test runs the trace's window of replies on the compiled ARM code at both log levels"
+need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::UdsHle::RunDlp" 32' "RunDlp keeps its 32 bytes (the trace is called from RunDlpHub without growing its frame)"
+need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::{anonymous}::NoteDlpFirst" 48' "the first-command line has its frame (48)"
+need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::{anonymous}::DlpTraceRequest" 24' "the trace's request capture"
+need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::{anonymous}::DlpTraceReply" 72' "the trace's line"
+need Includes/azl/dlp_fkcl_hle.hpp 'static constexpr u32 kResInvalidState = 0xE0A0AC01;' "a command beyond the wireless check gets the service's own 'invalid state'"
+need Tests/dlp_fkcl_test.cpp 'TestOffByDefault();' "the test that dlp:FKCL is the real service by default runs"
+
+# ---- the fake Download Play lobby, Phase 1 (Includes/azl/dlp_types.hpp, dlp_lobby.hpp, dlp_ipc.hpp; analysis/dlp-lobby-fake-2026-10-28/DESIGN-FASE1.md) ----
+# Three pure headers, tested on the PC only: nothing in the plugin includes them yet (Phase 3 does, and lifts that pin). What must not change by accident: the ceiling of
+# the user (THERE IS NEVER A FIFTH PLAYER, and every table is sized on the constants), the memory (no heap, objects of a fixed size, a few hundred bytes), the stack (the
+# code runs on the game thread that made the IPC call, some of which have 464 bytes below it), the numbers the games read (the results of the module, the channel mask, the
+# records, the times), the wire format between two plugins, and the answer of the probe mode that Battle Royale is served by (DlpFkclHle, which stays as it is).
+# - the ceiling of the user (2026-10-28): THERE IS NEVER A FIFTH PLAYER, a host and 3 clients and no more
+need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxPlayers = 4;' "the fake lobby holds a host and 3 clients and never a fifth player"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxClients = 3;' "a host has 3 clients at most"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxGroups = 4;' "a searcher keeps 4 lobbies at most: a room of 4 players holds no more hosts"
+need Includes/azl/dlp_types.hpp 'static_assert(kMaxPlayers == 4,' "the ceiling is an assertion too: raising it takes two edits, and the second says why not"
+need Includes/azl/dlp_types.hpp 'static_assert(kMaxClients + 1 == kMaxPlayers,' "host + clients = players"
+need Includes/azl/dlp_types.hpp 'static_assert(kMaxGroups <= kMaxPlayers,' "no more lobbies than players"
+# - every table of the modules is sized on those constants and says so in an assertion (a table of 8 places is the first step to a fifth player)
+need Includes/azl/dlp_lobby.hpp 'Group g[kMaxGroups];' "the scan table holds kMaxGroups lobbies"
+need Includes/azl/dlp_lobby.hpp 'NodeEntry roster[kMaxPlayers];' "the roster of a session holds kMaxPlayers players"
+need Includes/azl/dlp_lobby.hpp 'Track t[kMaxClients];' "the creator tracks kMaxClients clients"
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(ScanTable::g) / sizeof(Group) == kMaxGroups,' "the scan table is checked against kMaxGroups"
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(SessionTable::roster) / sizeof(NodeEntry) == kMaxPlayers,' "the roster is checked against kMaxPlayers"
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(HostTable::t) / sizeof(Track) == kMaxClients,' "the creator table is checked against kMaxClients"
+need Includes/azl/dlp_ipc.hpp 'u16 ids[kMaxPlayers];' "GetConnectingNodes writes 4 node ids at most, whatever the game asks"
+need Includes/azl/dlp_ipc.hpp 'static_assert(sizeof(ids) / sizeof(ids[0]) == kMaxPlayers,' "the ids of GetConnectingNodes are checked against kMaxPlayers"
+need Includes/azl/dlp_ipc.hpp 'u16 ids[kMaxClients];' "GetConnectingClients writes 3 client ids at most, whatever the game asks"
+need Includes/azl/dlp_ipc.hpp 'static_assert(sizeof(ids) / sizeof(ids[0]) == kMaxClients,' "the ids of GetConnectingClients are checked against kMaxClients"
+need Includes/azl/dlp_types.hpp 'static_assert(sizeof(HeardGroup) <= 40,' "a lobby heard is a local of a game thread: 36 bytes, and not more than 40"
+# - the memory: a few hundred bytes next to a game that needs all of its own (272 measured), and no record of the game (5032 and 664 bytes) kept
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(DlpLobby) <= 320,' "the whole lobby is at most 320 bytes: no heap, and one table of ONE of three shapes"
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(Tables) <= 168,' "the tables are one union whose biggest shape is 168 bytes"
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(Group) == 40,' "a lobby heard is 40 bytes with no u64: the same on ARM32 and on the PC"
+need Includes/azl/dlp_ipc.hpp 'static_assert(sizeof(DlpService) <= 64,' "the IPC front-end is a handful of words: no buffer, no record of the game"
+# - the results of the module that the games read (module 43, Download Play); success is 0 and there is no placeholder -1
+need Includes/azl/dlp_types.hpp 'constexpr u32 kInvalidState = 0xE0A0AC01;' "a command out of its state, the module own result (DlpFkclHle answers the same)"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kBusy = 0xE0A0AC03;' "the module or the radio is taken by the other role or the engine"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kNoData = 0xC880AFEF;' "the end of the list: Triple Deluxe calls GetTitleInfoInOrder until it gets exactly this result, any other error is a title to it"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kNotFound = 0xC880AC05;' "server not found, the result Battle Royale handles for a join that cannot start"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kTimeout = 0xC920AFFE;' "the join did not finish in time"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kOutOfRange = 0xD8E0AFFD;' "StartAccepting with a channel that is not 0, 1, 6 or 11"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kInvalidPointer = 0xD8E0AFF6;' "a buffer of the game that cannot be used"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kBadHeader = 0xD9001830;' "an id the service does not have, answered as DlpFkclHle does (not 0xD900182F of the specification)"
+need Includes/azl/dlp_ipc.hpp 'cmd[2] = 0x0421;' "GetChannels answers the mask of the channels 1, 6 and 11: Triple Deluxe calls it inside StartScan and a negative result is fatal there"
+# - the sizes and the places of the records the games read in their own buffers (the layout is the game: Triple Deluxe confirmed the name at +0x0C and the node at +0x24)
+need Includes/azl/dlp_types.hpp 'constexpr u32 kTitleInfoSize = 0x13A8;' "DLPTitleInfo is 5032 bytes"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kServerInfoSize = 0x298;' "DLPServerInfo is 664 bytes"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kDlpNodeInfoSize = 0x28;' "DLPNodeInfo is 40 bytes (and its name is not kNodeInfoSize, which uds_types.hpp has in the same namespace)"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kNodeInfoName = 0x0C;' "the name of a player is at +0x0C of the node record, as Triple Deluxe reads it (3dbrew says +0x08)"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kNodeInfoNodeId = 0x24;' "the node id is a u32 at +0x24 of the node record, as Triple Deluxe reads it"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kServerInfoTick = 0x290;' "ServerInfo+0x290 is the system tick the lobby was last heard at: the games drop an entry older than 5000 ms, and a 0 there deletes every lobby at every pass"
+# - the wire format between two plugins (version 1): a change of any of these makes a console of the next version deaf to one of this
+need Includes/azl/dlp_types.hpp 'constexpr u8 kAnnounceVersion = 1;' "the announcement of a lobby is version 1"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kAnnounceSize = 29;' "the announcement is 29 bytes (9 fixed and the 20-byte name)"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxMessage = 16;' "a message is 16 bytes at most (the biggest, GO, is 11)"
+need Includes/azl/dlp_types.hpp 'enum class MsgType : u8 { Start = 1, StartAck = 2, Go = 3, GoAck = 4 };' "the four messages and their numbers on the wire"
+# - the times (DESIGN-FASE1 sez. 4.4): the numbers a game waits on, and the ones the games are known to bound
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kPollMs = 20;' "the network work runs at most every 20 ms"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kMaxRx = 8;' "a pass reads 8 messages at most: the cost of a call into the lobby is bounded"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kGroupTtlMs = 1500;' "a lobby that is no longer heard disappears after 1500 ms, well under the 5000 ms after which the game drops an entry"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kJoinMs = 3000;' "a join gives up after 3000 ms, like the blocking StartFakeSession of Azahar"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kHostGoneMs = 2000;' "a host missing for 2000 ms is a lost host"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kResendMs = 200;' "START and GO are sent again every 200 ms"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kStartGraceMs = 1500;' "a client that does not answer START in 1500 ms is thrown out"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kGoGraceMs = 2000;' "the creator goes to 9 at most 2000 ms after it sent GO"
+need Includes/azl/dlp_lobby.hpp 'static constexpr u32 kRosterMs = 250;' "the roster of a session is read again every 250 ms"
+need Includes/azl/dlp_lobby.hpp 'static_assert(kGroupTtlMs < 5000,' "the game drops the entries older than 5000 ms: the lobby must drop them first"
+need Includes/azl/dlp_lobby.hpp 'static_assert(kResendMs * 2 < kStartGraceMs && kResendMs * 2 < kGoGraceMs,' "at least two resends before the grace of START and of GO"
+need Includes/azl/dlp_lobby.hpp 'static_assert(kPollMs <= kResendMs,' "Poll runs at least once per resend period"
+# - Battle Royale is served today by DlpFkclHle and goes on being served by it: it stays exactly as it is (its text is pinned by its sha256 below), and DlpService
+#   without a lobby (ProbeOnly) is tested against it word for word and counter for counter by dlp_ipc_test
+need Includes/azl/dlp_fkcl_hle.hpp 'static constexpr u32 kResBadHeader = 0xD9001830;' "an id the service does not have gets the dispatcher own answer"
+need Includes/azl/dlp_fkcl_hle.hpp 'static constexpr u32 kLastCommand = 0x11;' "DlpFkclHle knows the commands 1 to 0x11"
+need Includes/azl/dlp_ipc.hpp 'DlpLobby* lobby_ = nullptr;' "a DlpService starts without a lobby, that is in ProbeOnly mode"
+need Includes/azl/dlp_ipc.hpp 'return lobby_ != nullptr ? DlpMode::Lobby : DlpMode::ProbeOnly;' "the mode is decided by the lobby alone: none is ProbeOnly"
+need Tests/dlp_ipc_test.cpp '    TestProbeOnlyIsDlpFkclHle();' "the test that ProbeOnly is DlpFkclHle runs"
+need Tests/dlp_ipc_test.cpp '#include "azl/dlp_fkcl_hle.hpp"' "the test compares ProbeOnly with the real DlpFkclHle"
+need Tests/dlp_ipc_test.cpp '#include "azl/uds_engine.hpp"' "the test includes the engine header beside the DLP ones: the plugin uds_hle.cpp includes both, and a clash of names (kNodeInfoSize) must stop the test, not the plugin"
+need Tests/dlp_adv_ipc_test.cpp '#include "azl/uds_engine.hpp"' "the attack test includes the engine header beside the DLP ones too"
+# - Phase 1 is PC only: the plugin still answers dlp:FKCL with DlpFkclHle (Phase 3 changes this, and lifts the pins below)
+need_line Includes/ctr/uds_hle.hpp '#include "azl/dlp_fkcl_hle.hpp"' "the plugin front-end still carries the probe fake of Battle Royale"
+need Sources/ctr/uds_hle.cpp 'dlp_.Dispatch(cmd);' "the plugin dlp:FKCL request still goes to the probe fake"
+# - the PC tests of the lobby are built with the sanitizers and stop at the first undefined behaviour (an index beyond a table is a failure, not a line nobody reads)
+need Tests/run.sh '-pthread -fsanitize=address,undefined"' "the PC tests are built with AddressSanitizer and UBSan"
+need Tests/dlp_lobby_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+need Tests/dlp_ipc_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+need Tests/dlp_lobby_sim_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+need Tests/dlp_adv_lobby_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+need Tests/dlp_adv_ipc_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+
+# - no heap, no container, no function object, no lock, no exception and no system header in the three headers (only std::memcpy and std::memset are used); the one region of
+#   'game-thread code' of each (counted by game_thread_file above) is also held to the rule of the code that runs on a game thread: no printf family, no Log() / DebugEvent()
+#   with a format, no new / malloc, no std::string / std::vector, no char buffer over 64 bytes
+for h in Includes/azl/dlp_types.hpp Includes/azl/dlp_lobby.hpp Includes/azl/dlp_ipc.hpp; do
+  hit=$(tr -d '\r' < "$h" | sed 's://.*$::' | grep -o -E 'std::[A-Za-z_0-9]+|#include[[:space:]]*<[a-z_.]*>|\bthrow\b|\btry\b|\bcatch\b|\bthread_local\b|\bdelete[[:space:]]*(\[\])?[[:space:]]*[A-Za-z_(*]' | grep -v -E '^std::mem(cpy|set)$' | head -3)
+  [ -z "$hit" ] || fail "$h uses a heap, a container, a function object, a lock, an exception or a system header (only std::memcpy and std::memset are allowed): $hit"
+done
+# - DlpFkclHle (the answer of Battle Royale's probe, and the oracle that DlpService without a lobby is tested against) is exactly the file that was tested; Phase 3 may replace it, and then changes this line
+DLPFKCL_SHA=3f5019d169ad65249ab61d922f6991cbc393bba2b81feaffd1a614b07281b784
+SUM=$(tr -d '\r' < Includes/azl/dlp_fkcl_hle.hpp | sha256sum | cut -d' ' -f1)
+[ "$SUM" = "$DLPFKCL_SHA" ] || fail "Includes/azl/dlp_fkcl_hle.hpp is not the file of Phase 1 (sha256 $SUM): it is the answer of Battle Royale's probe and the oracle that DlpService in ProbeOnly mode is tested against; it stays as it is"
+# - the plugin and the app include none of the three headers (Phase 1 is PC only; Phase 3 changes the plugin and lifts this pin)
+hit=$(grep -r -n -E 'dlp_(types|lobby|ipc)\.hpp' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v '^Includes/azl/dlp_' | head -3)
+[ -z "$hit" ] || fail "the plugin or the app includes a header of the fake Download Play lobby other than the hub's (Phase 3: the plugin reaches the lobby only through azl/dlp_hub.hpp): $hit"
+# - Phase 3: the plugin reaches the lobby through the hub alone. Only Includes/ctr/plugin.hpp (the member) and Sources/ctr/uds_hle.cpp (the HLE) include azl/dlp_hub.hpp, nothing includes the
+#   adapter's header (the hub owns the adapter), and the app (ConfigApp) knows nothing of it.
+hit=$(grep -r -n -E 'azl/dlp_hub\.hpp"' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v '^Sources/azl/dlp_hub.cpp' | grep -v '^Includes/ctr/plugin.hpp' | grep -v '^Sources/ctr/uds_hle.cpp' | head -3)
+[ -z "$hit" ] || fail "something other than plugin.hpp, uds_hle.cpp and the hub itself includes azl/dlp_hub.hpp: $hit"
+hit=$(grep -r -n -E 'dlp_lobby_net\.hpp"' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v '^Sources/azl/dlp_lobby_net.cpp' | grep -v '^Includes/azl/dlp_hub.hpp' | head -3)
+[ -z "$hit" ] || fail "something other than the hub includes the adapter's header azl/dlp_lobby_net.hpp (the hub owns the adapter): $hit"
+hit=$(grep -r -n -E 'dlp_hub|DlpHub|EngineLobbyNet' ConfigApp --include=*.cpp --include=*.c --include=*.hpp --include=*.h | head -3)
+[ -z "$hit" ] || fail "the app (ConfigApp) uses the plugin's Download Play hub or adapter: $hit"
+
+# ---- the stack and the size of the fake Download Play lobby on the plugin's own target (rules 3 and 4 of the user; DESIGN-FASE1 sez. 1.3) ----
+# The PC tests are x86-64 with the sanitizers: they see neither the frame of an ARM function (some game threads have 464 bytes under them) nor what the plugin's compiler
+# and flags say about the code. Tests/dlp_stack_check.sh compiles Tests/dlp_stack_probe.cpp with arm-none-eabi-g++ and the flags of the Makefile, reads the frame of every
+# function and the sum of the frames down to the network, and Tests/run.sh runs it. What must not change by accident: that it runs, the flags it compiles with, its budgets,
+# the sizes the probe asserts on ARM32, a wrapper for every public function, and the noinline that keeps the big frames out of their callers.
+need_line Tests/run.sh '  bash Tests/dlp_stack_check.sh' "the suite runs the stack and size check of the fake lobby on the plugin's target (a frame of an ARM function is not seen by the x86-64 tests)"
+need Tests/dlp_stack_check.sh '-c Tests/dlp_stack_probe.cpp -o' "the check compiles the probe"
+need_line Tests/dlp_stack_check.sh 'for pass in A B; do' "two passes: as the plugin would build it (the sums of the frames are held) and with every function kept (every frame and every circle is seen)"
+need_line Tests/dlp_stack_check.sh '  [ "$pass" = B ] && extra="-fkeep-inline-functions"' "pass B keeps every inline function: a public function that has no wrapper yet, or a helper that pass A inlines everywhere, is still measured"
+need_line Tests/dlp_stack_check.sh '"$PY" "$W/check.py" --selftest' "the check tries itself on made-up listings first: a gate that cannot say no is not a gate"
+need Tests/dlp_stack_check.sh 'FRAME_MAX=48 ' "no function of the lobby has a frame over 48 bytes on ARM32"
+need Tests/dlp_stack_check.sh 'FRAME_DISPATCH=64 ' "Dispatch, which every command passes through, has a frame of 64 bytes at most"
+need Tests/dlp_stack_check.sh 'FRAME_POLLSCAN=64 ' "PollScan, which holds the lobby heard, is the one function allowed 64 bytes"
+need Tests/dlp_stack_check.sh 'CHAIN_MAX=160 ' "from a function of the lobby down to a call out of the module the frames add up to 160 bytes at most (Dispatch: 152 measured)"
+need_line Tests/dlp_stack_check.sh 'ARM_FLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Os -mword-relocations -fomit-frame-pointer -ffunction-sections -fno-strict-aliasing -Wall -Wno-psabi -fno-rtti -fno-exceptions -std=gnu++17"' "the probe is compiled with the flags of the Makefile (ARM11 MPCore, -Os, no RTTI, no exceptions, gnu++17): the frames of another compilation are not the plugin's"
+need_line Tests/dlp_stack_check.sh 'STRICT_FLAGS="-Wextra -Wpedantic -Wshadow -Werror -fstack-usage -fcallgraph-info=su"' "the headers must be clean for the plugin's compiler, and the compiler is asked for the frames and the call graph"
+need Tests/dlp_stack_check.sh '"${DEVKITARM:+$DEVKITARM/bin/arm-none-eabi-g++}" /opt/devkitpro/devkitARM/bin/arm-none-eabi-g++; do' "the compiler is looked for where the devkitARM container keeps it (not in its PATH)"
+need Tests/dlp_stack_check.sh 'if [ -n "$DLP_STACK_REQUIRED" ]; then' "without the compiler the check is skipped aloud, and DLP_STACK_REQUIRED makes that a failure"
+# Nothing may be kept in memory: a `static u8 scratch[4096]` is not in sizeof(DlpLobby) and not in a frame. The object file of the probe shows it (data and bss stay at 0),
+# and the array scan of the game-thread code looks at every line that is not a constant.
+need Tests/dlp_stack_check.sh 'read -r _text data bss _rest < <("$ARM_SIZE" "$W/probe_$pass.o" | awk '"'"'NR == 2'"'"')' "the check reads the size of the object file of the probe (text data bss)"
+need Tests/dlp_stack_check.sh 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the fake lobby keeps no static storage: data and bss of the probe are 0 (a static buffer would hide from sizeof and from the frames)"
+# A test of the lobby that hangs (a loop that waits for something a regression no longer does) must fail the suite after 20 minutes, not stop it for good.
+for t in dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test; do
+  need_line Tests/run.sh "  timeout 1200 \"\$OUT/$t\"" "the suite runs $t under a timeout: a hang is a failure, not a stop"
+done
+ARM_ARCH=$(tr -d '\r' < Makefile | sed -n 's/^ARCH[[:space:]]*:=[[:space:]]*//p')
+[ -n "$ARM_ARCH" ] && tr -d '\r' < Tests/dlp_stack_check.sh | grep -F -q -- "$ARM_ARCH" || fail "Tests/dlp_stack_check.sh does not compile for the Makefile's ARCH ('$ARM_ARCH'): the frames it measures are not the plugin's"
+[ -n "$ARM_ARCH" ] && tr -d '\r' < Tests/dlp_net_stack_check.sh | grep -F -q -- "$ARM_ARCH" || fail "Tests/dlp_net_stack_check.sh does not compile for the Makefile's ARCH ('$ARM_ARCH'): the frames it measures are not the plugin's"
+need Makefile '$(ARCH) -Os -mword-relocations' "the plugin is built with -Os (the check compiles with it too)"
+need Makefile '-fno-rtti -fno-exceptions -std=gnu++17' "the plugin is built without RTTI and exceptions as gnu++17 (the check compiles with the same)"
+# - the probe: the sizes on ARM32 as assertions, and a wrapper for every public function of the two classes
+need_line Tests/dlp_stack_probe.cpp '#if !defined(__arm__)' "the probe measures the plugin's target and refuses another compiler"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(void*) == 4,' "the probe knows it is ARM32"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpLobby) <= 272,' "the whole lobby is 272 bytes on ARM32: a growth is a decision"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpService) <= 40,' "the IPC front-end is 40 bytes on ARM32: a growth is a decision"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpLobby::Tables) == 168,' "the tables are one union of 168 bytes on ARM32"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(Group) == 40,' "a lobby heard is 40 bytes on ARM32"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(NodeEntry) == 32,' "a player as the network reports it is 32 bytes on ARM32"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(HeardGroup) <= 40,' "a lobby heard on the stack of a game thread is at most 40 bytes on ARM32"
+dlp_wrappers() { # $1 = header, $2 = class: every public function of the class is called by the probe
+  local names n
+  names=$(tr -d '\r' < "$1" | awk -v cls="$2" '
+      $0 ~ "^class " cls " [{]" { inclass = 1; pub = 0; next }
+      inclass && /^public:/ { pub = 1; next }
+      inclass && /^(private|protected):/ { pub = 0; next }
+      inclass && /^[}];/ { inclass = 0 }
+      inclass && pub && /^    [A-Za-z_][A-Za-z0-9_:<>*& ]* [*&]?[A-Za-z_][A-Za-z0-9_]*[(].*[)]( const)? [{]$/ { s = $0; sub(/[(].*$/, "", s); sub(/^.* [*&]?/, "", s); print s }')
+  [ -n "$names" ] || { fail "$1: the scan for the public functions of $2 found none (the probe's wrappers cannot be checked)"; return; }
+  for n in $names; do
+    grep -q -E "(->|[.])$n[(]" Tests/dlp_stack_probe.cpp || fail "Tests/dlp_stack_probe.cpp has no wrapper for $2::$n (every public function of the lobby is measured on ARM32 as the plugin calls it)"
+  done
+}
+dlp_wrappers Includes/azl/dlp_lobby.hpp DlpLobby
+dlp_wrappers Includes/azl/dlp_ipc.hpp DlpService
+# - the noinline that keeps the big frames out of their callers (the check measures the result, this holds the cause: with 13 and 28 of them the frames are 48 or less)
+need Includes/azl/dlp_lobby.hpp 'DLP_NOINLINE bool Announce(u8 accepting, u32 channel) {' "the announcement is built in a frame of its own: the creator's commands stay small"
+need Includes/azl/dlp_lobby.hpp 'DLP_NOINLINE void PollScan() {' "the lobby heard (36 bytes) lives in a frame of its own: the only one over 48"
+[ "$(grep -c '^    DLP_NOINLINE ' Includes/azl/dlp_lobby.hpp)" = "13" ] || fail "Includes/azl/dlp_lobby.hpp has not 13 functions marked DLP_NOINLINE (each keeps a frame out of its callers; a change is a decision: tell Tests/dlp_stack_check.sh and this line)"
+[ "$(grep -c '^    DLPIPC_NOINLINE ' Includes/azl/dlp_ipc.hpp)" = "28" ] || fail "Includes/azl/dlp_ipc.hpp has not 28 functions marked DLPIPC_NOINLINE (each handler keeps its frame out of Dispatch; a change is a decision: tell Tests/dlp_stack_check.sh and this line)"
+# - no array over 64 bytes with a number in its size in the code of the three headers (the stack check sees every size, the scan sees a number as it is written): char[N] is
+#   already refused above; here also u8, u16, u32, u64, Mac and the records of the lobby. A table sized by a constant (Group g[kMaxGroups]) is a member and is held by its assertion.
+dlp_big_arrays() { # $1 = a header of the lobby
+  local hit
+  hit=$(tr -d '\r' < "$1" | awk -v b="$GT_BEGIN" -v e="$GT_END" '
+      BEGIN { n = split("char:1 bool:1 u8:1 s8:1 u16:2 s16:2 u32:4 s32:4 int:4 unsigned:4 u64:8 s64:8 Mac:6 Track:8 HostAnnounce:28 Identity:32 NodeEntry:32 HeardGroup:36 Group:40", t, " "); for (i = 1; i <= n; i++) { split(t[i], kv, ":"); sz[kv[1]] = kv[2] } }
+      $0 ~ b { on = 1; next }
+      $0 ~ e { on = 0; next }
+      on { line = $0; sub(/\/\/.*$/, "", line); s = line
+           if (line ~ /constexpr|static[[:space:]]+const/) next
+           while (match(s, /[A-Za-z_][A-Za-z0-9_]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*(\[[[:space:]]*[0-9]+[[:space:]]*\])+/)) {
+             m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+             type = m; sub(/[[:space:]].*$/, "", type)
+             dims = m; sub(/^[^[]*/, "", dims)
+             bytes = sz[type] + 0
+             if (bytes > 0) { nd = split(dims, d, "]"); for (i = 1; i < nd; i++) { x = d[i]; sub(/^[[:space:]]*\[[[:space:]]*/, "", x); bytes *= x + 0 } }
+             if (bytes > 64) print FNR ": " m
+           } }' | head -2)
+  [ -z "$hit" ] || fail "$1 has an array over 64 bytes on a game thread (some of them have 464 bytes under the call): $hit"
+}
+dlp_big_arrays Includes/azl/dlp_types.hpp
+dlp_big_arrays Includes/azl/dlp_lobby.hpp
+dlp_big_arrays Includes/azl/dlp_ipc.hpp
+
+# ---- the fake Download Play lobby, Phase 2: the adapter on the UDS engine (Includes/azl/dlp_lobby_net.hpp, Sources/azl/dlp_lobby_net.cpp and the lobby's pieces of the engine; analysis/dlp-lobby-fake-2026-10-28/DESIGN-FASE2.md) ----
+# The lobby is a UDS network of its own that two plugins host and join; the engine is the game's nwm::UDS as well and has ONE state. What must not change by accident: whose network it
+# is (the Download Play's ids, never the game's), who may speak on it (a message counts only from the MAC of the host, or of the node it names), how much the engine keeps for it (a ring
+# of 8 messages of 16 bytes, 4 lobbies of 32 bytes: the user's ceiling of 4 players), that it hands the engine back clean, that nothing is allocated or kept by the adapter, and that
+# the plugin does not use any of it yet (Phase 3).
+game_thread_file Includes/azl/dlp_lobby_net.hpp 1
+game_thread_file Sources/azl/dlp_lobby_net.cpp 1
+dlp_big_arrays Includes/azl/dlp_lobby_net.hpp
+dlp_big_arrays Sources/azl/dlp_lobby_net.cpp
+# - the Download Play's own ids (a game's scan must not list the lobby, and ours must not list a game): wlancommid 0x2810 and id8 0x55 are the ones the real Download Play uses
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kLobbyWlanCommId = 0x00002810;' "the lobby's network is the Download Play's, never a game's: a game's scan (filtered by its ids) must not list it"
+need Includes/azl/uds_engine.hpp 'static constexpr u8 kLobbyId8 = 0x55;' "...and its id8"
+need Sources/azl/dlp_lobby_net.cpp 'engine_->BeginHostingLobby(UdsEngine::kLobbyWlanCommId, UdsEngine::kLobbyId8, channel,' "the creator hosts the lobby under the Download Play's ids"
+need Sources/azl/uds_engine.cpp 'LoadBE32(tags.network + 4) != kLobbyWlanCommId || tags.network[8] != kLobbyId8) {' "the engine files only the beacons of the Download Play's ids as lobbies"
+need Sources/azl/uds_engine.cpp 'if (!GetBeaconApplicationData(tags, &data, &size) || size == 0 || tags.network_size <= kMaxAt ||' "a beacon with no application data, or a tag too short for the node counts, is no lobby"
+# - the sizes the engine keeps for it: 8 messages of 16 bytes, 4 lobbies of 32 bytes of announcement (a room of 4 players holds 4 hosts at most)
+need Includes/azl/uds_engine.hpp 'static constexpr u8 kLobbyChannel = 0xD1;' "the lobby's messages travel on a data channel of their own"
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kLobbyMessageMax = 16;' "a lobby message is 16 bytes at most (the largest, GO, is 11)"
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kLobbyInbox = 8;' "the ring of the lobby's messages holds 8: 144 bytes"
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kHeardLobbies = 4;' "the engine remembers 4 lobbies: a room of 4 players holds at most 4 hosts"
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kHeardDataMax = 32;' "an announcement is 29 bytes: the engine copies 32 of a beacon's application data"
+need Includes/azl/dlp_lobby_net.hpp 'static_assert(kMaxGroups <= UdsEngine::kHeardLobbies,' "the engine remembers as many lobbies as the searcher keeps"
+need Includes/azl/dlp_lobby_net.hpp 'static_assert(kAnnounceSize <= UdsEngine::kHeardDataMax,' "an announcement fits in what the engine copies out of a beacon"
+need Includes/azl/dlp_lobby_net.hpp 'static_assert(kMaxMessage <= UdsEngine::kLobbyMessageMax,' "a message fits in what the engine's ring keeps"
+need Includes/azl/dlp_lobby_net.hpp 'static constexpr u32 kHeardFreshMs = 400;' "a lobby is listed while its last beacon is younger than 400 ms (they come every 102 ms; the lobby's own table keeps an entry 1500 ms)"
+need Includes/azl/dlp_lobby_net.hpp 'static constexpr u16 kBlockClients = 0x2;' "UDSNETATTR_DISABLE_CONNECT: the creator that stops accepting closes the admission in the engine"
+# - who may speak: the transmitter of the frame decides, never the node id in its header; a stranger's frame, a broadcast, a size outside 1..16 are refused
+need Sources/azl/uds_engine.cpp 'if (lobby_inbox_ && secure_data.data_channel == kLobbyChannel) {' "the lobby's messages are taken before the binds: they never reach a game's bind"
+need Sources/azl/uds_engine.cpp 'bool ok = secure_data.dest_node_id == connection_status_.network_node_id;' "the lobby speaks to one node at a time: a broadcast is not its message"
+need Sources/azl/uds_engine.cpp 'it->second.node_id == secure_data.src_node_id;' "the creator takes a message only from the node that has the transmitter's MAC"
+need Sources/azl/uds_engine.cpp 'ok = status == NetworkStatus::ConnectedAsClient && secure_data.src_node_id == kHostDestNodeId &&' "the searcher takes a message only from node 1 ..."
+need_line Sources/azl/uds_engine.cpp '             packet.transmitter_address == network_info_.host_mac_address;' "... and only from the MAC of the host it joined (a second lobby has the same node ids)"
+need Sources/azl/uds_engine.cpp 'if (!ok || n == 0 || n > kLobbyMessageMax) {' "a message outside 1..16 bytes, or from a stranger, is refused"
+[ "$(grep -c 'copy_dedupe_.Seen(secure_data.src_node_id, secure_data.sequence_number)' Sources/azl/uds_engine.cpp)" = "3" ] || fail "Sources/azl/uds_engine.cpp: the copy a radio_like=2 sender adds is dropped in three places (the host's router, the lobby's ring, the binds)"
+[ "$(grep -c 'lobby_->rx_first = static_cast<u8>((lobby_->rx_first + 1) % kLobbyInbox);' Sources/azl/uds_engine.cpp)" = "2" ] || fail "Sources/azl/uds_engine.cpp: the lobby's ring moves its first message on in two places (a full ring loses the oldest, a pop takes it)"
+need Sources/azl/uds_engine.cpp 'at = lobby_->rx_first; // full: the oldest message makes room' "a full ring loses its oldest message and keeps the newest"
+# - the engine hands out what the adapter needs, without a game's block: InitializeForLobby refuses an engine that is up, and a host says goodbye with Deauthentications (version 0x200 on)
+need Sources/azl/uds_engine.cpp 'if (initialized_ || service_state_ != kServiceRunning) {' "InitializeForLobby touches nothing of a session that is up (a game's, or the lobby's own)"
+need Sources/azl/uds_engine.cpp 'version_ = kMaxVersion; // (a host sends the Deauthentications of its goodbye from version 0x200 on)' "the lobby's host says goodbye to its clients: a goodbye lost leaves them connected to a host that is gone"
+need Sources/azl/uds_engine.cpp 'return initialized_ && (status == static_cast<u32>(NetworkStatus::ConnectedAsClient) ||' "ConnectPoll says 1 only for a node that is a client of its network"
+need Sources/azl/uds_engine.cpp 'network_info_.application_data_size = static_cast<u8>(app_size);' "the lobby's announcement is the application data of its beacon"
+need Sources/azl/uds_engine.cpp 'StoreBE32(network_info_.network_id_be, network_id | 1u);' "the lobby's network has a network id of its own (never 0)"
+# - the adapter: it takes the engine only when it is free, gives it back whole, and keeps nothing
+need Sources/azl/dlp_lobby_net.cpp 'if (engine_->InitializeForLobby(me.seed, me.name) != res::kSuccess) {' "the lobby takes the service only when no game has it"
+need Sources/azl/dlp_lobby_net.cpp 'return !engine_->initialized() && engine_->PrepareLobby();' "a scan is possible unless a game has the service, and it asks the engine to keep the lobbies it hears"
+need Sources/azl/dlp_lobby_net.cpp '    engine_->Shutdown();' "the lobby gives the service back whole (a game's Initialize after ours must not inherit our node, name or seed)"
+need Sources/azl/dlp_lobby_net.cpp 'engine_->UpdateNetworkAttribute(kBlockClients, a.accepting != 0 ? 0 : 1);' "a creator that stops accepting closes the admission in the engine, not only in its announcement"
+need Sources/azl/dlp_lobby_net.cpp 'if (to_node < 1 || to_node > kMaxPlayers || size == 0 || size > kMaxMessage) {' "a message goes to one node of 1..4, 1..16 bytes"
+need Sources/azl/dlp_lobby_net.cpp 'for (u32 id = 1; id <= 16 && count < kMaxPlayers; ++id) {' "the lobby is told about 4 nodes at most, whatever the engine says"
+need Sources/azl/dlp_lobby_net.cpp 'out->signal = 3;' "a lobby is always heard at full strength (as Azahar says)"
+[ "$(grep -c 'SetLobbyInbox' Sources/azl/dlp_lobby_net.cpp)" = "0" ] || fail "Sources/azl/dlp_lobby_net.cpp switches the inbox itself: the engine does it with the network (BeginHostingLobby, ConnectBeginLobby, Shutdown), in the same breath, so that no frame of the handshake meets it off"
+[ "$(grep -c 'lobby_inbox_ = true;' Sources/azl/uds_engine.cpp)" = "2" ] || fail "Sources/azl/uds_engine.cpp: the lobby's inbox is switched on in two places by the network that begins (the creator's BeginHostingLobby, the searcher's ConnectBeginLobby)"
+need Sources/azl/uds_engine.cpp 'lobby_inbox_ = false; // (the lobby' "Shutdown switches the lobby's inbox off and empties the ring"
+# - the plugin reaches the adapter and the engine's lobby functions only through the hub (Phase 3: Sources/azl/dlp_hub.cpp is the one caller; the front-end and the plugin never name them)
+hit=$(grep -r -n -E 'EngineLobbyNet|dlp_lobby_net|InitializeForLobby|BeginHostingLobby|HeardLobbyAt|ConnectBeginLobby|SetLobbyInbox|PopLobbyMessage|NodeSnapshot' Sources/ctr Includes/ctr Sources/main.cpp ConfigApp/source 2>/dev/null | head -3)
+[ -z "$hit" ] || fail "the plugin or the app names the adapter of the fake Download Play lobby or the engine's lobby functions: they are the hub's alone (Sources/azl/dlp_hub.cpp), the plugin goes through DlpHub: $hit"
+# - the checks that hold all this: the suite builds and runs them (the unit test under a timeout, the stack and static storage check of the adapter on the plugin's target, the probe against a real room)
+need_line Tests/run.sh '  bash Tests/dlp_net_stack_check.sh' "the suite runs the stack and static storage check of the lobby's adapter on the plugin's target"
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_net_test.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dlp_net_test"' "the unit test of the adapter over the engine is built with the adapter and the core"
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_room_probe"' "the probe of the lobby over a real room is built (with the monotonic clock of the other room tests)"
+need Tests/integration.sh '/tmp/azl_tests/dlp_room_probe $R1 24872' "the integration run plays the lobby over the real room server"
+need_line Tests/dlp_net_stack_check.sh 'ARM_FLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Os -mword-relocations -fomit-frame-pointer -ffunction-sections -fno-strict-aliasing -Wall -Wno-psabi -fno-rtti -fno-exceptions -std=gnu++17 -D__3DS__ -DAZL_USE_CTRPF"' "the adapter and the engine are compiled with the flags of the Makefile and the plugin's 3DS defines"
+# - what the review of 2026-10-29 asked for: a client of a lobby drops the frames of another lobby, its roster follows the departures, the engine keeps lobby state only when a lobby is used
+need Sources/azl/uds_engine.cpp 'PurgeLobbyMessagesLocked(node.node_id);' "a node that leaves takes its unread lobby messages with it"
+[ "$(grep -c 'RefreshClientsLocked();' Sources/azl/uds_engine.cpp)" = "1" ] || fail "Sources/azl/uds_engine.cpp: a departure is told to the clients that remain in one place (RemoveNodeLocked, while a lobby is up)"
+need Sources/azl/uds_engine.cpp 'if (slot.used && static_cast<u32>(stamp - slot.rx_ms) > kBeaconKeepMs) {' "a lobby silent for longer than the engine keeps a beacon is forgotten (unsigned age: no ghost after 24.8 days)"
+need Sources/azl/uds_engine.cpp 'return; // (no lobby is in use: a game' "a game that uses no lobby does not parse a beacon for one"
+need Sources/azl/uds_engine.cpp 'lobby_.reset(new (std::nothrow) LobbyState());' "what a lobby keeps is allocated the first time one is used, and a failure to allocate is an answer, not an abort"
+need Includes/azl/uds_engine.hpp 'static_assert(sizeof(HeardLobbySlot) == 48,' "a lobby heard is 48 bytes"
+need Sources/azl/uds_engine.cpp '    DebugSecure(kDirRx, packet, secure_data); // (the capture of a lobby' "a lobby frame that is taken is in the debug capture, as the ones that go out are"
+[ "$(grep -c 'const bool took = !held_;' Sources/azl/dlp_lobby_net.cpp)" = "2" ] || fail "Sources/azl/dlp_lobby_net.cpp: HostOpen and ConnectBegin end the lobby on a failure only when it was this call that took the engine"
+need Sources/azl/dlp_lobby_net.cpp 'if (a.max_nodes > kMaxPlayers) {' "a lobby of more than 4 players is never announced"
+[ "$(grep -c 'slot.lobby.host == packet.transmitter_address' Sources/azl/uds_engine.cpp)" = "1" ] || fail "Sources/azl/uds_engine.cpp: a lobby whose host beacons other ids is forgotten in one place (NoteLobbyBeaconLocked)"
+need Tests/dlp_net_adv_test.cpp "    XGameOwnsEngine();" "the scenario XGameOwnsEngine runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XFailures();" "the scenario XFailures runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XInbox();" "the scenario XInbox runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XRejoin();" "the scenario XRejoin runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XHostile();" "the scenario XHostile runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XNames();" "the scenario XNames runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XSpectator();" "the scenario XSpectator runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XBeacons();" "the scenario XBeacons runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XLimits();" "the scenario XLimits runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XStrangers();" "the scenario XStrangers runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XRosters();" "the scenario XRosters runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XDeparture();" "the scenario XDeparture runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XPurge();" "the scenario XPurge runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XStaleSlot();" "the scenario XStaleSlot runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XPresence();" "the scenario XPresence runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XSleep();" "the scenario XSleep runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XAdmission();" "the scenario XAdmission runs in main()"
+need Tests/dlp_net_adv_test.cpp "    XNeverAccepted();" "the scenario XNeverAccepted runs in main()"
+need Tests/dlp_net_adv_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+need Tests/dlp_net_adv_test.cpp '#include "dlp_net_rig.hpp"' "the adversarial half uses the rig of the first"
+# The third and the fourth half (2026-10-29, second review round and second mutation round).
+for t in dlp_net_churn_test dlp_net_extra_test; do
+  need Tests/$t.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the test $t stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+  need Tests/$t.cpp '#include "dlp_net_rig.hpp"' "the test $t uses the rig of the first"
+done
+for s in "R_Race()" "TA_Ghost(500)" "TA_Ghost(1500)" "G1_HalfOpen()" "G3_ClientSilent()" "G4_RejoinRing()" "C_Closed()"; do
+  need Tests/dlp_net_churn_test.cpp "    $s;" "the scenario $s of the churn test runs in main()"
+done
+need Tests/dlp_net_churn_test.cpp "        Fuzz(seed, 22);" "the churn fuzz runs 22 steps for each seed"
+need Tests/dlp_net_churn_test.cpp "    for (u32 seed : {1u, 2u, 3u}) {" "the churn fuzz runs three seeds (seed 2 and 3 are the ones that found the ghost node)"
+need Tests/dlp_net_churn_test.cpp "    CHECK_EQ(g_diverged, 0u);" "a roster or a message that disagrees in the churn fuzz is a failure"
+for s in YHeardTable YFreshEngine YRing YStaleRing YGameChannel YRefresh YGameHostQuiet YClientQuiet YForeign YManagement YGoodbye YGameConnect YCleanNode YCapture YClockWrap YNoMemory YStaleNodeMap; do
+  need Tests/dlp_net_extra_test.cpp "    $s();" "the scenario $s of the extra test runs in main()"
+done
+need Tests/run.sh '-Wl,--wrap=_ZN3azl8platform5NowMsEv -Wl,--wrap=malloc -o "$OUT/dlp_net_extra_test"' "the extra test is linked with the two wraps it needs (the clock and malloc): without them Y15 and Y16 fail on their own check"
+# The two engine rules the churn fuzz found (the departure's Logoff is no admission for a console that has not been answered; a lobby has no guard for a second goodbye).
+need Sources/azl/uds_engine.cpp "        if (lobby_inbox_ && !associated_) {" "a lobby client that is Connecting takes no Logoff before its host has answered the Authentication (the departure refresh is not its admission)"
+need Sources/azl/uds_engine.cpp "(!lobby_inbox_ && LeftRecentlyLocked(packet.transmitter_address, now))" "a lobby host arms no guard against a late second goodbye (its peers say it once, and the guard would keep the node of a console that left twice)"
+need Sources/azl/dlp_lobby_net.cpp "    if (a.accepting == 0) {" "a lobby opened closed is closed (BeginHostingLobby leaves the admission open)"
+[ "$(grep -c 'CHECK(false)' Tests/dlp_room_probe.cpp)" = "4" ] || fail "Tests/dlp_room_probe.cpp: a room that cannot be joined is a failure in each of the four scenarios (a probe that returns green without checking anything proves nothing)"
+[ "$(grep -c 'if (held_) {' Sources/azl/dlp_lobby_net.cpp)" = "3" ] || fail "Sources/azl/dlp_lobby_net.cpp: Acquire, ScanOpen and Kick each ask whether the lobby holds the engine (a scan is allowed while it does; nothing of a game's session is touched)"
+need_after Sources/azl/uds_engine.cpp 'void UdsEngine::NoteLobbyBeaconLocked(' 'if (!lobby_) {' "a game that uses no lobby does not parse a beacon for one"
+need Tests/dlp_net_stack_check.sh 'FRAME_ADAPTER=80 ' "no method of the adapter has a frame over 80 bytes on ARM32 (ScanRead, which holds the lobby heard, is the largest)"
+need Tests/dlp_net_stack_check.sh 'FRAME_ENGINE=64 ' "no function of the engine's lobby pieces that a game thread reaches has a frame over 64 bytes"
+need Tests/dlp_net_stack_check.sh '"$ARM_GXX" $ARM_FLAGS -Wextra -Wpedantic -Wshadow -Werror -fstack-usage -c Sources/azl/dlp_lobby_net.cpp -o "$W/adapter.o"' "the adapter is compiled for the plugin's target with the flags of the Makefile, strictly"
+need Tests/dlp_net_stack_check.sh '"$ARM_GXX" $ARM_FLAGS -fstack-usage -c Sources/azl/uds_engine.cpp -o "$W/engine.o"' "the engine is compiled for the plugin's target with the flags of the Makefile"
+need Tests/dlp_net_stack_check.sh 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the adapter keeps no static storage: data and bss of its object are 0"
+need Tests/dlp_net_stack_check.sh 'if check_su "$W/bad_frame.su" ' "the gate tries itself first: a frame over its budget must be refused"
+need Tests/dlp_net_stack_check.sh 'if check_su "$W/bad_dynamic.su" ' "... and a dynamic frame"
+need Tests/dlp_net_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+need Tests/dlp_room_probe.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this probe stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
+for s in TestClock TestEngineGuards TestHeardLobbies TestAnnounceAndScan TestJoin TestFullSequenceThenGameUds TestAdmissionClosedAndFull TestFourPlayers TestLeaveAndGone TestGameStartsUds TestTwoLobbies TestInboxAndStrangers TestNoAllocation; do
+  need Tests/dlp_net_test.cpp "    $s();" "the scenario $s of the lobby over the engine runs in main()"
+done
+for s in TestLobbyThenGameUds TestFourPlayers TestLeaveAndGone TestTwoLobbies; do
+  need Tests/dlp_room_probe.cpp "    $s(host, port);" "the scenario $s of the lobby over the real room runs in main()"
+done
+[ "$(grep -c 'CHECK_EQ(counted.count(), 0u);' Tests/dlp_net_test.cpp)" = "2" ] || fail "Tests/dlp_net_test.cpp: the reading calls of the adapter are proven to allocate nothing in two places (the console that holds the engine, the one that only looks)"
+[ "$(grep -c 'CHECK_EQ(res, R_TIMEOUT);' Tests/dlp_net_test.cpp)" = "2" ] || fail "Tests/dlp_net_test.cpp: a join to a host that does not answer (full, or closed) is proven to give up with the games' own timeout, twice"
 
 if [ "$FAILED" = 0 ]; then
   echo "policy check: defaults and switches as intended"

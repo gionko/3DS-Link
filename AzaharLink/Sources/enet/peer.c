@@ -5,6 +5,7 @@
 #include <string.h>
 #define ENET_BUILDING_LIB 1
 #include "enet/utility.h"
+#include "enet/time.h"
 #include "enet/enet.h"
 
 /** @defgroup peer ENet peer functions 
@@ -628,6 +629,14 @@ enet_peer_queue_acknowledgement (ENetPeer * peer, const ENetProtocol * command, 
 
     peer -> outgoingDataTotal += sizeof (ENetProtocolAcknowledge);
 
+    if (peer -> host -> azlAckSince == 0)
+    {
+       /* AzaharLink: the first acknowledgement that waits: when (see ENetHost::azlAckHoldEvents). The call's clock, no read of its own:
+          it is the start of the call or the end of its last poll, so never later than the datagram's arrival - an age that is too
+          large by what the call did before reading (a send), never too small. */
+       peer -> host -> azlAckSince = peer -> host -> serviceTime != 0 ? peer -> host -> serviceTime : 1;
+    }
+
     acknowledgement -> sentTime = sentTime;
     acknowledgement -> command = * command;
     
@@ -899,7 +908,16 @@ enet_peer_dispatch_incoming_reliable_commands (ENetPeer * peer, ENetChannel * ch
           if (incomingCommand -> azlDispatched)
             enet_free (incomingCommand);
           else
+          {
+            if (incomingCommand -> azlHoleSince != 0)
+            {
+               /* AzaharLink: it waited behind a hole; how long (ms) is the head-of-line blocking the room's reliable stream caused */
+               enet_uint32 waited = ENET_TIME_DIFFERENCE (peer -> host -> serviceTime, incomingCommand -> azlHoleSince);
+               if (waited < 0x7FFFFFFFu && waited > peer -> host -> azlCounters.holWaitMaxMs)
+                 peer -> host -> azlCounters.holWaitMaxMs = waited;
+            }
             enet_list_insert (enet_list_end (& peer -> dispatchedCommands), incomingCommand);
+          }
        }
     }
 
@@ -926,6 +944,9 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
     ENetIncomingCommand * incomingCommand;
     ENetListIterator currentCommand;
     ENetPacket * packet = NULL;
+    /* AzaharLink: a reliable command (not an unreliable or unsequenced one): when it is discarded below it is a copy the room resent */
+    const int azlReliable = (command -> header.command & ENET_PROTOCOL_COMMAND_MASK) == ENET_PROTOCOL_COMMAND_SEND_RELIABLE ||
+                            (command -> header.command & ENET_PROTOCOL_COMMAND_MASK) == ENET_PROTOCOL_COMMAND_SEND_FRAGMENT;
 
     if (peer -> state == ENET_PEER_STATE_DISCONNECT_LATER)
       goto discardCommand;
@@ -940,7 +961,11 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
            reliableWindow += ENET_PEER_RELIABLE_WINDOWS;
 
         if (reliableWindow < currentWindow || reliableWindow >= currentWindow + ENET_PEER_FREE_RELIABLE_WINDOWS - 1)
+        {
+          if (azlReliable)
+            ++ peer -> host -> azlCounters.dupCommands;
           goto discardCommand;
+        }
     }
                     
     switch (command -> header.command & ENET_PROTOCOL_COMMAND_MASK)
@@ -948,7 +973,10 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
     case ENET_PROTOCOL_COMMAND_SEND_FRAGMENT:
     case ENET_PROTOCOL_COMMAND_SEND_RELIABLE:
        if (reliableSequenceNumber == channel -> incomingReliableSequenceNumber)
+       {
+         ++ peer -> host -> azlCounters.dupCommands;
          goto discardCommand;
+       }
        
        for (currentCommand = enet_list_previous (enet_list_end (& channel -> incomingReliableCommands));
             currentCommand != enet_list_end (& channel -> incomingReliableCommands);
@@ -970,6 +998,7 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
              if (incomingCommand -> reliableSequenceNumber < reliableSequenceNumber)
                break;
 
+             ++ peer -> host -> azlCounters.dupCommands;
              goto discardCommand;
           }
        }
@@ -1044,6 +1073,13 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
     incomingCommand -> packet = packet;
     incomingCommand -> fragments = NULL;
     incomingCommand -> azlDispatched = 0;
+    incomingCommand -> azlHoleSince = 0;
+    if (azlReliable && reliableSequenceNumber != (enet_uint16) (channel -> incomingReliableSequenceNumber + 1))
+    {
+       /* AzaharLink: not the next one in the sequence: it waits behind a hole (or goes out ahead of it, azlDeliverOutOfOrder) */
+       ++ peer -> host -> azlCounters.oooCommands;
+       incomingCommand -> azlHoleSince = peer -> host -> serviceTime != 0 ? peer -> host -> serviceTime : 1;
+    }
     
     if (fragmentCount > 0)
     { 

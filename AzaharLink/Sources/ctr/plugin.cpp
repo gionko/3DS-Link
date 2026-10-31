@@ -11,6 +11,7 @@
 #include <new>
 
 #include "azl/log.hpp"
+#include "azl/plugin_compare.hpp"
 #include "azl/rcvbuf.h"
 #include "azl/soc_plan.hpp"
 #include "azl/stats.hpp"
@@ -20,6 +21,9 @@
 #include "ctr/boot_diag.hpp"
 #include "ctr/soc.hpp"
 #include "ctr/teardown.hpp"
+
+// (libctru's weak hid function; Sources/main.cpp overrides it. No header of libctru declares it.)
+extern "C" bool hidShouldUseIrrst(void);
 
 extern "C" int azl_enet_socket_buffers; // Sources/enet/enet_3ds.c
 extern "C" int azl_enet_rcvbuf_bytes;
@@ -283,6 +287,156 @@ std::string ReadIconSelfNcch(u8 language) {
     return title;
 }
 
+// What the plugin does with the Download Play services (dlp:FKCL, dlp:SRVR) of a game, by title id (DlpGameMode, azl/dlp_hub.hpp):
+//   ProbeOnly: the games whose wireless mode (UDS, every player with their own copy) starts by asking dlp:FKCL whether the wireless
+//     is on and then never uses Download Play. dlp:FKCL is answered by the plugin (azl/dlp_fkcl_hle.hpp); dlp:SRVR stays the real one.
+//     Another game may need the same as Battle Royale: to add one, put its title id here and check in its log that the only
+//     dlp:FKCL commands are Initialize / InitializeWithName and Finalize (anything else is refused and written as
+//     "dlp: dlp:FKCL command 0x.. refused").
+//   Lobby: the games whose wireless mode goes on with the Download Play proper: Kirby Triple Deluxe and Kirby Planet Robobot (tried
+//     with the probe on 2026-10-28: after Initialize they ask GetChannels, scan for a host and join; the probe refuses those
+//     ("invalid state") and the game answers with an error screen, 0xE0A0AC01). The room carries their lobby: BOTH services are
+//     served by the plugin's DlpHub (azl/dlp_hub.hpp), the host's announcement and the four messages of the creator go over the
+//     room like the game's own UDS frames, and the engine is given back to the game's nwm::UDS whole when the game starts it.
+// A game that is not listed keeps the real services, as before (Zelda Tri Force Heroes has no entry). Only the games in Lobby mode get
+// a hub: nothing of it exists in the others.
+struct DlpGame {
+    u64 title_id;
+    DlpGameMode mode;
+};
+constexpr DlpGame kDlpGames[] = {
+    {0x00040000001C2100ull, DlpGameMode::ProbeOnly}, // Kirby Battle Royale (seen: InitializeWithName, Finalize 1 ms later, then nwm::UDS only)
+    {0x00040000001C2000ull, DlpGameMode::ProbeOnly}, // Kirby Battle Royale, another region's title id (not seen)
+    {0x000400000010C000ull, DlpGameMode::Lobby},     // Kirby Triple Deluxe (seen on a console: dlp:FKCL InitializeWithName, GetChannels, then the scan)
+    {0x000400000010BF00ull, DlpGameMode::Lobby},     // Kirby Triple Deluxe, another region's title id (from a catalogue, not seen)
+    {0x0004000000183600ull, DlpGameMode::Lobby},     // Kirby Planet Robobot (seen on a console; the ids of its other regions are not known here)
+};
+
+DlpGameMode DlpModeOf(u64 title_id) {
+    for (const DlpGame& game : kDlpGames) {
+        if (game.title_id == title_id) {
+            return game.mode;
+        }
+    }
+    return DlpGameMode::None;
+}
+
+/// A game of the probe's kind (Battle Royale): dlp:FKCL is answered by the plugin's probe, nothing else of Download Play is.
+bool AsksDlpOnlyForTheWireless(u64 title_id) {
+    return DlpModeOf(title_id) == DlpGameMode::ProbeOnly;
+}
+
+/// FNV-1a, 64 bits: the friend code seed of the lobby is the hash of the console's MAC, so that it is the console's own (two
+/// consoles that enter the same lobby in the same round with one seed and one name would adopt the same Logoff) and the same
+/// for as long as the session lasts.
+u64 Fnv1a64(const u8* data, std::size_t size) {
+    u64 hash = 0xCBF29CE484222325ull;
+    for (std::size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 0x100000001B3ull;
+    }
+    return hash;
+}
+
+/// The IpcResolver of the lobby (what DlpService maps the game's buffers with): the plugin lives in the game's address space, so an
+/// address the game put in a request is the pointer itself; what is refused is an address that cannot be one - null, below the code (0x00100000), at or past
+/// the end of the application's range (0x40000000), or a range that wraps. Runs on the game's thread inside the IPC call (some
+/// have 464 bytes below it): no local, no library call, at most 76 bytes of stack (Tests/stack_usage.sh).
+u8* MapGameAddress(void* /*ctx*/, u32 address, u32 size) {
+    constexpr u32 kLow = 0x00100000;
+    constexpr u32 kHigh = 0x40000000;
+    if (address < kLow || address >= kHigh || size > kHigh - address) {
+        return nullptr;
+    }
+    return reinterpret_cast<u8*>(address);
+}
+
+/// The hub of a game in Lobby mode, or null (no memory: the game keeps the real services). `name` of the lobby's default player is
+/// "3DS Link" (the game's InitializeWithName replaces it).
+std::unique_ptr<DlpHub> MakeDlpHub(UdsEngine* engine, KernelOps* kernel, u64 game_tid, const Mac& console_mac) {
+    LobbyConfig config = {};
+    config.game_tid = game_tid;
+    config.friend_seed = Fnv1a64(console_mac.data(), console_mac.size());
+    static const char kDefaultName[] = "3DS Link";
+    for (std::size_t i = 0; i < kNameUnits && kDefaultName[i] != '\0'; ++i) {
+        config.name[i] = static_cast<u16>(kDefaultName[i]);
+    }
+    IpcResolver resolver;
+    resolver.ctx = nullptr;
+    resolver.map = &MapGameAddress;
+    return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Is the plugin that runs in this game the one 3DS Link keeps in /3ds/3DSLink/? (azl/plugin_compare.hpp)
+// ---------------------------------------------------------------------------------------------
+
+constexpr const char* kMasterPluginPath = "/3ds/3DSLink/AzaharLink.3gx";
+constexpr u64 kMasterCheckAfterMs = 25000; // (a while after the start: the game is loading from the same card before that)
+
+/// The first 12 bytes of a file and its size. false when it is not there or cannot be read.
+bool ReadPluginHead(const std::string& path, u8* head, u64* size) {
+    File file;
+    if (File::Open(file, path, File::READ) != File::SUCCESS) {
+        return false;
+    }
+    *size = file.GetSize();
+    return *size >= 12 && file.Read(head, 12) >= 0;
+}
+
+/// Are the two files the same bytes? Read in pieces of 16 KB with a short rest between them: the card is the game's too.
+bool PluginFilesAreEqual(const std::string& a, const std::string& b) {
+    File fa;
+    File fb;
+    if (File::Open(fa, a, File::READ) != File::SUCCESS || File::Open(fb, b, File::READ) != File::SUCCESS) {
+        return false;
+    }
+    const u64 size = fa.GetSize();
+    if (size != fb.GetSize()) {
+        return false;
+    }
+    std::vector<u8> ba(16 * 1024), bb(16 * 1024);
+    for (u64 done = 0; done < size;) {
+        const u32 n = static_cast<u32>(std::min<u64>(ba.size(), size - done));
+        if (fa.Read(ba.data(), n) < 0 || fb.Read(bb.data(), n) < 0 || std::memcmp(ba.data(), bb.data(), n) != 0) {
+            return false;
+        }
+        done += n;
+        platform::SleepMs(1);
+    }
+    return true;
+}
+
+/// This game's copy (the file Luma loaded: sd:/luma/plugins/<title id>/AzaharLink.3gx) against the plugin of 3DS Link's folder. `detail` says what was found, for the log.
+MasterPlugin LookAtMasterPlugin(u64 game_id, std::string* detail) {
+    char own_path[96];
+    std::snprintf(own_path, sizeof(own_path), "/luma/plugins/%016llX/AzaharLink.3gx", static_cast<unsigned long long>(game_id));
+    u8 own_head[12] = {};
+    u8 master_head[12] = {};
+    u64 own_size = 0;
+    u64 master_size = 0;
+    if (!ReadPluginHead(own_path, own_head, &own_size)) {
+        *detail = std::string("this game's copy is not at ") + own_path + " (the plugin was loaded from another file): nothing to compare";
+        return MasterPlugin::Unreadable;
+    }
+    if (!ReadPluginHead(kMasterPluginPath, master_head, &master_size)) {
+        *detail = std::string("the plugin of 3DS Link's folder (") + kMasterPluginPath + ") is not there or cannot be read";
+        return MasterPlugin::Unreadable;
+    }
+    const u32 own = PluginHeaderVersionWord(own_head, 12);
+    const u32 master = PluginHeaderVersionWord(master_head, 12);
+    const bool same_version = own != 0 && own == master;
+    // (the bytes are read only when the two say the same version and have the same size: otherwise they cannot be the same)
+    const bool bytes_equal = same_version && own_size == master_size && PluginFilesAreEqual(own_path, kMasterPluginPath);
+    const MasterPlugin relation = RelateMaster(own, master, bytes_equal);
+    char text[160];
+    std::snprintf(text, sizeof(text), "this game's copy: version word 0x%08lx, %llu bytes | 3DS Link's folder: version word 0x%08lx, %llu bytes",
+                  static_cast<unsigned long>(own), static_cast<unsigned long long>(own_size), static_cast<unsigned long>(master),
+                  static_cast<unsigned long long>(master_size));
+    *detail = text;
+    return relation;
+}
+
 /// Source 2: the title archive (what Checkpoint uses), trying the media this application was
 /// launched from first.
 std::string ReadIconTitleArchive(u64 title_id, u8 language) {
@@ -335,6 +489,39 @@ std::string ReadIconTitleArchive(u64 title_id, u8 language) {
         }
     }
     return "";
+}
+
+/// 3DS Link's title id (DlpLink/tools/common.sh: UNIQUE_ID 0x0F83D1, variation 00: the app 000400000F83D100).
+constexpr u64 kAppTitleId = 0x000400000F83D100ull;
+
+/// A PROBE, log only (2026-10-28), made once with the log on, a while after the start: what can the process of a GAME learn of the installed 3DS Link?
+///   1. its version, from AM (am:net): the TMD version of the CIA is the version of 3DS Link (1.0.8 = 1032), so a game that sees a later one than its own
+///      plugin's could say "open 3DS Link to update your games" even when the app was installed and never opened (the file in /3ds/3DSLink/ is only
+///      written by the app when it runs);
+///   2. its icon, through the title archive (the way the game's own icon is read: ReadIconTitleArchive): if that is refused, a game cannot read another
+///      title's files at all, and the idea of a marker inside the app's content is closed.
+/// Nothing is done with the answers: the log says them. (If this stays, it is a diagnostic; if the answers are yes, the warning replaces it.)
+void ProbeInstalledApp(const char* plugin_version_text) {
+    const Result am_rc = amInit();
+    Log("probe: amInit (am:net) from the game's process -> %s", DescribeResult(am_rc).c_str());
+    if (R_SUCCEEDED(am_rc)) {
+        u64 title_id = kAppTitleId;
+        AM_TitleEntry entry = {};
+        const Result info_rc = AM_GetTitleInfo(MEDIATYPE_SD, 1, &title_id, &entry);
+        if (R_SUCCEEDED(info_rc)) {
+            const u32 word = PluginVersionWordFromText(plugin_version_text);
+            const u32 own_tmd = (word >> 24) << 10 | ((word >> 16) & 0xFF) << 4 | ((word >> 8) & 0xFF);
+            Log("probe: 3DS Link is installed on the SD card: TMD version %u (%u.%u.%u), %llu bytes | this plugin is %s = TMD version %u: %s",
+                static_cast<unsigned>(entry.version), static_cast<unsigned>(entry.version >> 10), static_cast<unsigned>((entry.version >> 4) & 0x3F),
+                static_cast<unsigned>(entry.version & 0xF), static_cast<unsigned long long>(entry.size), plugin_version_text, static_cast<unsigned>(own_tmd),
+                entry.version > own_tmd ? "the app is NEWER than this plugin" : entry.version == own_tmd ? "the same version" : "the app is older");
+        } else {
+            Log("probe: AM_GetTitleInfo(3DS Link, SD card) -> %s", DescribeResult(info_rc).c_str());
+        }
+        amExit();
+    }
+    const std::string title = ReadIconTitleArchive(kAppTitleId, 1);
+    Log("probe: the icon of 3DS Link through its title archive: %s%s", title.empty() ? "NOT read" : "read, the title is ", title.c_str());
 }
 
 } // namespace
@@ -460,6 +647,8 @@ void Plugin::StartLogWriter() {
                 platform::MarkLogWriterThread(); // (the one thread that may wait for the log's locks: azl/platform.hpp)
                 bool backlog = false; // the last pass of the capture was cut short (LogFiles::DrainDebug) with records left
                 u32 rest_ms = 20;     // ... and how long the card is left alone before the next pass then
+                bool capture_early = false; // something asked for the capture to be written at once (the HOME button)
+                bool master_checked = false; // the plugin of 3DS Link's folder was compared with this game's copy (once, a while after the start)
                 while (!log_stop_.load()) {
                     // Once a second is plenty for the statistics window (all there is to do with the log
                     // off); the debug capture fills a 512 KB ring that wants emptying four times as often,
@@ -484,14 +673,42 @@ void Plugin::StartLogWriter() {
                             g_stats.writer_late_max = slept_ms - asked_ms;
                         }
                     }
+                    if (!master_checked && platform::NowMs() - start_ms_ >= kMasterCheckAfterMs && !log_stop_.load()) {
+                        master_checked = true;
+                        std::string detail;
+                        const MasterPlugin relation = LookAtMasterPlugin(game_id_, &detail);
+                        Log("plugin: %s", detail.c_str());
+                        if (g_debug_level > 0) {
+                            ProbeInstalledApp(kVersion); // (log only)
+                        }
+                        if (MasterPluginWarns(relation)) {
+                            Log("plugin: 3DS Link keeps %s plugin than this game's copy: open 3DS Link to update your games",
+                                relation == MasterPlugin::Newer ? "a newer" : "another build of the same");
+                            PostNotification(relation == MasterPlugin::Newer
+                                                 ? "AzaharLink: 3DS Link has a newer plugin. Open 3DS Link to update your games."
+                                                 : "AzaharLink: this game's plugin is not the one in 3DS Link. Open 3DS Link to update your games.");
+                        } else {
+                            Log("plugin: this game's copy is %s",
+                                relation == MasterPlugin::Same    ? "the plugin of 3DS Link's folder (same bytes)"
+                                : relation == MasterPlugin::Older ? "newer than the plugin of 3DS Link's folder (nothing to say)"
+                                                                  : "not compared (see above)");
+                        }
+                    }
                     const u64 card_before = log_files_->card_wait_ticks();
                     ServiceLog();
                     if (g_debug_level > 0) {
                         LogProcessEvents();
                         if (log_flush_requested_.exchange(false)) {
                             log_files_->Flush(); // (the HOME button: see OnHomeButton)
+                            capture_early = true;
                         }
-                        backlog = log_files_->DrainDebug(false);
+                        // The capture goes to the card in few, large passes (LogFileLimits::capture_every_ms): the game reads from the
+                        // same card, and a pass every 250 ms kept it waiting (the writer spent 63-77% of its time in the card). A pass
+                        // that was cut short comes back soon (backlog); the ring is left to fill meanwhile (it is the plugin's memory).
+                        if (backlog || log_files_->CaptureDue(platform::NowMs(), DebugRingUsedBytes(), capture_early)) {
+                            capture_early = false;
+                            backlog = log_files_->DrainDebug(false);
+                        }
                     } else {
                         backlog = false;
                     }
@@ -1049,6 +1266,22 @@ void Plugin::LogStatsWire(const Stats& s) {
            static_cast<unsigned long>(s.gap_hist[3]), static_cast<unsigned long>(s.gap_hist[4]));
     // The host's second copies (an Azahar host re-broadcasts what it relays): frames that came through the host
     // and could have a twin, those dropped because the direct twin was delivered, those delivered as the only copy.
+    // The room's reliable stream (ENet): packets that arrived behind a hole and the longest wait behind one, resent copies of
+    // packets we had already handled, the datagrams we sent that held only acknowledgements (and those where the acknowledgement
+    // rode on data), and how long a read pass was (datagrams, ms): the three causes of a gap told apart.
+    Append(text, sizeof(text), &n,
+           " | enet room stream: out of order %lu (waited up to %lu ms), resent copies received %lu, ack-only datagrams sent %lu"
+           " (acks riding on data %lu), read passes %lu (longest %lu datagrams, %lu ms, %lu cut short), empty receives skipped %lu,"
+           " packets handed over before their ack %lu (ack limit hit %lu times, longest ack hold %lu ms), link-back pings %lu,"
+           " SendTo with the broadcast flag addressed to a node's MAC %lu",
+           static_cast<unsigned long>(s.enet_ooo), static_cast<unsigned long>(s.enet_hol_max_ms),
+           static_cast<unsigned long>(s.enet_dup_rx), static_cast<unsigned long>(s.enet_ack_only),
+           static_cast<unsigned long>(s.enet_ack_data), static_cast<unsigned long>(s.enet_passes),
+           static_cast<unsigned long>(s.enet_pass_dgrams_max), static_cast<unsigned long>(s.enet_pass_ms_max),
+           static_cast<unsigned long>(s.enet_passes_capped), static_cast<unsigned long>(s.enet_recv_skipped),
+           static_cast<unsigned long>(s.enet_events_before_ack), static_cast<unsigned long>(s.enet_ack_limit_hits),
+           static_cast<unsigned long>(s.enet_ack_hold_max_ms), static_cast<unsigned long>(s.enet_silence_probes),
+           static_cast<unsigned long>(s.sendto_addressed));
     Append(text, sizeof(text), &n, " | copies dropped %lu | twin candidates %lu (dropped %lu, delivered alone %lu)",
            static_cast<unsigned long>(s.drop_dup_copy), static_cast<unsigned long>(s.fwd_candidates), static_cast<unsigned long>(s.drop_fwd_dup),
            static_cast<unsigned long>(s.fwd_unmatched));
@@ -1377,7 +1610,7 @@ void Plugin::EarlyInit() {
         // the [sss.mmm] of the lines is only the time since the plugin started)
         char stamp[24];
         FormatConsoleClock(osGetTime(), stamp);
-        Log("==== AzaharLink %s (built %s %s), console clock %s ====", kVersion, __DATE__, __TIME__, stamp);
+        Log("==== AzaharLink %s (built %s), console clock %s ====", kVersion, kBuildStamp, stamp);
     }
     if (!capture_ready) {
         Log("debug: not enough memory for the capture ring: only AzaharLink.log is written");
@@ -1394,6 +1627,13 @@ void Plugin::EarlyInit() {
     Log("game: %s (title id %08lx%08lx), console MAC %s", process_name_.c_str(),
         static_cast<unsigned long>(game_id_ >> 32), static_cast<unsigned long>(game_id_),
         MacToString(console_mac_).c_str());
+    // Which build this is, in a way the log can show: libctru's hidInit() opens ir:rst (C-stick, ZL, ZR) on a New 3DS unless
+    // the program says otherwise (Sources/main.cpp), and a plugin that holds it leaves the game without its C-stick.
+    {
+        const bool irrst = hidShouldUseIrrst();
+        Log("hid: the plugin %s ir:rst (C-stick and ZL/ZR %s)", irrst ? "OPENS" : "does not open",
+            irrst ? "are taken from the game" : "stay with the game");
+    }
     // Which family of console this is, from the size of the application memory region (64 MiB on an
     // Old 3DS / 2DS, 124 MiB on a New 3DS). Nothing below depends on it: the socket buffer is placed
     // from the limits the kernel reports for this very process.
@@ -1478,10 +1718,35 @@ void Plugin::EarlyInit() {
     transport.get_mac = [this]() { return room_->joined() ? room_->mac() : console_mac_; };
     engine_.reset(new UdsEngine(&kernel_, transport));
     hle_.reset(new UdsHle(engine_.get()));
+    hle_->SetDlpProbeFake(AsksDlpOnlyForTheWireless(game_id_));
+    if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {
+        // The Download Play lobby of the room, for the games that play over it (Kirby Triple Deluxe, Planet Robobot): the one new
+        // allocation of the lobby; the other games never have one. It is made here, after the engine and the HLE and before the
+        // hooks (below) and before the room is started (Connect, long after), and neither the pointer nor the hub is changed
+        // from here on: the network thread's tick callback and the game's threads read them without a lock.
+        dlp_hub_ = MakeDlpHub(engine_.get(), &kernel_, game_id_, console_mac_);
+        if (dlp_hub_) {
+            hle_->SetDlpHub(dlp_hub_.get());
+            const u64 seed = Fnv1a64(console_mac_.data(), console_mac_.size());
+            Log("dlp: the Download Play lobby is carried by the room for this game (title id %08lx%08lx): dlp:FKCL and dlp:SRVR are"
+                " served by the plugin, friend code seed %08lx%08lx, %lu bytes of hub",
+                static_cast<unsigned long>(game_id_ >> 32), static_cast<unsigned long>(game_id_),
+                static_cast<unsigned long>(seed >> 32), static_cast<unsigned long>(seed), static_cast<unsigned long>(sizeof(DlpHub)));
+        } else {
+            Log("dlp: no memory for the Download Play lobby: dlp:FKCL and dlp:SRVR stay the real services for this game");
+        }
+    }
 
     room_->SetWifiCallback([this](const WifiPacket& packet) { engine_->OnWifiPacket(packet); });
     room_->SetWifiPrefilter([this](const u8* message, std::size_t size) { return engine_->TryDiscardEncoded(message, size); });
-    room_->SetTickCallback([this](u64 now_ms) { engine_->Tick(now_ms); });
+    // (after the engine's own round: the hub serves the request a game thread left and pumps the lobby, on this thread - the one
+    // thread that may call the lobby's network side. dlp_hub_ is set above, before the room exists as a thread, and never changed.)
+    room_->SetTickCallback([this](u64 now_ms) {
+        engine_->Tick(now_ms);
+        if (dlp_hub_) {
+            dlp_hub_->Tick();
+        }
+    });
     room_->SetRoomInfoCallback([this](const room::RoomInfo& info) { OnRoomInfo(info); });
     room_->SetStateCallback([this](RoomClient::State state, RoomClient::Error error) {
         Log("room: %s%s%s", RoomClient::StateName(state),
@@ -1541,6 +1806,13 @@ void Plugin::EarlyInit() {
             if (!OnRoomJoined()) {
                 PostNotification("Joined room \"" + info.name + "\" (" +
                                  std::to_string(info.members.size()) + " players)");
+            }
+            // The version that runs, on the line below the first join of the launch (the log has it too: it is what one looks at to know
+            // which build a console really ran after an update).
+            static bool version_said = false;
+            if (!version_said) {
+                version_said = true;
+                PostNotification(std::string("AzaharLink ") + kVersion + " (built " + kBuildStamp + ")");
             }
         } else if (state == RoomClient::State::Idle && error != RoomClient::Error::None &&
                    static_cast<int>(error) != last_notified_error_) {
@@ -1606,6 +1878,11 @@ void Plugin::ResolveIdentity() {
                 ascii += name[i] < 0x80 ? static_cast<char>(name[i]) : '_';
             }
             console_name_ = SanitizeNickname(ascii);
+            if (dlp_hub_) {
+                // The name every list of the Download Play lobby shows for this player (Kirby Triple Deluxe and Planet Robobot send their
+                // Initialize with no name): the console's own, kNameUnits UTF-16 units as the config block keeps them.
+                dlp_hub_->SetPlayerName(name);
+            }
         } else {
             Log("identity: cannot read the console's user name (0x%08lx)", static_cast<unsigned long>(rc));
         }
@@ -1660,12 +1937,16 @@ void Plugin::OnRoomInfo(const room::RoomInfo& info) {
     }
     NoteRoomMembers(info);
     {
-        // Who is in the room: a player that leaves it takes its node out of the game's session (the engine waits
-        // a moment before it believes it, and nothing goes on the wire).
+        // Who is in the room and plays: a player that leaves it takes its node out of the game's session (the engine waits
+        // a moment before it believes it, and nothing goes on the wire). So does one that stays in the room but tells it
+        // that it plays nothing (azl/room_members.hpp: an emulator that is closed says no goodbye on the air, and the host
+        // waited 30 s for its frames, Kirby Battle Royale 2026-10-28).
         std::vector<Mac> members;
         members.reserve(info.members.size());
         for (const room::MemberInfo& member : info.members) {
-            members.push_back(member.mac);
+            if (RoomMemberPlays(member.game_name, member.game_id)) {
+                members.push_back(member.mac);
+            }
         }
         engine_->OnRoomMembers(members);
     }
@@ -1711,13 +1992,16 @@ void Plugin::NoteRoomMembers(const room::RoomInfo& info) {
     std::vector<RoomMemberRow> now;
     now.reserve(info.members.size());
     for (const room::MemberInfo& member : info.members) {
-        now.push_back({member.mac, member.nickname, SanitizeTitle(member.game_name)});
+        now.push_back({member.mac, member.nickname, SanitizeTitle(member.game_name), RoomMemberPlays(member.game_name, member.game_id)});
     }
     if (room_members_known_ && g_debug_level > 0) {
         // (azl/room_members.hpp: "room: 'Friend-A' [FINAL FANTASY EXPLORERS] joined the room ..."; a player the room has not
         // yet told the game of has no brackets)
         for (const std::string& line : RoomMemberLines(room_members_, now, info.member_slots)) {
             Log("%s", line.c_str());
+        }
+        for (const std::string& line : RoomMemberStoppedLines(room_members_, now)) {
+            Log("%s", line.c_str()); // (a player still in the room that plays nothing any more: the engine counts it out)
         }
     }
     room_members_ = std::move(now);
@@ -1985,6 +2269,14 @@ void Plugin::Shutdown() {
     // through them while it closes, rewriting live code without invalidating the instruction cache
     // can crash them, and the trampolines stay mapped until the process dies anyway. The HLE keeps
     // answering the fake sessions the game still holds.
+
+    // The Download Play hub (a game in Lobby mode) before the network thread: the thread that serves its requests is about to go.
+    // Stop() answers a request still in the queue with the failure and makes every later one fail at once, so no game thread is
+    // left waiting for a network thread that is not there. The hub itself is NOT destroyed, here or ever (nor is the plugin: the
+    // game's threads may still be inside the HLE while it closes, and they keep the hub, the engine and the HLE they were using).
+    if (dlp_hub_) {
+        dlp_hub_->Stop();
+    }
 
     // The network thread first, with a deadline: it may be starved or stuck in a service call, and
     // the framework gives main() about one second before it tears everything down.

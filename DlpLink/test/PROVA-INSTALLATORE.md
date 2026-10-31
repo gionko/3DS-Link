@@ -1,6 +1,6 @@
 # Prova su console dell'installatore «3DS Link Installer» (una sessione, esiti → decisioni scritti prima)
 
-Cosa si prova: una console con **solo Luma e il Download Play di sistema** riceve da un'altra console il figlio «3DS Link Installer» (sotto: «Powered by Gionko · v1.0.4»),
+Cosa si prova: una console con **solo Luma e il Download Play di sistema** riceve da un'altra console il figlio «3DS Link Installer» (sotto: «Powered by Gionko · v1.0.10»),
 lo vede nella lista del Download Play, lo scarica, il sistema lo avvia da solo, e **il figlio installa 3DS Link** (l'app e il plugin) sulla SD.
 Tutta la catena è già provata su PC (verificatori; l'installatore: le sue decisioni, il codice che scrive i file sulla scheda e quello che decide l'avviso su boot9.bin, 591 controlli con ASan/UBSan) e **nell'emulatore** (installazione, aggiornamento, stessa versione,
 versione più nuova, errori); su una console vera **non è mai stata provata** la parte che sta fra il Download Play e l'installazione: `am:net` da un

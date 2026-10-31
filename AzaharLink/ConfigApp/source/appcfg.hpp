@@ -2,7 +2,7 @@
 // "key=value" per line, lines it does not know are ignored:
 //   first_start_done=1        written at the end of the first start (the file's presence is what says "not the first start")
 //   boot9=<path>              the boot9.bin the user pointed the app to (the Installation check's search or folder choice); one of the places boot9.bin is looked for
-//   plugin_stamp=<size:mtime> the plugin file the copies in the titles' folders were last brought up to (the quiet look is skipped while it is the same file)
+//   plugin_stamp=<size>:h<hash> the plugin (its size and the hash of its bytes: setup::PluginContentStamp) the copies in the titles' folders were last brought up to (the quiet look is skipped while it is the same plugin; an older app wrote <size>:<mtime>, which never equals it: one more look)
 //   dlp_delivery=0|1          the emergency switch of 3DS Link Delivery (Settings > Download Play delivery): 0 (or off, false, no) shuts the whole feature; 1 (on,
 //                             true, yes) and anything the app cannot read, or no line at all, leave it on. It is written every time so that a hand edit on
 //                             a PC only flips the digit.

@@ -3,7 +3,7 @@ Author: AzaharLink contributors
 Version: # Plugin version
     Major: 1
     Minor: 0
-    Revision: 4
+    Revision: 10
 
 Targets: # Low TitleId of games which are compatibles with this plugin (0 for all)
 

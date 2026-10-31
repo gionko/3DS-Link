@@ -360,6 +360,38 @@ static void TestInspect(const std::string& root) {
     CHECK(p.exists && p.readable && !p.header_ok && p.size == 0);
 }
 
+// The stamp the copies in the titles' folders are brought up to (3DSLink.cfg plugin_stamp): it is made from the BYTES. Two plugins of the same size differ (the stamp of the build is a
+// string of fixed length), a plugin that is cut short or longer differs, the same bytes give the same stamp, and an app that wrote the old "<size>:<date>" stamp never equals it.
+static void TestContentStamp() {
+    std::vector<std::uint8_t> plugin(1014783);
+    for (std::size_t i = 0; i < plugin.size(); ++i) {
+        plugin[i] = static_cast<std::uint8_t>((i * 31 + i / 7) & 0xFF);
+    }
+    const std::string a = PluginContentStamp(plugin.data(), plugin.size());
+    CHECK(a.size() == 7 + 2 + 16); // "1014783:h" + 16 hex digits
+    CHECK(a.compare(0, 9, "1014783:h") == 0);
+    CHECK(a.find_first_not_of("0123456789abcdef", 9) == std::string::npos);
+    CHECK(PluginContentStamp(plugin.data(), plugin.size()) == a); // (the same bytes, the same stamp)
+    std::vector<std::uint8_t> copy = plugin; // (a different file with the same bytes)
+    CHECK(PluginContentStamp(copy.data(), copy.size()) == a);
+    // one byte different, anywhere (the first, the middle, the last): another stamp, though the size is the same
+    for (const std::size_t at : {std::size_t(0), plugin.size() / 2, plugin.size() - 1}) {
+        std::vector<std::uint8_t> other = plugin;
+        other[at] ^= 1;
+        const std::string b = PluginContentStamp(other.data(), other.size());
+        CHECK(b != a);
+        CHECK(b.compare(0, 9, "1014783:h") == 0);
+    }
+    // another length: another stamp (and the size is in front)
+    CHECK(PluginContentStamp(plugin.data(), plugin.size() - 1) != a);
+    CHECK(PluginContentStamp(plugin.data(), plugin.size() - 1).compare(0, 9, "1014782:h") == 0);
+    // nothing to stamp: nothing (the copies are then never skipped)
+    CHECK(PluginContentStamp(nullptr, 0).empty());
+    CHECK(PluginContentStamp(plugin.data(), 0).empty());
+    // the stamp an app of the days before wrote ("<size>:<date>", the date 0 on the card) is not this one
+    CHECK(a != "1014783:0");
+}
+
 int main() {
     char tmpl[] = "/tmp/plugin_install_test_XXXXXX";
     if (!mkdtemp(tmpl)) {
@@ -372,6 +404,7 @@ int main() {
     TestWords();
     TestToastTime();
     TestSwitch();
+    TestContentStamp();
     TestInspect(root);
     TestEnsure(root);
     TestWriteFailures(root);

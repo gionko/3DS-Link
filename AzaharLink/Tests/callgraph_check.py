@@ -15,7 +15,8 @@ see - a snprintf in a helper that nobody marked, a Log() in a header, a library 
 
 What is a root: the two assembly entries of the hook (azl_svc32_entry: SendSyncRequest, azl_svc23_entry: CloseHandle) and the
 functions the hook calls through a pointer or a vtable, which a listing of direct calls cannot follow: the observers of the
-game's APT session, the sink of the log, the engine's transport and the kernel operations of the engine.
+game's APT session, the sink of the log, the engine's transport and the kernel operations of the engine; and, for the games that have
+the Download Play hub, the hub's functions a game thread runs past the cut and the adapter methods it reaches through the lobby's vtable.
 
 What is cut: UdsHle::Run. Past it is the HLE proper - the dispatch of a fake session's command, the engine, NdmHle - which
 keeps its Log() formats, legitimately needs more stack than a small thread has, and runs on the game's UDS thread (Tests/chain_sim
@@ -42,6 +43,13 @@ CALLBACK_ROOTS = [
     r'^std::_Function_handler<std::array<unsigned char, 6u> \(\), azl::ctr::Plugin::EarlyInit\(\)::\{lambda\(\)#1\}>::_M_invoke',
     r'^azl::ctr::CtrKernelOps::(?!~)',
     r'^azl::LogFiles::Append\(char const\*\)$',
+    # The Download Play hub (DESIGN-FASE3): what a dlp:FKCL / dlp:SRVR call runs is past the cut (UdsHle::Run > RunDlp), so the hub's game-thread
+    # functions are roots of their own, and the LobbyNet methods a game thread can reach through the lobby's `net_->` calls - which are calls
+    # through a vtable that a listing of direct calls cannot follow - are roots too: the clock of the inline commands, and what the give-back
+    # of the engine on the calling thread (DlpHub::RunHere, from OnGameUdsStarting) asks of the adapter. (The other methods of the adapter are
+    # the network thread's; Tests/dlp_chain_report.py proves from the call graph of the sources which ones a game thread reaches.)
+    r'^azl::DlpHub::(?:Serve|PollPending|OnGameUdsStarting|OnSessionClosed)\(',
+    r'^azl::EngineLobbyNet::(?:NowMs|NowTicks|HostClose|Disconnect|ScanClose)\(',
 ]
 
 # ... that the compiler may fold into their caller (then they are not in the listing and nothing is lost)
@@ -295,6 +303,13 @@ def selftest():
         paths = [p for p in violations2 if p[-1] == 'vsnprintf']
         expect(paths and paths[0] == ['azl_svc32_entry', 'hook', 'tail_helper', 'HleRun', 'HleFormats', 'vsnprintf'],
                'the path to a formatter is reported (%r)' % (paths,))
+        # a function that is a root is followed from there even though the cut hides it from the entries (the Download Play hub's functions are
+        # roots for that reason: UdsHle::Run is the cut and everything a dlp command does is behind it)
+        CALLBACK_ROOTS = [r'^HleFormats$']
+        CUT = [r'^HleRun$']
+        _, violations4, _, _, _ = analyse(funcs, dem)
+        expect(any(p[0] == 'HleFormats' and p[-1] == 'vsnprintf' for p in violations4),
+               'a root behind the cut is followed from its own start: its vsnprintf is a violation (%r)' % (violations4,))
         # a renamed root is an error, not a silent pass
         CALLBACK_ROOTS = [r'^NoSuchCallback$']
         problems3, _, _, _, _ = analyse(funcs, dem)

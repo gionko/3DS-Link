@@ -48,6 +48,13 @@ struct LogFileLimits {
     /// dropped. The full 128 GB card of the Zelda session (2026-10-14) took ~40 KB/s, so a full 512 KB ring needs ~13 s, and the system gives the game
     /// a moment to leave, not that: the main log's last lines - the only record of how the exit went - must reach the file first.
     u32 exit_capture_ms = 500;
+    /// The capture goes to the card in FEW, LARGE passes: a flush costs the card about the same whatever it carries, and on the console
+    /// the writer spent 63-77% of its time waiting for the SD card (the game reads from the same card: its music stuttered, 2026-10-28,
+    /// Kirby Battle Royale) with a pass every 250 ms for 5-20 KB of text. A pass is due (CaptureDue) when this long has gone by since the
+    /// last one, or when the ring holds this much (a ring of 512 KB must not fill while the card is busy), or when something asks at once
+    /// (the HOME button, a switch-off). The ring is the memory of the plugin (the heap Luma gave it), not the game's: it exists already.
+    u32 capture_every_ms = 2000;
+    u32 capture_ring_high = 160 * 1024;
 };
 
 class LogFiles {
@@ -76,6 +83,11 @@ public:
     /// of it, however long it takes). Returns true when the pass stopped at its bounds with records left in the ring: the
     /// writer then comes back soon instead of after its usual pause.
     bool DrainDebug(bool final);
+    /// Is a pass of the capture due now? `ring_used` is how much the ring holds (DebugRingUsedBytes), `early` that something asks for it at
+    /// once. The writer asks every time it wakes (every 250 ms at level 1) and only passes when this says so: see LogFileLimits::capture_every_ms.
+    bool CaptureDue(u64 now_ms, u32 ring_used, bool early) const;
+    /// Remembers that a pass of the capture began at `now_ms` (DrainDebug does it; a test may too).
+    void NoteCapturePass(u64 now_ms);
     /// Writes what is left, closes the files and forgets the queue. The main log goes first; the capture's last drain is bounded
     /// by BeginShutdown() when the launch is ending (a switch-off from the menu has no such bound: it drains everything).
     void Close();
@@ -188,6 +200,7 @@ private:
     platform::Mutex crumb_mutex_; ///< guards the trail's file (only ever taken by the breadcrumb thread, and Close)
     void* crumb_file_ = nullptr;
     Ticks64 card_wait_ticks_ = 0;
+    u64 last_capture_ms_ = 0;      ///< when the last pass of the capture began (atomic accesses; 0: none yet, so the first is due at once)
     u64 shutdown_deadline_ms_ = 0; ///< 0: the launch is not ending; else the time the capture stops writing (atomic accesses)
 };
 

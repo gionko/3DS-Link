@@ -9,6 +9,7 @@
 
 #include "azl/platform.hpp"
 #include "copyworker.hpp"
+#include "pages.hpp"
 #include "plugin_resource.hpp"
 #include "titles.hpp"
 
@@ -377,18 +378,22 @@ void App::RefreshInstall() {
 }
 
 void App::QueuePluginCopyRefresh() {
-    if (plugin_copies_checked || !plugin_ready || !titles::Scan().done()) {
-        return; // (the look waits for the scan of the titles: both read the card, and the scan is what the user waits for)
+    if (plugin_copies_checked || !plugin_ready) {
+        // (it does NOT wait for the scan of the titles any more: whoever has just installed an update waits for THIS, and the scan of a big library takes minutes; the thread of
+        // the copies and the scan read the card side by side, which only makes the scan a little slower)
+        return;
     }
     plugin_copies_checked = true;
-    // The copies were brought up to this very plugin file (its size and date) on an earlier start, and 3DSLink.cfg says so: nothing to read. A
-    // plugin file that was replaced has another stamp, and the look is made (and the new stamp written when it is done: main.cpp).
-    const std::string stamp = setup::FileStamp(paths.plugin_file);
+    // The copies were brought up to this very plugin (its size and its bytes: PluginContentStamp) on an earlier start, and 3DSLink.cfg says so: nothing to read. A plugin that was
+    // replaced has another stamp, and the look is made (and the new stamp written when it is done: main.cpp). The plugin file on the card is, byte for byte, the plugin inside the
+    // app here (plugin_ready), so the stamp is made from the bytes in memory.
+    const std::string stamp = setup::PluginContentStamp(setup::EmbeddedPluginData(), setup::EmbeddedPluginSize());
     if (!stamp.empty() && stamp == app_cfg.plugin_stamp) {
         return;
     }
     plugin_stamp_pending = stamp;
     setup::CopyWorker& worker = setup::CopyWorker::Get();
+    int submitted = 0;
     for (const std::string& name : setup::ListPluginFolders()) {
         char* end = nullptr;
         const u64 tid = std::strtoull(name.c_str(), &end, 16);
@@ -396,7 +401,10 @@ void App::QueuePluginCopyRefresh() {
             continue;
         }
         worker.SubmitRefresh(tid, paths.plugin_file); // (the work, reading the folder and the two files, is the thread's)
+        ++submitted;
     }
+    plugin_pass_total = submitted;
+    plugin_pass_open = submitted > 0; // (the main page tells how it goes and when it is over)
 }
 
 void App::RefreshLoader() {
@@ -1246,7 +1254,23 @@ Footer ListPage::BuildFooter() const {
 }
 
 bool ListPage::StartEnabled() const {
-    return setup::CopyWorker::Get().PendingCount() == 0;
+    return setup::CopyWorker::Get().PendingCount() == 0 || g.plugin_pass_open;
+}
+
+void ListPage::AskLeaveDuringPluginPass() {
+    const int left = setup::CopyWorker::Get().PendingCount();
+    const int done = g.plugin_pass_total > left ? g.plugin_pass_total - left : 0;
+    PushPage(pages::NewConfirmPage(
+        "Plugin update in progress",
+        Fmt("3DS Link is putting the new plugin in your games: %d of %d folders done. If you leave now, the games not reached yet keep the OLD plugin, and the update starts again the next "
+            "time you open 3DS Link. Leave anyway?",
+            done, g.plugin_pass_total),
+        "Leave", "Keep waiting", [this](bool yes) {
+            if (yes) {
+                setup::CopyWorker::Get().CancelRefreshes();
+                OnStart();
+            }
+        }));
 }
 
 void ListPage::Update(const Input& in) {
@@ -1255,6 +1279,10 @@ void ListPage::Update(const Input& in) {
     const Footer footer = BuildFooter();
     const FooterRects buttons = LayoutFooter(footer);
     if (footer.start && footer.start_enabled && ((in.down & KEY_START) || Tapped(in, buttons.start))) {
+        if (g.plugin_pass_open && setup::CopyWorker::Get().PendingCount() > 0) {
+            AskLeaveDuringPluginPass(); // (the pass over the games is not over: say so, and let the user choose)
+            return;
+        }
         OnStart();
         return;
     }

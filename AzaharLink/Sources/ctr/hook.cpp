@@ -1,4 +1,5 @@
 #include "ctr/hook.hpp"
+#include "ctr/text_search_guard.hpp"
 
 #include <CTRPluginFramework.hpp>
 
@@ -175,6 +176,14 @@ struct TracedSession {
 };
 TracedSession g_traced[kMaxTracedSessions];
 u32 g_trace_lines = 0;
+
+// Download Play (dlp:FKCL, the fake client of the games that join a Download Play session as a game with its own
+// copy: Kirby Battle Royale, Mario Kart 7, Luigi's Mansion): the system module starts a radio of its own, which
+// cannot happen while ndm is faked to keep the tunnel up, and answers "wireless off". One explanatory line per
+// launch, only with the log on (LogLine is inactive with the log off: the card stays untouched).
+constexpr u32 kDlpWirelessOff = 0xC940AC04;
+bool g_dlp_open_noted = false;
+bool g_dlp_fail_noted = false;
 
 struct CommandSeen {
     u32 key;
@@ -369,6 +378,13 @@ __attribute__((noinline)) Result PassThroughGetService(Handle handle) {
         DebugLine line;
         line.Str("srv GetServiceHandle '").Str(name).Str("' -> 0x").Hex(service_rc, 8).Str(" (handle 0x")
             .Hex(session).Str(")");
+        if (session && !g_dlp_open_noted && std::strcmp(name, "dlp:FKCL") == 0) {
+            g_dlp_open_noted = true;
+            LogLine note;
+            note.Str("dlp: the game opened dlp:FKCL: its local multiplayer is Download Play, which the system module "
+                     "cannot run while this plugin keeps the console on the access point (ndm is faked); expect "
+                     "'wireless must be turned on' and no tunnel for this game");
+        }
     }
     const bool apt = IsAptService(name);
     if (session && (apt || IsTracedService(name))) {
@@ -402,6 +418,12 @@ __attribute__((noinline)) Result PassThroughTraced(Handle handle, const TracedSe
             .Str(") -> 0x").Hex(result, 8);
     }
     DebugSvcReal(traced->name, command, arg0, result);
+    if (result == kDlpWirelessOff && !g_dlp_fail_noted && std::strcmp(traced->name, "dlp:FKCL") == 0) {
+        g_dlp_fail_noted = true;
+        LogLine note;
+        note.Str("dlp: dlp:FKCL command 0x").Hex(command, 4).Str(" answered 0xC940AC04 (the system module says "
+                 "wireless is off): this game's local multiplayer needs the real radio and cannot use the tunnel");
+    }
     return rc;
 }
 
@@ -548,6 +570,11 @@ HookStats InstallSvcHooks(UdsHle* hle) {
         static_cast<unsigned long>(stats.send_sync_sites),
         static_cast<unsigned long>(stats.close_sites), static_cast<unsigned long>(stats.skipped_sites),
         static_cast<unsigned long>(stats.framework_sites), static_cast<unsigned long>(stats.thumb_candidates));
+    if (TextSearchTrims() != 0) {
+        Log("hook: the framework's startup search for the GSP call was cut to the game's code %lu time(s) "
+            "(it would have read past the end of .text and crashed)",
+            static_cast<unsigned long>(TextSearchTrims()));
+    }
     return stats;
 }
 

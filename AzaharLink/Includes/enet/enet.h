@@ -183,6 +183,7 @@ typedef struct _ENetIncomingCommand
    enet_uint32 *    fragments;
    ENetPacket *     packet;
    enet_uint32      azlDispatched; /**< AzaharLink: 1 = a placeholder: the packet was handed over out of order already (packet is NULL) */
+   enet_uint32      azlHoleSince;  /**< AzaharLink: the host clock (ms, never 0) when this command was queued behind a hole in the reliable sequence; 0 = it came in order */
 } ENetIncomingCommand;
 
 typedef enum _ENetPeerState
@@ -341,6 +342,26 @@ typedef enet_uint32 (ENET_CALLBACK * ENetChecksumCallback) (const ENetBuffer * b
 /** Callback for intercepting received raw UDP packets. Should return 1 to intercept, 0 to ignore, or -1 to propagate an error. */
 typedef int (ENET_CALLBACK * ENetInterceptCallback) (struct _ENetHost * host, struct _ENetEvent * event);
  
+/* AzaharLink: counters of the data path that cost nothing to keep (an increment, or a compare at a point the code passes anyway).
+   They are per host. The plugin takes them once per network round with enet_azl_counters_take, which also clears them, and the
+   statistics window adds them up (the maxima: takes the largest). Times are milliseconds of the host's own clock. */
+typedef struct _ENetAzlCounters
+{
+   enet_uint32 oooCommands;      /**< reliable commands that arrived behind a hole in the sequence (an earlier datagram of the room was lost or late) */
+   enet_uint32 holWaitMaxMs;     /**< the longest such a command waited behind the hole, from its arrival to its hand-over (a maximum) */
+   enet_uint32 dupCommands;      /**< reliable commands that arrived again after they had been handled: the room resent them */
+   enet_uint32 ackOnlyDatagrams; /**< datagrams sent that held acknowledgements and nothing else */
+   enet_uint32 ackDataDatagrams; /**< datagrams sent that held acknowledgements and data: the acknowledgement rode along */
+   enet_uint32 passes;           /**< receive passes that read at least one datagram */
+   enet_uint32 passDatagramsMax; /**< most datagrams one pass read (a maximum) */
+   enet_uint32 passMsMax;        /**< longest pass, from the end of its second datagram to the end of its last, in ms (a maximum; a pass of one datagram is one receive call, the soc statistics time those) */
+   enet_uint32 recvSkipped;      /**< receives not made: the socket had been found empty and a poll with a timeout followed (see azlSkipEmptyRecv) */
+   enet_uint32 passesCapped;     /**< passes that stopped at the limit of datagrams with the socket not yet empty (see azlMaxDatagrams) */
+   enet_uint32 eventsBeforeAck;  /**< packets handed over while the acknowledgements of the datagrams that carried them still waited (see azlAckHoldEvents) */
+   enet_uint32 ackHoldLimitHits; /**< times the acknowledgements were sent because they had waited for azlAckHoldEvents packets or azlAckHoldMs */
+   enet_uint32 ackHoldMaxMs;     /**< the longest an acknowledgement waited between being queued and being sent (a maximum) */
+} ENetAzlCounters;
+
 /** An ENet host for communicating with peers.
   *
   * No fields should be modified unless otherwise stated.
@@ -408,6 +429,41 @@ typedef struct _ENetHost
    /* AzaharLink: with azlDeliverOutOfOrder, which packets may go ahead of a hole: NULL = any; else only the ones this returns nonzero
       for (the room client lets the relayed game frames and the beacons go, and keeps the handshake and the room's messages in order). */
    int (* azlEarlyFilter) (const enet_uint8 * data, size_t dataLength);
+   /* AzaharLink: a receive on a socket that has nothing is a call to the soc service (0.04 to 0.5 ms on the console) for an answer that
+      is "nothing". azlSocketEmpty is 1 from the moment a receive found the socket empty or a poll waited its whole time without a datagram,
+      until the next receive attempt or a poll that reported data (a poll that came back early with nothing readable - the soc service's
+      way of reporting a socket in trouble - leaves it 0: the receive of the next call is where the error shows). With azlSkipEmptyRecv (1, the default; 0 = every service call probes, as ENet does) a
+      service call that is going to poll (a timeout above 0) does not probe first: the poll reports a datagram that is there at once -
+      unless the timer of a packet of ours is due, when the socket is read first as ever: the acknowledgement that stops the timer may be
+      in it, and the check of the timers comes next (a socket that failed for 6 s, a thread that was away).
+      A call that ends without having polled after such a skip (its time ran out in the sends) forgets that the socket was empty, so
+      a datagram is never read later than one service call. */
+   enet_uint32          azlSkipEmptyRecv;
+   enet_uint32          azlSocketEmpty;
+   /* AzaharLink: how much one receive pass may read before it hands the datagrams it has to the caller. ENet reads until the socket is
+      empty or 256 datagrams, and hands over the first packet only then: on the console a datagram costs 1 to 2 ms to read when the game
+      is busy, so a backlog of 100 held the first frame for 150 ms. A pass stops after azlMaxDatagrams datagrams; the call then hands over
+      what it has, and the next one goes on reading without polling (the socket still holds data). 0 = ENet's own 256. The 32 are the model's
+      choice (Tests/vsim, 25 recorded traces, 5 seeds each): any count from 24 to 64 takes Star Rush's mean delay and p99 down by 14 to 17%
+      and changes nothing for the games whose passes are short (a pass never reaches it); a TIME limit as well (6 ms was tried) did nothing
+      more for Star Rush and made NSMB2's p99 15% worse - every piece costs a send of acknowledgements - so there is none. */
+   enet_uint32          azlMaxDatagrams;
+   enet_uint32          azlReadCapped;
+   /* AzaharLink: ENet sends the acknowledgements of the datagrams it has just read BEFORE it hands over the packets they carried: a send
+      to the soc service (0.3 ms to 4 ms on the console) in front of every frame. With azlAckHoldEvents above 0 the packets go first and
+      the acknowledgements follow at the start of the next call, riding on whatever the caller queued meanwhile (a reply to the frame is
+      one datagram, not two); they are sent ahead of the next packet when azlAckHoldEvents packets were handed over since the first one
+      waited, or when it has waited azlAckHoldMs (0: no time limit; on a connection that answers faster than a WiFi one, a third of the
+      retransmission timeout if that is shorter, 2 ms at least), so that a backlog of packets never keeps an acknowledgement from the
+      room for longer than a fraction of the room's retransmission timeout (24 to 31 ms on a LAN). The model of Tests/vsim (25 recorded
+      traces, 5 seeds each): the TIME limit decides - 8 ms takes Star Rush's mean delay down 20% against ENet's order, 4 ms only 13% and
+      NSMB2's p99 goes up 19%, 12 ms is no better within the noise - and the count of packets changes nothing between 4 and 32, so the
+      smaller one of the two the room's timeout can bear is kept. 0 = ENet's order. */
+   enet_uint32          azlAckHoldEvents;
+   enet_uint32          azlAckHoldMs;
+   enet_uint32          azlAckEvents;  /* (running) packets handed over since the acknowledgements started to wait */
+   enet_uint32          azlAckSince;   /* (running) the host clock when the first of the waiting acknowledgements was queued, 0 = none waits */
+   ENetAzlCounters      azlCounters;
 } ENetHost;
 
 /* AzaharLink counters (cumulative; the plugin takes the differences per statistics window):
@@ -415,6 +471,11 @@ typedef struct _ENetHost
    sample was not taken because the servicing thread had been away (ENET_AZL_PAUSE_MS or more since the previous service call
    and a sample above the current estimate). */
 #define ENET_AZL_PAUSE_MS 8
+/* The default of ENetHost::azlMaxDatagrams (see there). */
+#define ENET_AZL_READ_MAX_DATAGRAMS 32
+/* The defaults of ENetHost::azlAckHoldEvents / azlAckHoldMs (see there). */
+#define ENET_AZL_ACK_HOLD_EVENTS 8
+#define ENET_AZL_ACK_HOLD_MS 8
 extern enet_uint32 enet_azl_throttled_packets;
 extern enet_uint32 enet_azl_ack_samples_skipped;
 extern enet_uint32 enet_azl_early_dispatched; /* reliable packets handed over out of order (azlDeliverOutOfOrder) */
@@ -588,6 +649,8 @@ ENET_API enet_uint32  enet_crc32 (const ENetBuffer *, size_t);
                 
 ENET_API ENetHost * enet_host_create (const ENetAddress *, size_t, size_t, enet_uint32, enet_uint32);
 ENET_API void       enet_host_destroy (ENetHost *);
+/** AzaharLink: copies the host's counters (ENetAzlCounters) into `out` and clears them: the maxima start again. */
+ENET_API void       enet_azl_counters_take (ENetHost *, ENetAzlCounters *);
 ENET_API ENetPeer * enet_host_connect (ENetHost *, const ENetAddress *, size_t, enet_uint32);
 ENET_API int        enet_host_check_events (ENetHost *, ENetEvent *);
 ENET_API int        enet_host_service (ENetHost *, ENetEvent *, enet_uint32);
