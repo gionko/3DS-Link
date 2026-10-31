@@ -18,6 +18,7 @@ struct HookStats {
     u32 skipped_sites = 0;     ///< sites that could not be hooked safely (see the log)
     u32 framework_sites = 0;   ///< svc 0x32 sites left alone: CTRPluginFramework hooks them itself
     u32 thumb_candidates = 0;  ///< Thumb `svc 0x32` encodings seen (not hooked)
+    u32 gsp_stub_wrappers = 0; ///< GSP wrappers whose `bl` to the svc stub was rewritten as the svc itself (see azl/gsp_wrapper.hpp)
     bool trampolines_ready = false;
 };
 

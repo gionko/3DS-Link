@@ -7,6 +7,7 @@
 
 #include "azl/apt_sleep.hpp"
 #include "azl/arm_reloc.hpp"
+#include "azl/gsp_wrapper.hpp"
 #include "azl/svc_patch.hpp"
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
@@ -85,18 +86,7 @@ bool BuildTrampoline(u32 site, u32 next, u32 entry, u32* tramp_address) {
 // followed by the command header 0x00130042 somewhere in its first 0x50 bytes (hook at +0x28).
 // ---------------------------------------------------------------------------------------------
 
-constexpr u32 kGspRegisterInterruptHeader = 0x00130042;
-
-constexpr u32 kGspWrapperCtru[] = {
-    0xE92D4070, 0xE1A06003, 0xE59D5010, 0xEE1D3F70, 0xE2834080, 0xE59F3034, 0xE3A0C000,
-    0xE584100C, 0xE9841004, 0xE5843000, 0xE5900000, 0xEF000032, 0xE2101102, 0x4A000004,
-    0xE5940008, 0xE5850000, 0xE5940010, 0xE5860000, 0xE5940004, 0xE8BD8070, 0x00130042};
-constexpr u32 kGspWrapperCtruSvcOffset = 0x2C;
-
-constexpr u32 kGspWrapperSdk[] = {0xE92D4070, 0xE1A05003, 0xE59D6010, 0xEE1D4F70, 0xE59FC034,
-                                  0xE3A03000, 0xE5A4C080, 0xE584100C, 0xE1C420F4};
-constexpr u32 kGspWrapperSdkSvcOffset = 0x28;
-constexpr u32 kGspWrapperSdkHeaderWindow = 0x50;
+// (the patterns themselves are in azl/gsp_wrapper.hpp, where the host tests can reach them)
 
 constexpr u32 kMaxFrameworkSites = 8;
 u32 g_framework_sites[kMaxFrameworkSites];
@@ -500,6 +490,23 @@ HookStats InstallSvcHooks(UdsHle* hle) {
     const u32 last = stats.text_start + stats.text_size - 8;
     const u32 send_entry = reinterpret_cast<u32>(&azl_svc32_entry);
     const u32 close_entry = reinterpret_cast<u32>(&azl_svc23_entry);
+
+    // A game whose GSP wrapper has its svc behind a stub (LEGO Batman 2) would make the framework abort at start: the svc is written in
+    // place of the `bl` (the same for the CPU), so that the framework finds the wrapper it knows. This must come before the next step.
+    {
+        u32 stubbed[4];
+        const u32 count = FindStubbedGspWrappers(ReadGameWord, nullptr, first, stats.text_start + stats.text_size, stubbed, 4);
+        for (u32 i = 0; i < count; ++i) {
+            if (CTRPluginFramework::Process::Patch(stubbed[i], kSvcSendSyncRequest)) {
+                ++stats.gsp_stub_wrappers;
+                Log("hook: the GSP wrapper at 0x%08lx calls its svc through a stub: the svc is now in place of the bl, so that the "
+                    "framework finds the wrapper (it aborts at start otherwise)",
+                    static_cast<unsigned long>(stubbed[i] - kGspWrapperCtruSvcOffset));
+            } else {
+                Log("hook: could not rewrite the bl of the GSP wrapper at 0x%08lx", static_cast<unsigned long>(stubbed[i] - kGspWrapperCtruSvcOffset));
+            }
+        }
+    }
 
     // The framework hooks one of the game's svc 0x32 words by itself: do not touch that one.
     FindFrameworkSites(first, stats.text_start + stats.text_size);

@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.0.11 - 2026-10-31
+
+**LEGO Batman 2: DC Super Heroes no longer closes at launch.** Nothing else changed since 1.0.10.
+
+> Tried on **two New Nintendo 3DS consoles** connected through an Azahar room, with the plugin switched on: the game starts and plays. It was **not tried on an Old 3DS, nor with the USA copy**: the report of the same symptom ([issue 2](https://github.com/gionko/3DS-Link/issues/2)) comes from an Old 3DS with the USA copy, and it is not known whether it has the same cause. The logs of that test are still to be read.
+
+> The fix is part of the plugin's hooks, so it works **when 3DS Link is switched on** (main switch on). With the main switch off the plugin file stays in the game's folder and the framework still stops this game: to play it without 3DS Link, take the game off in *Enable Titles*. This is to be fixed in the next version.
+
+### At a glance
+
+| Game | Before | Now | Since |
+|---|---|---|---|
+| LEGO Batman 2: DC Super Heroes | a "Fatal plugin error" screen (`abort()` called, code `0x0705C108`), then a Luma exception dump | the game starts and plays between two consoles | 1.0.11 |
+
+### Not fixed
+
+| What | Notes |
+|---|---|
+| Old 3DS: pressing HOME with the plugin enabled closes the game | reported by users, no Old 3DS in the test set; the cause is understood, the fix is not written yet: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| *Monster Hunter XX* closes when a multiplayer match starts (Old 3DS) | reported by users: [issue 3](https://github.com/gionko/3DS-Link/issues/3) |
+| *Mario Tennis Open*: after the online option the game says the Wi-Fi switch is off (Old 3DS) | reported by a user, not analysed: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
+| *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
+
+### Technical notes
+
+<details>
+<summary>Why LEGO Batman 2 closed, and what the plugin does now</summary>
+
+**Why.** The plugin framework (CTRPluginFramework) hooks the game's GSP function `GSPGPU_RegisterInterruptRelayQueue`, which it finds in the game's code by instruction pattern. If it does not find it, it calls `abort()` before the game starts: a "Fatal plugin error" screen, then a Luma exception dump (no log is written, because the plugin's log opens later). In LEGO Batman 2 the function is there and equals the pattern except for one word: its `svc 0x32` is not inline but behind a `bl` to a stub of the game, which is exactly `svc 0x32 ; bx lr`.
+
+**What the plugin does.** At start, before the framework searches, the plugin looks in the game's code for that function with a `bl` to such a stub (the other 20 words equal to the pattern, the condition "always", the target inside the game's code) and writes the `svc 0x32` in place of the `bl`. For the CPU the two are the same (the function leaves with `pop {..., pc}`, so the `lr` that `bl` changes is not used, and `svc` does not touch the flags). The framework then finds a function it knows and hooks it as in any other game. The code is `AzaharLink/Includes/azl/gsp_wrapper.hpp` and `InstallSvcHooks` in `AzaharLink/Sources/ctr/hook.cpp`; the test is `AzaharLink/Tests/gsp_wrapper_test.cpp`.
+
+**Other games.** The rewrite only happens when the other 20 words equal the pattern and the 12th is a `bl` to exactly `svc 0x32 ; bx lr`. It was looked for in the code of *Final Fantasy Explorers*, *Kirby Battle Royale*, *Kirby: Planet Robobot* and *Kirby: Triple Deluxe* and found nothing there, so those games are not touched. With the debug log on, the log line `hook: the GSP wrapper at 0x... calls its svc through a stub` tells that it happened.
+
+</details>
+
+<details>
+<summary>About the files of this release</summary>
+
+`3DSLink.cia` is the very file that was tried on the consoles (same bytes); `3DSLink.3dsx` was built in the same run, from the same plugin, and was not installed on its own.
+
+</details>
+
 ## 1.0.10 - 2026-10-31
 
 The first release after 1.0.4.
@@ -25,7 +69,7 @@ The first release after 1.0.4.
 |---|---|---|---|---|
 | Kirby: Triple Deluxe and Planet Robobot, **launch** | closed at launch | start normally | 1.0.6 | yes |
 | Kirby: Planet Robobot, **wireless play** | none (the game looks for its group with Download Play) | in the room, up to 4 players, consoles only (Azahar cannot take part) | 1.0.10 | 2 consoles: 9/10. 3–4 players, Azahar player: **not tried** |
-| Kirby: Triple Deluxe, **wireless play** | none (as above) | in the room, up to 4 players, consoles only (Azahar cannot take part) | 1.0.10 | 2 consoles: works, a little slow (cause not known). 3–4 players, Azahar player: **not tried** |
+| Kirby: Triple Deluxe, **wireless play** | none (as above) | in the room, up to 4 players, consoles only (Azahar cannot take part) | 1.0.10 | 2 consoles: 9/10, found a little slow (cause not known). 3–4 players, Azahar player: **not tried** |
 | Kirby Battle Royale, **wireless check** | asked for the wireless to be turned on | the plugin answers the game's wireless check; the game goes on to the normal wireless | 1.0.6 | not again; tried on 1.0.6 (debug log on) |
 | Kirby Battle Royale, **Azahar player closed abruptly** | the console waited about 30 s | *intended*: dropped after 3 s (see "Room members that stopped playing" below) | 1.0.10 | **not tried** |
 
@@ -74,10 +118,11 @@ The first release after 1.0.4.
 
 | What | Notes |
 |---|---|
-| Old 3DS: pressing HOME with the plugin enabled closes the game | reported by users, no Old 3DS in the test set: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| Old 3DS: pressing HOME with the plugin enabled closes the game | reported by users, no Old 3DS in the test set; the cause is understood, the fix is not written yet: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
 | *Monster Hunter XX* closes when a multiplayer match starts (Old 3DS) | reported by users: [issue 3](https://github.com/gionko/3DS-Link/issues/3) |
-| *LEGO Batman 2* closes at launch | an abort of the plugin framework; cause identified, fix not in 1.0.10: [Known limits](README.md#known-limits) |
+| *LEGO Batman 2* closes at launch | an abort of the plugin framework; not fixed in 1.0.10, fixed in 1.0.11 (see above) |
 | *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
+| *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
 
 ### Technical notes
 

@@ -999,7 +999,7 @@ need_line Tests/stack_usage.sh 'budget hook "azl::ctr::PassThrough" 32' "the hot
 # Test hygiene. A test that no script runs is a gate that is not there: every test source is built AND run by the script
 # that owns it (the host tests by Tests/run.sh, the 32-bit ones, which drive UdsHle, by Tests/ipc_test/build.sh and then
 # Tests/hle_tests.sh and Tests/integration.sh), and a new *_test.cpp that is in none of them fails here
-for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test logrot_test log_module_test ncch_icon_test reloc_test; do
+for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test logrot_test log_module_test ncch_icon_test reloc_test gsp_wrapper_test; do
   tr -d '\r' < Tests/run.sh | grep -q -E "^  (timeout 1200 )?\"\\\$OUT/$t\"( |\$)" || fail "Tests/run.sh does not run the unit test $t (a line of its own that calls \"\$OUT/$t\")"
   need Tests/run.sh "-o \"\$OUT/$t\"" "the unit test $t is built by Tests/run.sh"
 done
@@ -1728,6 +1728,10 @@ need Sources/ctr/text_search_guard.cpp 'constexpr u32 kAddR6R6Imm4 = 0xe2866004;
 need Sources/ctr/text_search_guard.cpp 'if (return_address[0] != kMovR7R0 || return_address[1] != kAddR6R6Imm4) {' "every other caller of GetTextSize() gets the real value"
 need_line Sources/ctr/text_search_guard_entry.s '    b    azl_text_size_guard' "the stub of the guard hands over to the C++ function by a plain branch (lr is left alone)"
 need Sources/ctr/hook.cpp 'if (TextSearchTrims() != 0) {' "the log says when the startup search was cut to the game's code"
+# A game whose GSP wrapper has its svc behind a stub (LEGO Batman 2) makes the framework abort at start unless the plugin writes the svc in place of the bl BEFORE the framework searches (GSP::Initialize runs after PatchProcess); the framework's own sites are found after that
+need Sources/ctr/hook.cpp 'FindStubbedGspWrappers(ReadGameWord, nullptr, first, stats.text_start + stats.text_size, stubbed, 4);' "the GSP wrapper behind a stub is looked for in the game's .text"
+need Sources/ctr/hook.cpp 'CTRPluginFramework::Process::Patch(stubbed[i], kSvcSendSyncRequest)' "the bl of the GSP wrapper becomes the svc itself"
+need_order Sources/ctr/hook.cpp 'FindStubbedGspWrappers(ReadGameWord' 'FindFrameworkSites(first, stats.text_start + stats.text_size);' "the wrapper is made the framework's one BEFORE the sites of the framework are looked for"
 need Tests/run.sh 'Tests/text_search_guard_test.cpp' "the PC test of the guard is built by the suite"
 need_line Tests/run.sh '  "$OUT/text_search_guard_test"' "... and run (the whole line: the build line has the same words)"
 need Tests/text_search_guard_elf_check.sh 'text search guard: OK' "the check of the call in the built .elf exists"

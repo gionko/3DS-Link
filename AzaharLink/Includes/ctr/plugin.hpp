@@ -27,7 +27,7 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.0.10"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.10: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.0.11"; // (the log header and the menu text; the menu's ints and plgInfo say 1.0.11: Tests/set_version.py writes all of them)
 
 /// "Mon DD YYYY HH:MM:SS" of the last build that changed any object: Sources/ctr/build_id.cpp, which the Makefile recompiles
 /// after every other object. The log header prints it instead of plugin.cpp's own __DATE__ / __TIME__, which stay as old as

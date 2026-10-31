@@ -94,6 +94,7 @@ g++ $CXXFLAGS Tests/link_policy_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/link_pol
 # the platform layer's three socket calls so that the test can count them, and ENet's clock so that it can hold it
 g++ $CXXFLAGS Tests/enet_path_test.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_wait -Wl,--wrap=enet_time_get -o "$OUT/enet_path_test"
 g++ $CXXFLAGS Tests/reloc_test.cpp Sources/azl/arm_reloc.cpp -o "$OUT/reloc_test"
+g++ $CXXFLAGS Tests/gsp_wrapper_test.cpp -o "$OUT/gsp_wrapper_test"
 g++ $CXXFLAGS Tests/soc_plan_test.cpp -o "$OUT/soc_plan_test"
 g++ $CXXFLAGS Tests/text_search_guard_test.cpp Sources/ctr/text_search_guard.cpp -o "$OUT/text_search_guard_test"
 g++ $CXXFLAGS Tests/plugin_compare_test.cpp -o "$OUT/plugin_compare_test"
@@ -233,4 +234,5 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/ncch_icon_test"
   "$OUT/builtin_keys_test"
   "$OUT/reloc_test" $RELOC_GAME_CODE   # RELOC_GAME_CODE=<decompressed .code> adds the game sweep
+  "$OUT/gsp_wrapper_test" $GSP_GAME_CODE   # GSP_GAME_CODE="<decompressed .code> <text size> <expected bl address>" runs the search over a game
 fi
