@@ -358,6 +358,37 @@ int main() {
     CHECK(std::strcmp(azl::DebugHint(false), " (set debug=1 for details)") == 0);
     CHECK(std::strcmp(azl::DebugHint(true), "") == 0);
 
+    // The list of the games that get their block when the sockets start. By then Monster Hunter XX holds 80 MiB (13,264 KB of code and stack, 8,240 KB of
+    // heap up to 0x0880C000, 59 MiB of device memory): on a New 3DS 44 MiB of budget are left, on an Old 3DS none, and in both cases the plan must offer places
+    // above its heap (on the Old 3DS the block then comes from outside the budget).
+    CHECK(sizeof(kLateBlockTitles) / sizeof(kLateBlockTitles[0]) >= 1);
+    for (const uint64_t title : kLateBlockTitles) {
+        CHECK(TakesBlockLate(title));
+        CHECK((title >> 32) == 0x00040000u); // an application, base title: the id the plugin reads from the process
+    }
+    CHECK(TakesBlockLate(0x0004000000197100ull));
+    CHECK(!TakesBlockLate(0x0004000E00197100ull)); // (its update: not the id of the process)
+    CHECK(!TakesBlockLate(0x0004000000197000ull));
+    CHECK(!TakesBlockLate(0x00040000001C2100ull)); // Kirby Battle Royale
+    CHECK(!TakesBlockLate(0x000400000F83D100ull)); // the app
+    CHECK(!TakesBlockLate(0));
+    {
+        const uint32_t heap_end = 0x0880C000;
+        const Inputs late_new{0x7C00000, 0x5000000, 0x0FFE8000, 0x7C00000};
+        const Inputs late_old{0x5000000, 0x5000000, 0x0FFE8000, 0x5000000};
+        for (const Inputs& late : {late_new, late_old}) {
+            Candidate list[kMaxCandidates];
+            PlanInfo plan{};
+            const int count = Build(late, kSocBlockSize, list, kMaxCandidates, &plan);
+            CHECK(count > 0);
+            CHECK(plan.known && plan.provable);
+            for (int i = 0; i < count; ++i) {
+                CHECK(list[i].base >= heap_end);
+                CHECK(list[i].base + kSocBlockSize <= kRegionEnd);
+            }
+        }
+    }
+
     std::printf("%s (%d checks)\n", g_fail ? "FAILED" : "all checks passed", g_checks);
     return g_fail != 0;
 }

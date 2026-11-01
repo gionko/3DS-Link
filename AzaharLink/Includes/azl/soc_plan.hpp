@@ -62,6 +62,27 @@ constexpr uint32_t kSocBlockSize = 0x20000;
 // Sizes tried in this order (the kernel refuses when the commit room or the physical memory is short).
 constexpr uint32_t kBlockSizes[] = {0x20000, 0x10000};
 
+// THE LIST of the games that cannot spare the block while they size their heap: they get it at the first connection, not before their first
+// instruction. A game with the same defect needs its title id here (every region of it) and nothing else. The defect, as Monster Hunter XX has it
+// (2026-11-01): with the plugin off it plays; with the plugin on it dies before its first frame, with a small FAR in its own code
+// (the same in Luma's dumps of two Old 3DS and a New 2DS XL) right after a NULL from its allocator, because its entry point reads the commit
+// (svc 0x3A) and fills what is left:
+//     heap = min(told to the game, 80 MiB) - commit now - 59 MiB of device memory = 8,240 KB, 8,112 KB with the block charged, and that is short
+// Not a rule for every game: one that fills a budget as large as the whole region would leave a late block no room, where it can spare 128 KB today.
+// A game that takes a late block outside its budget (ctr/soc.cpp, a console with nothing left) should not be one that frees and takes back memory at its limit.
+constexpr uint64_t kLateBlockTitles[] = {
+    0x0004000000197100ull, // Monster Hunter XX (Japan: it has no other region)
+};
+
+inline bool TakesBlockLate(uint64_t title_id) {
+    for (const uint64_t title : kLateBlockTitles) {
+        if (title == title_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // What the start-up says on screen about the block that was reserved (the sizes of kBlockSizes); "" = nothing to say.
 // The smaller block holds only a 32 KiB ring, half the buffer time of a 4-player session, and a player who loses frames
 // should be told why. The text carries the reason itself (there may be no log to read: it is written only with debug=1) and,

@@ -6,7 +6,7 @@
 
 **Connect, share, play together.** 3DS Link is an application for the Nintendo 3DS family that carries local wireless games over the internet, and moves software between consoles without a PC.
 
-Current version: **1.0.12**. Download it from the [Releases](../../releases/latest) page.
+Current version: **1.0.13**. Download it from the [Releases](../../releases/latest) page.
 
 A player on a PC with Azahar, a player on a tablet with Azahar and a player on a real Nintendo 3DS can all be in the same match of the same game, over the internet.
 
@@ -90,7 +90,7 @@ The first two tables were tested by the project owner, on the owner's consoles a
 
 | Table | Tested on | Debug log | Rating |
 |---|---|---|---|
-| [Tested on 1.0.10, 1.0.11 and 1.0.12](#tested-on-1010-1011-and-1012) | 1.0.10, 1.0.11 or 1.0.12 (the version is in each row) | **off**, no logs, except where the row says (a log is only written with the debug log on, which changes how the games behave: see [Known limits](#known-limits)) | score 1 to 10 |
+| [Tested on 1.0.10 or later](#tested-on-1010-or-later) | 1.0.10 or later (the version is in each row) | **off**, no logs, except where the row says (a log is only written with the debug log on, which changes how the games behave: see [Known limits](#known-limits)) | score 1 to 10 |
 | [Last tested on an older version](#last-tested-on-an-older-version) | the version written in the row | mostly on, as some rows say | none yet: the words used then |
 | [Reported or known not to work](#reported-or-known-not-to-work) | — | — | — |
 
@@ -101,7 +101,7 @@ How to read the columns:
 * **Modification that matters (since)**, in the first table, and **Modification since then that matters**, in the second: which change, and since which version, is relevant for that game. The full list is in the [CHANGELOG](CHANGELOG.md). The ENet data path change of 1.0.5 touches every game, so it is only written where it is the one that matters most.
 * **Result then** (second table): the words used when the game was tried; no score has been given yet.
 
-### Tested on 1.0.10, 1.0.11 and 1.0.12
+### Tested on 1.0.10 or later
 
 | Game | Players tested | Score | 3DS Link | Modification that matters (since) |
 |---|---|---|---|---|
@@ -115,12 +115,13 @@ How to read the columns:
 | LEGO Batman 2: DC Super Heroes | 2 New 3DS consoles connected through an Azahar room, with the debug log on (the logs are still to be read) | works; **no score given yet** | 1.0.11 | 1.0.11 the game no longer closes at launch (the plugin rewrites the game's GSP wrapper so that the framework finds it); 1.0.12 also with the main switch off (**not tried**) |
 | SEGA 3D Classics Collection | 2 consoles, with *Altered Beast* (an earlier build of 1.0.12, before the *Mario Tennis Open* change; the debug log setting was not written down) | **10/10** | 1.0.12 | 1.0.5 ENet data path |
 | Mario Tennis Open (Europe copy) | 2 New 2DS XL consoles, several modes and several matches, no problems (the debug log setting was not written down) | **9/10** | 1.0.12 | 1.0.12 the Download Play lobby is provided inside the room, with the console's own friend code seed (see the [CHANGELOG](CHANGELOG.md)) |
+| Monster Hunter XX (Japanese copy with the English patch v5) | New 2DS XL (the number of players and the debug log setting were not written down) | **10/10** | 1.0.13 | 1.0.13 the game no longer closes at launch: the socket buffer is taken at the first connection (see the [CHANGELOG](CHANGELOG.md)) |
 
 Not tried yet with three or four players: the games that use the lobby (the two Kirby games, *Mario Tennis Open*). Not tried with an Azahar player in the room: the same (the lobby is made between 3DS Link consoles, Azahar cannot take part in it). The title ids of the USA, Japanese and Taiwanese copies of *Mario Tennis Open* are in the plugin's table but were never seen on a console.
 
 ### Last tested on an older version
 
-These were not re-tested on 1.0.10, 1.0.11 or 1.0.12. The result is the one of the version written in the row, in the words used then; no score has been given to them yet.
+These were not re-tested on 1.0.10 or later. The result is the one of the version written in the row, in the words used then; no score has been given to them yet.
 
 | Game | Players tested | Result then | 3DS Link | Modification since then that matters |
 |---|---|---|---|---|
@@ -138,7 +139,7 @@ These were not re-tested on 1.0.10, 1.0.11 or 1.0.12. The result is the one of t
 
 | Game | What happens | Since / notes |
 |---|---|---|
-| Monster Hunter XX (Japan) | Closes at the start of a multiplayer match (Old 3DS, issue 3) | Not fixed |
+| Monster Hunter XX (Japan) on an Old 3DS | Closed at launch, before its first frame, with the plugin enabled (issues 2 and 3; the same crash happened on a New 2DS XL) | A fix since 1.0.13, tried on a New 2DS XL. **Not tried on an Old 3DS**, where it takes another road |
 | Mario Tennis Open (USA copy, Old 3DS) | After the online option the game says the Wi-Fi switch is off (issue 2) | Not confirmed fixed: the Europe copy plays between two New 2DS XL since 1.0.12; the report may be the game's internet mode, which 3DS Link does not carry. Not tried on an Old 3DS |
 | Balloon Fight (Virtual Console) | Closes at startup: the framework the plugin is built on aborts in Virtual Console games | Known limit |
 | Pac-Man & Galaga Dimensions, Ridge Racer 3D, The Legend of Zelda: Ocarina of Time 3D | Close at launch on one of the test consoles with the plugin switched on (error `0xE0A01839`); with the game left off they run | See [Known limits](#known-limits) |
@@ -150,7 +151,7 @@ These were not re-tested on 1.0.10, 1.0.11 or 1.0.12. The result is the one of t
 | **One plugin per game** | Another Luma plugin in the same game's folder: 3DS Link leaves that folder alone | By design |
 | **Download Play games** | Only *Kirby: Triple Deluxe*, *Kirby: Planet Robobot*, *Kirby Battle Royale* and *Mario Tennis Open* work; other Download Play games, single-copy Download Play and Virtual Console games do not | Not supported, except those four |
 | **Some 2011 titles** | *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) on one console | A remedy exists in the notes, **not** applied or tried |
-| **Old 3DS and Old 2DS** | HOME closes the game; *Monster Hunter XX* closes in multiplayer (reported by users) | HOME: a fix is in 1.0.12, **not tried on an Old 3DS**. *Monster Hunter XX*: **not fixed** |
+| **Old 3DS and Old 2DS** | HOME closes the game; *Monster Hunter XX* closes at launch (reported by users) | HOME: a fix is in 1.0.12, **not tried on an Old 3DS**. *Monster Hunter XX*: a fix is in 1.0.13, **not tried on an Old 3DS** |
 | **The debug log** | Makes everything stutter; with it on the Kirby games, *Dragon Ball Z* and *Tekken* are not playable | Not fixable here: keep it off (the default) |
 | **Fast fighting games** | Can stutter on a slow connection; *Tekken 3D* lags between two consoles | Cause of Tekken's gaps not located |
 | **The Download Play lobby** (*Triple Deluxe*, *Planet Robobot*, *Mario Tennis Open*) | At most four players; tried with two consoles; *Triple Deluxe* found "a little slow" | Partly tried |
@@ -160,7 +161,7 @@ These were not re-tested on 1.0.10, 1.0.11 or 1.0.12. The result is the one of t
 * **One plugin per game.** A game switched on in 3DS Link cannot also have another Luma plugin (cheats, CTGP-7, ...): 3DS Link detects it and leaves that game's folder alone.
 * **Download Play games.** The plugin carries the game's own local wireless (`nwm::UDS`). Four games use the Download Play service to find their group and work: *Kirby: Triple Deluxe* and *Kirby: Planet Robobot* because 3DS Link provides that part inside the room (since 1.0.10, between consoles only: Azahar cannot take part), *Mario Tennis Open* for the same reason (since 1.0.12), and *Kirby Battle Royale* because the plugin answers its wireless check (since 1.0.6; last tried on 1.0.6). Other games that use Download Play to play together, single-copy Download Play (sending the game to a console that does not have it) and Virtual Console games do not work.
 * **Some 2011 titles.** On a New 3DS XL, with the plugin enabled for the title, *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D* and *Ocarina of Time 3D* end within five seconds with the error code `0xE0A01839` (the result of the game's own `svcCreateThread`). With the title not enabled they run, and the same plugin works with newer games on the same console. The analysis points at a worker thread of the plugin framework that is started on the second core for these titles. A game without local wireless can simply stay off in *Enable Titles*. The analysis and a diagnostic build of the plugin are in [`AzaharLink/diag/README.md`](AzaharLink/diag/README.md).
-* **Old 3DS and Old 2DS.** There is no console of this kind in the test set, and users report problems: with the plugin enabled, pressing HOME closes the game (the cause: Luma frees the plugin's memory while a game thread is still inside the plugin's hook). **1.0.12 contains a fix for it, written from Luma's source and tested on a PC only; it has not been tried on an Old 3DS.** A user also reports that the power button does the same: it is not known whether the same fix covers it. *Monster Hunter XX* closes when a multiplayer match starts ([issue 2](https://github.com/gionko/3DS-Link/issues/2), [issue 3](https://github.com/gionko/3DS-Link/issues/3)): not fixed. *LEGO Batman 2* also closed at launch on an Old 3DS, with the USA copy (issue 2): the cause found on New 3DS consoles is fixed in 1.0.11 (see the [CHANGELOG](CHANGELOG.md)); the same user reports that the game starts there now (alone, nobody joined), which is a report and not a test of ours, and it has **not** been tried in a match on an Old 3DS. Luma 13.0–13.2 are untested.
+* **Old 3DS and Old 2DS.** There is no console of this kind in the test set, and users report problems: with the plugin enabled, pressing HOME closes the game (the cause: Luma frees the plugin's memory while a game thread is still inside the plugin's hook). **1.0.12 contains a fix for it, written from Luma's source and tested on a PC only; it has not been tried on an Old 3DS.** A user also reports that the power button does the same: it is not known whether the same fix covers it. *Monster Hunter XX* closes at launch, before its first frame ([issue 2](https://github.com/gionko/3DS-Link/issues/2), [issue 3](https://github.com/gionko/3DS-Link/issues/3); the same crash happened on a New 2DS XL): **1.0.13 contains a fix, tried on a New 2DS XL.** On an Old 3DS the game leaves no memory for the plugin's socket buffer, so the fix takes another road there, which **has not been tried on an Old 3DS**. *LEGO Batman 2* also closed at launch on an Old 3DS, with the USA copy (issue 2): the cause found on New 3DS consoles is fixed in 1.0.11 (see the [CHANGELOG](CHANGELOG.md)); the same user reports that the game starts there now (alone, nobody joined), which is a report and not a test of ours, and it has **not** been tried in a match on an Old 3DS. Luma 13.0–13.2 are untested.
 * **The debug log** (*Settings → Debug log*) writes a lot to the SD card. With it on, the Kirby games, *Dragon Ball Z* and *Tekken* are not playable (the capture probably saturates the card the game loads from: the game does not load or freezes, and the other consoles drop out), and some games with short network timeouts lose the room. Turn it on only to make a report. Writing the capture every 2 s instead of four times a second (1.0.8) did not solve it.
 * **Fast fighting games** feel the network more and can stutter on a slow connection. *Tekken 3D* lags between two consoles: gaps of 80 ms and more rather than latency.
 * **The Download Play lobby** (the two Kirby games and *Mario Tennis Open*) is made of at most four players and was tried with two consoles only. *Triple Deluxe* was found "a little slow" without saying where (no log: the debug log cannot be used with these games).

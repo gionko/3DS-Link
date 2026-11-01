@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.0.13 - 2026-11-01
+
+**Monster Hunter XX no longer closes at launch. A list for any other game with the same defect.**
+
+> Tried on the owner's **New 2DS XL**, with the Japanese copy of *Monster Hunter XX* and the English patch v5: it works very well: **10/10**. **Not tried on any Old 3DS or Old 2DS**: the two users who reported the crash have one, and there the fix takes another road. All the other games are unchanged.
+
+### At a glance
+
+| Game or area | Before | Now | Since |
+|---|---|---|---|
+| *Monster Hunter XX*, New 3DS family, plugin enabled | closed at launch, before its first frame | starts and plays: 10/10 | 1.0.13 |
+| *Monster Hunter XX*, Old 3DS family, plugin enabled | closed at launch, before its first frame | a fix, **not tried on an Old 3DS** | 1.0.13 |
+| A game with the same defect | no remedy | its title id goes in a list (`socplan::kLateBlockTitles`) | 1.0.13 |
+
+### Not fixed or not tried
+
+| What | Notes |
+|---|---|
+| *Monster Hunter XX* on an Old 3DS | the fix **has not been tried** there: [issue 3](https://github.com/gionko/3DS-Link/issues/3), [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| Old 3DS: pressing HOME with the plugin enabled | a fix since 1.0.12, **not tried on an Old 3DS**: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| *Mario Tennis Open*, USA copy on an Old 3DS: "the Wi-Fi switch is off" after the online option | [issue 2](https://github.com/gionko/3DS-Link/issues/2): not confirmed fixed, not tried on an Old 3DS (the Europe copy plays between two New 2DS XL) |
+| The power button closes the game on an Old 3DS | reported in [issue 2](https://github.com/gionko/3DS-Link/issues/2); it is not known whether the fix for HOME covers it |
+| *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
+| *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
+
+### Technical notes
+
+<details>
+<summary>Monster Hunter XX: the cause, the fix and the correction of what was written before</summary>
+
+**The cause.** The Luma dumps of two Old 3DS and of a New 2DS XL show the same crash in the same place. At launch the game works out its heap once, down to the last page, from what is left: the smaller of the memory it is told it has and 80 MiB, minus what is already charged to it, minus 59 MiB of device memory. That is 8,240 KB, and the game fills them. The plugin took its 128 KB socket buffer before the game's first instruction, and that buffer is charged to the game: the heap became 8,112 KB, one of the game's allocations returned nothing, the game did not check and wrote through a null pointer. With the plugin off the game plays.
+
+**The fix.** The titles in the list `socplan::kLateBlockTitles` (today only this game) get the buffer at the first connection to the room, when the game has already done its sums; so the game sees what it sees with the plugin off. For a game with the same defect, its title id in the list is enough. It is not a rule for every game: a game that fills a budget as large as the whole memory region would leave no room for a late buffer, while today it can spare 128 KB.
+
+* **New 3DS family:** about 44 MiB of the game's budget are still free: a normal allocation.
+* **Old 3DS family:** the game holds all of its 80 MiB, so the buffer comes from the SYSTEM region, like the plugin's own block on that console, through Luma's `svcControlMemoryUnsafe`. Such a block is charged to nobody, but when a process ends the kernel adds up its private blocks and gives the sum back to the budget, and if the sum is more than what was charged it gives back nothing: the next game would find no budget until a reboot. Freeing the block at the end would not be enough: after HOME on an Old 3DS the plugin is swapped out and, if the game is closed from there, Luma does not tell it. So the 128 KB are written on the process's own resource limit when the block is taken, after checking on the live object that its limits and its current value are where they are expected: if they are not, the buffer is not taken and the game runs without the room. The end then balances by itself, however the game ends.
+* **Trying the Old 3DS road on a New 3DS:** an empty file `sd:/3ds/3DSLink/soc-from-system`, read only for the titles in the list.
+
+**Corrections.** This changelog and the README said that the game closes "when a multiplayer match starts": it closes at launch. A reply in [issue 3](https://github.com/gionko/3DS-Link/issues/3) said that the dump shows a fault on the address `0x100b`: that value is another register of the dump, and the faulting address is `0xC000`.
+
+</details>
+
 ## 1.0.12 - 2026-11-01
 
 **Mario Tennis Open is played between consoles. A fix for HOME on the Old 3DS (not tried on one). A change so that LEGO Batman 2 also starts with 3DS Link switched off (not tried).**

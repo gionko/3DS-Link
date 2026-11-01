@@ -872,6 +872,10 @@ need Sources/ctr/plugin.cpp "const std::string text = gamemem::InfoText(reading)
 need Sources/ctr/plugin.cpp "const std::string text = gamemem::LowText(reading);" "... and a figure below the limit says so instead"
 need_after Sources/ctr/plugin.cpp "void Plugin::CheckGameMemory(u64 now_ms) {" "if (!active_) {" "a plugin that is off for this launch has nothing to say about the game's memory"
 need Sources/ctr/plugin.cpp "socplan::StartupIssue(SocketBufferSize(), g_debug_level > 0)" "the start-up text drops the pointer to the log when the log is on"
+# - The list of the games that cannot spare the socket buffer while they size their heap (Monster Hunter XX): not there before their first instruction; one outside the budget goes on the kernel's books as it is taken, or a game closed from HOME on an Old 3DS leaves the next one without a budget
+need Sources/ctr/plugin.cpp '(late || ReserveSocketMemory())' "a title of the list does not take the socket buffer before the game's first instruction"
+need Sources/ctr/soc.cpp 'if (g_reserve_late && FindBooks()) {' "a block outside the budget only for a title of the list, and only with the kernel's books found on the live object"
+need_after Sources/ctr/soc.cpp 'if (AllocateBlock(socplan::kSocBlockSize, true, &p)) {' 'ChargeBooks(socplan::kSocBlockSize);' "the block outside the budget goes on the kernel's books as soon as it is taken"
 # - frames lost: the text depends on the game's UDS calls (no call in the window, or none in its last second: not reading)
 need Includes/azl/screen_text.hpp "constexpr u32 kNotReadingMs = 1000;" "a game that has made no UDS call for a second is not reading"
 need Includes/azl/screen_text.hpp "constexpr unsigned long kWarnAbove = 50;" "more than 50 frames in a window is worth a toast"

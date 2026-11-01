@@ -1740,9 +1740,18 @@ void Plugin::EarlyInit() {
     }
     if (active_) {
         // The hooks give the game a wireless that leads into the room through sockets: without
-        // memory for them the plugin stays out of the game (the real wireless keeps working).
-        const bool reserved = !bootdiag::Skip("soc") && ReserveSocketMemory();
-        LogMemory(reserved ? "with the socket buffer" : "without a socket buffer");
+        // memory for them the plugin stays out of the game (the real wireless keeps working). A game that cannot spare the block
+        // while it sizes its heap gets it at the first connection (socplan::kLateBlockTitles); an empty file /3ds/3DSLink/soc-from-system
+        // sends such a game down the road of an Old 3DS on a New one, the only place where that road can be tried.
+        const bool late = socplan::TakesBlockLate(game_id_);
+        if (late) {
+            const bool from_system = File::Exists("/3ds/3DSLink/soc-from-system") == 1;
+            LeaveSocketMemoryForLater(from_system);
+            Log("soc: this game sizes its heap to the page: the buffer waits for the first connection%s",
+                from_system ? " (soc-from-system: from the SYSTEM region)" : "");
+        }
+        const bool reserved = !bootdiag::Skip("soc") && (late || ReserveSocketMemory());
+        LogMemory(late ? "before the socket buffer" : reserved ? "with the socket buffer" : "without a socket buffer");
         if (!reserved) {
             active_ = false;
             startup_issue_ = "No memory for the network: AzaharLink is OFF for this launch";
