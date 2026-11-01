@@ -120,8 +120,9 @@ How to read the columns:
 | Monster Hunter XX (Japanese copy with the English patch v5) | 2 consoles over the internet (New 3DS XL and New 2DS XL); the first test, on 1.0.13 with one New 2DS XL, gave 10/10 too (the number of players was not written down) | **10/10** | 1.0.14 | 1.0.13 the game no longer closes at launch: the socket buffer is taken at the first connection (see the [CHANGELOG](CHANGELOG.md)) |
 | Luigi's Mansion 2 (Dark Moon), tower mode ("Torre del Caos" in the Italian copy; ScareScraper in the US game) | 2 consoles over the internet (New 3DS XL and New 2DS XL) | **9/10** | 1.0.14 | — |
 | New Super Mario Bros. 2 (Special Edition) | 2 consoles over the internet (New 3DS XL and New 2DS XL) | **7/10** | 1.0.14 | it improved a lot with the recent versions without any change aimed at it; the room data path changed in 1.0.5 (not measured) |
+| Metroid Prime: Federation Force | 2 consoles over the internet (New 3DS and New 2DS) | **10/10** | 1.0.14 | — |
 
-**New on 1 November 2026:** *Luigi's Mansion 2* (9/10), *Monster Hunter XX* with two consoles (10/10), and *New Super Mario Bros. 2*, which was in the older table as "playable, with several slowdowns" and is now 7/10. They were tried over the internet with two consoles of the New 3DS family; the debug log setting of those tests was not written down.
+**New on 1 November 2026:** *Luigi's Mansion 2* (9/10), *Metroid Prime: Federation Force* (10/10), *Monster Hunter XX* with two consoles (10/10), and *New Super Mario Bros. 2*, which was in the older table as "playable, with several slowdowns" and is now 7/10. They were tried over the internet with two consoles of the New 3DS family; the debug log setting of those tests was not written down.
 
 Not tried yet with three or four players: the games that use the lobby (the two Kirby games, *Mario Tennis Open*). Not tried with an Azahar player in the room: the same (the lobby is made between 3DS Link consoles, Azahar cannot take part in it). The title ids of the USA, Japanese and Taiwanese copies of *Mario Tennis Open* are in the plugin's table but were never seen on a console.
 

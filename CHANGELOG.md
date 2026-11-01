@@ -63,6 +63,7 @@
 | *Luigi's Mansion 2* (Dark Moon), tower mode | 2 consoles over the internet (New 3DS XL and New 2DS XL) | 9/10 |
 | *Monster Hunter XX* (Japanese copy, English patch v5) | the same | 10/10 |
 | *New Super Mario Bros. 2* (Special Edition) | the same | 7/10: it was "playable, with several slowdowns" on 1.0.0 and it improved a lot with the recent versions, with no change aimed at it |
+| *Metroid Prime: Federation Force* | 2 consoles over the internet (New 3DS and New 2DS) | 10/10 |
 
 The debug log setting of these tests was not written down. Nothing in the code changed for them: see [Tested games](README.md#tested-games).
 
