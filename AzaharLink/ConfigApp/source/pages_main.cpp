@@ -138,6 +138,9 @@ public:
     // The quiet look at the copies of the plugin (once a start, in the thread of the copies) says so when it made one. What the app did about its own plugin at the start
     // (put it on the card, or could not) is said once, here: the first page the user sees.
     void Update(const Input& in) override {
+        if (pages::PollUpdateAtStart(in)) {
+            return;
+        }
         ListPage::Update(in);
         if (!g.plugin_notice.empty()) {
             g.ShowToast(g.plugin_notice, g.plugin_notice_color, 7000);

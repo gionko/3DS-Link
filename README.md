@@ -6,7 +6,7 @@
 
 **Connect, share, play together.** 3DS Link is an application for the Nintendo 3DS family that carries local wireless games over the internet, and moves software between consoles without a PC.
 
-Current version: **1.0.13**. Download it from the [Releases](../../releases/latest) page.
+Current version: **1.0.14**. Download it from the [Releases](../../releases/latest) page.
 
 A player on a PC with Azahar, a player on a tablet with Azahar and a player on a real Nintendo 3DS can all be in the same match of the same game, over the internet.
 
@@ -57,6 +57,7 @@ A console that has 3DS Link offers it to the others through the system's Downloa
 * **A console with Luma3DS.** 3DS Link installs from Luma3DS 10 up, and Titles Delivery and 3DS Link Delivery already work there.
 * **For the Azahar room, Luma3DS 13.3 or newer** with the **Plugin Loader enabled** (Rosalina menu: `L + Down + Select` → *Plugin Loader*; 3DS Link tells you, and enables it for you). The plugin was tested on 13.3.3; 13.0 to 13.2 should work but are untested.
 * **For the Azahar room, a Wi-Fi connection with internet and an Azahar room.** Anyone can open one from Azahar (*Multiplayer → Create Room*) or with Azahar's room server. If the room runs at home and the other players connect from outside, forward UDP port 24872 on the router.
+* **To update from the app, a Wi-Fi connection with internet and the right date on the console.** Without them 3DS Link works as usual and you update by hand.
 * **A good, genuine SD card.** The speed of Titles Delivery depends on it: the receiving console installs while it downloads, and a slow, worn-out or counterfeit card slows everything down or corrupts files. Test a new card first (H2testw on Windows, F3 on Linux).
 * **`boot9.bin` from your own console, only for sending.** Titles Delivery needs it to send titles and 3DS Link Delivery to offer 3DS Link. Receiving needs nothing. Do not download it and do not share it: dump it once from your own console with GodMode9; the app has a step-by-step guide (*Settings → Installation check*, the `boot9.bin` row, `Y`).
 * 3DS Link contains no game, no firmware image and no per-console key. It reads the `boot9.bin` of your own console, and only to *send* titles; it never uploads it. It is meant for titles you own and consoles you own.
@@ -67,6 +68,7 @@ Download `3DSLink.cia` (or `3DSLink.3dsx`) from the [Releases](../../releases/la
 
 1. Install `3DSLink.cia` with FBI or any other CIA installer (or put `3DSLink.3dsx` in `/3ds/`). A console that has no 3DS Link can also get it from one that has it, with Download Play alone (*3DS Link Delivery*).
 2. Open **3DS Link** from the HOME Menu. The first start reads the installed titles and checks the installation; it writes `AzaharLink.3gx` to `sdmc:/3ds/3DSLink/` by itself. Anything that is missing gets its own row, and in most cases `A` fixes it.
+3. **Updates come from the app, from 1.0.14 on.** At every start it asks GitHub in the background and, when a new version is out, offers to download and install it, then starts again and brings the plugin up to date in your games. Wait for its message before closing it. *Settings → Check for updates* asks at any time; *Check at start* turns the question off. An older version is updated by hand, one last time.
 
 ## Playing local wireless games online
 
@@ -216,6 +218,7 @@ On a PC, in Docker, from the repository root:
 * `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W 2>/dev/null || pwd):/src" -w /src/AzaharLink azl-hle-build bash Tests/run.sh`: unit tests of the engine, the settings and the app logic, and replays of real captured frames;
 * `bash AzaharLink/Tests/policy_check.sh`: a plain-text check that the settings and rules that decide what the plugin does have not been changed by accident (on a tree that was never built it skips the checks of the build products and says so);
 * `bash DlpLink/tests/run_checks.sh`: checks of the CIAs; they need a build, python3 and openssl, which the `devkitpro/devkitarm` container has: `docker run --rm -v "$(pwd -W 2>/dev/null || pwd):/src" -w /src devkitpro/devkitarm bash DlpLink/tests/run_checks.sh`;
+* `cd AzaharLink && bash Tests/update_http_test.sh`: the requests of the update, with the same libcurl as the console, against a server of its own and against GitHub (`--no-github` leaves GitHub out);
 * `python AzaharLink/Tests/policy_mutants.py`: changes the sources one rule at a time and demands that the policy check notices (over a thousand cases, slow).
 
 The names of other players and the addresses of consoles and rooms in the notes and in the test data were replaced by labels (`Friend-A`, `Player-G`, `Console-A`, documentation IP ranges). The Download Play tests open the host with a **placeholder console MAC** (`02:00:00:00:00:01`, marked `PLACEHOLDER MAC` in `DlpLink/host/tests/dlph_test.c`, `DlpLink/host/tests/3ds.h` and `DlpLink/tests/dlpc_glue_dlph.c`): to compare the library with a capture of a real console, set that console's real MAC there (the checksum seed of a Download Play host depends on it).
@@ -237,7 +240,7 @@ Issues and pull requests are welcome: see [`CONTRIBUTING.md`](CONTRIBUTING.md). 
 
 ## License, credits and notices
 
-3DS Link is free software, **GPL-2.0-or-later** (the UDS logic of the plugin is a port of code from Azahar, itself from Citra: "GPLv2 or any later version"); see [`LICENSE`](LICENSE). ENet (`AzaharLink/third_party/enet`) keeps its MIT license. The full list of what 3DS Link uses or copied, with authors, licenses and links, is [`AzaharLink/CREDITS.md`](AzaharLink/CREDITS.md) (it is also the *Credits and thanks* page of the app): Azahar and Citra, FBI, 3dbrew, devkitPro, libctru, citro2d/citro3d, Luma3DS, CTRPluginFramework, ENet, GodMode9, makerom/ctrtool, bannertool and Pillow. Thanks to everyone who tested the consoles and the emulator.
+3DS Link is free software, **GPL-2.0-or-later** (the UDS logic of the plugin is a port of code from Azahar, itself from Citra: "GPLv2 or any later version"); see [`LICENSE`](LICENSE). ENet (`AzaharLink/third_party/enet`) keeps its MIT license. The app also links libcurl, Mbed TLS and zlib (devkitPro's portlibs) and carries Mozilla's list of root certificates (`AzaharLink/ConfigApp/certs/cacert.pem`, MPL-2.0). The full list of what 3DS Link uses or copied, with authors, licenses and links, is [`AzaharLink/CREDITS.md`](AzaharLink/CREDITS.md) (it is also the *Credits and thanks* page of the app): Azahar and Citra, FBI, 3dbrew, devkitPro, libctru, citro2d/citro3d, Luma3DS, CTRPluginFramework, ENet, GodMode9, makerom/ctrtool, bannertool and Pillow. Thanks to everyone who tested the consoles and the emulator.
 
 **Where the public values come from.** A few constants in the code are public, not secret. The key generator constant and the Download Play checksum IV are the defaults Azahar ships (see [Building from source](#building-from-source)). The Download Play passphrase (`dlph.c`) is the one in Azahar's own source (`src/core/hle/service/dlp/dlp_base.h`). The SHA-256 digests that recognise a `boot9.bin` (`AzaharLink/ConfigApp/source/paths.cpp`) are digests of the same kind that tools such as pyctr list: they identify the file, they are not its content. The ticket skeleton (`titleshare/common/ticket_template.h`) follows the public ticket layout (3dbrew, *Ticket*), with a fake signature, no title key and no console ID, and the certificate names are the public ones. The network bytes in `AzaharLink/Tests/*.inc` are frames captured from play sessions, kept as test vectors.
 

@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "ui.hpp"
+#include "update_worker.hpp"
 
 using ui::g;
 
@@ -91,6 +92,8 @@ void SuspendNetwork() {
     if (!s.open || s.net_suspended) {
         return;
     }
+    // A check of the update may be running: it stops at its next step, and the sockets are closed after it (the name of a host, the one call it cannot leave, takes seconds at worst).
+    update::Worker::Get().Stop(15000);
     CloseSockets();
     if (g.ac_ready) {
         acExit();

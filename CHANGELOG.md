@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.0.14 - 2026-11-01
+
+**3DS Link now updates itself: it tells you when a new version is out, installs it and starts again.**
+
+> Tried on one of the owner's consoles, with a test build of this code that called itself 1.0.1 and updated itself to the public 1.0.13: the whole way went well, from the question to the restart and the plugin brought up to date in the games. **Not tried on any Old 3DS or Old 2DS.** This is the first version that has the update, so **it has to be installed by hand, one last time**. The plugin's code is unchanged: the games behave as in 1.0.13. Requested in [issue 4](https://github.com/gionko/3DS-Link/issues/4).
+
+### At a glance
+
+| Area | Before | Now | Since |
+|---|---|---|---|
+| A new version is out | you had to find out | at every start the app asks GitHub, in the background, and a popup offers the update | 1.0.14 |
+| Installing it | by hand, with FBI | one button: download, install, restart | 1.0.14 |
+| The plugin in your games | brought up to date at the next start | the same, and the update tells you to wait for its message | 1.0.14 |
+| No Wi-Fi, no internet, GitHub not answering | - | nothing is shown at start | 1.0.14 |
+| The console's clock is wrong | - | one popup: it is not serious, but updates cannot work until the date is right | 1.0.14 |
+| *Settings* | - | `Check for updates` and the switch `Check at start` | 1.0.14 |
+
+### How it behaves
+
+* **The question.** The bottom screen shows the new version and yours, the top screen what is new. `A Update` goes on. `B Not now` is remembered for that version: the start does not ask about it again, a newer version does, and *Settings → Check for updates* always does.
+* **The update.** The file is downloaded into memory and checked (it must be 3DS Link, at the version that was announced) before anything on the console changes. If anything fails you keep the version you have. Then 3DS Link starts again by itself; if it does not, open it from the HOME Menu.
+* **The plugin.** After the restart 3DS Link brings the plugin up to date in all your games by itself and says when it is done. Wait for that message before closing it.
+* **`3DSLink.3dsx`.** The file is replaced, and you open it again from the Homebrew Launcher.
+* **What is sent.** One ordinary HTTPS request to GitHub at every start, and nothing about your console. `Check at start` turns it off.
+
+### Not fixed or not tried
+
+| What | Notes |
+|---|---|
+| The update on an Old 3DS or Old 2DS | **not tried**: the secure connection takes longer there, and how long is not known |
+| *Monster Hunter XX* on an Old 3DS | the fix **has not been tried** there: [issue 3](https://github.com/gionko/3DS-Link/issues/3), [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| Old 3DS: pressing HOME with the plugin enabled | a fix since 1.0.12, **not tried on an Old 3DS**: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| *Mario Tennis Open*, USA copy on an Old 3DS: "the Wi-Fi switch is off" after the online option | [issue 2](https://github.com/gionko/3DS-Link/issues/2): not confirmed fixed, not tried on an Old 3DS (the Europe copy plays between two New 2DS XL) |
+| The power button closes the game on an Old 3DS | reported in [issue 2](https://github.com/gionko/3DS-Link/issues/2); it is not known whether the fix for HOME covers it |
+| *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
+| *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
+
+### Technical notes
+
+<details>
+<summary>How the update is made</summary>
+
+**The check.** A single `HEAD` of `/releases/latest`: GitHub answers with a redirect to the tag, and the tag is the version. No API, so no limit of requests and no JSON. A prerelease or a tag with a suffix is never offered.
+
+**The connection.** libcurl 8.4.0 on Mbed TLS 2.28 (devkitPro's portlibs), plain HTTPS: certificate, dates and host name are checked against Mozilla's public list of roots, which the app carries (`ConfigApp/certs/cacert.pem`). It does not depend on the console's own SSL module, which is asked only for random numbers.
+
+**The clock.** Certificates cannot be checked with a clock that is years off. A year before 2026, or a certificate outside its dates, gives the popup once; it can come back only after a check has gone through.
+
+**The install.** The CIA goes to AM without deleting the title first, because that title is running. A failure at any step leaves the old one in place.
+
+**The size.** These libraries are in the app only: the CIA goes from 1.75 to 2.40 MB and the `.3dsx` from 2.43 to 3.40 MB. The Download Play child, which carries the CIA, goes from 3.10 to 3.76 MB.
+
+**The tests.** `AzaharLink/Tests/settings_test/update_test.cpp` for the decisions and the words, `AzaharLink/Tests/update_http_test.sh` for the requests: the same libcurl on a PC against a server of its own (redirects, a file cut short, a 404, a file too big, a stop, silences, certificates that are out of date, of another host or of another authority) and against GitHub, also with the clock in 2011 and in 2040.
+
+</details>
+
 ## 1.0.13 - 2026-11-01
 
 **Monster Hunter XX no longer closes at launch. A list for any other game with the same defect.**

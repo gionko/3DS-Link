@@ -16,6 +16,7 @@
 //   the popups          a question, a message, a choice, the search of the card, the folder browser and the test of a new room
 //                       (modal.cpp, probe.cpp)
 //   the guide           "How to get boot9.bin": a picture of GodMode9's screen for each step (pages_guide.cpp, over ConfigApp/guide)
+//   the update          the check, the question, the download and the install (pages_update.cpp)
 #pragma once
 
 #include <functional>
@@ -88,5 +89,15 @@ void StartTitlesCleanup();
 // Opens the guide (GodMode9's steps, a picture each) as a page over the current one: L / R and the D-pad's up and down move between the steps, B closes it.
 // False when this build has no pictures: nothing was opened, and the caller says so (dlp::kNoGuideToast) or falls back on words.
 bool OpenBoot9Guide();
+
+// ---------------------------------------------------------------------------------------------
+// The update from GitHub (pages_update.cpp)
+// ---------------------------------------------------------------------------------------------
+
+// The row of Settings: asks GitHub now and says what came of it, in the open (the check of a start says nothing).
+ui::Page* NewUpdateCheckPage();
+// Once a frame on the main page, before anything else it does: the quiet check of this start. It may only start the check, or (true) it has just pushed a popup: the question, or the
+// one word about the clock. Nothing else happens on the main page in that frame.
+bool PollUpdateAtStart(const ui::Input& in);
 
 } // namespace pages

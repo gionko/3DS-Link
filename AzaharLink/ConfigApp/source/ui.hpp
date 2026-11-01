@@ -134,6 +134,7 @@ struct App {
     int language = 1;                             // the console's language (CFG_Language): the names of the games are read in it
     InputPoller input;
     bool quit = false;
+    bool relaunch = false; // an update was installed: when the app ends, the system starts this title again
     bool save_ok = true;
     bool home_blocked = false; // the HOME button does nothing now (a transfer, the search for rooms): the bottom bar says so
     // HOME is switched off by whoever needs it (the list of rooms, a transfer, the copies of the plugin, the choice of what to send) and given

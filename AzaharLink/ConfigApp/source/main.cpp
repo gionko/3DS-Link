@@ -17,6 +17,7 @@
 #include "system.hpp"
 #include "titles.hpp"
 #include "ui.hpp"
+#include "update_worker.hpp"
 
 using ui::g;
 
@@ -172,10 +173,17 @@ int main(int argc, char** argv) {
         setup::SaveSettings(g.cfg);
     }
     FinishCopies();
+    update::Worker::Get().Shutdown(); // (before the sockets go; an install that has begun is finished, a request is stopped)
     g.home_holds = 0;
     g.ApplyHome();
     ui::ClearPages(); // leaves the room if a test is still running
     titles::Shutdown(); // waits (a few seconds at most) for the scan of the titles if it is still running
     session::Stop();
+    // The update was installed: the system starts the title again when the app has ended (aptExit), from its new files. On a console the HOME Menu makes that jump. Without it (an
+    // emulator that was given the title directly) libctru's way out needs Luma3DS and leaves a black screen: a plain exit then, and the words already said to open it by hand.
+    bool home_menu = false;
+    if (g.relaunch && R_SUCCEEDED(APT_IsRegistered(aptGetMenuAppID(), &home_menu)) && home_menu) {
+        aptSetChainloaderToSelf();
+    }
     return 0;
 }

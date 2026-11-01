@@ -221,6 +221,18 @@ inline constexpr Credit kCredits[] = {
      "The reliable UDP library the room speaks (version 1.3.18). It is in the plugin and in the app; enet_3ds.c, the layer on the 3DS sockets, is derived from "
      "ENet's own unix.c.",
      "MIT license", "github.com/lsalzman/enet"},
+    {"libcurl", "curl", "Daniel Stenberg and the curl contributors",
+     "The HTTPS of the update from GitHub (version 8.4.0, devkitPro's 3ds-curl). It is in the app only, never in the plugin.",
+     "curl license (MIT style)", "curl.se"},
+    {"Mbed TLS", "Apache/GPL", "the Mbed TLS contributors",
+     "The TLS under libcurl (version 2.28, devkitPro's 3ds-mbedtls). It is in the app only, never in the plugin.",
+     "Apache-2.0 or GPL-2.0-or-later, at the choice of who uses it", "github.com/Mbed-TLS/mbedtls"},
+    {"zlib", "zlib", "Jean-loup Gailly and Mark Adler",
+     "What libcurl is linked with (devkitPro's 3ds-zlib). It is in the app only, never in the plugin.",
+     "zlib license", "zlib.net"},
+    {"Mozilla CA list", "MPL-2.0", "Mozilla, as curl.se publishes it",
+     "The public list of root certificates the app carries (certs/cacert.pem): what the certificate of GitHub is checked against.",
+     "Mozilla Public License 2.0", "curl.se/docs/caextract.html"},
     {"GodMode9", "GPL-3.0", "d0k3 and the GodMode9 contributors",
      "The guide \"How to get boot9.bin\" shows GodMode9 v2.1.1: its pictures are cropped screenshots with arrows. The CIA code builds the certificate chain the way "
      "GodMode9 does. GM9Megascript, the script the guide has you run, is by annson24.",

@@ -5,6 +5,7 @@
 #include "dlp_text.hpp"
 #include "pages.hpp"
 #include "plugin_resource.hpp"
+#include "update_worker.hpp"
 
 using namespace ui;
 
@@ -229,6 +230,29 @@ protected:
                      "A on a line that is not right fixes it: search the card for the plugin, make the folder, find boot9.bin.";
         add(check);
 
+        // The update from GitHub: the row that asks now, and the switch of the quiet check at every start (both in the app's own file).
+        Row updates;
+        updates.id = kCheckUpdates;
+        updates.kind = Kind::Link;
+        updates.label = update::kCheckRowLabel;
+        const update::Status update_status = update::Worker::Get().Read();
+        if (update_status.stage == update::Stage::Checked && update::IsNewer(update_status.latest, setup::kVersion)) {
+            updates.value = "v" + update_status.latest;
+            updates.value_color = col::kOn;
+        }
+        updates.note_title = update::kCheckRowLabel;
+        updates.note = update::kCheckRowNote;
+        add(updates);
+
+        Row update_at_start;
+        update_at_start.id = kUpdateAtStart;
+        update_at_start.kind = Kind::Toggle;
+        update_at_start.label = update::kAtStartRowLabel;
+        update_at_start.on = g.app_cfg.update_check;
+        update_at_start.note_title = update::kAtStartRowLabel;
+        update_at_start.note = update::kAtStartRowNote;
+        add(update_at_start);
+
         Row about_row;
         about_row.id = kAbout;
         about_row.kind = Kind::Link;
@@ -301,6 +325,19 @@ protected:
                 PushPage(pages::NewInstallCheckPage());
             }
             break;
+        case kCheckUpdates:
+            if (step == 0) {
+                PushPage(pages::NewUpdateCheckPage());
+            }
+            break;
+        case kUpdateAtStart: {
+            bool on = g.app_cfg.update_check;
+            if (SetSwitch(on, step)) {
+                g.app_cfg.update_check = on;
+                g.SaveAppConfig();
+            }
+            break;
+        }
         case kAbout:
             if (step == 0) {
                 PushPage(pages::NewAboutPage());
@@ -312,7 +349,7 @@ protected:
     }
 
 private:
-    enum Id { kAutoconnect = 1, kRadio, kSleep, kDebug, kMenu, kTest, kCheck, kAbout, kNickname, kDlpDelivery };
+    enum Id { kAutoconnect = 1, kRadio, kSleep, kDebug, kMenu, kTest, kCheck, kAbout, kNickname, kDlpDelivery, kCheckUpdates, kUpdateAtStart };
 
     void EditNickname() {
         std::string input = g.cfg.nickname;

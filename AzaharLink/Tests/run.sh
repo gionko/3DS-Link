@@ -174,6 +174,8 @@ g++ $CXXFLAGS -IConfigApp/guide Tests/settings_test/guide_test.cpp -o "$OUT/guid
 # about_test: "About 3DS Link" and the credits (ConfigApp/source/about_text.hpp, plain C++ header): the name, the claim, the version, "Created by Gionko", how the app was started, the plugin row, the list of credits
 # against CREDITS.md and against what the repository really holds (it reads files of the tree: run from AzaharLink/)
 g++ $CXXFLAGS -IConfigApp/source Tests/settings_test/about_test.cpp -o "$OUT/about_test"
+# update_test: the update from GitHub, what needs no console (ConfigApp/source/update_logic.hpp, plain C++ header): the versions, the redirect of GitHub, which file a run replaces, the CIA that came, the summary, the clock, when the question comes, the words; and the keys of 3DSLink.cfg. The requests themselves are Tests/update_http_test.sh
+g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/update_test.cpp ConfigApp/source/appcfg.cpp ConfigApp/source/fileio.cpp -o "$OUT/update_test"
 # logrot_test: the title delivery module's log names and rotation and what the app tells it (titleshare_host/logrot.c and hostcfg.c, plain C), against the app's own paths
 for f in logrot hostcfg; do
   gcc -O1 -g -Wall -Wextra -c ConfigApp/titleshare_host/$f.c -o "$OUT/th_$f.o"
@@ -233,6 +235,7 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/dlp_prepare_test" "$OUT/child_model.bin"
   "$OUT/guide_test"
   "$OUT/about_test"
+  "$OUT/update_test"
   "$OUT/logrot_test"
   "$OUT/log_module_test"
   "$OUT/ncch_icon_test"

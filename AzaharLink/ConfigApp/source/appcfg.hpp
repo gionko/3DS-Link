@@ -6,6 +6,9 @@
 //   dlp_delivery=0|1          the emergency switch of 3DS Link Delivery (Settings > Download Play delivery): 0 (or off, false, no) shuts the whole feature; 1 (on,
 //                             true, yes) and anything the app cannot read, or no line at all, leave it on. It is written every time so that a hand edit on
 //                             a PC only flips the digit.
+//   update_check=0|1          the quiet check for a new version at every start (Settings > Check at start); like dlp_delivery, anything else or no line at all leaves it on
+//   update_not_now=<X.Y.Z>    the version the user answered "Not now" to: the check of a start does not ask about it again (a newer one, or the row of Settings, does)
+//   clock_warned=1            the popup about a wrong clock was shown: not again until the clock has been right
 // Plain C++ and POSIX file calls (Tests/settings_test/paths_test.cpp builds this very file on a PC).
 #pragma once
 
@@ -18,6 +21,9 @@ struct AppConfig {
     std::string boot9_path; // "" = none chosen
     std::string plugin_stamp; // "" = the copies were never looked at
     bool dlp_delivery = true; // 3DS Link Delivery (the Download Play host) is on: the default, and what an unknown or damaged value means
+    bool update_check = true; // ask GitHub for a new version at every start
+    std::string update_not_now; // "" = none
+    bool clock_warned = false;
 };
 
 AppConfig ParseAppConfig(const std::string& text);

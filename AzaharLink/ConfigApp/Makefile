@@ -46,6 +46,9 @@ SOURCES		+=	dlpc guide
 # from it). bin2o links it in as AzaharLink_3gx and AzaharLink_3gx_size (plugin_resource.cpp). build_all.sh builds the plugin BEFORE the app and copies it here, and
 # check_chain.sh proves that the app's ELF, .3dsx and CIA carry exactly that file (size and SHA-256) and that its header says the version of VERSION.
 DATA		:=	data
+# certs/cacert.pem is the public list of root certificates (Mozilla's, as curl.se publishes it): what libcurl checks GitHub's certificate against when the app looks for an update
+# (update_http.cpp). bin2o links it in as cacert_pem and cacert_pem_size. It is the whole list on purpose: GitHub's chains change, and the update must keep working.
+DATA		+=	certs
 INCLUDES	:=	../Includes source
 GRAPHICS	:=	guide/gfx
 
@@ -95,13 +98,14 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17 -fdata-sections
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lcitro2d -lcitro3d -lctru -lm
+# libcurl with its mbedTLS and zlib (devkitPro's portlibs: 3ds-curl, 3ds-mbedtls, 3ds-zlib): the HTTPS of the update. In the app only, never in the plugin.
+LIBS	:= -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro2d -lcitro3d -lctru -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(CTRULIB)
+LIBDIRS	:= $(PORTLIBS) $(CTRULIB)
 
 
 #---------------------------------------------------------------------------------
@@ -273,6 +277,14 @@ $(DLPH_OFILES) : %.o : $(TOPDIR)/dlph/%.c
 # The plugin (data/AzaharLink.3gx) is data too: its symbol is AzaharLink_3gx
 #---------------------------------------------------------------------------------
 %.3gx.o	%_3gx.h :	%.3gx
+#---------------------------------------------------------------------------------
+	@echo $(notdir $<)
+	@$(bin2o)
+
+#---------------------------------------------------------------------------------
+# The public list of root certificates (certs/cacert.pem) is data too: its symbol is cacert_pem
+#---------------------------------------------------------------------------------
+%.pem.o	%_pem.h :	%.pem
 #---------------------------------------------------------------------------------
 	@echo $(notdir $<)
 	@$(bin2o)

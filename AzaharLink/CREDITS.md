@@ -71,6 +71,34 @@ Le voci sono in inglese perché sono le righe che l'app mostra; le licenze sono 
 - License: MIT - MIT license
 - Link: https://github.com/lsalzman/enet
 
+### libcurl
+
+- What for: The HTTPS of the update from GitHub (version 8.4.0, devkitPro's 3ds-curl). It is in the app only, never in the plugin.
+- By: Daniel Stenberg and the curl contributors
+- License: curl - curl license (MIT style)
+- Link: https://curl.se
+
+### Mbed TLS
+
+- What for: The TLS under libcurl (version 2.28, devkitPro's 3ds-mbedtls). It is in the app only, never in the plugin.
+- By: the Mbed TLS contributors
+- License: Apache/GPL - Apache-2.0 or GPL-2.0-or-later, at the choice of who uses it
+- Link: https://github.com/Mbed-TLS/mbedtls
+
+### zlib
+
+- What for: What libcurl is linked with (devkitPro's 3ds-zlib). It is in the app only, never in the plugin.
+- By: Jean-loup Gailly and Mark Adler
+- License: zlib - zlib license
+- Link: https://zlib.net
+
+### Mozilla CA list
+
+- What for: The public list of root certificates the app carries (certs/cacert.pem): what the certificate of GitHub is checked against.
+- By: Mozilla, as curl.se publishes it
+- License: MPL-2.0 - Mozilla Public License 2.0
+- Link: https://curl.se/docs/caextract.html
+
 ### GodMode9
 
 - What for: The guide "How to get boot9.bin" shows GodMode9 v2.1.1: its pictures are cropped screenshots with arrows. The CIA code builds the certificate chain the way GodMode9 does. GM9Megascript, the script the guide has you run, is by annson24.
