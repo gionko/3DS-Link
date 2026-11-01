@@ -4,7 +4,7 @@
 
 **Mario Tennis Open is played between consoles. A fix for HOME on the Old 3DS (not tried on one). A change so that LEGO Batman 2 also starts with 3DS Link switched off (not tried).**
 
-> Tried on **two New Nintendo 3DS consoles** (the owner's): *Mario Tennis Open* (Europe copy, several modes: it works) and *SEGA 3D Classics Collection* (*Altered Beast*, 10/10). **Not tried on any Old 3DS or Old 2DS**: the fix for HOME was written from Luma3DS's source and tested on a PC only. The change for *LEGO Batman 2* with the main switch off was not tried either. Scores and setups: [Tested games](README.md#tested-games).
+> Tried on the owner's consoles: *Mario Tennis Open* (Europe copy, **two New Nintendo 2DS XL**, several modes and several matches, no problems: 9/10) and *SEGA 3D Classics Collection* (*Altered Beast*, 2 consoles, 10/10). **Not tried on any Old 3DS or Old 2DS**: the fix for HOME was written from Luma3DS's source and tested on a PC only. The change for *LEGO Batman 2* with the main switch off was not tried either. Scores and setups: [Tested games](README.md#tested-games).
 
 ### At a glance
 
@@ -19,7 +19,7 @@
 | What | Notes |
 |---|---|
 | *Monster Hunter XX* closes when a multiplayer match starts (Old 3DS) | reported by users: [issue 3](https://github.com/gionko/3DS-Link/issues/3), [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
-| *Mario Tennis Open*, USA copy on an Old 3DS: "the Wi-Fi switch is off" after the online option | [issue 2](https://github.com/gionko/3DS-Link/issues/2): not confirmed fixed, not tried on an Old 3DS (the Europe copy plays between two New 3DS) |
+| *Mario Tennis Open*, USA copy on an Old 3DS: "the Wi-Fi switch is off" after the online option | [issue 2](https://github.com/gionko/3DS-Link/issues/2): not confirmed fixed, not tried on an Old 3DS (the Europe copy plays between two New 2DS XL) |
 | The power button closes the game on an Old 3DS | reported in [issue 2](https://github.com/gionko/3DS-Link/issues/2); it is not known whether the fix for HOME covers it |
 | *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
 | *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
@@ -82,7 +82,7 @@ With the main switch off, Luma still loads the plugin, the framework ran and sto
 |---|---|
 | Old 3DS: pressing HOME with the plugin enabled closes the game | reported by users, no Old 3DS in the test set; the cause is understood, the fix was not written yet (it is in 1.0.12, not tried on an Old 3DS): [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
 | *Monster Hunter XX* closes when a multiplayer match starts (Old 3DS) | reported by users: [issue 3](https://github.com/gionko/3DS-Link/issues/3) |
-| *Mario Tennis Open*: after the online option the game says the Wi-Fi switch is off (Old 3DS) | reported by a user, not analysed at the time: [issue 2](https://github.com/gionko/3DS-Link/issues/2). Local play between two consoles works since 1.0.12 (Europe copy, two New 3DS); whether this report was the same message is not confirmed (the "online option" may also be the game's internet mode, which 3DS Link does not carry) |
+| *Mario Tennis Open*: after the online option the game says the Wi-Fi switch is off (Old 3DS) | reported by a user, not analysed at the time: [issue 2](https://github.com/gionko/3DS-Link/issues/2). Local play between two consoles works since 1.0.12 (Europe copy, two New 2DS XL); whether this report was the same message is not confirmed (the "online option" may also be the game's internet mode, which 3DS Link does not carry) |
 | *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
 | *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
 

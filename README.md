@@ -114,7 +114,7 @@ How to read the columns:
 | Kirby: Triple Deluxe | 2 consoles | **9/10**; found a little slow | 1.0.10 | 1.0.6 the game no longer closes at launch; 1.0.10 the Download Play lobby is provided inside the room |
 | LEGO Batman 2: DC Super Heroes | 2 New 3DS consoles connected through an Azahar room, with the debug log on (the logs are still to be read) | works; **no score given yet** | 1.0.11 | 1.0.11 the game no longer closes at launch (the plugin rewrites the game's GSP wrapper so that the framework finds it); 1.0.12 also with the main switch off (**not tried**) |
 | SEGA 3D Classics Collection | 2 consoles, with *Altered Beast* (an earlier build of 1.0.12, before the *Mario Tennis Open* change; the debug log setting was not written down) | **10/10** | 1.0.12 | 1.0.5 ENet data path |
-| Mario Tennis Open (Europe copy) | 2 New 3DS consoles, several modes (the debug log setting was not written down) | works perfectly (the owner's words); **no score given yet** | 1.0.12 | 1.0.12 the Download Play lobby is provided inside the room, with the console's own friend code seed (see the [CHANGELOG](CHANGELOG.md)) |
+| Mario Tennis Open (Europe copy) | 2 New 2DS XL consoles, several modes and several matches, no problems (the debug log setting was not written down) | **9/10** | 1.0.12 | 1.0.12 the Download Play lobby is provided inside the room, with the console's own friend code seed (see the [CHANGELOG](CHANGELOG.md)) |
 
 Not tried yet with three or four players: the games that use the lobby (the two Kirby games, *Mario Tennis Open*). Not tried with an Azahar player in the room: the same (the lobby is made between 3DS Link consoles, Azahar cannot take part in it). The title ids of the USA, Japanese and Taiwanese copies of *Mario Tennis Open* are in the plugin's table but were never seen on a console.
 
@@ -139,7 +139,7 @@ These were not re-tested on 1.0.10, 1.0.11 or 1.0.12. The result is the one of t
 | Game | What happens | Since / notes |
 |---|---|---|
 | Monster Hunter XX (Japan) | Closes at the start of a multiplayer match (Old 3DS, issue 3) | Not fixed |
-| Mario Tennis Open (USA copy, Old 3DS) | After the online option the game says the Wi-Fi switch is off (issue 2) | Not confirmed fixed: the Europe copy plays between two New 3DS since 1.0.12; the report may be the game's internet mode, which 3DS Link does not carry. Not tried on an Old 3DS |
+| Mario Tennis Open (USA copy, Old 3DS) | After the online option the game says the Wi-Fi switch is off (issue 2) | Not confirmed fixed: the Europe copy plays between two New 2DS XL since 1.0.12; the report may be the game's internet mode, which 3DS Link does not carry. Not tried on an Old 3DS |
 | Balloon Fight (Virtual Console) | Closes at startup: the framework the plugin is built on aborts in Virtual Console games | Known limit |
 | Pac-Man & Galaga Dimensions, Ridge Racer 3D, The Legend of Zelda: Ocarina of Time 3D | Close at launch on one of the test consoles with the plugin switched on (error `0xE0A01839`); with the game left off they run | See [Known limits](#known-limits) |
 
