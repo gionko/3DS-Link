@@ -70,11 +70,16 @@ constexpr u32 kStatsIntervalMs = 5000;
 constexpr int kLogWriterPriority = 0x2E;
 constexpr u32 kNetStopTimeoutMs = 400;
 // Process events of the framework (Plugin::NoteProcessEvent, CTRPluginFramework's Process::Event): the index of
-// EXIT and of the two sleep ones.
+// EXIT, of the two sleep ones and of the two swap ones.
 constexpr int kEventExit = 0;
 constexpr int kEventSleepEnter = 1;
 constexpr int kEventSleepExit = 2;
+constexpr int kEventSwapEnter = 5;
+constexpr int kEventSwapExit = 6;
 constexpr u32 kLogStopTimeoutMs = 400;
+// SWAP_ENTER (Old 3DS, HOME): how long the plugin waits for the game's threads that are inside the hook to leave it before it lets Luma3DS free the plugin's block.
+// Luma3DS itself waits 10 s for the answer (waitForReplyTimeout); the threads that matter leave in microseconds, the budget is for a call that waits in a real service.
+constexpr u32 kSwapDrainTimeoutMs = 1500;
 
 // The WiFi MAC address of the console, as exposed by the kernel in the shared page, and the two bytes
 // after the 6 of the MAC (the link strength 0..3 and the network state; their meaning on this system is
@@ -293,16 +298,24 @@ std::string ReadIconSelfNcch(u8 language) {
 //     Another game may need the same as Battle Royale: to add one, put its title id here and check in its log that the only
 //     dlp:FKCL commands are Initialize / InitializeWithName and Finalize (anything else is refused and written as
 //     "dlp: dlp:FKCL command 0x.. refused").
-//   Lobby: the games whose wireless mode goes on with the Download Play proper: Kirby Triple Deluxe and Kirby Planet Robobot (tried
+//   Lobby: the games whose wireless mode goes on with the Download Play proper: Mario Tennis Open (its local multiplayer scene starts the
+//     Download Play client as soon as it opens: Initialize, GetMyStatus every 5 ms, GetChannels, scan, join; the real module answers "wireless off" because
+//     ndm is ours, and the game shows its Wi-Fi switch message), Kirby Triple Deluxe and Kirby Planet Robobot (tried
 //     with the probe on 2026-10-28: after Initialize they ask GetChannels, scan for a host and join; the probe refuses those
 //     ("invalid state") and the game answers with an error screen, 0xE0A0AC01). The room carries their lobby: BOTH services are
 //     served by the plugin's DlpHub (azl/dlp_hub.hpp), the host's announcement and the four messages of the creator go over the
 //     room like the game's own UDS frames, and the engine is given back to the game's nwm::UDS whole when the game starts it.
 // A game that is not listed keeps the real services, as before (Zelda Tri Force Heroes has no entry). Only the games in Lobby mode get
 // a hub: nothing of it exists in the others.
+// console_seed (Mario Tennis Open): the game keeps the players of the Download Play lobby in a table and, when the game's own network starts,
+// zeroes their ids and gives each one back by comparing the friend code seed of the lobby with the seed of the player's nwm::UDS node
+// (Tests: written from the debugger's reading of a stalled game, 2026-11-01). The seed the game gives nwm::UDS is the console's own, read from
+// the config block 0x00090000; the real Download Play modules give the same one. With the hash of the MAC in the lobby the two never match,
+// the guest keeps id 0 in the host's table and the game's synchronisation can never finish. The other Lobby games (Kirby) do not compare them.
 struct DlpGame {
     u64 title_id;
     DlpGameMode mode;
+    bool console_seed = false;  // Lobby only: the lobby announces the console's OWN friend code seed (see LobbySeedIsConsoles)
 };
 constexpr DlpGame kDlpGames[] = {
     {0x00040000001C2100ull, DlpGameMode::ProbeOnly}, // Kirby Battle Royale (seen: InitializeWithName, Finalize 1 ms later, then nwm::UDS only)
@@ -310,6 +323,10 @@ constexpr DlpGame kDlpGames[] = {
     {0x000400000010C000ull, DlpGameMode::Lobby},     // Kirby Triple Deluxe (seen on a console: dlp:FKCL InitializeWithName, GetChannels, then the scan)
     {0x000400000010BF00ull, DlpGameMode::Lobby},     // Kirby Triple Deluxe, another region's title id (from a catalogue, not seen)
     {0x0004000000183600ull, DlpGameMode::Lobby},     // Kirby Planet Robobot (seen on a console; the ids of its other regions are not known here)
+    {0x000400000007C800ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Europe (the owner's copy, tried on two New 3DS with the plugin in 1.0.12: its local multiplayer scene starts the Download Play client at once, read from the code)
+    {0x000400000007C700ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, USA (catalogues and the Azahar list; not seen)
+    {0x0004000000064D00ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Japan (one source; not seen)
+    {0x00040000000B9100ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Taiwan (one source; not seen)
 };
 
 DlpGameMode DlpModeOf(u64 title_id) {
@@ -319,6 +336,17 @@ DlpGameMode DlpModeOf(u64 title_id) {
         }
     }
     return DlpGameMode::None;
+}
+
+/// Does the lobby of this game announce the console's own friend code seed (config block 0x00090000, 8 bytes: what the game itself
+/// reads for nwm::UDS) instead of the hash of the MAC? Only where the game compares the two (Mario Tennis Open); false for every other game.
+bool LobbySeedIsConsoles(u64 title_id) {
+    for (const DlpGame& game : kDlpGames) {
+        if (game.title_id == title_id) {
+            return game.console_seed;
+        }
+    }
+    return false;
 }
 
 /// A game of the probe's kind (Battle Royale): dlp:FKCL is answered by the plugin's probe, nothing else of Download Play is.
@@ -1501,13 +1529,21 @@ long Plugin::HeapFreeBytes() const {
 }
 
 void Plugin::NoteProcessEvent(int event) {
-    // (the framework's keep-alive thread: flag stores only)
+    // (the framework's keep-alive thread, 4 KB of stack: flag stores and the swap below, nothing that formats or takes a lock of the log)
     if (event >= 0 && event < kProcessEvents) {
         event_ms_[event] = static_cast<u32>(platform::NowMs());
         event_count_[event] = event_count_[event] + 1;
         if (event == kEventSleepEnter || event == kEventSleepExit) {
             // (the trail of the sleep: a few stores and one event signal)
             NoteSleepEvent(event == kEventSleepEnter ? SleepCrumbs::kFwEnter : SleepCrumbs::kFwExit, 0);
+        }
+        if (event == kEventSwapEnter) {
+            // Old 3DS, HOME: Luma3DS is waiting for the framework's answer, which this callback precedes, and frees the plugin's block as soon as it has it.
+            // Every call site goes back to the game's own words and the threads still inside the hook are waited for (the thread that raised the swap
+            // is not one of them: it went back to the game's code, azl_handback_site). The line about it comes with the event's, from the writer.
+            SuspendSvcHooks(kSwapDrainTimeoutMs);
+        } else if (event == kEventSwapExit) {
+            ResumeSvcHooks(); // (the block is back, byte for byte: the sites take their old trampolines again)
         }
     }
 }
@@ -1521,7 +1557,9 @@ void Plugin::LogProcessEvents() {
     using CTRPluginFramework::Process;
     static_assert(static_cast<int>(Process::Event::EXIT) == kEventExit &&
                       static_cast<int>(Process::Event::SLEEP_ENTER) == kEventSleepEnter &&
-                      static_cast<int>(Process::Event::SLEEP_EXIT) == kEventSleepExit,
+                      static_cast<int>(Process::Event::SLEEP_EXIT) == kEventSleepExit &&
+                      static_cast<int>(Process::Event::SWAP_ENTER) == kEventSwapEnter &&
+                      static_cast<int>(Process::Event::SWAP_EXIT) == kEventSwapExit,
                   "the indices of the framework's process events");
     for (int i = 0; i < kProcessEvents; ++i) { // (EXIT too: the line that says the game was closing, before 'shutdown: begin')
         const u32 count = event_count_[i];
@@ -1538,6 +1576,21 @@ void Plugin::LogProcessEvents() {
             static_cast<unsigned long>(since_start % 1000),
             i == kEventExit ? "is closing" : i <= 2 ? "sleeps (lid) or wakes" : "goes to / returns from the HOME menu",
             wall);
+        if (i == kEventSwapEnter || i == kEventSwapExit) {
+            const SwapStats swap = GetSwapStats();
+            if (i == kEventSwapEnter) {
+                Log("hook swap: %lu call sites given back to the game (%lu not ours), %lu thread(s) in the hook at the start and %lu left after %lu us | "
+                    "%lu call(s) handed back to their call site so far (%lu refused), %lu APT:ReceiveParameter asked about (%lu with no HOME button seen)",
+                    static_cast<unsigned long>(swap.restored), static_cast<unsigned long>(swap.not_ours),
+                    static_cast<unsigned long>(swap.in_flight), static_cast<unsigned long>(swap.in_flight_left),
+                    static_cast<unsigned long>(swap.waited_us), static_cast<unsigned long>(swap.handbacks),
+                    static_cast<unsigned long>(swap.handback_refused), static_cast<unsigned long>(swap.asked),
+                    static_cast<unsigned long>(swap.no_home));
+            } else {
+                Log("hook swap: %lu call sites back in the hook (%lu re-armed without a swap so far)", static_cast<unsigned long>(swap.hooked_again),
+                    static_cast<unsigned long>(swap.rearmed));
+            }
+        }
     }
 }
 
@@ -1835,6 +1888,11 @@ void Plugin::EarlyInit() {
     // seconds, before main() runs (0.1.2 log: "game opened ndm:u" at boot). If that session were
     // the real one, the game's EnterExclusiveState(LocalCommunications) later makes the system drop
     // the infrastructure WiFi and our room connection dies (0.1.3 regression).
+    //
+    // The one thing done whether the plugin is on or off (Luma3DS keeps the plugin loaded and the framework runs either way): a game whose GSP
+    // wrapper has its svc behind a stub (LEGO Batman 2) makes the framework abort at start unless the bl is written as the svc, here, before
+    // GSP::Initialize and before the hooks look for the framework's sites.
+    RewriteStubbedGspWrappers();
     if (active_) {
         // The game's APT session tells when the console goes to sleep; we only look (see OnSleepEnter).
         SetSleepObserver([](bool enter) {
@@ -1870,8 +1928,23 @@ void Plugin::ResolveIdentity() {
     if (R_SUCCEEDED(cfguInit())) {
         u16 name[0x1C / 2 + 1] = {};
         const Result rc = CFGU_GetConfigInfoBlk2(0x1C, 0x000A0000, name);
+        // The console's friend code seed (config block 0x00090000, 8 bytes: what the game reads for the NodeInfo it gives nwm::UDS). The games that
+        // compare it with the seed of the lobby's players (LobbySeedIsConsoles) get it in the lobby instead of the hash of the MAC.
+        u64 console_seed = 0;
+        const bool wants_seed = dlp_hub_ && LobbySeedIsConsoles(game_id_);
+        const Result seed_rc = wants_seed ? CFGU_GetConfigInfoBlk2(sizeof(console_seed), 0x00090000, &console_seed) : 0;
         CFGU_GetSystemLanguage(&language);
         cfguExit();
+        if (wants_seed) {
+            if (R_SUCCEEDED(seed_rc) && console_seed != 0) {
+                dlp_hub_->SetFriendSeed(console_seed);
+                Log("dlp: the lobby's friend code seed is the console's own (config block 0x00090000): %08lx%08lx, the one this game gives nwm::UDS",
+                    static_cast<unsigned long>(console_seed >> 32), static_cast<unsigned long>(console_seed));
+            } else {
+                Log("WARNING: cannot read the console's friend code seed (config block 0x00090000, 0x%08lx): the lobby keeps the hash of the MAC and"
+                    " this game may stop at its character selection", static_cast<unsigned long>(seed_rc));
+            }
+        }
         if (R_SUCCEEDED(rc)) {
             std::string ascii;
             for (int i = 0; i < 10 && name[i]; ++i) {
@@ -1888,6 +1961,10 @@ void Plugin::ResolveIdentity() {
         }
     } else {
         Log("identity: config service not available, the nickname will be generic");
+        if (dlp_hub_ && LobbySeedIsConsoles(game_id_)) {
+            Log("WARNING: cannot read the console's friend code seed (no config service): the lobby keeps the hash of the MAC and this game may"
+                " stop at its character selection");
+        }
     }
     if (console_name_.empty()) {
         char buf[24];

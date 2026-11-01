@@ -1,12 +1,74 @@
 # Changelog
 
+## 1.0.12 - 2026-11-01
+
+**Mario Tennis Open is played between consoles. A fix for HOME on the Old 3DS (not tried on one). A change so that LEGO Batman 2 also starts with 3DS Link switched off (not tried).**
+
+> Tried on **two New Nintendo 3DS consoles** (the owner's): *Mario Tennis Open* (Europe copy, several modes: it works) and *SEGA 3D Classics Collection* (*Altered Beast*, 10/10). **Not tried on any Old 3DS or Old 2DS**: the fix for HOME was written from Luma3DS's source and tested on a PC only. The change for *LEGO Batman 2* with the main switch off was not tried either. Scores and setups: [Tested games](README.md#tested-games).
+
+### At a glance
+
+| Game or area | Before | Now | Since |
+|---|---|---|---|
+| *Mario Tennis Open*, local wireless | the game said the Wi-Fi switch was off | the plugin provides the Download Play lobby inside the room, as for the Kirby games, with the console's own friend code seed in it; played between two consoles | 1.0.12 |
+| Old 3DS: pressing HOME with the plugin enabled | closed the game | a fix, **not tried on an Old 3DS** | 1.0.12 |
+| *LEGO Batman 2* with the main switch off | by reading the code, the framework still stopped the game at launch (never seen on a console) | the plugin rewrites the stub whatever the switch | 1.0.12 (**not tried**) |
+
+### Not fixed
+
+| What | Notes |
+|---|---|
+| *Monster Hunter XX* closes when a multiplayer match starts (Old 3DS) | reported by users: [issue 3](https://github.com/gionko/3DS-Link/issues/3), [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| *Mario Tennis Open*, USA copy on an Old 3DS: "the Wi-Fi switch is off" after the online option | [issue 2](https://github.com/gionko/3DS-Link/issues/2): not confirmed fixed, not tried on an Old 3DS (the Europe copy plays between two New 3DS) |
+| The power button closes the game on an Old 3DS | reported in [issue 2](https://github.com/gionko/3DS-Link/issues/2); it is not known whether the fix for HOME covers it |
+| *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
+| *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
+
+### Technical notes
+
+<details>
+<summary>Mario Tennis Open: why it needed the lobby, and the friend code seed</summary>
+
+**The lobby.** The game's local multiplayer scene starts the Download Play client at once (`Initialize`, `GetMyStatus` every 5 ms, `GetChannels`, a scan, a join) and, for the player who hosts, the Download Play server. 3DS Link replaces the wireless services, so the real service answered "wireless off" and the game showed its message about the Wi-Fi switch. The game is now one of the titles of `kDlpGames` that get the Download Play lobby inside the room (the one made for the Kirby games).
+
+**What the first try showed.** With the lobby alone, the match was found and the match type could be chosen, but at the character selection nothing loaded on either console. Reading the game's memory with Luma's debugger showed both consoles inside the game's own synchronisation: the host waits until the number of players with a valid id, minus one, equals the number of "ready" messages it received. Its table of players held the guest with the right name and **id 0**. The game keeps the players of the lobby in a table and, when its own network starts, zeroes their ids and gives each one back by comparing the friend code seed of the lobby with the seed of the player's `nwm::UDS` node. The lobby used a seed made by the plugin (a hash of the console's MAC), while the game gives `nwm::UDS` the console's real seed (it reads it from config block `0x00090000`, 8 bytes, just before `Initialize`), so the comparison never matched.
+
+**What the plugin does now.** For this game only, it reads that config block at start and announces it as the lobby's seed. The table is `kDlpGames` in `AzaharLink/Sources/ctr/plugin.cpp`: the Europe copy `000400000007C800` was tried; the USA `000400000007C700`, Japan `0004000000064D00` and Taiwan `00040000000B9100` ids come from catalogues and were never seen on a console. The Kirby games, which work with the hash, are unchanged. With the debug log on, the line `dlp: the lobby's friend code seed is the console's own` tells that it happened (**it prints the console's friend code seed: do not post it**); `WARNING: cannot read the console's friend code seed` says the block could not be read.
+
+</details>
+
+<details>
+<summary>Old 3DS: the fix for HOME (not tried on an Old 3DS)</summary>
+
+**Why the game fell.** On an Old 3DS, Luma saves the plugin's memory to a file and frees its 5 MiB when the game goes to the HOME menu. The kernel raises that event on the **game's own thread**, at the end of its `APT:ReceiveParameter`, and that thread sleeps in the kernel until the swap is finished. If the system call was made by the plugin's hook, the thread wakes up in memory that is no longer there (the crash of the report: PC in `svcSendSyncRequest`, LR in the plugin's hook).
+
+**What the plugin does.** On an Old 3DS only, and right after a HOME seen (10 s window), that one call returns to its call site and the game makes the system call from its own code. At the start of the swap all the call sites go back to the game and the threads already inside the hook are waited for (up to 1.5 s; Luma gives 10). At its end the sites re-enter the hook. On a New 3DS nothing of this happens (there is no swap event). The cost for every call of the game is a counter and a comparison.
+
+**What was checked, and what was not.** The logic of the sites, the real entry assembly in an ARM11 emulator and the compiled plugin were tested on a PC, with ThreadSanitizer and mutants. **Not checked**: that Luma behaves on a real console as its source says (read, not run), what the other threads of the game do in the short time between the start of the swap and the suspension, and that the game's APT session is always the one the plugin tracks. If it does not hold, the behaviour stays the one of before (the game closes). With the debug log on, a successful HOME shows `hook swap: ... call sites given back`, then `SWAP_EXIT`.
+
+</details>
+
+<details>
+<summary>LEGO Batman 2 with the main switch off, and the bound test</summary>
+
+With the main switch off, Luma still loads the plugin, the framework ran and stopped the game. The rewrite of the stub (see 1.0.11) now runs before the hooks whatever the switch; it reads the game's `.text` and writes one word. In the search, `stub + 8 > end` could overflow for a `bl` aimed at `0xFFFFFFFC` (never seen in a game); the test is now `stub > end - 8` and `AzaharLink/Tests/gsp_wrapper_test.cpp` tries six targets around the top of the address space.
+
+</details>
+
+<details>
+<summary>About the files of this release</summary>
+
+`3DSLink.cia` is the very file that was tried on the consoles (same bytes); `3DSLink.3dsx` was built in the same run, from the same plugin, and was not installed on its own. *SEGA 3D Classics Collection* was tried on an earlier build of 1.0.12, before the *Mario Tennis Open* change, which only touches that game's four title ids.
+
+</details>
+
 ## 1.0.11 - 2026-10-31
 
 **LEGO Batman 2: DC Super Heroes no longer closes at launch.** Nothing else changed since 1.0.10.
 
 > Tried on **two New Nintendo 3DS consoles** connected through an Azahar room, with the plugin switched on: the game starts and plays. It was **not tried on an Old 3DS, nor with the USA copy**: the report of the same symptom ([issue 2](https://github.com/gionko/3DS-Link/issues/2)) comes from an Old 3DS with the USA copy, and it is not known whether it has the same cause. The logs of that test are still to be read.
 
-> The fix is part of the plugin's hooks, so it works **when 3DS Link is switched on** (main switch on). With the main switch off the plugin file stays in the game's folder and the framework still stops this game: to play it without 3DS Link, take the game off in *Enable Titles*. This is to be fixed in the next version.
+> The fix is part of the plugin's hooks, so it works **when 3DS Link is switched on** (main switch on). With the main switch off the plugin file stays in the game's folder and the framework still stops this game: to play it without 3DS Link, take the game off in *Enable Titles*. This is changed in 1.0.12 (not tried yet).
 
 ### At a glance
 
@@ -18,9 +80,9 @@
 
 | What | Notes |
 |---|---|
-| Old 3DS: pressing HOME with the plugin enabled closes the game | reported by users, no Old 3DS in the test set; the cause is understood, the fix is not written yet: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| Old 3DS: pressing HOME with the plugin enabled closes the game | reported by users, no Old 3DS in the test set; the cause is understood, the fix was not written yet (it is in 1.0.12, not tried on an Old 3DS): [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
 | *Monster Hunter XX* closes when a multiplayer match starts (Old 3DS) | reported by users: [issue 3](https://github.com/gionko/3DS-Link/issues/3) |
-| *Mario Tennis Open*: after the online option the game says the Wi-Fi switch is off (Old 3DS) | reported by a user, not analysed: [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| *Mario Tennis Open*: after the online option the game says the Wi-Fi switch is off (Old 3DS) | reported by a user, not analysed at the time: [issue 2](https://github.com/gionko/3DS-Link/issues/2). Local play between two consoles works since 1.0.12 (Europe copy, two New 3DS); whether this report was the same message is not confirmed (the "online option" may also be the game's internet mode, which 3DS Link does not carry) |
 | *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
 | *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
 

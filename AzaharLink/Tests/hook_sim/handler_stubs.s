@@ -9,3 +9,14 @@ azl_hook_SendSyncRequest:
     .global azl_hook_CloseHandle
 azl_hook_CloseHandle:
     bx lr
+    .global azl_handback_site
+azl_handback_site:
+    mov r0, #0
+    bx lr
+
+@ The counter of the threads inside an entry (ctr/hook.cpp defines it in the plugin).
+    .data
+    .align 2
+    .global azl_hooks_in_flight
+azl_hooks_in_flight:
+    .word 0

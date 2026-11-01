@@ -77,6 +77,9 @@ public:
     /// The name every list shows for this console's player when the game gives none (kNameUnits UTF-16 units, zero padded): set once by
     /// the plugin when it knows the console's profile name, long before a game opens the wireless menu. Takes dlp_mutex_ briefly.
     void SetPlayerName(const u16* name);
+    /// The friend code seed this console has in the lobby (the config block 0x00090000 for the games that compare it with the one of their own
+    /// network): set once by the plugin, long before a game opens the wireless menu. Takes dlp_mutex_ briefly.
+    void SetFriendSeed(u64 seed);
     /// True while the lobby holds the engine (and no game session does). Lock-free.
     bool EngineHeld() const {
         return engine_held_.load(std::memory_order_relaxed);

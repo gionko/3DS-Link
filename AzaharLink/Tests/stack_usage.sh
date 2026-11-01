@@ -24,6 +24,8 @@
 #      DlpHub, DlpService and DlpLobby run commands, waits and closes with a spy LobbyNet (no method but the clock on the game
 #      thread) and over the real engine, the commands that succeed in every state with no network thread to serve them (Finalize,
 #      StopScan, StopSession, EndAccepting: answered with success, the hub object compared word by word), and the deepest SP is read.
+#   5. the assembly entry itself (Tests/hook_sim/entry_sim.py): the REAL Sources/ctr/svc_entry.s assembled and run in an ARM11 emulator: the counter of the threads in the hook, the registers
+#      and flags of the game, the stack at eight bytes in C, and the hand-back of the call that raises the swap on an Old 3DS (the thread ends at its call site, with the game's registers, sp and lr).
 #   bash Tests/stack_usage.sh        (Git Bash, from anywhere; Docker running, pablomk7/libctrpf:0.8.0 available;
 #                                      the chain test needs Python 3 with the `unicorn` package: pip install unicorn;
 #                                      CHAIN_SIM=skip leaves it out, KEEP_WORK=1 keeps the build copy)
@@ -77,6 +79,10 @@ budget hook "azl::ctr::PassThroughGetService" 80
 budget hook "azl::ctr::PassThroughTraced" 56
 budget hook "azl_hook_SendSyncRequest" 24
 budget hook "azl_hook_CloseHandle" 24
+# The call that raises the swap of the plugin's memory on an Old 3DS (svc_entry.s asks, 1.0.12): the question is out of line, behind a compare of the command buffer in registers, so
+# the frames above did not move. Its own frame is paid only by an APT:ReceiveParameter(application), on the game's APT thread (the chain test measures the whole path: 92 bytes
+# below the entry SP, the entry's extra push included).
+budget hook "azl_handback_site" 48
 # (0.1.16: DebugIpc writes its record from registers, with no record or array on the stack - 64 bytes before, with the diet and
 # the lanes in it 40 - so the pure pass-through path at debug 1 is 24 bytes shallower than the hotfix's; Tests/chain_sim pins that)
 budget log "azl::DebugIpc" 48
@@ -167,6 +173,7 @@ budget dlp_hub "azl::DlpHub::AlwaysSucceeds" 8
 budget dlp_hub "azl::DlpHub::EndsRole" 8
 budget dlp_hub "azl::DlpHub::Stamp" 16
 budget dlp_hub "azl::DlpHub::SetPlayerName" 24
+budget dlp_hub "azl::DlpHub::SetFriendSeed" 24
 # The IpcResolver of the lobby: the address of a buffer of the game is mapped by a range test with no local and no call (it runs inside
 # every command that has a buffer, under Serve; DESIGN-FASE3 sez. 5.3: at most 76 bytes, 0 measured)
 budget plugin "azl::ctr::{anonymous}::MapGameAddress" 76
@@ -239,6 +246,22 @@ else
     FAILED=1
   else
     "$PY" Tests/chain_sim/chain_sim.py "$WORK/AzaharLink.elf" || FAILED=1
+  fi
+fi
+
+# ---- the assembly entry (svc_entry.s): the counter of the threads in the hook and the hand-back of the call that raises the swap -------------------------------
+if [ -z "$PY" ]; then
+  echo "stack usage FAILED: no Python 3 with the unicorn package for Tests/hook_sim/entry_sim.py (pip install unicorn)"
+  FAILED=1
+else
+  ENTRY_REPO_WIN="$(pwd -W 2>/dev/null || pwd)"
+  ENTRY_WORK_WIN="$(cd "$WORK" && (pwd -W 2>/dev/null || pwd))"
+  if MSYS_NO_PATHCONV=1 docker run --rm -v "$ENTRY_REPO_WIN:/repo:ro" -v "$ENTRY_WORK_WIN:/work" -w /repo pablomk7/libctrpf:0.8.0 bash Tests/hook_sim/build_entry.sh /work/sim >"$WORK/entry_build.log" 2>&1; then
+    "$PY" Tests/hook_sim/entry_sim.py "$WORK/sim" || FAILED=1
+  else
+    echo "stack usage FAILED: could not assemble Sources/ctr/svc_entry.s for Tests/hook_sim/entry_sim.py"
+    tail -5 "$WORK/entry_build.log"
+    FAILED=1
   fi
 fi
 exit $FAILED

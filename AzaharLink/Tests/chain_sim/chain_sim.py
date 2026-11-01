@@ -234,6 +234,7 @@ class Sim:
         self.clear_event_fails = False
         self.yields = 0
         self.yield_pending = False
+        self.end_addr = STUB_RET        # where run_game stops: the trampoline's return, or the call site a call was handed back to
         self.win_entry = None       # the depth of ONE function (see window_begin)
         self.win_entry_sp = None
         self.win = None
@@ -522,7 +523,7 @@ class Sim:
         uc = self.uc
         pc = begin
         while True:
-            uc.emu_start(pc, STUB_RET, count=5_000_000)
+            uc.emu_start(pc, self.end_addr, count=5_000_000)
             if not self.yield_pending:
                 return
             self.yield_pending = False
@@ -869,6 +870,101 @@ def scenario_traced(elf, level):
     else:
         check(sim.log_lines == [], 'debug 0: a traced command logs nothing')
         check(sim.svc_log.count(0x32) == 2, 'debug 0: the traced command is still passed on')
+
+
+def scenario_handback(elf, level):
+    """APT:ReceiveParameter(application) in the seconds after the HOME button, on an Old 3DS: the swap of the plugin's memory is raised at the end of that
+    call, on the calling thread, which sleeps in the kernel until the block is gone and back, so the call must not be made from the plugin's code
+    (svc_entry.s, azl_handback_site). The real compiled code and the real assembly run: the thread ends at the call site with the registers, flags, sp
+    and lr the game had, the site holds the game's own words again, the counter of the threads in the hook is back to zero, and the path (the extra
+    push of the entry, the question, the site's two stores and the cache calls) stays within the budget of the pure path. The same call goes the
+    normal way when it is not an Old 3DS, when no HOME button was seen, and when the HOME button is old news."""
+    site = 0x00200000
+    original = (0xEF000032, 0xE1A00001)
+    tramp = STUB_RET - 8
+    game_lr = 0x00123454
+    sim = Sim(elf, level, hle=True)
+    uc = sim.uc
+    uc.mem_map(site, 0x1000)
+    p32(uc, site, 0xE51FF004)
+    p32(uc, site + 4, tramp)
+    for i, w in enumerate((site, original[0], original[1], tramp)):
+        p32(uc, elf.find('g_sites') + 4 * i, w)
+    p32(uc, elf.find('g_site_count'), 1)
+    uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', 1))
+    p32(uc, elf.find('g_home_seen'), 1)
+    p32(uc, elf.find('g_home_ms'), 0)
+    stats = elf.find('g_swap_stats')
+    ledger = elf.find('g_ledger')
+    counter = elf.find('azl_hooks_in_flight')
+    handle = 0x1D8031
+    sim.set_request([0x000D0080, 0x300])
+    sim.reset_game_stack(False)
+    sim.scenario = 'hand-back'
+    sim.roomy = False
+    p32(uc, ENTRY_SP, game_lr)                       # the word the trampoline pushed
+    marks = {UC_ARM_REG_R1: 0x11111111, UC_ARM_REG_R2: 0x22222222, UC_ARM_REG_R3: 0x33333333, UC_ARM_REG_R4: 0x44444444,
+             UC_ARM_REG_R5: 0x55555555, UC_ARM_REG_R6: 0x66666666, UC_ARM_REG_R7: 0x77777777, UC_ARM_REG_R8: 0x88888888,
+             UC_ARM_REG_R9: 0x99999999, UC_ARM_REG_R10: 0xAAAAAAAA, UC_ARM_REG_R11: 0xBBBBBBBB, UC_ARM_REG_R12: 0xCCCCCCCC}
+    for r, v in marks.items():
+        uc.reg_write(r, v)
+    uc.reg_write(UC_ARM_REG_R0, handle)
+    uc.reg_write(UC_ARM_REG_SP, ENTRY_SP)
+    uc.reg_write(UC_ARM_REG_LR, STUB_RET)
+    flags_in = (uc.reg_read(UC_ARM_REG_CPSR) & 0x0FFFFFFF) | 0xA0000000
+    uc.reg_write(UC_ARM_REG_CPSR, flags_in)
+    sim.min_sp = ENTRY_SP
+    sim.measuring = True
+    sim.entry_sp = ENTRY_SP
+    sim.end_addr = site
+    svc_before = sim.svc_log.count(0x32)
+    try:
+        sim.run_game(elf.sym('azl_svc32_entry'))
+    except UcError as e:
+        check(False, 'hand-back: emulation error %s at pc=%08x (%s)' % (e, sim.pc, sim.where(sim.pc)))
+        return
+    finally:
+        sim.measuring = False
+        sim.end_addr = STUB_RET
+    check(uc.reg_read(UC_ARM_REG_PC) == site, 'hand-back: the thread is at the call site (pc=%08x)' % uc.reg_read(UC_ARM_REG_PC))
+    check(sim.svc_log.count(0x32) == svc_before, 'hand-back: the plugin did not make the svc 0x32 itself')
+    check(uc.reg_read(UC_ARM_REG_R0) == handle, 'hand-back: r0 is the handle the game had')
+    for r, v in marks.items():
+        check(uc.reg_read(r) == v, 'hand-back: register %d is not the game\'s (%08x)' % (r - UC_ARM_REG_R0, uc.reg_read(r)))
+    check(uc.reg_read(UC_ARM_REG_SP) == ENTRY_SP + 4, 'hand-back: sp is the one the game had at the call site')
+    check(uc.reg_read(UC_ARM_REG_LR) == game_lr, 'hand-back: lr is the game\'s')
+    check((uc.reg_read(UC_ARM_REG_CPSR) & 0xF0000000) == (flags_in & 0xF0000000), 'hand-back: condition flags not preserved')
+    check(r32(uc, site) == original[0] and r32(uc, site + 4) == original[1], 'hand-back: the call site has the game\'s own svc and next instruction')
+    check(r32(uc, counter) == 0, 'hand-back: the counter of the threads in the hook is back to zero (%d)' % r32(uc, counter))
+    check(r32(uc, ledger) == 1, 'hand-back: the site is in the ledger of the sites to hook again')
+    check(r32(uc, stats + 4 * 8) == 1 and r32(uc, stats + 4 * 9) == 0, 'hand-back: one call handed back, none refused')
+    check(r32(uc, stats + 4 * 11) == 1 and r32(uc, stats + 4 * 12) == 0, 'hand-back: one call asked about, none without a HOME button')
+    depth = ENTRY_SP - sim.min_sp
+    record('hand-back (APT ReceiveParameter, Old 3DS)', level, depth, BUDGET_PURE, 'pure')
+    print('  hand-back (APT ReceiveParameter) at debug %d: SP down to %d' % (level, depth))
+    # the same call, not handed back: not an Old 3DS / no HOME button seen / the HOME button is old news
+    def arrange(old_3ds, home_seen, ticks):
+        uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', old_3ds))
+        p32(uc, elf.find('g_home_seen'), home_seen)
+        p32(uc, elf.find('g_home_ms'), 0)
+        sim.ticks = ticks
+
+    for what, state in (('not an Old 3DS', (0, 1, 0)), ('no HOME button seen', (1, 0, 0)), ('the HOME button is old news', (1, 1, 30 * 268112000))):
+        p32(uc, site, 0xE51FF004)
+        p32(uc, site + 4, tramp)
+        p32(uc, ledger, 0)
+        arrange(*state)
+        sim.kernel = srv_reply([0x000D0040, 0])
+        sim.set_request([0x000D0080, 0x300])
+        n32 = sim.svc_log.count(0x32)
+        asked0, no_home0 = r32(uc, stats + 4 * 11), r32(uc, stats + 4 * 12)
+        r0, depth2, ok = sim.enter('azl_svc32_entry', handle, 'receive parameter, %s' % what)
+        check(r32(uc, stats + 4 * 11) == asked0 + 1, 'APT ReceiveParameter (%s): the question is counted' % what)
+        check(r32(uc, stats + 4 * 12) == no_home0 + (0 if what == 'not an Old 3DS' else 1), 'APT ReceiveParameter (%s): counted as without a HOME button only when it is' % what)
+        check(sim.svc_log.count(0x32) == n32 + 1, 'APT ReceiveParameter (%s): the plugin makes the svc itself' % what)
+        check(r32(uc, site) == 0xE51FF004 and r32(uc, site + 4) == tramp, 'APT ReceiveParameter (%s): the call site is left in the hook' % what)
+        check(r32(uc, counter) == 0, 'APT ReceiveParameter (%s): the counter is back to zero' % what)
+        record('APT ReceiveParameter, %s' % what, level, depth2, BUDGET_PURE, 'pure')
 
 
 def scenario_apt(elf, level):
@@ -1937,6 +2033,7 @@ def main():
         scenario_getservice(elf, level)
         scenario_traced(elf, level)
         scenario_apt(elf, level)
+        scenario_handback(elf, level)
         scenario_hle_front(elf, level)
         scenario_throttle(elf, level)
         scenario_log_cost(elf, level)

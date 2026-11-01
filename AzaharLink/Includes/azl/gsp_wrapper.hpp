@@ -70,7 +70,9 @@ inline u32 FindStubbedGspWrappers(ReadWordFn read, void* context, u32 first, u32
         }
         const u32 site = addr + kGspWrapperCtruSvcOffset;
         u32 stub = 0;
-        if (!ArmBlTarget(read(context, site), site, &stub) || stub < first || stub + 8 > end || (stub & 3) != 0) {
+        // (`end - 8` cannot wrap: the loop above only gets here when end >= first + 84. The test written as a sum, target plus 8 against end, did: a bl whose target wraps round the top of
+        //  the address space, 0xFFFFFFFC, gave 4, passed the test, and the next line read there)
+        if (!ArmBlTarget(read(context, site), site, &stub) || stub < first || stub > end - 8 || (stub & 3) != 0) {
             continue;
         }
         if (read(context, stub) != kSvcSendSyncRequestWord || read(context, stub + 4) != kBxLrWord) {

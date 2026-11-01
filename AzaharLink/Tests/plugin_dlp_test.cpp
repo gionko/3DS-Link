@@ -64,7 +64,7 @@ struct FakeKernel final : KernelOps {
 };
 
 static void TableTest() {
-    std::printf("plugin/the table of title ids: exactly these five, nothing else\n");
+    std::printf("plugin/the table of title ids: exactly these nine, nothing else\n");
     struct Want {
         u64 tid;
         DlpGameMode mode;
@@ -76,6 +76,10 @@ static void TableTest() {
         {0x000400000010C000ull, DlpGameMode::Lobby},      // Kirby Triple Deluxe
         {0x000400000010BF00ull, DlpGameMode::Lobby},      // Kirby Triple Deluxe, another region
         {0x0004000000183600ull, DlpGameMode::Lobby},      // Kirby Planet Robobot
+        {0x000400000007C800ull, DlpGameMode::Lobby},      // Mario Tennis Open, Europe
+        {0x000400000007C700ull, DlpGameMode::Lobby},      // Mario Tennis Open, USA
+        {0x0004000000064D00ull, DlpGameMode::Lobby},      // Mario Tennis Open, Japan
+        {0x00040000000B9100ull, DlpGameMode::Lobby},      // Mario Tennis Open, Taiwan
     };
     CHECK_EQ(sizeof(kDlpGames) / sizeof(kDlpGames[0]), sizeof(want) / sizeof(want[0]));
     for (const Want& w : want) {
@@ -94,6 +98,30 @@ static void TableTest() {
             }
         }
     }
+    // the lobby announces the console's own friend code seed in exactly the four Mario Tennis Open ids: the game matches its lobby players with
+    // their nwm::UDS nodes by it; Kirby (which does not) keeps the hash of the MAC, and no other title has the flag
+    static const u64 console_seed_games[] = {0x000400000007C800ull, 0x000400000007C700ull, 0x0004000000064D00ull, 0x00040000000B9100ull};
+    for (const Want& w : want) {
+        bool listed = false;
+        for (const u64 t : console_seed_games) {
+            listed |= t == w.tid;
+        }
+        CHECK_EQ(LobbySeedIsConsoles(w.tid), listed);
+        if (listed) {
+            CHECK(DlpModeOf(w.tid) == DlpGameMode::Lobby);  // (the seed only matters where a hub exists)
+        }
+        for (int bit = 0; bit < 64; ++bit) {
+            CHECK(!LobbySeedIsConsoles(w.tid ^ (1ull << bit)) || [&] {
+                for (const u64 t : console_seed_games) {
+                    if (t == (w.tid ^ (1ull << bit))) {
+                        return true;
+                    }
+                }
+                return false;
+            }());
+        }
+    }
+    CHECK(!LobbySeedIsConsoles(0));
     // games that must keep the real services (Tri Force Heroes, Mario Party Star Rush, Fire Emblem Fates, Pokemon, the empty id)
     static const u64 others[] = {0, 0x0004000000164800ull, 0x0004000000199300ull, 0x000400000017E600ull, 0x0004000000055D00ull, 0x00040000001B5100ull,
                                  0x000400000010C100ull, 0x0004000000183700ull, 0x00040000001C2200ull, 0xFFFFFFFFFFFFFFFFull};

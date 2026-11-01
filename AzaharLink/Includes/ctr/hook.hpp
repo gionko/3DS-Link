@@ -5,6 +5,7 @@
 
 #include <3ds.h>
 
+#include "azl/hook_swap.hpp"
 #include "ctr/uds_hle.hpp"
 
 namespace azl {
@@ -21,6 +22,11 @@ struct HookStats {
     u32 gsp_stub_wrappers = 0; ///< GSP wrappers whose `bl` to the svc stub was rewritten as the svc itself (see azl/gsp_wrapper.hpp)
     bool trampolines_ready = false;
 };
+
+/// A game whose GSP wrapper has its `svc 0x32` behind a stub (LEGO Batman 2) makes CTRPluginFramework abort at start unless the `bl` to the stub is
+/// written as the `svc` itself before the framework searches (azl/gsp_wrapper.hpp). Reads the game's .text and writes one word: called from Plugin::EarlyInit
+/// (PatchProcess) whether the plugin is on or off, BEFORE InstallSvcHooks. Returns how many wrappers it rewrote.
+u32 RewriteStubbedGspWrappers();
 
 /// Scans the game's .text and redirects every ARM `svc 0x32` / `svc 0x23`.
 /// Must run before the game executes (PatchProcess).
@@ -43,6 +49,16 @@ void SetAptObserver(AptObserver observer);
 /// the sleep observer, and shorter still: it may only signal an event (the writer thread does the SD card work).
 using HomeObserver = void (*)();
 void SetHomeObserver(HomeObserver observer);
+
+/// The swap of the plugin's block on an Old 3DS (azl/hook_swap.hpp, svc_entry.s). SuspendSvcHooks runs when the framework says the swap is about to
+/// happen (SWAP_ENTER, on its keep-alive thread, before it answers Luma3DS): every call site goes back to the game's own words, and the threads that are inside
+/// the hook are waited for (at most `timeout_ms`; the report says how many were left). ResumeSvcHooks runs at SWAP_EXIT. RearmHandedBackSites runs on a plugin
+/// thread (the frame callback): a call that was handed back to its call site and no swap followed goes back into the hook after a while.
+void SuspendSvcHooks(u32 timeout_ms);
+void ResumeSvcHooks();
+void RearmHandedBackSites();
+u32 HooksInFlight();
+SwapStats GetSwapStats();
 
 /// Logs the sites whose first word is no longer ours (somebody else patched them after us). Call it
 /// once the framework has finished its own initialisation (LateInit).

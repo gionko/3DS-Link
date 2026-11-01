@@ -999,7 +999,7 @@ need_line Tests/stack_usage.sh 'budget hook "azl::ctr::PassThrough" 32' "the hot
 # Test hygiene. A test that no script runs is a gate that is not there: every test source is built AND run by the script
 # that owns it (the host tests by Tests/run.sh, the 32-bit ones, which drive UdsHle, by Tests/ipc_test/build.sh and then
 # Tests/hle_tests.sh and Tests/integration.sh), and a new *_test.cpp that is in none of them fails here
-for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test logrot_test log_module_test ncch_icon_test reloc_test gsp_wrapper_test; do
+for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test logrot_test log_module_test ncch_icon_test reloc_test hook_swap_test hook_swap_test_tsan gsp_wrapper_test; do
   tr -d '\r' < Tests/run.sh | grep -q -E "^  (timeout 1200 )?\"\\\$OUT/$t\"( |\$)" || fail "Tests/run.sh does not run the unit test $t (a line of its own that calls \"\$OUT/$t\")"
   need Tests/run.sh "-o \"\$OUT/$t\"" "the unit test $t is built by Tests/run.sh"
 done
@@ -1729,9 +1729,20 @@ need Sources/ctr/text_search_guard.cpp 'if (return_address[0] != kMovR7R0 || ret
 need_line Sources/ctr/text_search_guard_entry.s '    b    azl_text_size_guard' "the stub of the guard hands over to the C++ function by a plain branch (lr is left alone)"
 need Sources/ctr/hook.cpp 'if (TextSearchTrims() != 0) {' "the log says when the startup search was cut to the game's code"
 # A game whose GSP wrapper has its svc behind a stub (LEGO Batman 2) makes the framework abort at start unless the plugin writes the svc in place of the bl BEFORE the framework searches (GSP::Initialize runs after PatchProcess); the framework's own sites are found after that
-need Sources/ctr/hook.cpp 'FindStubbedGspWrappers(ReadGameWord, nullptr, first, stats.text_start + stats.text_size, stubbed, 4);' "the GSP wrapper behind a stub is looked for in the game's .text"
+need Sources/ctr/hook.cpp 'FindStubbedGspWrappers(ReadGameWord, nullptr, first, first + text_size, stubbed, 4);' "the GSP wrapper behind a stub is looked for in the game's .text"
 need Sources/ctr/hook.cpp 'CTRPluginFramework::Process::Patch(stubbed[i], kSvcSendSyncRequest)' "the bl of the GSP wrapper becomes the svc itself"
-need_order Sources/ctr/hook.cpp 'FindStubbedGspWrappers(ReadGameWord' 'FindFrameworkSites(first, stats.text_start + stats.text_size);' "the wrapper is made the framework's one BEFORE the sites of the framework are looked for"
+[ "$(grep -c 'FindStubbedGspWrappers(' Sources/ctr/hook.cpp)" = "1" ] || fail "Sources/ctr/hook.cpp: the GSP wrapper behind a stub is rewritten in ONE place (RewriteStubbedGspWrappers), not again in InstallSvcHooks"
+need Sources/ctr/hook.cpp 'u32 RewriteStubbedGspWrappers() {' "the rewrite is a function of its own, which the plugin calls whether it is on or off"
+need Sources/ctr/hook.cpp 'stats.gsp_stub_wrappers = g_gsp_stub_wrappers;' "InstallSvcHooks reports what the rewrite did"
+# ... called from EarlyInit, outside `if (active_)` (LEGO Batman 2 aborted at start with the main switch off, the plugin still loaded by Luma3DS), BEFORE the hooks look for the framework's sites
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c '^    RewriteStubbedGspWrappers();$')" = "1" ] || fail "Sources/ctr/plugin.cpp: RewriteStubbedGspWrappers() is called once, at the level of EarlyInit itself and not inside 'if (active_)': the framework aborts at start with the switch off otherwise"
+need_order Sources/ctr/plugin.cpp '    RewriteStubbedGspWrappers();' 'hook_stats_ = InstallSvcHooks(hle_.get());' "the GSP wrapper is rewritten BEFORE the hooks look for the framework's sites"
+need_order Sources/ctr/plugin.cpp '    RewriteStubbedGspWrappers();' "// The game's APT session tells when the console goes to sleep; we only look" "... and before the block that only runs when the plugin is on"
+need_order Sources/ctr/hook.cpp 'u32 RewriteStubbedGspWrappers() {' 'HookStats InstallSvcHooks(UdsHle* hle) {' "the rewrite is defined before the install, which reports it"
+need Includes/azl/gsp_wrapper.hpp 'stub > end - 8' "the end of the stub is tested without adding to the target (a bl whose target wraps round the top of the address space passed 'stub + 8 > end')"
+! grep -q 'stub + 8 > end' Includes/azl/gsp_wrapper.hpp || fail "Includes/azl/gsp_wrapper.hpp tests 'stub + 8 > end' again: it wraps for a target of 0xFFFFFFFC"
+need Tests/gsp_wrapper_test.cpp 'for (const u32 target : {0xFFFFFFFCu, 0xFFFFFFF8u, 0xFFFFFFF4u, 0xFFFFFFFFu, 0x00000000u, 0x00000004u}) {' "the test tries a bl whose target wraps round the top of the address space"
+[ "$(grep -c 'CHECK(g_wild_reads == before);' Tests/gsp_wrapper_test.cpp)" = "2" ] || fail "Tests/gsp_wrapper_test.cpp: both the wrap-round case and the last-stub case hold that the search never reads outside the image"
 need Tests/run.sh 'Tests/text_search_guard_test.cpp' "the PC test of the guard is built by the suite"
 need_line Tests/run.sh '  "$OUT/text_search_guard_test"' "... and run (the whole line: the build line has the same words)"
 need Tests/text_search_guard_elf_check.sh 'text search guard: OK' "the check of the call in the built .elf exists"
@@ -1746,10 +1757,16 @@ need Sources/ctr/plugin.cpp '0x00040000001C2100ull' "Kirby Battle Royale is in t
 need Sources/ctr/plugin.cpp '{0x000400000010C000ull, DlpGameMode::Lobby}' "Kirby Triple Deluxe is a Lobby game: the room carries its Download Play lobby"
 need Sources/ctr/plugin.cpp '{0x000400000010BF00ull, DlpGameMode::Lobby}' "Kirby Triple Deluxe, the other region's id, is a Lobby game"
 need Sources/ctr/plugin.cpp '{0x0004000000183600ull, DlpGameMode::Lobby}' "Kirby Planet Robobot is a Lobby game"
+# Mario Tennis Open: its local multiplayer scene starts the Download Play CLIENT at once (Initialize with no name, GetMyStatus every 5 ms, GetChannels, StartScan, StartFakeSession) and the host side runs
+# the SERVER (StartAccepting, GetConnectingClients): it is NOT a game of the probe (Battle Royale asks Initialize/Finalize only), it is a Lobby game, in all the regions whose id is known.
+need Sources/ctr/plugin.cpp '{0x000400000007C800ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Europe is a Lobby game: the room carries its Download Play lobby"
+need Sources/ctr/plugin.cpp '{0x000400000007C700ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, USA is a Lobby game: the room carries its Download Play lobby"
+need Sources/ctr/plugin.cpp '{0x0004000000064D00ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Japan is a Lobby game: the room carries its Download Play lobby"
+need Sources/ctr/plugin.cpp '{0x00040000000B9100ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Taiwan is a Lobby game: the room carries its Download Play lobby"
 need Sources/ctr/plugin.cpp '{0x00040000001C2100ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale answers the wireless check only (the probe)"
 need Sources/ctr/plugin.cpp '{0x00040000001C2000ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale, the other region's id, answers the wireless check only"
-hit=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -i -E '0x000400000010C000|0x000400000010BF00|0x0004000000183600|0x00040000001C2100|0x00040000001C2000' | grep -v 'DlpGameMode::' | head -3)
-[ -z "$hit" ] || fail "a title id of Triple Deluxe, Planet Robobot or Battle Royale is in Sources/ctr/plugin.cpp outside the table of games (a mode must stay next to it): $hit"
+hit=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -i -E '0x000400000010C000|0x000400000010BF00|0x0004000000183600|0x00040000001C2100|0x00040000001C2000|0x000400000007C800|0x000400000007C700|0x0004000000064D00|0x00040000000B9100' | grep -v 'DlpGameMode::' | head -3)
+[ -z "$hit" ] || fail "a title id of Triple Deluxe, Planet Robobot, Mario Tennis Open or Battle Royale is in Sources/ctr/plugin.cpp outside the table of games (a mode must stay next to it): $hit"
 need Sources/ctr/plugin.cpp 'constexpr DlpGame kDlpGames[] = {' "the table of games of the Download Play wiring"
 need Sources/ctr/plugin.cpp 'return DlpModeOf(title_id) == DlpGameMode::ProbeOnly;' "the probe is for the ProbeOnly games and nobody else"
 need Sources/ctr/plugin.cpp 'if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {' "the hub exists only for a Lobby game, and only when the plugin is active"
@@ -1759,6 +1776,15 @@ need_order Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' 'hook_stats
 need_after Sources/ctr/plugin.cpp 'engine_->Tick(now_ms);' 'dlp_hub_->Tick();' "the hub serves after the engine's own Tick, on the network thread"
 need_order Sources/ctr/plugin.cpp 'dlp_hub_->Stop();' 'room_->StopWithin(kNetStopTimeoutMs)' "the hub is stopped before the room: no request waits for a network thread that is going away"
 need Sources/ctr/plugin.cpp 'dlp_hub_->SetPlayerName(name);' "the console's profile name is the name the lobby shows (the games send Initialize with no name)"
+# Mario Tennis Open matches the players of the Download Play lobby with the nodes of its own network by the friend code seed (2026-11-01, found with the debugger on a stalled
+# game): the lobby announces the console's OWN seed (config block 0x00090000, 8 bytes: what the game gives nwm::UDS), for these four titles only.
+need Sources/ctr/plugin.cpp 'bool LobbySeedIsConsoles(u64 title_id) {' "the table says which games get the console's own friend code seed in the lobby"
+need Sources/ctr/plugin.cpp 'return game.console_seed;' "... and it is the table's flag"
+need Sources/ctr/plugin.cpp 'CFGU_GetConfigInfoBlk2(sizeof(console_seed), 0x00090000, &console_seed)' "the console's friend code seed is config block 0x00090000, 8 bytes (what the game reads itself)"
+need Sources/ctr/plugin.cpp 'dlp_hub_->SetFriendSeed(console_seed);' "the lobby announces that seed (not the hash of the MAC) for the games with the flag"
+need Includes/azl/dlp_lobby.hpp 'id_.seed = seed;' "the lobby's seed can be set (SetFriendSeed)"
+need Sources/azl/dlp_hub.cpp 'lobby_.SetFriendSeed(seed);' "the hub gives the seed to the lobby under its lock"
+need Tests/dlp_hub_test.cpp 'a.hub.SetFriendSeed(kHostSeed);' "F6 gives the hub a friend code seed"
 need Sources/ctr/plugin.cpp 'static const char kDefaultName[] = "3DS Link";' "the name before the profile name is known"
 need Sources/ctr/plugin.cpp 'u64 hash = 0xCBF29CE484222325ull;' "the friend code seed is FNV-1a-64 of the console's MAC (unique per console)"
 need Sources/ctr/plugin.cpp 'hash *= 0x100000001B3ull;' "... FNV-1a-64's prime"
@@ -2199,6 +2225,57 @@ for s in TestLobbyThenGameUds TestFourPlayers TestLeaveAndGone TestTwoLobbies; d
 done
 [ "$(grep -c 'CHECK_EQ(counted.count(), 0u);' Tests/dlp_net_test.cpp)" = "2" ] || fail "Tests/dlp_net_test.cpp: the reading calls of the adapter are proven to allocate nothing in two places (the console that holds the engine, the one that only looks)"
 [ "$(grep -c 'CHECK_EQ(res, R_TIMEOUT);' Tests/dlp_net_test.cpp)" = "2" ] || fail "Tests/dlp_net_test.cpp: a join to a host that does not answer (full, or closed) is proven to give up with the games' own timeout, twice"
+
+# ---- The swap of the plugin's memory on an Old 3DS: the HOME button must not take the game down (1.0.12) ---------------------------------------------------
+# Luma3DS saves the plugin's block to a file and frees it when an Old 3DS game goes to the HOME menu. The kernel raises that on the game's OWN thread, at the end of its
+# APT:ReceiveParameter, and puts the thread to sleep until the block is gone: if the hook made that svc, the thread wakes up in freed memory (the prefetch abort of the 1.0.4 report, PC in
+# svcSendSyncRequest, LR in azl_hook_SendSyncRequest). So the entry hands that call back to its call site (azl_handback_site: an Old 3DS, a HOME button just seen), the sites go back to the
+# game at SWAP_ENTER and into the hook at SWAP_EXIT, and the threads still in the hook are counted and waited for. On a New 3DS the framework sends no swap event and nothing of this runs
+# but the counter. The logic is held by Tests/hook_swap_test.cpp (and Tests/hook_swap_mutants.py), the assembly by Tests/hook_sim/entry_sim.py (Tests/hook_sim/entry_mutants.py), the whole chain
+# by Tests/chain_sim/chain_sim.py; these pins hold the text of each piece.
+need Sources/ctr/svc_entry.s "SVC_ENTRY azl_svc32_entry, azl_hook_SendSyncRequest, 1" "the SendSyncRequest entry asks whether the call is the one that raises the swap"
+need Sources/ctr/svc_entry.s "SVC_ENTRY azl_svc23_entry, azl_hook_CloseHandle, 0" "CloseHandle never hands a call back"
+need Sources/ctr/svc_entry.s "bl   azl_handback_site" "the entry asks azl_handback_site before it makes the call"
+need Sources/ctr/svc_entry.s "cmpeq r3, #0x300" "the call is APT:ReceiveParameter for the application's id (Luma3DS's kernel hook tests the same)"
+need Sources/ctr/svc_entry.s ".word 0x000D0080" "... ReceiveParameter's command header"
+need Sources/ctr/svc_entry.s ".word azl_hooks_in_flight" "the entry counts the threads inside it in the counter the swap waits for"
+need Sources/ctr/svc_entry.s "ldr  pc, [sp], #4" "the hand-back ends at the call site with the stack as the game had it"
+[ "$(grep -c -E '^([0-9]:)?[[:space:]]+ldrex ' Sources/ctr/svc_entry.s)" = "3" ] || fail "Sources/ctr/svc_entry.s: the counter of the threads in the hook is counted in once and out twice (the normal way and the hand-back), each with ldrex"
+[ "$(grep -c -E '^[[:space:]]+DMB ' Sources/ctr/svc_entry.s)" = "3" ] || fail "Sources/ctr/svc_entry.s: a barrier before the counter goes down (the normal way and the hand-back) and after it went up"
+need Sources/ctr/hook.cpp 'volatile u32 azl_hooks_in_flight = 0;' "the counter the assembly entry counts in"
+need Sources/ctr/hook.cpp 'extern "C" u32 azl_handback_site(Handle, u32 tramp_return) {' "the question the entry asks"
+need Sources/ctr/hook.cpp '    if (!g_old_3ds) {' "a call is handed back only on an Old 3DS ..."
+need Sources/ctr/hook.cpp 'if (!g_home_seen || static_cast<u32>(now - g_home_ms) > kHomeWindowMs) {' "... and after a HOME button was seen, in the last seconds"
+need Sources/ctr/hook.cpp 'g_old_3ds = !CTRPluginFramework::System::IsNew3DS();' "the console is asked once, at the start"
+need Sources/ctr/hook.cpp 'constexpr u32 kHomeWindowMs = 10000;' "a HOME button is news for ten seconds"
+need_after Sources/ctr/hook.cpp 'if (id == 1 || id == 2) {' 'g_home_ms = static_cast<u32>(platform::NowMs());' "the HOME notification stamps the time ..."
+need Sources/ctr/hook.cpp '            g_home_seen = 1;' "... and is noted at every debug level"
+need_order Sources/ctr/hook.cpp '            g_home_seen = 1;' 'if (g_apt_observer && g_debug_level > 0 && R_SUCCEEDED(rc)) {' "the HOME button is noted before anything that depends on the log level"
+need Sources/ctr/hook.cpp 'HandBackSite(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, tramp_return, now);' "the question is answered by the tested logic"
+need Sources/ctr/hook.cpp 'SuspendSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);' "SWAP_ENTER takes every site out"
+need Sources/ctr/hook.cpp 'ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);' "SWAP_EXIT puts every site back"
+need Sources/ctr/hook.cpp 'RearmSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);' "a call handed back with no swap after it goes back into the hook"
+need_after Sources/ctr/hook.cpp 'void StoreOriginal(u32 address, const u32 words[2]) const {' 'Poke(address, words[0]);' "the game's svc goes back first (a thread that passes between the two stores finds svc + literal, never a jump into the second word)"
+need_after Sources/ctr/hook.cpp 'void StoreHook(u32 address, const u32 words[2]) const {' 'Poke(address + 4, words[1]);' "the literal goes in first (the jump is the last word to appear)"
+need_after Sources/ctr/hook.cpp 'void Sync() const {' 'svcInvalidateEntireInstructionCache();' "the instruction cache of every core is invalidated after the stores"
+[ "$(grep -c 'svcFlushProcessDataCache(CUR_PROCESS_HANDLE, address, 8);' Sources/ctr/hook.cpp)" = "2" ] || fail "Sources/ctr/hook.cpp: both stores of a site clean the data cache for its two words"
+need Sources/ctr/hook.cpp 'constexpr s64 kSwapGraceNs = 2000000;' "the threads that are in a trampoline's few instructions when the counter reads zero get 2 ms"
+need_order Sources/ctr/hook.cpp 'SuspendSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);' 'svcSleepThread(kSwapGraceNs);' "the sites are out BEFORE the wait for the threads inside"
+need Sources/ctr/plugin.cpp 'constexpr int kEventSwapEnter = 5;' "the framework's SWAP_ENTER"
+need Sources/ctr/plugin.cpp 'constexpr int kEventSwapExit = 6;' "the framework's SWAP_EXIT"
+need Sources/ctr/plugin.cpp 'static_cast<int>(Process::Event::SWAP_ENTER) == kEventSwapEnter &&' "the indices are checked against the framework's enum"
+need Sources/ctr/plugin.cpp 'SuspendSvcHooks(kSwapDrainTimeoutMs);' "SWAP_ENTER takes the hooks out before the framework answers Luma3DS"
+need Sources/ctr/plugin.cpp 'ResumeSvcHooks(); // (the block is back' "SWAP_EXIT puts the hooks back"
+need_order Sources/ctr/plugin.cpp 'SuspendSvcHooks(kSwapDrainTimeoutMs);' 'ResumeSvcHooks(); // (the block is back' "enter before exit"
+DRAIN=$(grep -o 'kSwapDrainTimeoutMs = [0-9]*' Sources/ctr/plugin.cpp | grep -o '[0-9]*$')
+{ [ -n "$DRAIN" ] && [ "$DRAIN" -ge 500 ] && [ "$DRAIN" -le 5000 ]; } || fail "Sources/ctr/plugin.cpp: the wait for the threads inside the hook is $DRAIN ms (between half a second and five seconds: Luma3DS gives up on the answer after 10 s)"
+need Sources/main.cpp 'azl::ctr::RearmHandedBackSites();' "a call handed back with no swap after it goes back into the hook from the frame callback"
+need Includes/azl/hook_swap.hpp 'constexpr u32 kRearmDelayMs = 2000;' "a site handed back with no swap goes back into the hook after two seconds"
+need Tests/stack_usage.sh '"$PY" Tests/hook_sim/entry_sim.py "$WORK/sim" || FAILED=1' "the stack check runs the assembly entry in the emulator"
+need Tests/stack_usage.sh 'budget hook "azl_handback_site" 48' "the question of the entry is held to a small frame"
+need Tests/chain_sim/chain_sim.py 'def scenario_handback(elf, level):' "the whole-chain test has the hand-back scenario ..."
+need Tests/chain_sim/chain_sim.py '        scenario_handback(elf, level)' "... and runs it on the built plugin"
+need Tests/hook_sim/entry_sim.py 'scenario_receive(0x00123450, seed, counter0, mis)' "the entry test runs the hand-back"
 
 if [ "$FAILED" = 0 ]; then
   echo "policy check: defaults and switches as intended"

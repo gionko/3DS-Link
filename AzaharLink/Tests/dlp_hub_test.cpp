@@ -28,7 +28,7 @@
 //   X1..X12 (below the H scenarios): what the mutation round of phase 3 found missing (the alive window, a long-running command, Stop(), the events, deferred closes)
 //   F1a..F1d the commands that succeed in every state (FKCL Finalize / StopScan / StopSession, SRVR Finalize / EndAccepting) when the request cannot be served
 //            (network thread silent / alive but stalled / never ticked / stopped), F2 the Stop()/Post race, F3 OnGameUdsStarting with a request in flight,
-//            F4 a Tick longer than kAliveMs, F5 SetPlayerName (the descriptions are above F1a). `F1` runs F1a..F1d.
+//            F4 a Tick longer than kAliveMs, F5 SetPlayerName, F6 SetFriendSeed (the descriptions are above F1a). `F1` runs F1a..F1d.
 //
 // BUILD (inside the devkitpro/devkitarm container, from AzaharLink/; CORE and the ENet objects as in Tests/run.sh). The --wrap options are the
 // mangled names of the UdsEngine members the adapter calls (nm Sources/azl/dlp_lobby_net.o | grep UdsEngine): without them the thread spy sees
@@ -2855,6 +2855,9 @@ static void X12() {
 //   F4        a Tick that lasts longer than kAliveMs does not make the next requester find the network thread "dead" (the stamp at the END of the Tick)
 //   F5        SetPlayerName: the name of a console whose Initialize sends none, in the creator's list, in the roster and in the GetClientInfo / GetNodeInfo
 //             records; InitializeWithName still overrides it
+//   F6        SetFriendSeed: the console's own friend code seed (the one the game gives nwm::UDS) is the seed of the creator and of the searcher in
+//             every record the other side reads (the creator's GetClientInfo, the searcher's GetNodeInfo and GetServerInfo), the same one the
+//             game's own network will announce: the host's table matches its lobby players with the nodes of the game's network by it
 
 static void ExpectOk(const Rep& r, u32 id) {  // [(id << 16) | 0x40, 0]
     TCHECK(r.out == DlpOutcome::Done);
@@ -3347,6 +3350,47 @@ static void F5() {
     TCHECK_EQ(a.hub.cancelled() + b.hub.cancelled() + a.hub.failed_fast() + b.hub.failed_fast(), 0u);
 }
 
+static void F6() {
+    std::printf("F6: SetFriendSeed is the seed of the console in the creator's and the searcher's records\n");
+    constexpr u64 kHostSeed = 0x1a2b3c4d5e6f7081ull;   // (made-up seeds: the plugin sets each console's own, the one the game gives nwm::UDS)
+    constexpr u64 kGuestSeed = 0x8172635443d2c1b0ull;
+    Fix f({"Alice", "Bob"});
+    Node& a = f.n(0);
+    Node& b = f.n(1);
+    Game ga(a), gb(b);
+    a.hub.SetFriendSeed(kHostSeed);
+    b.hub.SetFriendSeed(kGuestSeed);
+    TCHECK_EQ(ga.SvInit(3).res(), 0u);
+    TCHECK_EQ(ga.SvDup().res(), 0u);
+    TCHECK_EQ(ga.SvAccepting(0, 6).res(), 0u);
+    TCHECK_EQ(gb.FkInit(4).res(), 0u);
+    TCHECK_EQ(gb.FkChannels().res(), 0u);
+    TCHECK_EQ(gb.FkScan().res(), 0u);
+    TCHECK(WaitFor(8000, [&] {
+        const Rep q = gb.FkInOrder(1);
+        return q.res() == 0 && std::memcmp(gb.TitleRec() + kTitleInfoMac, a.mac().data(), 6) == 0;
+    }));
+    Rep r = gb.FkServerInfo(a.mac());  // the creator's entry in the searcher's list
+    TCHECK_EQ(r.res(), 0u);
+    TCHECK(NameAt(gb.ServerRec() + kServerInfoHostName) == "Alice");  // (the scan record has the host's name and no seed: Azahar's convention; the seeds are in the node records below)
+    JoinResult j = JoinGroup(gb, a.mac());
+    TCHECK(j.done && j.rep.res() == 0);
+    TCHECK(WaitFor(5000, [&] { return gb.NodesTotal() == 2 && ga.ClientsTotal() == 1; }));
+    r = gb.FkNodeInfo(1);  // the roster, as the searcher reads it
+    TCHECK_EQ(r.res(), 0u);
+    CheckNodeRecord(r, 2, kHostSeed, "Alice", 1);
+    r = gb.FkNodeInfo(2);
+    TCHECK_EQ(r.res(), 0u);
+    CheckNodeRecord(r, 2, kGuestSeed, "Bob", 2);
+    r = ga.SvClientInfo(2);  // ... and as the creator reads it: the guest's seed is the one its own network announces later
+    TCHECK_EQ(r.res(), 0u);
+    CheckNodeRecord(r, 2, kGuestSeed, "Bob", 2);
+    r = ga.SvClientInfo(1);  // the host's own record (kNoData, filled)
+    TCHECK_EQ(r.res(), R_NO_DATA);
+    CheckNodeRecord(r, 2, kHostSeed, "Alice", 1);
+    TCHECK_EQ(a.hub.cancelled() + b.hub.cancelled() + a.hub.failed_fast() + b.hub.failed_fast(), 0u);
+}
+
 // =====================================================================================================================
 
 int main(int argc, char** argv) {
@@ -3365,7 +3409,7 @@ int main(int argc, char** argv) {
                                    {"X5", X5, 80}, {"X6", X6, 80}, {"X7", X7, 80}, {"X8", X8, 80}, {"X9", X9, 100},
                                    {"X10", X10, 100}, {"X11", X11, 80}, {"X12", X12, 80}, {"F1a", F1a, 60}, {"F1b", F1b, 90},
                                    {"F1c", F1c, 60},  {"F1d", F1d, 60}, {"F2", F2, 60},   {"F3", F3, 60},   {"F4", F4, 60},
-                                   {"F5", F5, 90},    {"F4b", F4b, 60}};
+                                   {"F5", F5, 90},    {"F6", F6, 90},    {"F4b", F4b, 60}};
     std::printf("dlp_hub_test: the hub of the fake Download Play lobby, real threads, real engines\n");
     const u64 t_start = platform::NowMs();
     int ran = 0;

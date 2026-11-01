@@ -45,9 +45,12 @@ struct Image {
     u32 End() const { return kBase + static_cast<u32>(bytes.size()); }
 };
 
+static int g_wild_reads = 0; // reads outside the image: the search must never make one (on a console it is an abort)
+
 static u32 Read(void* context, u32 address) {
     const Image* image = static_cast<const Image*>(context);
-    if (address < kBase || address + 4 > image->End()) {
+    if (address < kBase || address - kBase > image->End() - kBase - 4) {
+        ++g_wild_reads;
         return 0; // never part of a pattern
     }
     return image->Get(address);
@@ -187,6 +190,27 @@ static void TestFind() {
         Image image(0x1000);
         PutStub(image, kBase + 0x800);
         CHECK(Find(image, kBase, image.End(), sites) == 0);
+    }
+    // 11) a bl whose target wraps round the top of the address space (the target plus 8 overflows 32 bits): refused without a read there
+    for (const u32 target : {0xFFFFFFFCu, 0xFFFFFFF8u, 0xFFFFFFF4u, 0xFFFFFFFFu, 0x00000000u, 0x00000004u}) {
+        Image image(0x1000);
+        PutWrapper(image, kBase + 0x100, kBase + 0x800);
+        PutStub(image, kBase + 0x800);
+        image.Put(kBase + 0x100 + 0x2C, BlWord(kBase + 0x100 + 0x2C, target));
+        const int before = g_wild_reads;
+        CHECK(Find(image, kBase, image.End(), sites) == 0);
+        CHECK(g_wild_reads == before);
+    }
+    // ... and the last stub that fits is still found, one word further is not
+    {
+        Image image(0x1000);
+        PutWrapper(image, kBase + 0x100, image.End() - 8);
+        PutStub(image, image.End() - 8);
+        const int before = g_wild_reads;
+        CHECK(Find(image, kBase, image.End(), sites) == 1 && sites[0] == kBase + 0x12C);
+        PutWrapper(image, kBase + 0x100, image.End() - 4);
+        CHECK(Find(image, kBase, image.End(), sites) == 0);
+        CHECK(g_wild_reads == before);
     }
 }
 

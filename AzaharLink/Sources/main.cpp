@@ -290,6 +290,7 @@ static void OnFrame() {
     }
     last_start = start;
     Plugin& plugin = Plugin::Get();
+    azl::ctr::RearmHandedBackSites(); // (a call handed back to its call site with no swap after it: the site goes back into the hook)
 
     for (const std::string& message : plugin.TakeNotifications()) {
         OSD::Notify(message);
@@ -334,8 +335,9 @@ static void OnFrameOff() {
 }
 
 static void OnProcessEvent(Process::Event event) {
-    // This runs on the framework's small keep-alive thread: flag stores only. Sleep, home and swap are
-    // counted (the log writer reports them); the exit starts the shutdown.
+    // This runs on the framework's small keep-alive thread: flag stores only, and the swap of the plugin's memory (Old 3DS), which
+    // takes the hook out of the game before Luma3DS frees the block. Sleep, home and swap are counted (the log writer reports
+    // them); the exit starts the shutdown.
     Plugin::Get().NoteProcessEvent(static_cast<int>(event));
     if (event == Process::Event::EXIT) {
         Plugin::Get().RequestStop();
@@ -400,7 +402,7 @@ int main(void) {
     g_menu_off = plugin.menu_off();
     g_menu_keys = ParseKeys(cfg.menu_key) | Key::Select;
 
-    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 0, 11,
+    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 0, 12,
                                       "Plays 3DS local wireless games over the internet with\n"
                                       "Azahar emulator players and other 3DS consoles.\n\n"
                                       "1. Set the room address (and nickname).\n"

@@ -124,6 +124,7 @@ HUB_NOINLINE void p_hub_OnGameUdsStarting(DlpHub* h) { h->OnGameUdsStarting(); }
 HUB_NOINLINE void p_hub_OnSessionClosed(DlpHub* h, DlpKind kind) { h->OnSessionClosed(kind); }
 HUB_NOINLINE bool p_hub_EngineHeld(const DlpHub* h) { return h->EngineHeld(); }
 HUB_NOINLINE void p_hub_SetPlayerName(DlpHub* h, const u16* name) { h->SetPlayerName(name); }
+HUB_NOINLINE void p_hub_SetFriendSeed(DlpHub* h, u64 seed) { h->SetFriendSeed(seed); }
 HUB_NOINLINE void p_hub_Tick(DlpHub* h) { h->Tick(); }
 HUB_NOINLINE void p_hub_Stop(DlpHub* h) { h->Stop(); }
 HUB_NOINLINE u32 p_hub_counters(const DlpHub* h) {

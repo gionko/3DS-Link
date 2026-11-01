@@ -21,6 +21,11 @@ void DlpHub::SetPlayerName(const u16* name) {
     lobby_.SetDefaultName(name);
 }
 
+void DlpHub::SetFriendSeed(u64 seed) {
+    platform::LockGuard lock(dlp_mutex_);
+    lobby_.SetFriendSeed(seed);
+}
+
 // >>> game-thread code (Tests/policy_check.sh: no printf family, no Log()/DebugEvent() with a format, no big buffer)
 
 bool DlpHub::IsInline(DlpKind kind, u32 id) {

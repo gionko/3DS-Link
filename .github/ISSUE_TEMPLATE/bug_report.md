@@ -15,4 +15,4 @@ labels: bug
 
 **Does it also happen with the main switch "3DS Link" OFF and the title still enabled?** (it separates a problem of the plugin's own work from one of the Plugin Loader):
 
-**Logs** (`AzaharLink.log`, and `AzaharLink.debug.log` if `debug=1`). **They contain your console's MAC address and the names of the players: read and edit them before posting.**
+**Logs** (`AzaharLink.log`, and `AzaharLink.debug.log` if `debug=1`). **They contain your console's MAC address, the names of the players and, with the debug log on, the friend code seed of your console: read and edit them before posting.**

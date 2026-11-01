@@ -632,6 +632,12 @@ public:
     void SetDefaultName(const u16* name) {
         CopyName(id_.name, name);
     }
+    /// The friend code seed of the player (what the creator's GetClientInfo and the searcher's GetNodeInfo / GetServerInfo give for this console). The
+    /// plugin sets the console's own one for the games that match the lobby's players with their own network by it (Mario Tennis Open); read at
+    /// HostOpen / ConnectBegin / ServerClientInfo, so it is set before the game opens the wireless menu. Under the caller's lock.
+    void SetFriendSeed(u64 seed) {
+        id_.seed = seed;
+    }
     void SetOnNet(bool on) {
         SetF2(kF2OnNet, on);
     }

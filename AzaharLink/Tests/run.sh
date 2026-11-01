@@ -94,6 +94,10 @@ g++ $CXXFLAGS Tests/link_policy_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/link_pol
 # the platform layer's three socket calls so that the test can count them, and ENet's clock so that it can hold it
 g++ $CXXFLAGS Tests/enet_path_test.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_wait -Wl,--wrap=enet_time_get -o "$OUT/enet_path_test"
 g++ $CXXFLAGS Tests/reloc_test.cpp Sources/azl/arm_reloc.cpp -o "$OUT/reloc_test"
+# hook_swap_test: the logic of the svc hook around the swap of the plugin's memory on an Old 3DS (azl/hook_swap.hpp: the hand-back of the call that raises the swap, the sites out and back,
+# the re-hook) over an array that plays the game's text; the same source with ThreadSanitizer (the ledger of the sites handed back is claimed by compare-and-swap from game threads)
+g++ $CXXFLAGS Tests/hook_swap_test.cpp Sources/azl/svc_patch.cpp Sources/azl/arm_reloc.cpp -o "$OUT/hook_swap_test"
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/hook_swap_test.cpp Sources/azl/svc_patch.cpp Sources/azl/arm_reloc.cpp -o "$OUT/hook_swap_test_tsan"
 g++ $CXXFLAGS Tests/gsp_wrapper_test.cpp -o "$OUT/gsp_wrapper_test"
 g++ $CXXFLAGS Tests/soc_plan_test.cpp -o "$OUT/soc_plan_test"
 g++ $CXXFLAGS Tests/text_search_guard_test.cpp Sources/ctr/text_search_guard.cpp -o "$OUT/text_search_guard_test"
@@ -234,5 +238,7 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/ncch_icon_test"
   "$OUT/builtin_keys_test"
   "$OUT/reloc_test" $RELOC_GAME_CODE   # RELOC_GAME_CODE=<decompressed .code> adds the game sweep
+  "$OUT/hook_swap_test"
+  "$OUT/hook_swap_test_tsan"
   "$OUT/gsp_wrapper_test" $GSP_GAME_CODE   # GSP_GAME_CODE="<decompressed .code> <text size> <expected bl address>" runs the search over a game
 fi

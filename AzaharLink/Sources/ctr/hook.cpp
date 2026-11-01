@@ -8,8 +8,10 @@
 #include "azl/apt_sleep.hpp"
 #include "azl/arm_reloc.hpp"
 #include "azl/gsp_wrapper.hpp"
+#include "azl/hook_swap.hpp"
 #include "azl/svc_patch.hpp"
 #include "azl/log.hpp"
+#include "azl/platform.hpp"
 #include "azl/stats.hpp"
 #include "csvc.h"
 
@@ -31,12 +33,42 @@ constexpr u32 kMaxSites = 2048;
 
 UdsHle* g_hle = nullptr;
 
-struct Site {
-    u32 address;
-    u32 original[2];
-};
-Site g_sites[kMaxSites];
+HookSite g_sites[kMaxSites];
 u32 g_site_count = 0;
+
+// The swap of the plugin's memory on an Old 3DS (azl/hook_swap.hpp): what is ours to remember between the two events.
+HandBackLedger g_ledger;
+volatile u32 g_hooks_state = kHooksActive;
+volatile u32 g_patch_lock = 0; // the plugin's threads that change the game's sites (the keep-alive thread, the frame callback) take turns; the game's thread never waits for it
+SwapStats g_swap_stats;
+bool g_old_3ds = false;
+u32 g_gsp_stub_wrappers = 0; // what RewriteStubbedGspWrappers() rewrote (InstallSvcHooks reports it)
+
+/// The game's text, written and read as the host tests' array is: the words, the data cache cleaned for them, the instruction cache invalidated for all cores
+/// by Sync(). Luma3DS has made the whole process RWX in the MMU (see InstallSvcHooks), so the stores need no permission call.
+struct GameTextMemory {
+    u32 Load(u32 address) const {
+        return *reinterpret_cast<const volatile u32*>(address);
+    }
+    // (a thread that passes a site between the two stores finds the svc and then the literal word: the svc is the game's own, and the literal, a trampoline
+    //  address, runs as a conditional instruction that most often does nothing; the other order would jump into the second word)
+    void StoreOriginal(u32 address, const u32 words[2]) const {
+        Poke(address, words[0]);
+        Poke(address + 4, words[1]);
+        svcFlushProcessDataCache(CUR_PROCESS_HANDLE, address, 8);
+    }
+    void StoreHook(u32 address, const u32 words[2]) const {
+        Poke(address + 4, words[1]);
+        Poke(address, words[0]);
+        svcFlushProcessDataCache(CUR_PROCESS_HANDLE, address, 8);
+    }
+    void Sync() const {
+        svcInvalidateEntireInstructionCache();
+    }
+    static void Poke(u32 address, u32 value) {
+        *reinterpret_cast<volatile u32*>(address) = value;
+    }
+};
 
 // Executable scratch memory for the trampolines. It lives in the plugin's own image (.bss).
 alignas(0x1000) u32 g_trampolines[kMaxSites * kWordsPerTrampoline];
@@ -155,6 +187,12 @@ bool IsFrameworkSite(u32 address) {
 // ---------------------------------------------------------------------------------------------
 
 // >>> game-thread code (Tests/policy_check.sh)
+// The threads that are inside an entry of svc_entry.s right now (it counts them in and out; Tests/hook_sim/entry_sim.py holds the assembly, ctr/hook.cpp's
+// SuspendSvcHooks waits for it to reach zero before the framework answers Luma3DS and the plugin's block is freed).
+extern "C" {
+volatile u32 azl_hooks_in_flight = 0;
+}
+
 constexpr u32 kSrvGetServiceHandle = 0x00050100;
 constexpr u32 kMaxTracedSessions = 16;
 constexpr u32 kMaxTraceLines = 160;
@@ -237,6 +275,12 @@ constexpr u32 kAptReplySleepQuery = 0x003E0080;
 constexpr u32 kAptReplySleepNotificationComplete = 0x003F0040;
 constexpr u32 kMaxAptLines = 120;
 
+// The HOME button as the game's APT session tells it (InquireNotification: 1 and 2). On an Old 3DS the swap of the plugin's memory follows within a moment, and
+// it is the game's next APT:ReceiveParameter that raises it (azl_handback_site below): that call is only handed back to its call site in the seconds after this.
+constexpr u32 kHomeWindowMs = 10000;
+volatile u32 g_home_seen = 0;
+volatile u32 g_home_ms = 0;
+
 const char* AptSignalName(u32 id) {
     static const char* const kNames[] = {"none",          "home button",      "home button (2)", "sleep query",
                                          "sleep cancelled", "sleep begins",     "wake-up",         "shutdown",
@@ -282,6 +326,10 @@ Result PassThroughApt(Handle handle) {
         const u32 id = AptSignalOf(raw); // (the low 16 bits: Mario Party: The Top 100 gets 0x1BC00001 for the HOME button)
         if (id == 0) {
             return rc; // (polled all the time: only the notifications themselves are of interest)
+        }
+        if (id == 1 || id == 2) {
+            g_home_ms = static_cast<u32>(platform::NowMs());
+            g_home_seen = 1;
         }
         if (g_apt_observer && g_debug_level > 0 && R_SUCCEEDED(rc)) {
             g_apt_observer(kAptNoteNotification, id); // (before the sleep observer below acts on it)
@@ -460,13 +508,63 @@ extern "C" Result azl_hook_CloseHandle(Handle handle) {
     }
     return svcCloseHandle(handle);
 }
+
+// Called by azl_svc32_entry (svc_entry.s) before it makes an APT:ReceiveParameter(application) call, with the trampoline's return address: the call at whose end
+// Luma3DS's kernel raises the swap of the plugin's block on an Old 3DS, on the calling thread, which it then puts to sleep until the block is gone and back.
+// Returns the call site the game's thread must go back to (its svc and next instruction are the game's own again) to make the call itself, or 0 to make it here.
+// A few loads on every path but the one answer: no printf, no wait, and the frame is held by Tests/stack_usage.sh.
+extern "C" u32 azl_handback_site(Handle, u32 tramp_return) {
+    __atomic_fetch_add(&g_swap_stats.asked, 1u, __ATOMIC_RELAXED);
+    if (!g_old_3ds) {
+        return 0;
+    }
+    const u32 now = static_cast<u32>(platform::NowMs());
+    if (!g_home_seen || static_cast<u32>(now - g_home_ms) > kHomeWindowMs) {
+        __atomic_fetch_add(&g_swap_stats.no_home, 1u, __ATOMIC_RELAXED);
+        return 0;
+    }
+    const GameTextMemory memory;
+    const u32 site = HandBackSite(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, tramp_return, now);
+    __atomic_fetch_add(site ? &g_swap_stats.handbacks : &g_swap_stats.handback_refused, 1u, __ATOMIC_RELAXED);
+    return site;
+}
 // <<< game-thread code
+
+u32 RewriteStubbedGspWrappers() {
+    const u32 first = kGameTextBase;
+    const u32 text_size = CTRPluginFramework::Process::GetTextSize();
+    if (text_size < 8) {
+        return 0; // (InstallSvcHooks says so in the log when the plugin is on)
+    }
+    // A game whose GSP wrapper has its svc behind a stub (LEGO Batman 2) would make the framework abort at start: the svc is written in
+    // place of the `bl` (the same for the CPU), so that the framework finds the wrapper it knows. This must come before the framework's search
+    // (GSP::Initialize, after PatchProcess) and before FindFrameworkSites; it reads the game's .text and writes one word, so it does not need the
+    // plugin to be on: with the main switch off Luma3DS keeps the plugin loaded and the framework still runs.
+    u32 stubbed[4];
+    const u32 count = FindStubbedGspWrappers(ReadGameWord, nullptr, first, first + text_size, stubbed, 4);
+    u32 rewritten = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (CTRPluginFramework::Process::Patch(stubbed[i], kSvcSendSyncRequest)) {
+            ++rewritten;
+            Log("hook: the GSP wrapper at 0x%08lx calls its svc through a stub: the svc is now in place of the bl, so that the "
+                "framework finds the wrapper (it aborts at start otherwise)",
+                static_cast<unsigned long>(stubbed[i] - kGspWrapperCtruSvcOffset));
+        } else {
+            Log("hook: could not rewrite the bl of the GSP wrapper at 0x%08lx", static_cast<unsigned long>(stubbed[i] - kGspWrapperCtruSvcOffset));
+        }
+    }
+    g_gsp_stub_wrappers = rewritten;
+    return rewritten;
+}
 
 HookStats InstallSvcHooks(UdsHle* hle) {
     HookStats stats;
     g_hle = hle;
     g_site_count = 0;
     g_trampoline_words = 0;
+    g_old_3ds = !CTRPluginFramework::System::IsNew3DS();
+    g_hooks_state = kHooksActive;
+    LedgerClear(g_ledger);
 
     stats.text_start = kGameTextBase;
     stats.text_size = CTRPluginFramework::Process::GetTextSize();
@@ -491,22 +589,9 @@ HookStats InstallSvcHooks(UdsHle* hle) {
     const u32 send_entry = reinterpret_cast<u32>(&azl_svc32_entry);
     const u32 close_entry = reinterpret_cast<u32>(&azl_svc23_entry);
 
-    // A game whose GSP wrapper has its svc behind a stub (LEGO Batman 2) would make the framework abort at start: the svc is written in
-    // place of the `bl` (the same for the CPU), so that the framework finds the wrapper it knows. This must come before the next step.
-    {
-        u32 stubbed[4];
-        const u32 count = FindStubbedGspWrappers(ReadGameWord, nullptr, first, stats.text_start + stats.text_size, stubbed, 4);
-        for (u32 i = 0; i < count; ++i) {
-            if (CTRPluginFramework::Process::Patch(stubbed[i], kSvcSendSyncRequest)) {
-                ++stats.gsp_stub_wrappers;
-                Log("hook: the GSP wrapper at 0x%08lx calls its svc through a stub: the svc is now in place of the bl, so that the "
-                    "framework finds the wrapper (it aborts at start otherwise)",
-                    static_cast<unsigned long>(stubbed[i] - kGspWrapperCtruSvcOffset));
-            } else {
-                Log("hook: could not rewrite the bl of the GSP wrapper at 0x%08lx", static_cast<unsigned long>(stubbed[i] - kGspWrapperCtruSvcOffset));
-            }
-        }
-    }
+    // (A game whose GSP wrapper has its svc behind a stub has been dealt with already, by RewriteStubbedGspWrappers(): it runs from Plugin::EarlyInit
+    //  whether the plugin is on or off, before this, so that the search for the framework's sites below finds the wrapper as the framework does.)
+    stats.gsp_stub_wrappers = g_gsp_stub_wrappers;
 
     // The framework hooks one of the game's svc 0x32 words by itself: do not touch that one.
     FindFrameworkSites(first, stats.text_start + stats.text_size);
@@ -556,8 +641,9 @@ HookStats InstallSvcHooks(UdsHle* hle) {
     g_site_count = 0;
     for (u32 i = 0; i < pending_count; ++i) {
         const u32 patch[2] = {kSiteJumpWord, pending[i].tramp};
-        Site& site = g_sites[g_site_count];
+        HookSite& site = g_sites[g_site_count];
         site.address = pending[i].site;
+        site.tramp = pending[i].tramp;
         if (!CTRPluginFramework::Process::Patch(pending[i].site, const_cast<u32*>(patch),
                                                 sizeof(patch), site.original)) {
             ++stats.skipped_sites;
@@ -582,6 +668,93 @@ HookStats InstallSvcHooks(UdsHle* hle) {
             "(it would have read past the end of .text and crashed)",
             static_cast<unsigned long>(TextSearchTrims()));
     }
+    return stats;
+}
+
+namespace {
+
+bool TakePatchLock() {
+    return __atomic_exchange_n(&g_patch_lock, 1u, __ATOMIC_ACQUIRE) == 0;
+}
+
+void ReleasePatchLock() {
+    __atomic_store_n(&g_patch_lock, 0u, __ATOMIC_RELEASE);
+}
+
+// The threads of the plugin that change the game's sites take turns (a re-hook and a suspend must not interleave: the block would be freed with a site pointing in
+// it). The suspend and the resume wait a little; the re-hook gives up and comes back with the next frame.
+void WaitPatchLock() {
+    for (u32 i = 0; i < 2000 && !TakePatchLock(); ++i) {
+        svcSleepThread(100000);
+    }
+}
+
+constexpr s64 kSwapStepNs = 100000;   // between two looks at the counter of threads in the hook
+constexpr s64 kSwapGraceNs = 2000000; // after the last one left: the few instructions each has left in its trampoline
+
+} // namespace
+
+u32 HooksInFlight() {
+    return __atomic_load_n(&azl_hooks_in_flight, __ATOMIC_ACQUIRE);
+}
+
+void SuspendSvcHooks(u32 timeout_ms) {
+    if (g_site_count == 0) {
+        return;
+    }
+    WaitPatchLock(); // (not obtained after 200 ms: goes on without it, the block is about to go)
+    const GameTextMemory memory;
+    const u64 start = platform::NowUs();
+    g_swap_stats.in_flight = HooksInFlight();
+    SuspendSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);
+    // The threads that are inside the hook already: a call that waits in a real service, a lock of the hub. (The thread that raised the swap is not one of
+    // them: it went back to the game's code, see azl_handback_site.)
+    u32 left = HooksInFlight();
+    for (;;) {
+        const u64 waited_us = platform::NowUs() - start;
+        if (left == 0 || waited_us >= static_cast<u64>(timeout_ms) * 1000) {
+            break;
+        }
+        svcSleepThread(kSwapStepNs);
+        left = HooksInFlight();
+    }
+    svcSleepThread(kSwapGraceNs);
+    left = HooksInFlight();
+    if (left != 0) { // (one more look: a thread that was in the trampoline's first instructions when the counter was zero)
+        svcSleepThread(kSwapStepNs);
+        left = HooksInFlight();
+    }
+    const u64 waited_us = platform::NowUs() - start;
+    g_swap_stats.in_flight_left = left;
+    g_swap_stats.waited_us = waited_us > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<u32>(waited_us);
+    ReleasePatchLock();
+}
+
+void ResumeSvcHooks() {
+    if (g_site_count == 0) {
+        return;
+    }
+    WaitPatchLock();
+    const GameTextMemory memory;
+    ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);
+    ReleasePatchLock();
+}
+
+void RearmHandedBackSites() {
+    if (!LedgerAny(g_ledger) || !TakePatchLock()) {
+        return;
+    }
+    const GameTextMemory memory;
+    RearmSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);
+    ReleasePatchLock();
+}
+
+SwapStats GetSwapStats() {
+    SwapStats stats = g_swap_stats;
+    stats.handbacks = __atomic_load_n(&g_swap_stats.handbacks, __ATOMIC_RELAXED);
+    stats.handback_refused = __atomic_load_n(&g_swap_stats.handback_refused, __ATOMIC_RELAXED);
+    stats.asked = __atomic_load_n(&g_swap_stats.asked, __ATOMIC_RELAXED);
+    stats.no_home = __atomic_load_n(&g_swap_stats.no_home, __ATOMIC_RELAXED);
     return stats;
 }
 
