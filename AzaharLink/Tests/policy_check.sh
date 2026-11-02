@@ -2238,6 +2238,23 @@ done
 # but the counter. The logic is held by Tests/hook_swap_test.cpp (and Tests/hook_swap_mutants.py), the assembly by Tests/hook_sim/entry_sim.py (Tests/hook_sim/entry_mutants.py), the whole chain
 # by Tests/chain_sim/chain_sim.py; these pins hold the text of each piece.
 need Sources/ctr/svc_entry.s "SVC_ENTRY azl_svc32_entry, azl_hook_SendSyncRequest, 1" "the SendSyncRequest entry asks whether the call is the one that raises the swap"
+# The plugin's own threads around the same swap (2026-11-02): stopping a thread does not take back its service call, and a service answering with the block gone stops the console (kernel panic, process `socket`: issues 3 and 5).
+# The gate's logic is held by Tests/swap_gate_test.cpp (and Tests/swap_gate_mutants.py); these pins hold its callers, which no test on the PC runs.
+[ "$(grep -c 'azl_c_soc_enter ();' Sources/enet/enet_3ds.c)" = "12" ] || fail "Sources/enet/enet_3ds.c: the twelve socket calls that move bytes through the plugin's memory go through the gate"
+[ "$(grep -c 'azl_c_soc_leave ();' Sources/enet/enet_3ds.c)" = "13" ] || fail "Sources/enet/enet_3ds.c: every enter of the gate has its leave (the receive has two, one per branch)"
+need Sources/ctr/plugin.cpp 'CloseSwapGate(kSwapGateTimeoutMs);' "SWAP_ENTER closes the gate of the plugin's threads"
+need Sources/ctr/plugin.cpp 'OpenSwapGate();' "SWAP_EXIT opens it"
+need Sources/ctr/plugin.cpp 'OpenSwapGate(); // (a thread stopped at the gate could never be joined)' "the shutdown opens it"
+need Sources/ctr/plugin.cpp 'InitSwapGate(); // (before the threads that use it)' "the gate is set up on an Old 3DS before the threads start"
+need Sources/ctr/plugin.cpp 'const SwapGateScope gate(kGateWriter);' "a pass of the log's writer is inside the gate"
+need Sources/ctr/plugin.cpp 'const SwapGateScope gate(kGateTrail);' "the lines of the sleep's trail are inside the gate"
+need Sources/ctr/swap_gate.cpp 'if (CTRPluginFramework::System::IsNew3DS()) {' "the gate stays off on a New 3DS"
+need Sources/ctr/swap_gate.cpp 'svcWaitSynchronization(g_gate_open, -1);' "a stopped thread waits with no end, until SWAP_EXIT"
+need Sources/ctr/plugin.cpp 'log_files_->SetStopCapture(&g_swap_gate.closed);' "the capture leaves the card when the gate closes: two writes on a slow card outlast the wait"
+need Makefile '-Wl,--wrap=svcCreateThread -Wl,--wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv' "the framework's syscore worker is held off core 1 on an Old 3DS: a thread that has not begun escapes the stop at the swap"
+need Sources/ctr/thread_core.cpp 'g_moving = svcGetSystemInfo(&is_new, 0x10001, 0) != 0;' "only on an Old 3DS, by the very test of Luma's swap"
+need Sources/ctr/hook.cpp 'NoteReceiveSite(g_sites, g_site_count, g_ledger, tramp_return);' "the sites of APT:ReceiveParameter are noted while the hooks are in: at the swap back they are out"
+need Sources/ctr/plugin.cpp 'constexpr u32 kSwapGateTimeoutMs = 7000;' "the wait of the gate stays within what Luma waits for the answer (10 s, with the hooks' 1.7 s before it)"
 need Sources/ctr/svc_entry.s "SVC_ENTRY azl_svc23_entry, azl_hook_CloseHandle, 0" "CloseHandle never hands a call back"
 need Sources/ctr/svc_entry.s "bl   azl_handback_site" "the entry asks azl_handback_site before it makes the call"
 need Sources/ctr/svc_entry.s "cmpeq r3, #0x300" "the call is APT:ReceiveParameter for the application's id (Luma3DS's kernel hook tests the same)"
@@ -2258,7 +2275,7 @@ need Sources/ctr/hook.cpp '            g_home_seen = 1;' "... and is noted at ev
 need_order Sources/ctr/hook.cpp '            g_home_seen = 1;' 'if (g_apt_observer && g_debug_level > 0 && R_SUCCEEDED(rc)) {' "the HOME button is noted before anything that depends on the log level"
 need Sources/ctr/hook.cpp 'HandBackSite(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, tramp_return, now);' "the question is answered by the tested logic"
 need Sources/ctr/hook.cpp 'SuspendSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);' "SWAP_ENTER takes every site out"
-need Sources/ctr/hook.cpp 'ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);' "SWAP_EXIT puts every site back"
+need Sources/ctr/hook.cpp 'ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);' "SWAP_EXIT puts every site back"
 need Sources/ctr/hook.cpp 'RearmSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);' "a call handed back with no swap after it goes back into the hook"
 need_after Sources/ctr/hook.cpp 'void StoreOriginal(u32 address, const u32 words[2]) const {' 'Poke(address, words[0]);' "the game's svc goes back first (a thread that passes between the two stores finds svc + literal, never a jump into the second word)"
 need_after Sources/ctr/hook.cpp 'void StoreHook(u32 address, const u32 words[2]) const {' 'Poke(address + 4, words[1]);' "the literal goes in first (the jump is the last word to appear)"

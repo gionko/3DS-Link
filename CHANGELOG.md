@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.1.0 - 2026-11-02
+
+**Three fixes for the HOME button and the power button on an Old 3DS, not tried on one yet. Nothing changes for the games on a New 3DS.**
+
+> Two users with an Old 3DS sent the same crash: a `kernel panic` with `socket` as the current process, on 1.0.4 ([issue 5](https://github.com/gionko/3DS-Link/issues/5)) and on 1.0.15 ([issue 3](https://github.com/gionko/3DS-Link/issues/3)), with two different games. It is not the crash of HOME fixed in 1.0.12. These fixes were tested on a PC, on the compiled code and against a real room: **not tried on any Old 3DS or Old 2DS**, where they run. Tried on two New 2DS XL, debug log off, to see that nothing changes there: *Super Street Fighter IV 3D Edition*, a match over the internet, HOME and back, HOME and close, HOME and power off, no problems. A console with 1.0.14 or 1.0.15 is offered this version by the app; an older one installs it by hand.
+
+The number is 1.1.0 and not 1.0.16 because the third number of a 3DS title stops at 15.
+
+### At a glance
+
+| Area | Before | Now | Since |
+|---|---|---|---|
+| Old 3DS: HOME while in a room | `kernel panic`, the console stops | a fix, **not tried on an Old 3DS** | 1.1.0 |
+| Old 3DS: the log's writer and the sleep's trail at HOME | the same risk, never seen in a dump | they wait at the same gate | 1.1.0 |
+| Old 3DS: the game fails right after coming back from HOME, or when powering off from the HOME menu (`0xD8E007F7`, [issue 5](https://github.com/gionko/3DS-Link/issues/5)) | seen on 1.0.15 | a real risk removed; **it is not proven to be the cause** and it was not tried on an Old 3DS | 1.1.0 |
+| *Monster Hunter XX* on an Old 3DS | closed at launch | a user reports a whole mission on 1.0.15 (copy with a Spanish patch) | 1.0.13 |
+| *Terraria* (Europe, update 1.0.5), *Super Smash Bros. for Nintendo 3DS* (Europe) | | new in [Tested games](README.md#tested-games): **10/10**, two consoles of the New 3DS family over the internet, on 1.0.15 | |
+| Old 3DS: the framework's worker thread beginning in memory that is gone (prefetch abort at `_thread_begin`, core 1, [issue 5](https://github.com/gionko/3DS-Link/issues/5)) | seen on an Old 3DS | a fix, **not tried on an Old 3DS** | 1.1.0 |
+| New 3DS family | | the games behave as in 1.0.15: the gate stays off and the worker does not move | |
+
+### Not fixed or not tried
+
+| What | Notes |
+|---|---|
+| These fixes on an Old 3DS or Old 2DS | **not tried**: these paths do not run on a New 3DS |
+| Back from HOME on an Old 3DS, in a room | the room may have dropped the console meanwhile, and the plugin should join again: **never seen** in this situation |
+| A network call that lasts more than 7 s at that moment (a room's name with no DNS) | the swap then goes on as before this fix, so that crash remains possible there; the debug log says who was left |
+| The power button on an Old 3DS (1.0.15) | a log from an Old 3DS shows it going through; another user got a dump once, and not after a full reboot: not settled |
+| A game whose only `svc 0x32` is one shared function, on an Old 3DS | that site cannot wait out of the hook, so the risk of the swap back stays there |
+| The update on an Old 3DS or Old 2DS | **not tried**: the secure connection takes longer there, and how long is not known |
+| *Mario Tennis Open*, USA copy on an Old 3DS: "the Wi-Fi switch is off" after the online option | [issue 2](https://github.com/gionko/3DS-Link/issues/2): not confirmed fixed, not tried on an Old 3DS (the Europe copy plays between two New 2DS XL) |
+| *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
+| *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
+
+### Technical notes
+
+<details>
+<summary>The kernel panic at HOME: stopping a thread does not take back its service call</summary>
+
+**The crash.** On an Old 3DS, when a game goes to the HOME menu, Luma stops the plugin's threads and unmaps the plugin's memory. A stopped thread can still have a service call under way. The room's network thread sits in `poll()` about 91% of the time (133 windows of the log of issue 3). `socket` then answers, the kernel writes the answer into the buffer of `poll()`, which is in the plugin's heap, finds the page gone, and stops the console. So the current process is `socket`, though it did nothing wrong.
+
+**What the dump says.** The arguments on the stack are a reply with 2 normal words and 2 translated ones, to a client's static buffer of 12 bytes: one `struct pollfd`. The destination is inside the plugin's heap, and the check that failed is the first one, on the client's memory. The photo in issue 5 has the same layout.
+
+**Why 1.0.12 did not cover it.** That fix takes the game's threads out of the hook. The network thread never was in the hook, and nothing stopped it.
+
+**The fix.** A gate (`Includes/azl/swap_gate.hpp`, `Sources/ctr/swap_gate.cpp`). At `SWAP_ENTER`, after the hooks are out and before the framework answers Luma, it closes: who is inside a call is waited for, for 7 s at most (Luma waits for 10), and who comes later stops on an event until the gate opens. It covers the twelve socket calls of the network thread that move bytes through the plugin's memory (`sendto` too: the kernel reads a request's buffer when the service picks it up), a pass of the log's writer, which also leaves the card after the write in hand, and the lines of the sleep's trail. It opens at `SWAP_EXIT` and at the plugin's shutdown. On a New 3DS it is one test of a flag, since Luma swaps on an Old 3DS only.
+
+**How it was tested.** `Tests/swap_gate_test.cpp` (real threads, ThreadSanitizer) with `Tests/swap_gate_mutants.py`, a new scenario of `Tests/chain_sim/chain_sim.py` on the compiled ARM code, and `Tests/integration.sh` against a real room. Luma and the kernel are not in any of them.
+
+**The swap back.** A hook is two words: a jump and the address it jumps to. The thread that brings the block back sleeps inside the game's own `svc`, with the hooks out, and wakes up at the word after it. The framework, woken at the same moment, puts the hooks back: if it comes first, that word is the address, run as an instruction, and the game's next instruction is skipped. So the plugin notes where the game makes its `APT:ReceiveParameter`, leaves those sites to the game when the hooks go back, and hooks them 2 s later. On issue 5 a log shows an APT call with handle 0 right after the swap back, which fails with `0xD8E007F7`: this may be the cause, and it is not proven (another launch went through the same path unharmed, and the game's code was not read). A site that is only `svc; bx lr` is every call of the game, so it goes back at once: it stays exposed.
+
+**The worker that had not begun.** The plugin framework starts one idle worker on core 1. A thread there runs only when the game leaves that core some time, so it may not have begun when the game goes to HOME. Luma knows a thread of the plugin by a mark that the thread itself writes when it begins, so a thread that has not begun is not stopped, and it then begins in memory that is gone. On an Old 3DS the worker now goes to core 0, where it begins at once and is stopped with the others (`Includes/ctr/thread_core.hpp`). The move runs only on the console where Luma swaps.
+
+**In the debug log.** Back from HOME, the line `swap gate: in a service call at the start: ...` says who was inside, who was left and how long it waited.
+
+</details>
+
 ## 1.0.15 - 2026-11-02
 
 **On an Old 3DS the power button should no longer close the game: a fix, not tried on one yet. Nothing changes on a New 3DS.**

@@ -15,12 +15,15 @@
 #include "azl/rcvbuf.h"
 #include "azl/soc_plan.hpp"
 #include "azl/stats.hpp"
+#include "azl/swap_gate.hpp"
 #include "azl/text_wrap.hpp"
 #include "azl/ticks.h"
 #include "azl/wallclock.hpp"
 #include "ctr/boot_diag.hpp"
 #include "ctr/soc.hpp"
+#include "ctr/swap_gate.hpp"
 #include "ctr/teardown.hpp"
+#include "ctr/thread_core.hpp"
 
 // (libctru's weak hid function; Sources/main.cpp overrides it. No header of libctru declares it.)
 extern "C" bool hidShouldUseIrrst(void);
@@ -80,6 +83,10 @@ constexpr u32 kLogStopTimeoutMs = 400;
 // SWAP_ENTER (Old 3DS, HOME): how long the plugin waits for the game's threads that are inside the hook to leave it before it lets Luma3DS free the plugin's block.
 // Luma3DS itself waits 10 s for the answer (waitForReplyTimeout); the threads that matter leave in microseconds, the budget is for a call that waits in a real service.
 constexpr u32 kSwapDrainTimeoutMs = 1500;
+// ... and for the plugin's own threads to leave their service calls (azl/swap_gate.hpp): a poll() lasts 96 ms at most in the logs, a write of the log's writer can take a second and more on a slow card,
+// and a getaddrinfo with no DNS takes seconds. Luma3DS waits for the answer for 10 s in all, and the hooks may have used 1.7 s of them. (A call that lasts longer: the swap then goes on as it did before the gate;
+// the debug log says who was left, if the console survives it.)
+constexpr u32 kSwapGateTimeoutMs = 7000;
 
 // The WiFi MAC address of the console, as exposed by the kernel in the shared page, and the two bytes
 // after the 6 of the MAC (the link strength 0..3 and the network state; their meaning on this system is
@@ -689,6 +696,8 @@ void Plugin::StartLogWriter() {
                     } else {
                         platform::SleepMs(250);
                     }
+                    // A pass is many calls to the card with their buffers in the plugin's memory: none may be under way when an Old 3DS swaps that memory out (azl/swap_gate.hpp).
+                    const SwapGateScope gate(kGateWriter);
                     const u64 woke = platform::NowTicks();
                     // (the lateness of the wake-up: above the game's threads since 2026-10-20 it should be nil;
                     // a late wake-up now means a thread above this one held the core)
@@ -781,6 +790,7 @@ void Plugin::StartCrumbs() {
         {
             // The file is created here, with a line of its own, and not by the first event of a sleep: creating a file on the
             // card is the slowest thing the trail does, and a freeze right after the sleep query must find it written.
+            const SwapGateScope gate(kGateTrail);
             char stamp[24];
             FormatConsoleClock(osGetTime(), stamp);
             log_files_->WriteCrumb(std::string("sleep: the trail of this launch begins | tick ") +
@@ -789,6 +799,7 @@ void Plugin::StartCrumbs() {
         while (!crumb_stop_.load()) {
             const s64 wait_ns = crumbs_.watching() ? static_cast<s64>(SleepCrumbs::kPollMs) * 1000000LL : -1;
             svcWaitSynchronization(crumb_wake_, wait_ns);
+            const SwapGateScope gate(kGateTrail); // (its lines go to the card: azl/swap_gate.hpp)
             if (crumb_stop_.load()) {
                 break;
             }
@@ -1532,7 +1543,6 @@ void Plugin::NoteProcessEvent(int event) {
     // (the framework's keep-alive thread, 4 KB of stack: flag stores and the swap below, nothing that formats or takes a lock of the log)
     if (event >= 0 && event < kProcessEvents) {
         event_ms_[event] = static_cast<u32>(platform::NowMs());
-        event_count_[event] = event_count_[event] + 1;
         if (event == kEventSleepEnter || event == kEventSleepExit) {
             // (the trail of the sleep: a few stores and one event signal)
             NoteSleepEvent(event == kEventSleepEnter ? SleepCrumbs::kFwEnter : SleepCrumbs::kFwExit, 0);
@@ -1542,9 +1552,15 @@ void Plugin::NoteProcessEvent(int event) {
             // Every call site goes back to the game's own words and the threads still inside the hook are waited for (the thread that raised the swap
             // is not one of them: it went back to the game's code, azl_handback_site). The line about it comes with the event's, from the writer.
             SuspendSvcHooks(kSwapDrainTimeoutMs);
+            // Then the plugin's own threads: a service answering a call of theirs with the block gone stops the console (kernel panic, process `socket`). After the hooks: a game's thread in the
+            // hook may wait for what a thread stopped at the gate holds.
+            CloseSwapGate(kSwapGateTimeoutMs);
         } else if (event == kEventSwapExit) {
             ResumeSvcHooks(); // (the block is back, byte for byte: the sites take their old trampolines again)
+            OpenSwapGate();
         }
+        // Last: the writer reports an event once, when it sees the count change, and the HOME button has just woken it. Counted before the gate closes, it could print the numbers of the swap before this one.
+        event_count_[event] = event_count_[event] + 1;
     }
 }
 
@@ -1579,6 +1595,12 @@ void Plugin::LogProcessEvents() {
         if (i == kEventSwapEnter || i == kEventSwapExit) {
             const SwapStats swap = GetSwapStats();
             if (i == kEventSwapEnter) {
+                const SwapGateStats& gate = g_swap_gate.stats;
+                Log("swap gate: in a service call at the start: network %lu, log writer %lu, trail %lu | left: network %lu, log writer %lu, trail %lu | waited %lu us | %lu stop(s) at the gate so far",
+                    static_cast<unsigned long>(gate.inside_start / kGateNet & 0xFF), static_cast<unsigned long>(gate.inside_start / kGateWriter & 0xFF),
+                    static_cast<unsigned long>(gate.inside_start / kGateTrail & 0xFF), static_cast<unsigned long>(gate.inside_left / kGateNet & 0xFF),
+                    static_cast<unsigned long>(gate.inside_left / kGateWriter & 0xFF), static_cast<unsigned long>(gate.inside_left / kGateTrail & 0xFF),
+                    static_cast<unsigned long>(gate.waited_us), static_cast<unsigned long>(g_swap_gate.stops));
                 Log("hook swap: %lu call sites given back to the game (%lu not ours), %lu thread(s) in the hook at the start and %lu left after %lu us | "
                     "%lu call(s) handed back to their call site so far (%lu refused), %lu APT:ReceiveParameter asked about (%lu with no HOME or power button seen)",
                     static_cast<unsigned long>(swap.restored), static_cast<unsigned long>(swap.not_ours),
@@ -1587,8 +1609,8 @@ void Plugin::LogProcessEvents() {
                     static_cast<unsigned long>(swap.handback_refused), static_cast<unsigned long>(swap.asked),
                     static_cast<unsigned long>(swap.no_home));
             } else {
-                Log("hook swap: %lu call sites back in the hook (%lu re-armed without a swap so far)", static_cast<unsigned long>(swap.hooked_again),
-                    static_cast<unsigned long>(swap.rearmed));
+                Log("hook swap: %lu call sites back in the hook, %lu of APT:ReceiveParameter left to the game for 2 s (%lu re-armed so far)", static_cast<unsigned long>(swap.hooked_again),
+                    static_cast<unsigned long>(swap.kept_out), static_cast<unsigned long>(swap.rearmed));
             }
         }
     }
@@ -1642,6 +1664,7 @@ void Plugin::EarlyInit() {
     bootdiag::Begin(); // (the diagnostic build only: the state of the process before we touch anything, on the card at once)
     log_files_.reset(new LogFiles(file_layer_.get(), kDataDir, start_ms_));
     log_files_->SetConsoleClock(&ConsoleClockMs); // (the first line of every capture file)
+    log_files_->SetStopCapture(&g_swap_gate.closed); // (the writer leaves the card when an Old 3DS is about to swap the block out)
     SetLogSink([this](const char* line) { log_files_->Append(line); });
 
     // The settings come first. Two of them have to be known BEFORE the game runs and before the first line is
@@ -1711,6 +1734,8 @@ void Plugin::EarlyInit() {
             Log("plugin block: the framework's header is not available");
         }
     }
+    // (ctr/thread_core.hpp: on an Old 3DS a worker that has not begun would escape the stop of the plugin's threads at the swap)
+    Log("threads: %lu framework start-up thread(s) moved from core 1 to core 0", static_cast<unsigned long>(threadcore::FrameworkThreadsMoved()));
     clock_base_os_ms_ = osGetTime();
     clock_base_ms_ = start_ms_;
     // Before the game's own start-up (this runs ahead of its first instruction): what the plugin
@@ -2266,6 +2291,7 @@ void Plugin::LateInit() {
     // Open the log files and write what was recorded before the file system was usable. With debug=0 this does
     // nothing at all: no file is created.
     log_files_->Open();
+    InitSwapGate(); // (before the threads that use it)
     StartLogWriter();
 
     const bool loaded = LoadConfig();
@@ -2340,6 +2366,7 @@ void Plugin::Shutdown() {
     }
     shut_down_ = true;
     shutting_down_.store(true);
+    OpenSwapGate(); // (a thread stopped at the gate could never be joined)
     // The lines nobody has reported yet - the EXIT event above all: the writer reports it too if it wakes first, and
     // whichever of the two comes first logs it once - come before 'shutdown: begin', so that the end of a log reads in
     // the order it happened.

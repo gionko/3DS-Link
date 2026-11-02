@@ -83,6 +83,10 @@ public:
     /// of it, however long it takes). Returns true when the pass stopped at its bounds with records left in the ring: the
     /// writer then comes back soon instead of after its usual pause.
     bool DrainDebug(bool final);
+    /// While `*flag` is not zero, a pass of the capture does not begin and stops after the write in hand, with what is left kept in the ring (`final` passes
+    /// are not stopped). The plugin gives it the gate of its threads (azl/swap_gate.hpp): the writer must leave the card before an Old 3DS swaps the block out, and on a
+    /// slow card (~40 KB/s) two writes of a pass and the flush outlast what the swap can wait.
+    void SetStopCapture(const volatile u32* flag) { stop_capture_ = flag; }
     /// Is a pass of the capture due now? `ring_used` is how much the ring holds (DebugRingUsedBytes), `early` that something asks for it at
     /// once. The writer asks every time it wakes (every 250 ms at level 1) and only passes when this says so: see LogFileLimits::capture_every_ms.
     bool CaptureDue(u64 now_ms, u32 ring_used, bool early) const;
@@ -201,6 +205,7 @@ private:
     void* crumb_file_ = nullptr;
     Ticks64 card_wait_ticks_ = 0;
     u64 last_capture_ms_ = 0;      ///< when the last pass of the capture began (atomic accesses; 0: none yet, so the first is due at once)
+    const volatile u32* stop_capture_ = nullptr; ///< see SetStopCapture
     u64 shutdown_deadline_ms_ = 0; ///< 0: the launch is not ending; else the time the capture stops writing (atomic accesses)
 };
 

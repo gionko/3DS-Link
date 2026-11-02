@@ -10,10 +10,16 @@
 //   * any other thread that happens to be in the hook (a call that blocks in a real service, a lock of the Download Play hub): the hooks are taken out of the
 //     game when the framework tells the plugin that the swap is about to happen (SuspendSites), the threads already inside are waited for (ctr/hook.cpp counts them),
 //     and the hooks are put back when the block is back (ResumeSites).
+//   * THE thread that brings the block back: the same kernel code, at the end of the game's own APT:ReceiveParameter while the game is in the HOME menu, with the hooks out. It wakes up at
+//     the word after its svc, and the framework, woken at the same moment, puts the hooks back: with the hook in, that word is the trampoline's address, run as an instruction in place of the game's
+//     next one. So the sites where a ReceiveParameter was seen stay the game's when the hooks go back, and take the hook later (ResumeSites, RearmSites). A site that is only `svc; bx lr` is every call
+//     of the game (some games have one such site and no other): it cannot wait out of the hook, a fake session would go to the kernel; there the risk stays.
+// (The plugin's own threads have their own gate: azl/swap_gate.hpp.)
 // Everything here is plain code over an injected memory (`Mem`), so that the host tests can run it against an array.
 #pragma once
 
 #include "azl/common.hpp"
+#include "azl/gsp_wrapper.hpp"
 #include "azl/svc_patch.hpp"
 
 namespace azl {
@@ -36,6 +42,7 @@ constexpr u32 kRearmDelayMs = 2000;
 struct HandBackLedger {
     volatile u32 slot[kMaxHandedBack] = {}; ///< site index + 1, 0 = free (a slot is claimed with a compare-and-swap: two game threads can come at once)
     volatile u32 last_ms = 0;
+    volatile u32 receive[kMaxHandedBack] = {}; ///< the sites of APT:ReceiveParameter (site index + 1, 0 = free), for the whole launch: see ResumeSites
 };
 
 struct SwapStats {
@@ -52,6 +59,7 @@ struct SwapStats {
     u32 rearmed = 0;        ///< handed-back sites that went back into the hook with no swap
     u32 asked = 0;          ///< APT:ReceiveParameter(application) calls the entry asked about (on every console: this one is how the log tells the New 3DS from the Old)
     u32 no_home = 0;        ///< ... of which, on an Old 3DS, with no HOME or power button seen in the last seconds: left with the hook
+    u32 kept_out = 0;       ///< sites of APT:ReceiveParameter the last resume left to the game for a while
 };
 
 template <class Mem>
@@ -112,6 +120,36 @@ inline void LedgerClear(HandBackLedger& ledger) {
     }
 }
 
+/// Remembers where the game makes its APT:ReceiveParameter: the svc of the thread that brings the block back is there (see the top of this file). Runs on the GAME's thread, like HandBackSite.
+inline void NoteReceiveSite(const HookSite* sites, u32 count, HandBackLedger& ledger, u32 tramp_return) {
+    const u32 index = FindSiteIndex(sites, count, tramp_return);
+    if (index == kNoSite || sites[index].original[1] == kBxLrWord) {
+        return;
+    }
+    for (u32 i = 0; i < kMaxHandedBack; ++i) {
+        const u32 entry = __atomic_load_n(&ledger.receive[i], __ATOMIC_ACQUIRE);
+        if (entry == index + 1) {
+            return;
+        }
+        u32 expected = 0;
+        if (entry == 0 && __atomic_compare_exchange_n(&ledger.receive[i], &expected, index + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+        if (expected == index + 1) {
+            return;
+        }
+    }
+}
+
+inline bool IsReceiveSite(const HandBackLedger& ledger, u32 index) {
+    for (u32 i = 0; i < kMaxHandedBack; ++i) {
+        if (__atomic_load_n(&ledger.receive[i], __ATOMIC_ACQUIRE) == index + 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// The game's thread that is about to make the APT:ReceiveParameter that may raise the swap goes back to its call site with the game's own `svc` and next
 /// instruction in it. Returns the address of the call site, or 0 when the call stays with the hook (hooks out already, the trampoline is not one of ours, a site
 /// somebody else changed, no room in the ledger).
@@ -167,22 +205,30 @@ inline u32 SuspendSites(Mem& m, HookSite* sites, u32 count, HandBackLedger& ledg
     return restored;
 }
 
-/// SWAP_EXIT: the sites that hold the game's own words go back into the hook, and the hook is active again. Returns how many.
+/// SWAP_EXIT: the sites that hold the game's own words go back into the hook, and the hook is active again. Returns how many. The sites of APT:ReceiveParameter wait: the thread that
+/// brought the block back may be about to wake up at one of them. They go into the ledger, and RearmSites hooks them `kRearmDelayMs` from now.
 template <class Mem>
-inline u32 ResumeSites(Mem& m, HookSite* sites, u32 count, HandBackLedger& ledger, volatile u32* state, SwapStats* stats) {
+inline u32 ResumeSites(Mem& m, HookSite* sites, u32 count, HandBackLedger& ledger, volatile u32* state, u32 now_ms, SwapStats* stats) {
+    LedgerClear(ledger);
     u32 again = 0;
+    u32 kept = 0;
     for (u32 i = 0; i < count; ++i) {
         if (SiteIsOriginal(m, sites[i])) {
+            if (IsReceiveSite(ledger, i) && LedgerAdd(ledger, i)) {
+                ++kept;
+                continue;
+            }
             const u32 words[2] = {kSiteJumpWord, sites[i].tramp};
             m.StoreHook(sites[i].address, words);
             ++again;
         }
     }
+    __atomic_store_n(&ledger.last_ms, now_ms, __ATOMIC_RELEASE);
     m.Sync();
-    LedgerClear(ledger);
     if (stats) {
         ++stats->resumes;
         stats->hooked_again = again;
+        stats->kept_out = kept;
     }
     __atomic_store_n(state, kHooksActive, __ATOMIC_RELEASE); // (last: a hand-back before this would find sites half done)
     return again;
