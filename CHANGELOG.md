@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.0.15 - 2026-11-02
+
+**On an Old 3DS the power button should no longer close the game: a fix, not tried on one yet. Nothing changes on a New 3DS.**
+
+> A user with an Old 3DS confirms that, with 1.0.14, HOME no longer closes the game: the first confirmation on a real Old 3DS of the fix in 1.0.12. The same user reports that the power button still did, and sent a Luma dump. This fix was tested on a PC only, on the compiled code: **not tried on any Old 3DS or Old 2DS**. A console with 1.0.14 is offered this version by the app; an older one installs it by hand.
+
+### At a glance
+
+| Area | Before | Now | Since |
+|---|---|---|---|
+| Old 3DS: the power button with the plugin enabled | closed the game | a fix, **not tried on an Old 3DS** | 1.0.15 |
+| Old 3DS: HOME with the plugin enabled | closed the game | a user confirms it no longer does (on 1.0.14) | 1.0.12 |
+| New 3DS family | | the games behave as in 1.0.14 | |
+
+### Not fixed or not tried
+
+| What | Notes |
+|---|---|
+| The fix for the power button on an Old 3DS or Old 2DS | **not tried**: this path does not run on a New 3DS |
+| The update on an Old 3DS or Old 2DS | **not tried**: the secure connection takes longer there, and how long is not known |
+| *Monster Hunter XX* on an Old 3DS | the fix **has not been tried** there: [issue 3](https://github.com/gionko/3DS-Link/issues/3), [issue 2](https://github.com/gionko/3DS-Link/issues/2) |
+| *Mario Tennis Open*, USA copy on an Old 3DS: "the Wi-Fi switch is off" after the online option | [issue 2](https://github.com/gionko/3DS-Link/issues/2): not confirmed fixed, not tried on an Old 3DS (the Europe copy plays between two New 2DS XL) |
+| *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) | on one console (a New 3DS XL): [Known limits](README.md#known-limits) |
+| *Balloon Fight* (Virtual Console) closes at startup | the plugin framework aborts in Virtual Console games: a known limit |
+
+### Technical notes
+
+<details>
+<summary>The power button: why the fix for HOME did not cover it</summary>
+
+**The dump.** The game's main thread wakes up at the return of `svcSendSyncRequest` in the plugin's memory, which is no longer mapped, with the game's `APT:ReceiveParameter` on its stack. It is the case of HOME: on an Old 3DS Luma swaps the plugin's memory out at the end of that call, on the thread that made it, so a call made from the plugin's code wakes up in nothing.
+
+**The cause.** Since 1.0.12 that call goes back to the game's own call site, but only in the seconds after a HOME button was seen: the notifications 1 and 2. The power button sends 8 and then 9, about 0.6 s later, as the logs of real consoles show. Its dialog belongs to the HOME menu, so Luma swaps in the same way, and the plugin was not ready for it.
+
+**The fix.** `AptSignalPrecedesSwap` (`Includes/azl/apt_sleep.hpp`) holds 1, 2, 8 and 9. On a New 3DS the call is never handed back, so nothing changes for the game. A new scenario of `Tests/chain_sim/chain_sim.py` runs the compiled code with the reply word of a real console: it fails on 1.0.14 and passes on 1.0.15.
+
+**What is not known.** Reading Luma's source, the swap happens at every `COMMAND_RESPONSE`, so library applets on an Old 3DS (the software keyboard, the Mii selector) may fall in the same way: nobody has reported it, and they were not touched.
+
+</details>
+
 ## 1.0.14 - 2026-11-01
 
 **3DS Link now updates itself: it tells you when a new version is out, installs it and starts again.**

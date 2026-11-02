@@ -275,7 +275,7 @@ constexpr u32 kAptReplySleepQuery = 0x003E0080;
 constexpr u32 kAptReplySleepNotificationComplete = 0x003F0040;
 constexpr u32 kMaxAptLines = 120;
 
-// The HOME button as the game's APT session tells it (InquireNotification: 1 and 2). On an Old 3DS the swap of the plugin's memory follows within a moment, and
+// The HOME button and the power button as the game's APT session tells them (InquireNotification, AptSignalPrecedesSwap). On an Old 3DS the swap of the plugin's memory follows within a moment, and
 // it is the game's next APT:ReceiveParameter that raises it (azl_handback_site below): that call is only handed back to its call site in the seconds after this.
 constexpr u32 kHomeWindowMs = 10000;
 volatile u32 g_home_seen = 0;
@@ -327,7 +327,7 @@ Result PassThroughApt(Handle handle) {
         if (id == 0) {
             return rc; // (polled all the time: only the notifications themselves are of interest)
         }
-        if (id == 1 || id == 2) {
+        if (AptSignalPrecedesSwap(id)) {
             g_home_ms = static_cast<u32>(platform::NowMs());
             g_home_seen = 1;
         }

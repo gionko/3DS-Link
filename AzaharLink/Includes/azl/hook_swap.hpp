@@ -51,7 +51,7 @@ struct SwapStats {
     u32 handback_refused = 0; ///< hand-backs that were asked for and could not be done
     u32 rearmed = 0;        ///< handed-back sites that went back into the hook with no swap
     u32 asked = 0;          ///< APT:ReceiveParameter(application) calls the entry asked about (on every console: this one is how the log tells the New 3DS from the Old)
-    u32 no_home = 0;        ///< ... of which, on an Old 3DS, with no HOME button seen in the last seconds: left with the hook
+    u32 no_home = 0;        ///< ... of which, on an Old 3DS, with no HOME or power button seen in the last seconds: left with the hook
 };
 
 template <class Mem>

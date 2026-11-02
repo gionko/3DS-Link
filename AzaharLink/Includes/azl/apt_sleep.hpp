@@ -28,6 +28,12 @@ inline u32 AptSignalOf(u32 reply_word) {
     return reply_word & 0xFFFFu;
 }
 
+/// The signals after which the game goes to the HOME menu's side of the system: the HOME button (1 and 2) and the power button (8 and 9, about 0.6 s apart on a
+/// console: its dialog is the HOME menu's). On an Old 3DS the swap of the plugin's memory follows either of them, at the end of the game's next APT:ReceiveParameter.
+inline bool AptSignalPrecedesSwap(u32 signal) {
+    return signal == 1 || signal == 2 || signal == 8 || signal == 9;
+}
+
 /// What a finished APT call means for the sleep protocol. `request_header` is the header the game sent,
 /// `reply` the command buffer after the call: [1] the result, [2] the notification (0 = none).
 // >>> game-thread code (Tests/policy_check.sh: no printf family, no Log()/DebugEvent() with a format, no big buffer)

@@ -543,6 +543,16 @@ static void TestAptSleepEvents() {
     CHECK(AptSleepEventOf(0x000B0040, none) == AptSleepEvent::None);
     CHECK(AptSleepEventOf(0x000B0040, home) == AptSleepEvent::None);
     CHECK(AptSleepEventOf(0x000B0040, failed) == AptSleepEvent::None);
+    // What comes before the swap of the plugin's memory on an Old 3DS: the HOME button and the power button (the logs of a New 3DS: 8, then 9; on an Old 3DS a
+    // power button with only 1 and 2 here left the thread in the hook and it woke up in unmapped memory), and nothing else: sleep, shutdown and "order to close" do not.
+    for (const u32 signal : {1u, 2u, 8u, 9u}) {
+        CHECK(AptSignalPrecedesSwap(signal));
+    }
+    for (const u32 signal : {0u, 3u, 4u, 5u, 6u, 7u, 10u, 11u, 12u, 0xFFFFu}) {
+        CHECK(!AptSignalPrecedesSwap(signal));
+    }
+    CHECK(AptSignalPrecedesSwap(AptSignalOf(0x1BC00008))); // the reply word of a real console for the power button, bits above the signal included
+    CHECK(AptSignalPrecedesSwap(AptSignalOf(0x1BC00001)));
     // bits above the signal (Mario Party: The Top 100 got 0x1BC00001 for the HOME button on a console, 2026-10-14): the signal is the low 16 bits
     const u32 enter_hi[] = {0x000B0080, 0, 0x1BC00005}, wake_hi[] = {0x000B0080, 0, 0x1BC00006}, home_hi[] = {0x000B0080, 0, 0x1BC00001},
               only_hi[] = {0x000B0080, 0, 0x1BC00000};

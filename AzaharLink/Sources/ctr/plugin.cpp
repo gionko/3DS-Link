@@ -1580,7 +1580,7 @@ void Plugin::LogProcessEvents() {
             const SwapStats swap = GetSwapStats();
             if (i == kEventSwapEnter) {
                 Log("hook swap: %lu call sites given back to the game (%lu not ours), %lu thread(s) in the hook at the start and %lu left after %lu us | "
-                    "%lu call(s) handed back to their call site so far (%lu refused), %lu APT:ReceiveParameter asked about (%lu with no HOME button seen)",
+                    "%lu call(s) handed back to their call site so far (%lu refused), %lu APT:ReceiveParameter asked about (%lu with no HOME or power button seen)",
                     static_cast<unsigned long>(swap.restored), static_cast<unsigned long>(swap.not_ours),
                     static_cast<unsigned long>(swap.in_flight), static_cast<unsigned long>(swap.in_flight_left),
                     static_cast<unsigned long>(swap.waited_us), static_cast<unsigned long>(swap.handbacks),

@@ -967,6 +967,71 @@ def scenario_handback(elf, level):
         record('APT ReceiveParameter, %s' % what, level, depth2, BUDGET_PURE, 'pure')
 
 
+def scenario_power_handback(elf, level):
+    """The power button on an Old 3DS (a Luma dump of 2026-11-01: a prefetch abort at the `bx lr` of svcSendSyncRequest in the plugin's unmapped memory, with the game's
+    APT:ReceiveParameter on the stack): the notification of the power button must make the next ReceiveParameter go back to its call site, as the HOME button does.
+    The real compiled code from the entry down: before the notification the call stays in the hook, a notification that does not come before a swap (shutdown) changes
+    nothing, and the reply word of a real console for the power button (0x1BC00008, bits above the signal included) arms the hand-back."""
+    site = 0x00200000
+    original = (0xEF000032, 0xE1A00001)
+    tramp = STUB_RET - 8
+    game_lr = 0x00123454
+    sim = Sim(elf, level, hle=True)
+    uc = sim.uc
+    uc.mem_map(site, 0x1000)
+    p32(uc, site, 0xE51FF004)
+    p32(uc, site + 4, tramp)
+    for i, w in enumerate((site, original[0], original[1], tramp)):
+        p32(uc, elf.find('g_sites') + 4 * i, w)
+    p32(uc, elf.find('g_site_count'), 1)
+    uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', 1))
+    p32(uc, elf.find('g_home_seen'), 0)
+    seen = elf.find('g_home_seen')
+    stats = elf.find('g_swap_stats')
+    sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1D0041])
+    sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('APT:U'))) + [5, 0])
+    sim.enter('azl_svc32_entry', 0x14801F, 'getservice APT:U')
+    apt = 0x1D0041
+    # what the dump shows: no HOME button, so the plugin makes the svc itself and the thread sleeps in the kernel inside the plugin's code
+    sim.kernel = srv_reply([0x000D0040, 0])
+    sim.set_request([0x000D0080, 0x300])
+    n32 = sim.svc_log.count(0x32)
+    sim.enter('azl_svc32_entry', apt, 'receive parameter, before the power button')
+    check(sim.svc_log.count(0x32) == n32 + 1, 'power: before the notification the plugin makes the svc itself')
+    check(r32(uc, site) == 0xE51FF004 and r32(uc, site + 4) == tramp, 'power: before the notification the call site stays in the hook')
+    for word, armed, what in ((7, 0, 'shutdown'), (0x1BC00008, 1, 'the power button, as a console says it')):
+        sim.kernel = srv_reply([0x000B0080, 0, word])
+        sim.set_request([0x000B0040, 0x300])
+        sim.enter('azl_svc32_entry', apt, 'apt inquire, %s' % what)
+        check(r32(uc, seen) == armed, 'power: after the notification of %s the hand-back is %s' % (what, 'armed' if armed else 'not armed'))
+    sim.set_request([0x000D0080, 0x300])
+    sim.reset_game_stack(False)
+    sim.scenario = 'power hand-back'
+    sim.roomy = False
+    p32(uc, ENTRY_SP, game_lr)
+    uc.reg_write(UC_ARM_REG_R0, apt)
+    uc.reg_write(UC_ARM_REG_SP, ENTRY_SP)
+    uc.reg_write(UC_ARM_REG_LR, STUB_RET)
+    sim.min_sp = ENTRY_SP
+    sim.measuring = True
+    sim.entry_sp = ENTRY_SP
+    sim.end_addr = site
+    n32 = sim.svc_log.count(0x32)
+    try:
+        sim.run_game(elf.sym('azl_svc32_entry'))
+    except UcError as e:
+        check(False, 'power: emulation error %s at pc=%08x (%s)' % (e, sim.pc, sim.where(sim.pc)))
+        return
+    finally:
+        sim.measuring = False
+        sim.end_addr = STUB_RET
+    check(uc.reg_read(UC_ARM_REG_PC) == site, 'power: the thread is at the call site (pc=%08x)' % uc.reg_read(UC_ARM_REG_PC))
+    check(sim.svc_log.count(0x32) == n32, 'power: the plugin did not make the svc 0x32 itself')
+    check(uc.reg_read(UC_ARM_REG_LR) == game_lr, "power: lr is the game's")
+    check(r32(uc, site) == original[0] and r32(uc, site + 4) == original[1], "power: the call site has the game's own svc and next instruction")
+    check(r32(uc, stats + 4 * 8) == 1 and r32(uc, stats + 4 * 9) == 0, 'power: one call handed back, none refused')
+
+
 def scenario_apt(elf, level):
     sim = Sim(elf, level, hle=True)
     uc = sim.uc
@@ -2034,6 +2099,7 @@ def main():
         scenario_traced(elf, level)
         scenario_apt(elf, level)
         scenario_handback(elf, level)
+        scenario_power_handback(elf, level)
         scenario_hle_front(elf, level)
         scenario_throttle(elf, level)
         scenario_log_cost(elf, level)

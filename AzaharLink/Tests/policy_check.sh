@@ -2252,7 +2252,8 @@ need Sources/ctr/hook.cpp '    if (!g_old_3ds) {' "a call is handed back only on
 need Sources/ctr/hook.cpp 'if (!g_home_seen || static_cast<u32>(now - g_home_ms) > kHomeWindowMs) {' "... and after a HOME button was seen, in the last seconds"
 need Sources/ctr/hook.cpp 'g_old_3ds = !CTRPluginFramework::System::IsNew3DS();' "the console is asked once, at the start"
 need Sources/ctr/hook.cpp 'constexpr u32 kHomeWindowMs = 10000;' "a HOME button is news for ten seconds"
-need_after Sources/ctr/hook.cpp 'if (id == 1 || id == 2) {' 'g_home_ms = static_cast<u32>(platform::NowMs());' "the HOME notification stamps the time ..."
+need_after Sources/ctr/hook.cpp 'if (AptSignalPrecedesSwap(id)) {' 'g_home_ms = static_cast<u32>(platform::NowMs());' "the HOME and power notifications stamp the time ..."
+need Includes/azl/apt_sleep.hpp 'return signal == 1 || signal == 2 || signal == 8 || signal == 9;' "the power button comes before the swap too (a dump from an Old 3DS: the thread woke up in unmapped memory)"
 need Sources/ctr/hook.cpp '            g_home_seen = 1;' "... and is noted at every debug level"
 need_order Sources/ctr/hook.cpp '            g_home_seen = 1;' 'if (g_apt_observer && g_debug_level > 0 && R_SUCCEEDED(rc)) {' "the HOME button is noted before anything that depends on the log level"
 need Sources/ctr/hook.cpp 'HandBackSite(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, tramp_return, now);' "the question is answered by the tested logic"
@@ -2278,6 +2279,7 @@ need Includes/azl/hook_swap.hpp 'constexpr u32 kRearmDelayMs = 2000;' "a site ha
 need Tests/stack_usage.sh '"$PY" Tests/hook_sim/entry_sim.py "$WORK/sim" || FAILED=1' "the stack check runs the assembly entry in the emulator"
 need Tests/stack_usage.sh 'budget hook "azl_handback_site" 48' "the question of the entry is held to a small frame"
 need Tests/chain_sim/chain_sim.py 'def scenario_handback(elf, level):' "the whole-chain test has the hand-back scenario ..."
+need Tests/chain_sim/chain_sim.py '        scenario_power_handback(elf, level)' "the whole-chain test runs the power button of the Old 3DS's dump"
 need Tests/chain_sim/chain_sim.py '        scenario_handback(elf, level)' "... and runs it on the built plugin"
 need Tests/hook_sim/entry_sim.py 'scenario_receive(0x00123450, seed, counter0, mis)' "the entry test runs the hand-back"
 
