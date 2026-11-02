@@ -158,6 +158,10 @@ public:
     void SetStateCallback(std::function<void(State, Error)> cb);
     /// Called from the network thread every time the room sends its information (members, games).
     void SetRoomInfoCallback(std::function<void(const room::RoomInfo&)> cb);
+    /// Called from the network thread for every chat line another member sends (nickname, message; neither is cleaned: whoever shows it must).
+    void SetChatCallback(std::function<void(const std::string&, const std::string&)> cb);
+    /// Sends a chat line to the room (any thread, any time after Start(); dropped while the client is idle). Reliable and ordered.
+    void SendChat(const std::string& message);
 
     /// Changes the game shown next to our name in the room (any time after Start()).
     void UpdateGameInfo(const std::string& name, u64 id);
@@ -201,6 +205,7 @@ private:
     std::atomic<u32> cb_generation_{0}; // bumped by every setter above: the network loop copies the callbacks again
     std::function<void(State, Error)> state_cb_;
     std::function<void(const room::RoomInfo&)> room_info_cb_;
+    std::function<void(const std::string&, const std::string&)> chat_cb_;
 
     platform::Thread thread_;
 };

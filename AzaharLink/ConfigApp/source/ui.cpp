@@ -249,6 +249,17 @@ void App::SaveServers() {
     }
 }
 
+void App::SelectServerList(int list) {
+    if (list < 1 || list > setup::kServerLists) {
+        return;
+    }
+    server_list = list;
+    paths.servers_file = setup::JoinPath(paths.datadir, setup::ServersFileName(list));
+    servers = setup::ServerList();
+    const setup::LoadResult loaded = setup::LoadServers(paths.servers_file, servers);
+    servers_writable = loaded != setup::LoadResult::Unreadable; // (a file that could not be read is never written over)
+}
+
 void App::SaveAppConfig() {
     if (!app_cfg.first_start_done) {
         return; // (the first start is not over: the file's absence is what keeps it going)

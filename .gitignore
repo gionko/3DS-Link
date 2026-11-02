@@ -1,5 +1,6 @@
 # build products
 Build/
+.ccache/
 build/
 out/
 work/
@@ -13,6 +14,8 @@ work/
 *.3gx
 *.cia
 *.bnr
+*.py
+*.bak
 # generated resources of the app (build_all.sh makes them)
 AzaharLink/ConfigApp/data/AzaharLink.3gx
 AzaharLink/ConfigApp/data/child_model.bin

@@ -239,6 +239,19 @@ protected:
         active.host = g.cfg.host;
         active.port = g.cfg.port;
         const std::vector<setup::Server>& servers = g.servers.entries();
+        {
+            Row list;
+            list.id = kList;
+            list.kind = Kind::Action;
+            list.label = Fmt("List %d of %d", g.server_list, setup::kServerLists);
+            list.value = setup::ServersFileName(g.server_list);
+            list.mark = Mark::Slot;
+            list.gap = 6.0f;
+            list.note_title = "Room lists";
+            list.note = "A: open the next list (servers.txt, servers2.txt ... servers10.txt). Each list keeps 10 rooms. The ROOMS button in the game "
+                        "(chat build) shows the same lists and joins a room from any of them.";
+            rows.push_back(list);
+        }
         for (std::size_t i = 0; i < servers.size(); ++i) {
             const bool in_use = servers[i].Same(active);
             Row row;
@@ -265,21 +278,35 @@ protected:
                    "A page with the room's name, address, port and password. The new room is tested at once and, when it answers, used from "
                    "now on. The list keeps 10 rooms.";
         rows.push_back(add);
+        Row lobby;
+        lobby.id = kLobby;
+        lobby.kind = Kind::Action;
+        lobby.label = "Browse public rooms...";
+        lobby.mark = Mark::Slot;
+        lobby.note_title = "Public rooms";
+        lobby.note = "The rooms of an Azahar lobby server (its web API address): pick one and it is tested and used, like a room added by hand.";
+        rows.push_back(lobby);
     }
 
     void Activate(const Row& row, int step) override {
         if (step != 0) {
             return;
         }
-        if (row.id == kAdd) {
+        if (row.id == kList) {
+            g.SelectServerList(g.server_list % setup::kServerLists + 1);
+            list_.sel = 0;
+            list_.follow = true;
+        } else if (row.id == kAdd) {
             AddServer();
+        } else if (row.id == kLobby) {
+            PushPage(pages::NewLobbyPage());
         } else if (row.id >= kServerBase) {
             Use(static_cast<std::size_t>(row.id - kServerBase));
         }
     }
 
 private:
-    enum Id { kAdd = 1, kServerBase = 100 };
+    enum Id { kAdd = 1, kLobby = 2, kList = 3, kServerBase = 100 };
 
     // The ini keeps the room 3DS Link joins (with its password); the list only remembers rooms.
     void Select(const setup::Server server) { // (by value: the list is rearranged below)
@@ -293,7 +320,7 @@ private:
         if (g.servers.Use(server)) {
             g.SaveServers();
         }
-        list_.sel = 0; // the room is on top now: the cursor goes with it
+        list_.sel = 1; // the room is on top now: the cursor goes with it
         list_.follow = true;
     }
 
@@ -362,7 +389,7 @@ private:
             g.cfg.password = room.password;
             g.Save();
         }
-        list_.sel = 0;
+        list_.sel = 1;
         list_.follow = true;
         if (!changed) {
             g.ShowToast("Saved.", col::kOn);

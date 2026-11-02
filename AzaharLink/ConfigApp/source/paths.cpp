@@ -93,6 +93,10 @@ std::string AppDirFromArgv0(const char* argv0) {
     return dir;
 }
 
+std::string ServersFileName(int list) {
+    return list <= 1 ? std::string(kServersFileName) : "servers" + std::to_string(list) + ".txt";
+}
+
 std::string JoinPath(const std::string& dir, const std::string& name) {
     if (dir.empty()) {
         return name;

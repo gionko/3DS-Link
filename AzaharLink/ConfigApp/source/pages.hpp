@@ -6,6 +6,7 @@
 //   InstallCheckPage    what the installation has and lacks, and what A does about it (pages_check.cpp)
 //   MainPage            the main page (pages_main.cpp)
 //   ServersPage         the saved rooms: use, add, remove, rename (pages_servers.cpp)
+//   LobbyPage           the public rooms of an Azahar lobby server (its web API): browse, test and use one (pages_lobby.cpp)
 //   EnableGamePage      which titles run with 3DS Link: their icons, names and switches (pages_enable.cpp)
 //   DeliveryPage        Titles Delivery: send titles, receive titles (pages_delivery.cpp, delivery_run.cpp; declared in
 //                       delivery.hpp with the pages under it)
@@ -33,6 +34,7 @@ ui::Page* NewStartupPage();
 ui::Page* NewInstallCheckPage(std::function<void(bool go_on)> on_close = nullptr, bool first_start_summary = false);
 ui::Page* NewMainPage();
 ui::Page* NewServersPage();
+ui::Page* NewLobbyPage();
 ui::Page* NewEnableGamePage();
 ui::Page* NewConfigPage();
 ui::Page* NewAboutPage();

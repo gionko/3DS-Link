@@ -225,6 +225,26 @@ void RoomClient::SetRoomInfoCallback(std::function<void(const room::RoomInfo&)> 
     room_info_cb_ = std::move(cb);
 }
 
+void RoomClient::SetChatCallback(std::function<void(const std::string&, const std::string&)> cb) {
+    platform::LockGuard lock(mutex_);
+    chat_cb_ = std::move(cb);
+}
+
+void RoomClient::SendChat(const std::string& message) {
+    if (message.empty() || state() == State::Idle) {
+        return;
+    }
+    TxQueue::Item item;
+    item.bytes = room::EncodeChat(message);
+    const u64 now = platform::NowMs();
+    item.queued_ms = now;
+    TxQueue::Drops drops;
+    platform::LockGuard lock(mutex_);
+    tx_.Push(std::move(item), now, &drops);
+    tx_pending_.store(1, std::memory_order_release);
+    StatsAdd(g_stats.tx_cap_drops, drops.cap);
+}
+
 void RoomClient::UpdateGameInfo(const std::string& name, u64 id) {
     if (state() == State::Idle) {
         return;
@@ -705,6 +725,21 @@ void RoomClient::Run(Config config, u32 generation) {
                         }
                         break;
                     }
+                    case room::IdChatMessage: {
+                        std::string nick;
+                        std::string text;
+                        if (room::DecodeChat(data, size, &nick, &text)) {
+                            std::function<void(const std::string&, const std::string&)> cb;
+                            {
+                                platform::LockGuard lock(mutex_);
+                                cb = chat_cb_;
+                            }
+                            if (cb) {
+                                cb(nick, text);
+                            }
+                        }
+                        break;
+                    }
                     case room::IdJoinSuccess:
                     case room::IdJoinSuccessAsMod: {
                         Mac assigned{};
@@ -754,7 +789,7 @@ void RoomClient::Run(Config config, u32 generation) {
                         keep_running = false;
                         break;
                     default:
-                        break; // chat, status messages, moderation: not needed here
+                        break; // status messages, moderation: not needed here
                     }
                 }
                 enet_packet_destroy(event.packet);

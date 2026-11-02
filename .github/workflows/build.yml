@@ -1,0 +1,63 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      enable_chat:
+        description: 'Build with the chat overlay (CHAT=1)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # CHAT=1 (overlay built in) unless the box is unticked on a manual run
+    env:
+      CHAT: ${{ github.event.inputs.enable_chat == 'false' && '0' || '1' }}
+      
+    steps:
+      - uses: actions/checkout@v4
+      
+      - run: bash AzaharLink/Tests/policy_check.sh
+      
+      # The compiled objects (ccache) and makerom/ctrtool are kept between runs: only what changed is compiled again.
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - uses: actions/cache@v4
+        id: ctr_tools
+        with:
+          path: |
+            tools_ctr/makerom
+            tools_ctr/ctrtool
+          key: ctr-tools-${{ hashFiles('tools_ctr/build_tools.sh') }}
+
+      - if: steps.ctr_tools.outputs.cache-hit != 'true'
+        run: bash tools_ctr/build_tools.sh
+
+      
+      - run: bash DlpLink/tools/build_all.sh --dist
+      
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 3DSLink
+          path: |
+            AzaharLink/AzaharLink.3gx
+            AzaharLink/ConfigApp/3DSLink.3dsx
+            DlpLink/out/3dslink.cia
+            
+      - uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: build-${{ github.run_number }}
+          files: |
+            AzaharLink/AzaharLink.3gx
+            AzaharLink/ConfigApp/3DSLink.3dsx
+            DlpLink/out/3dslink.cia

@@ -502,7 +502,7 @@ private:
         u64 rx_ms;
     };
     std::list<HeardBeacon> received_beacons_;
-    bool scan_filter_enforced_ = true;
+    bool scan_filter_enforced_ = false; // off (cross-region): the scan lists the networks of every game, so a room of another region of the game is found; the ones it would leave out are still counted
 
     u32 connection_status_event_ = 0; // engine-owned, persistent
     u32 connect_event_ = 0;           // engine-owned, signalled when ConnectToNetwork completes

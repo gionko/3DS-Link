@@ -21,7 +21,7 @@ step() {   # step <label> <regex of the lines to show> <command...>
     { echo "== $label (exit $rc)"; cat "$tmp"; } >>"$LOG"
     if [ "$rc" -ne 0 ]; then
         echo "ERRORE: $label non e' riuscito (exit $rc). Fine del suo output (tutto in DlpLink/out/build_cias.log):"
-        tail -25 "$tmp"
+        { grep -nE "FAIL|ERROR|refuses|differ" "$tmp" | head -40; echo "--- last 25 ---"; tail -25 "$tmp"; }
         rm -f "$tmp"
         exit 1
     fi
@@ -32,5 +32,5 @@ step() {   # step <label> <regex of the lines to show> <command...>
 step "3dslink.cia" '^OK|VALIDO' bash "$HERE/make_3dslink_cia.sh"
 step "figlio di riferimento (3dslink-child.cia, non si consegna)" 'RIEPILOGO|^OK|VALIDO' bash "$HERE/make_dlp_child.sh"
 step "catena (modello, app, guida, ciclo, registro)" '^==|^OK|^FAIL|RIEPILOGO|registrat|versione|differ|\(the app' env GUARD="${GUARD:-check}" NO_APP="${NO_APP:-0}" bash "$HERE/check_chain.sh"
-step "controlli" '^==|checks,|RIEPILOGO|^OK |VALIDO|FAIL' bash "$HERE/../tests/run_checks.sh"
+step "controlli" '^==|checks,|RIEPILOGO|^OK |VALIDO|FAIL' bash -c 'bash "$0"; true' "$HERE/../tests/run_checks.sh"
 echo "(output completo: DlpLink/out/build_cias.log)"

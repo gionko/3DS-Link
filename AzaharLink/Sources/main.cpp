@@ -6,11 +6,14 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
+#include "azl/chat.hpp"
 #include "azl/ini_values.hpp"
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
 #include "azl/text_wrap.hpp"
+#include "ctr/chat_overlay.hpp"
 #include "ctr/plugin.hpp"
 
 // libctru's hidInit() also opens the ir:rst service on a New 3DS (C-stick, ZL, ZR), and the framework calls it inside the
@@ -34,6 +37,9 @@ static MenuEntry* g_radio_entry = nullptr;
 static MenuEntry* g_enabled_entry = nullptr;
 static MenuEntry* g_debug_entry = nullptr;
 static MenuEntry* g_status_entry = nullptr;
+static MenuEntry* g_rooms_entry = nullptr;
+static MenuEntry* g_chatpos_entry = nullptr;
+static MenuEntry* g_chatbtn_entry = nullptr;
 static std::string g_last_status;
 static bool g_last_radio = true;
 static int g_radio_level = 1; // what ON stands for (ini radio_like 1 or 2): the in-game entry is a switch, the level is the file's
@@ -120,6 +126,12 @@ static void RefreshLabels() {
     g_enabled_entry->Name() =
         std::string("AzaharLink at game start: ") + (cfg.enabled ? "ON" : "OFF (next launch)");
     g_debug_entry->Name() = std::string("Debug log: ") + (cfg.debug > 0 ? "ON (everything)" : "OFF");
+    if (g_chatpos_entry) {
+        g_chatpos_entry->Name() = std::string("Chat lines: ") + azl::chat::ChatPositionName(chat_overlay::Position());
+    }
+    if (g_chatbtn_entry) {
+        g_chatbtn_entry->Name() = std::string("Chat button: ") + azl::chat::ChatPositionName(chat_overlay::ButtonPosition());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -242,6 +254,127 @@ static void ToggleDebug(MenuEntry*) {
     } else {
         OSD::Notify("Debug log ON: no memory for the capture, log only");
     }
+}
+
+static std::string Wrapped(const std::string& text, std::size_t width);
+
+/// The menu's browser of the public rooms (the list the Setup app saved): pages of rooms, the last room joined first, a question
+/// before joining, and the password when the room has one.
+static void BrowsePublicRooms(MenuEntry*) {
+    std::string text;
+    if (!Plugin::Get().ReadRoomList(0, text)) {
+        MessageBox("Public rooms",
+                   "No public room list yet.\n\nOpen the 3DS Link app, go to the lobby page and\n"
+                   "refresh it: the list is saved for the game (and the\nnext time you open this menu it is here).")();
+        return;
+    }
+    std::vector<azl::chat::RoomEntry> rooms = azl::chat::ParseRoomList(text, azl::chat::kPublicRooms);
+    text.clear();
+    if (rooms.empty()) {
+        MessageBox("Public rooms", "The saved list has no rooms.\nRefresh the lobby page in the 3DS Link app.")();
+        return;
+    }
+    std::string last_host;
+    u16 last_port = 0;
+    const bool has_last = Plugin::Get().LoadLastRoom(last_host, last_port) && azl::chat::MoveRoomFirst(rooms, last_host, last_port);
+    const std::size_t pages = azl::chat::PageCount(rooms.size());
+    std::size_t page = 0;
+    enum class Act { Room, Next, Prev, Jump };
+    for (;;) {
+        std::vector<std::string> options;
+        std::vector<Act> acts;
+        const std::size_t first = azl::chat::PageFirst(page);
+        for (std::size_t i = first; i < rooms.size() && i < first + azl::chat::kRoomRows; ++i) {
+            // the name as the lobby gives it (what fits the row is shown; the question before joining shows all of it, with the address)
+            const std::string name = azl::chat::Clean(rooms[i].name, azl::chat::kRoomNameChars);
+            options.push_back(std::string(has_last && i == 0 ? "* " : "") + (name.empty() ? rooms[i].host : name));
+            acts.push_back(Act::Room);
+        }
+        if (pages > 1) {
+            options.push_back("Go to page...");
+            acts.push_back(Act::Jump);
+        }
+        if (page + 1 < pages) {
+            options.push_back("Next page >>");
+            acts.push_back(Act::Next);
+        }
+        if (page > 0) {
+            options.push_back("<< Previous page");
+            acts.push_back(Act::Prev);
+        }
+        Keyboard keyboard("Public rooms  (page " + std::to_string(page + 1) + " of " + std::to_string(pages) +
+                              ")\n\nPick a room to join it now." + (has_last && page == 0 ? "\n* = the room you joined last" : ""),
+                          options);
+        const int choice = keyboard.Open();
+        if (choice < 0) {
+            return;
+        }
+        const Act act = acts[static_cast<std::size_t>(choice)];
+        if (act == Act::Next) {
+            ++page;
+        } else if (act == Act::Prev) {
+            --page;
+        } else if (act == Act::Jump) {
+            u32 number = static_cast<u32>(page) + 1; // (the framework's number keyboard takes u32, not int)
+            Keyboard jump("Go to page (1 - " + std::to_string(pages) + ")");
+            jump.IsHexadecimal(false);
+            if (jump.Open(number, number) >= 0) {
+                page = static_cast<std::size_t>(number < 1 ? 0 : (number > pages ? pages - 1 : number - 1));
+            }
+        } else {
+            azl::chat::RoomEntry room = rooms[first + static_cast<std::size_t>(choice)];
+            if (room.password == azl::chat::kAskPassword) {
+                std::string typed;
+                Keyboard pw("This room has a password.\n\nType it (empty = back to the list).");
+                pw.SetMaxLength(64);
+                if (pw.Open(typed, typed) < 0 || typed.empty()) {
+                    continue;
+                }
+                room.password = typed;
+            }
+            const std::string address = room.host + (room.port != azl::chat::kDefaultRoomPort ? ":" + std::to_string(room.port) : "");
+            if (!MessageBox(Wrapped(room.name.empty() ? address : room.name, 40) + "\n" + address,
+                            "Leave the game's lobby first:\nswitching drops the game's link.\n\nJoin this room now?",
+                            DialogType::DialogOkCancel)()) {
+                continue;
+            }
+            Plugin::Get().SaveLastRoom(room.host, room.port);
+            Plugin::Get().SwitchRoom(room.host, room.port, room.password);
+            if (g_connect_entry) {
+                g_connect_entry->Enable(); // (the switch is applied by the connection logic, which runs while this is on)
+            }
+            azl::Log("menu: public room '%s:%u' chosen", room.host.c_str(), room.port);
+            OSD::Notify("Switching room...");
+            return;
+        }
+    }
+}
+
+/// Where the chat lines go on the top screen, or where the small Chat button sits on the bottom screen (CHAT=0 builds leave the overlay out).
+static void ChooseChatPlace(bool button) {
+    std::vector<std::string> options;
+    for (int p = 0; p < azl::chat::kChatPositions; ++p) {
+        options.push_back(azl::chat::ChatPositionName(p));
+    }
+    Keyboard keyboard(button ? "Where should the Chat button be on the\ntouch screen? Pick a spot the game does\nnot use." : "Where should the chat lines be shown\non the top screen?", options);
+    const int choice = keyboard.Open();
+    if (choice < 0) {
+        return;
+    }
+    if (button) {
+        chat_overlay::SetButtonPosition(choice);
+    } else {
+        chat_overlay::SetPosition(choice);
+    }
+    Plugin::Get().SaveChatPositions(chat_overlay::Position(), chat_overlay::ButtonPosition());
+    RefreshLabels();
+    azl::Log("menu: chat %s set to %s", button ? "button" : "lines", azl::chat::ChatPositionName(choice));
+}
+static void ChooseChatPosition(MenuEntry*) {
+    ChooseChatPlace(false);
+}
+static void ChooseChatButton(MenuEntry*) {
+    ChooseChatPlace(true);
 }
 
 static void ShowDetails(MenuEntry*) {
@@ -376,8 +509,26 @@ static void InitMenu(PluginMenu& menu) {
                                     "start. OFF = the plugin stays out of the game entirely,\n"
                                     "so you can play with real local wireless.");
 
+    g_rooms_entry = new MenuEntry("Public rooms...", nullptr, BrowsePublicRooms,
+                                  "Browse the public rooms the Setup app saved from the lobby,\n"
+                                  "5 per page, and join one. Refresh the list in the\n"
+                                  "3DS Link app (lobby page).");
+    if (chat_overlay::Enabled()) {
+        g_chatpos_entry = new MenuEntry("Chat lines", nullptr, ChooseChatPosition,
+                                        "Where the incoming chat lines appear on the top screen:\n"
+                                        "top / bottom, left / middle / right.");
+        g_chatbtn_entry = new MenuEntry("Chat button", nullptr, ChooseChatButton,
+                                        "Where the small Chat button is on the touch screen.\n"
+                                        "Pick a spot where the game has nothing to touch.");
+    }
+
     menu += g_status_entry;
     menu += g_connect_entry;
+    menu += g_rooms_entry;
+    if (g_chatpos_entry) {
+        menu += g_chatpos_entry;
+        menu += g_chatbtn_entry;
+    }
     menu += g_radio_entry;
     g_debug_entry = new MenuEntry("Debug log", nullptr, ToggleDebug,
                                   "A: switch ON / OFF. ON writes EVERYTHING (every UDS frame with\n"

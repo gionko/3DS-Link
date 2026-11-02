@@ -82,6 +82,17 @@ public:
     /// Joins the configured room (background thread). Returns false if it cannot even start.
     bool Connect();
     void Disconnect();
+    /// The menu's room browser chose a room: the next Tick leaves the room it is in and joins this one (the settings file is not changed:
+    /// the room of AzaharLink.ini is still the one the next launch joins). Callable from any thread.
+    void SwitchRoom(const std::string& host, u16 port, const std::string& password);
+    /// The text of room list `list` for the menu's room browser: 0 = public_rooms.txt (saved by the Setup app from the lobby), 1.. = servers.txt, servers2.txt ... False: no such file.
+    bool ReadRoomList(int list, std::string& text);
+    /// The chat overlay's places (0..5): the incoming lines on the top screen and the Chat button on the bottom one; read from / written to chat_pos.txt in the data folder.
+    void LoadChatPositions(int& lines, int& button);
+    bool SaveChatPositions(int lines, int button);
+    /// The last room picked in the menu's browser (last_room.txt; before the first pick, the room of the settings): the browser lists it first.
+    bool LoadLastRoom(std::string& host, u16& port);
+    bool SaveLastRoom(const std::string& host, u16 port);
 
     /// Per-frame bookkeeping: reconnect on lost connections, flush notifications.
     /// `want_connected` is the state requested by the user.
@@ -309,6 +320,11 @@ private:
     std::string startup_issue_;
     u64 last_issue_ms_ = 0;
     u64 last_hint_ms_ = 0;          ///< the last "no room address" reminder (only with the in-game menu off, see Tick)
+    platform::Mutex switch_mutex_;   ///< guards the pending room switch below
+    bool switch_pending_ = false;
+    std::string switch_host_;
+    u16 switch_port_ = 0;
+    std::string switch_password_;
     int last_notified_error_ = -1;  ///< last room error shown on screen: do not repeat the same one
 
     // The room link and the game's session (see azl/link_policy.hpp).

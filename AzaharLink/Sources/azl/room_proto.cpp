@@ -25,6 +25,33 @@ std::vector<u8> EncodeSetGameInfo(const std::string& name, u64 id) {
     return w.Take();
 }
 
+std::vector<u8> EncodeChat(const std::string& message) {
+    PacketWriter w;
+    w.U8(IdChatMessage);
+    w.String(message.size() > kMaxChatChars ? message.substr(0, kMaxChatChars) : message);
+    return w.Take();
+}
+
+bool DecodeChat(const u8* data, std::size_t size, std::string* nickname, std::string* message) {
+    PacketReader r(data, size);
+    if (r.U8() != IdChatMessage) {
+        return false;
+    }
+    std::string nick = r.String();
+    r.String(); // the username of the account (not shown)
+    std::string text = r.String();
+    if (!r.ok()) {
+        return false;
+    }
+    if (nickname) {
+        *nickname = std::move(nick);
+    }
+    if (message) {
+        *message = std::move(text);
+    }
+    return true;
+}
+
 std::vector<u8> EncodeWifiPacket(const WifiPacket& packet) {
     PacketWriter w;
     w.Reserve(1 + 1 + 1 + 6 + 6 + 4 + packet.data.size());

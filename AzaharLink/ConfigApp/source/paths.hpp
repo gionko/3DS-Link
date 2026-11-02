@@ -30,6 +30,10 @@ constexpr const char* kBoot9FileName = "boot9.bin";
 constexpr const char* kDataDirName = "3DSLink";           // the app's own folder: what the app keeps, made when it is first used
 constexpr const char* kConfigFileName = "3DSLink.cfg";
 constexpr const char* kServersFileName = "servers.txt";
+// More lists of saved rooms: servers.txt is list 1, then servers2.txt ... servers10.txt. The plugin's ROOMS list in the game reads the same files.
+constexpr int kServerLists = 10;
+// "servers.txt" for list 1, "servers<n>.txt" for the others (n = 1..kServerLists).
+std::string ServersFileName(int list);
 constexpr const char* kGamesCacheFileName = "titles.cache";
 constexpr const char* kCatalogCacheFileName = "catalog.cache"; // (the name titleshare_host/hostcfg's data_path("catalog.cache") builds)
 constexpr const char* kParkDirName = "park";

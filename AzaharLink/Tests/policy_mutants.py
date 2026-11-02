@@ -972,7 +972,7 @@ mutants = [
     ('the writer no longer says what was given up', 'Sources/azl/log_files.cpp', '    ReportBusyDrops();\n', ''),
     ('the writer does not mark itself', 'Sources/ctr/plugin.cpp', '                platform::MarkLogWriterThread(); // (the one thread that may wait for the log\'s locks: azl/platform.hpp)\n', ''),
     ('the writer is the lowest priority again', 'Sources/ctr/plugin.cpp', 'constexpr int kLogWriterPriority = 0x2E;', 'constexpr int kLogWriterPriority = 0x38;'),
-    ('a scan lists the networks of another game again', 'Includes/azl/uds_engine.hpp', 'bool scan_filter_enforced_ = true;', 'bool scan_filter_enforced_ = false;'),
+    ('the scan filter is back on: the rooms of another region are left out', 'Includes/azl/uds_engine.hpp', 'bool scan_filter_enforced_ = false;', 'bool scan_filter_enforced_ = true;'),
     ('the debug notice never shows', 'Sources/ctr/plugin.cpp', '    if (card_pct >= 50 || lost_pct >= 30) {', '    if (false) {'),
     ('the memory record is touched with the log off', 'Sources/ctr/plugin.cpp', 'void Plugin::CompareMemoryWithLastLaunch() {\n    if (g_debug_level <= 0) {\n        return;\n    }\n', 'void Plugin::CompareMemoryWithLastLaunch() {\n'),
     ('the memory record keeps one title only again', 'Sources/ctr/plugin.cpp', '    constexpr int kRecords = 16;', '    constexpr int kRecords = 1;'),

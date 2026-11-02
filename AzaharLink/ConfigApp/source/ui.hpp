@@ -87,6 +87,7 @@ bool PressedNow(const Input& in, const Rect& r);
 struct App {
     setup::Settings cfg;
     setup::ServerList servers; // the saved rooms, the most recently used first (servers.txt in the data folder)
+    int server_list = 1;       // which list of saved rooms is open: 1 = servers.txt, 2 = servers2.txt ... (paths.servers_file is that file)
     bool servers_writable = true; // false when the file exists but could not be read: it is never written over
     std::string console_name;
     std::string app_path;      // where the launcher started this app from (argv[0]); empty when it does not say
@@ -162,6 +163,8 @@ struct App {
     void Save();
     // Writes the list of saved rooms (a toast only when it cannot).
     void SaveServers();
+    // Opens list `list` (1..kServerLists) of saved rooms: paths.servers_file and `servers` become that list. A list with no file is empty.
+    void SelectServerList(int list);
     // Writes 3DSLink.cfg. Until the first start is over (first_start_done) nothing is written: the file's presence is what says it is over.
     void SaveAppConfig();
 

@@ -46,9 +46,24 @@ while [ $# -gt 0 ]; do
   shift
 done
 cd "$ROOT"
+# ccache: the compilers run in Docker, so the cache and the ccache binary sit in one host folder (.ccache, or $CCACHE_HOST) mounted at /ccache
+# in every container; CI keeps that folder between runs (.github/workflows/build.yml). The binary is fetched once into .ccache/bin; when it
+# cannot be fetched or run, the build is the plain one (NO_CCACHE=1 forces that).
+CCACHE_VERSION=4.10.2
+CCACHE_HOST="${CCACHE_HOST:-$ROOT/.ccache}"
+mkdir -p "$CCACHE_HOST/bin" "$CCACHE_HOST/cache"
+if [ "${NO_CCACHE:-0}" != 1 ] && [ ! -x "$CCACHE_HOST/bin/ccache" ]; then
+  curl -fsSL --retry 2 "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/ccache-$CCACHE_VERSION-linux-x86_64.tar.xz" \
+    | tar -xJ -C "$CCACHE_HOST/bin" --strip-components=1 "ccache-$CCACHE_VERSION-linux-x86_64/ccache" 2>/dev/null \
+    || echo "   (ccache could not be fetched: building without it)"
+fi
+CCACHE_MOUNT="$(cd "$CCACHE_HOST" && pwd -W 2>/dev/null || pwd)"
+CCACHE_DOCKER=(-v "$CCACHE_MOUNT:/ccache" -e CCACHE_DIR=/ccache/cache -e CCACHE_MAXSIZE=300M -e CCACHE_COMPRESS=1 -e NO_CCACHE="${NO_CCACHE:-0}")
+# run inside the container: make with the compilers behind ccache when it is there and runs, else a plain make
+MAKE_WITH_CCACHE='if [ "${NO_CCACHE:-0}" != 1 ] && [ -x /ccache/bin/ccache ] && /ccache/bin/ccache --version >/dev/null 2>&1; then exec make CC="/ccache/bin/ccache arm-none-eabi-gcc" CXX="/ccache/bin/ccache arm-none-eabi-g++"; else exec make; fi'
 docker_run() {   # docker_run <cartella di lavoro dentro /src> <comando...>
   local wd="$1"; shift
-  MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W 2>/dev/null || pwd):/src" -w "/src/$wd" devkitpro/devkitarm "$@"
+  MSYS_NO_PATHCONV=1 docker run --rm "${CCACHE_DOCKER[@]}" -v "$(pwd -W 2>/dev/null || pwd):/src" -w "/src/$wd" devkitpro/devkitarm "$@"
 }
 
 # make_in <cartella> <file da cancellare prima...>: un make che FALLISCE ferma tutto. (Prima l'uscita di make andava in un grep con `|| true` e il test -s
@@ -58,7 +73,7 @@ make_in() {
   shift
   rm -f "$@"
   tmp="$(mktemp)"
-  docker_run "$wd" make >"$tmp" 2>&1 || rc=$?
+  docker_run "$wd" bash -c "$MAKE_WITH_CCACHE" >"$tmp" 2>&1 || rc=$?
   grep -E "warning|error|Error|linking|built" "$tmp" || true
   if [ "$rc" -ne 0 ]; then
     echo "ERRORE: make in $wd e' fallito (exit $rc). Fine del suo output:" >&2
@@ -84,7 +99,9 @@ echo "== versione di 3DS Link per questo giro: $(python AzaharLink/Tests/set_ver
 if [ "$PLUGIN" = 1 ]; then
   echo "== 0. il plugin (da zero: il Makefile del plugin non sempre ricollega l'ELF)"
   rm -rf AzaharLink/AzaharLink.elf AzaharLink/AzaharLink.3gx AzaharLink/Build
-  MSYS_NO_PATHCONV=1 docker run --rm -v "$(cd AzaharLink && pwd -W 2>/dev/null || pwd):/src" -w /src pablomk7/libctrpf:0.8.0 make 2>&1 | grep -E "warning|error|Error|built|3gx" | tail -8 || true
+  # CHAT goes into the container with -e: the Makefile reads it to add -DAZL_CHAT_OVERLAY (docker run does not pass on the host's environment)
+  echo "   CHAT=${CHAT:-1} (1 = the in-game chat overlay is compiled in, 0 = left out)"
+  MSYS_NO_PATHCONV=1 docker run --rm "${CCACHE_DOCKER[@]}" -e CHAT="${CHAT:-1}" -v "$(cd AzaharLink && pwd -W 2>/dev/null || pwd):/src" -w /src pablomk7/libctrpf:0.8.0 bash -c "$MAKE_WITH_CCACHE" 2>&1 | grep -E "warning|error|Error|built|3gx" | tail -8 || true
   test -s AzaharLink/AzaharLink.3gx
 fi
 

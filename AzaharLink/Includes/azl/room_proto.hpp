@@ -191,6 +191,11 @@ std::vector<u8> EncodeJoinRequest(const std::string& nickname, const std::string
                                   const std::string& token);
 std::vector<u8> EncodeSetGameInfo(const std::string& name, u64 id);
 std::vector<u8> EncodeWifiPacket(const WifiPacket& packet);
+/// A chat line (the room relays at most kMaxChatChars of it to everybody else, Azahar's MaxMessageSize).
+constexpr std::size_t kMaxChatChars = 500;
+std::vector<u8> EncodeChat(const std::string& message);
+/// A relayed chat packet is [id][nickname][username][message]; `data` is the whole packet with the id byte.
+bool DecodeChat(const u8* data, std::size_t size, std::string* nickname, std::string* message);
 
 /// `data` is the whole ENet packet including the leading message id byte.
 bool DecodeWifiPacket(const u8* data, std::size_t size, WifiPacket* out);
