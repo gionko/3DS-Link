@@ -216,6 +216,7 @@ class Sim:
         self.apt_calls = []         # (kind, value, svc 0x32 calls made so far) told to the APT observer
         self.svc_log = []
         self.kernel = None          # callable(sim, number) -> sets the reply, returns r0
+        self.on_svc_seen = None     # callable(sim, number): a scenario that plays the other threads around a svc (the swap gate)
         self.min_sp = 0xFFFFFFFF
         self.min_pc = 0
         self.measuring = False
@@ -470,6 +471,8 @@ class Sim:
         insn, = struct.unpack('<I', uc.mem_read(pc - 4, 4))
         num = insn & 0xFFFFFF
         self.svc_log.append(num)
+        if self.on_svc_seen:
+            self.on_svc_seen(self, num)
         if num == 0x28:       # GetSystemTick
             self.ticks += self.tick_step
             uc.reg_write(UC_ARM_REG_R0, self.ticks & 0xFFFFFFFF)
@@ -1030,6 +1033,206 @@ def scenario_power_handback(elf, level):
     check(uc.reg_read(UC_ARM_REG_LR) == game_lr, "power: lr is the game's")
     check(r32(uc, site) == original[0] and r32(uc, site + 4) == original[1], "power: the call site has the game's own svc and next instruction")
     check(r32(uc, stats + 4 * 8) == 1 and r32(uc, stats + 4 * 9) == 0, 'power: one call handed back, none refused')
+
+
+def scenario_resume_keeps_receive(elf, level):
+    """The thread that brings the plugin's block back wakes up after its own svc: when the framework puts the hooks back, the word after the svc of APT:ReceiveParameter must still be the game's (the
+    ErrDisp of issue 5, not proven to be this: an APT call with handle 0 right after the swap back). The real compiled code: a ReceiveParameter through the hook notes its site, the swap takes all the
+    sites out, the resume leaves that one to the game and hooks the others, and the frame callback's re-arm hooks it a while later. A site that is `svc; bx lr` is every call of the game: it goes back at once."""
+    sim = Sim(elf, level, hle=True)
+    uc = sim.uc
+    sites_at = elf.find('g_sites')
+    base = 0x00200000
+    uc.mem_map(base, 0x1000)
+    tramp_lit = STUB_RET - 8
+    # site 0: the game's ReceiveParameter, reached through its trampoline; site 1: any other call; site 2: another trampoline, for the wrapper
+    original = ((0xEF000032, 0xE1A04000), (0xEF000032, 0xE1A05000))
+    for i, (w0, w1) in enumerate(original):
+        site, tramp = base + 0x40 * i, tramp_lit if i == 0 else tramp_lit - 0x40
+        p32(uc, site, 0xE51FF004)
+        p32(uc, site + 4, tramp)
+        for k, w in enumerate((site, w0, w1, tramp)):
+            p32(uc, sites_at + 16 * i + 4 * k, w)
+    p32(uc, elf.find('g_site_count'), 2)
+    uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', 1))
+    p32(uc, elf.find('g_home_seen'), 0)
+    sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1D0041])
+    sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('APT:U'))) + [5, 0])
+    sim.enter('azl_svc32_entry', 0x14801F, 'getservice APT:U')
+    apt = 0x1D0041
+    # with no HOME button seen the call stays with the hook, and its site is noted
+    sim.kernel = srv_reply([0x000D0040, 0])
+    sim.set_request([0x000D0080, 0x300])
+    sim.enter('azl_svc32_entry', apt, 'receive parameter, noted')
+    ledger = elf.find('g_ledger')
+    receive = ledger + 4 * (8 + 1)
+    check(r32(uc, receive) == 1, 'resume: the site of ReceiveParameter is noted (%d)' % r32(uc, receive))
+    check(r32(uc, base) == 0xE51FF004, 'resume: noting it changes nothing in the site')
+    sim.call(elf.find('SuspendSvcHooks'), [100])
+    for i, (w0, w1) in enumerate(original):
+        check(r32(uc, base + 0x40 * i) == w0 and r32(uc, base + 0x40 * i + 4) == w1, 'resume: site %d is the game\'s during the swap' % i)
+    sim.call(elf.find('ResumeSvcHooks'), [])
+    check(r32(uc, base) == original[0][0] and r32(uc, base + 4) == original[0][1], 'resume: the site of ReceiveParameter still has the game\'s next word when the thread wakes up')
+    check(r32(uc, base + 0x40) == 0xE51FF004, 'resume: the other sites are back in the hook')
+    check(r32(uc, ledger) == 1, 'resume: the site waits in the ledger')
+    sim.call(elf.find('RearmHandedBackSites'), [])
+    check(r32(uc, base) == original[0][0], 'resume: not hooked again at once')
+    sim.ticks += 3 * 268112000
+    sim.call(elf.find('RearmHandedBackSites'), [])
+    check(r32(uc, base) == 0xE51FF004 and r32(uc, base + 4) == tramp_lit, 'resume: hooked again a while later')
+    check(r32(uc, receive) == 1, 'resume: the site stays noted for the next swap')
+
+
+def scenario_worker_off_core1(elf, level):
+    """On an Old 3DS the framework's syscore worker must not take core 1: a thread that has not begun escapes Luma3DS's stop at the swap and begins in memory that is gone (the Luma dump of issue 5,
+    prefetch abort at _thread_begin on core 1). The real compiled code: the wrap moves core 1 and nothing else, only between the two wraps; and every call in the ELF goes through the wraps."""
+    sim = Sim(elf, level)
+    uc = sim.uc
+    moving = elf.find('g_moving')
+    wrap = elf.sym('__wrap_svcCreateThread')
+    out = sim.alloc(8)
+    seen = []
+    def watch(s, num):
+        if num == 0x08:
+            seen.append(uc.reg_read(UC_ARM_REG_R4))
+    sim.on_svc_seen = watch
+    def create(core):
+        del seen[:]
+        sim.call(wrap, [out, 0x07000100, 0, 0x06000000], stack_args=[0x20, core & 0xFFFFFFFF])
+        check(len(seen) == 1, 'worker: the kernel is called once (core %d)' % core)
+        return seen[0] if seen else None
+    uc.mem_write(moving, b'\0')
+    for core in (1, 0, -2 & 0xFFFFFFFF):
+        check(create(core) == core, 'worker: outside the framework\'s start, or on a New 3DS, core %x stays' % core)
+    uc.mem_write(moving, b'\1')
+    check(create(1) == 0, 'worker: on an Old 3DS, during the framework\'s start, core 1 becomes core 0')
+    for core in (0, -2 & 0xFFFFFFFF, -1 & 0xFFFFFFFF, 2):
+        check(create(core) == core, 'worker: core %x is not moved' % core)
+    uc.mem_write(moving, b'\0')
+    sim.on_svc_seen = None
+    # the wraps are really in the way: nothing but the wrap calls the real functions
+    real_create = elf.sym('svcCreateThread') & ~1
+    real_init = elf.sym('_ZN18CTRPluginFramework9Scheduler10InitializeEv') & ~1
+    wrap_init = elf.sym('__wrap__ZN18CTRPluginFramework9Scheduler10InitializeEv') & ~1
+    callers = {real_create: [], real_init: [], wrap & ~1: [], wrap_init: []}
+    for vaddr, off, filesz, memsz in elf.segments:
+        for o in range(0, filesz - 3, 4):
+            w, = struct.unpack_from('<I', elf.data, off + o)
+            if (w & 0x0F000000) in (0x0B000000, 0x0A000000) and (w >> 28) != 0xF:
+                imm = w & 0xFFFFFF
+                if imm & 0x800000:
+                    imm -= 0x1000000
+                t = (vaddr + o + 8 + imm * 4) & 0xFFFFFFFF
+                if t in callers:
+                    callers[t].append(vaddr + o)
+    names = {real_create: 'svcCreateThread', real_init: 'Scheduler::Initialize'}
+    for t, own in ((real_create, wrap & ~1), (real_init, wrap_init)):
+        size = 0x100
+        check(all(own <= a < own + size for a in callers[t]), 'worker: only the wrap calls the real %s (%s)' % (names[t], ['%08x' % a for a in callers[t]]))
+    check(len(callers[wrap & ~1]) >= 2, 'worker: the framework\'s threads go through the wrap (%d callers)' % len(callers[wrap & ~1]))
+    check(len(callers[wrap_init]) == 1, 'worker: KeepThreadMain calls the wrap of Scheduler::Initialize (%d callers)' % len(callers[wrap_init]))
+
+
+def scenario_swap_gate(elf, level):
+    """The gate of the plugin's threads around the swap of its block on an Old 3DS (azl/swap_gate.hpp, ctr/swap_gate.cpp): the real compiled code, the one that goes to the console. Off on a New 3DS: no
+    svc and nothing counted. On an Old one: a socket call is counted; a closed gate stops the thread on a wait with no end, and it goes on when the gate opens; the close waits for who is inside and
+    gives up at its limit with the gate still closed; the close fits the framework's keep-alive thread (4 KB). Luma3DS and the kernel are not here: only an Old 3DS shows them."""
+    sim = Sim(elf, level)
+    uc = sim.uc
+    gate = elf.find('g_swap_gate')
+    ON, CLOSED, INSIDE, STOPS, PARK = gate, gate + 4, gate + 8, gate + 12, gate + 16
+    CLOSES, IN_START, IN_LEFT, WAITED, OPENS = gate + 20, gate + 24, gate + 28, gate + 32, gate + 36
+    event = elf.find('g_gate_open')
+    enter, leave = elf.sym('azl_c_soc_enter'), elf.sym('azl_c_soc_leave')
+    close, open_gate = elf.find('CloseSwapGate'), elf.find('OpenSwapGate')
+    park = elf.find('ParkAtGate')
+    sim.tick_step = 26811  # (100 us per read of the clock)
+
+    # a New 3DS: InitSwapGate returned at once
+    before = len(sim.svc_log)
+    sim.call(enter, [])
+    check(r32(uc, INSIDE) == 0, 'gate: off, a socket call is not counted')
+    sim.call(leave, [])
+    check(r32(uc, INSIDE) == 0, 'gate: off, the leave counts nothing')
+    p32(uc, CLOSED, 1)
+    sim.call(enter, [])
+    check(r32(uc, STOPS) == 0, 'gate: off, nothing ever stops')
+    p32(uc, CLOSED, 0)
+    check(len(sim.svc_log) == before, 'gate: off, no svc on the way of a socket call')
+
+    # an Old 3DS, as InitSwapGate leaves it
+    p32(uc, event, 0x00BB0000)
+    p32(uc, PARK, park)
+    p32(uc, ON, 1)
+    sim.call(enter, [])
+    check(r32(uc, INSIDE) == 1, 'gate: a socket call is counted')
+    sim.call(leave, [])
+    check(r32(uc, INSIDE) == 0, 'gate: ... and uncounted')
+
+    # the close with nobody inside: the event goes clear BEFORE the gate closes, and nothing is waited for
+    seen = []
+    def watch(s, num):
+        seen.append((num, r32(uc, CLOSED)))
+    sim.on_svc_seen = watch
+    span = 0x2000
+    uc.mem_write(PLUGIN_STACK_TOP - 0x100 - span, b'\xA5' * span)
+    sim.call(close, [3000])
+    low = bytes(uc.mem_read(PLUGIN_STACK_TOP - 0x100 - span, span))
+    used = span - next(i for i, b in enumerate(low) if b != 0xA5)
+    check(used <= 512, 'gate: the close uses %d bytes of stack: the keep-alive thread has 4 KB and the frames of the framework' % used)
+    check((0x19, 0) in seen, 'gate: the event is cleared before the gate closes')
+    check(0x0A not in [n for n, _ in seen], 'gate: nobody inside, no wait')
+    check(r32(uc, CLOSED) == 1 and r32(uc, CLOSES) == 1, 'gate: closed and counted')
+
+    # a thread at the closed gate: a wait with no end on the event, and it goes on when the gate opens
+    waits = []
+    def wake(s, num):
+        if num == 0x24:
+            waits.append((uc.reg_read(UC_ARM_REG_R0), uc.reg_read(UC_ARM_REG_R2), uc.reg_read(UC_ARM_REG_R3)))
+            check(r32(uc, INSIDE) == 0, 'gate: a stopped thread is not counted (the close would wait for it)')
+            p32(uc, CLOSED, 0)
+    sim.on_svc_seen = wake
+    sim.call(enter, [])
+    check(len(waits) == 1, 'gate: the thread stopped once')
+    check(waits and waits[0] == (0x00BB0000, 0xFFFFFFFF, 0xFFFFFFFF), 'gate: it waits on the event with no end (a thread that wakes up runs in a block that is gone)')
+    check(r32(uc, STOPS) == 1, 'gate: the stop is counted')
+    check(r32(uc, INSIDE) == 1, 'gate: after the stop the thread is in its call')
+
+    # the close waits for who is inside: the call ends at the third look
+    sleeps = []
+    def leaves(s, num):
+        if num == 0x0A:
+            sleeps.append(num)
+            if len(sleeps) == 3:
+                p32(uc, INSIDE, 0)
+    sim.on_svc_seen = leaves
+    sim.call(close, [3000])
+    check(len(sleeps) == 3, 'gate: the close waited until the thread left (%d looks)' % len(sleeps))
+    check(r32(uc, IN_START) == 1 and r32(uc, IN_LEFT) == 0, 'gate: inside at the start 1, left 0')
+    check(r32(uc, WAITED) > 0, 'gate: the wait is in the log')
+
+    # the open wakes the parked ones
+    signals = []
+    def sig(s, num):
+        if num == 0x18:
+            signals.append(uc.reg_read(UC_ARM_REG_R0))
+    sim.on_svc_seen = sig
+    sim.call(open_gate, [])
+    check(r32(uc, CLOSED) == 0 and r32(uc, OPENS) >= 1, 'gate: open')
+    check(signals == [0x00BB0000], 'gate: the open signals the event')
+
+    # a call that does not end (a getaddrinfo with no DNS): the close gives up at its limit, the gate stays closed
+    p32(uc, INSIDE, 1)
+    looks = []
+    def count(s, num):
+        if num == 0x0A:
+            looks.append(num)
+    sim.on_svc_seen = count
+    sim.tick_step = 268112  # (1 ms)
+    sim.call(close, [50])
+    check(0 < len(looks) <= 50, 'gate: the close stops at its limit (%d looks)' % len(looks))
+    check(r32(uc, IN_LEFT) == 1 and r32(uc, CLOSED) == 1, 'gate: it says who was left, and stays closed')
+    sim.on_svc_seen = None
 
 
 def scenario_apt(elf, level):
@@ -2100,6 +2303,9 @@ def main():
         scenario_apt(elf, level)
         scenario_handback(elf, level)
         scenario_power_handback(elf, level)
+        scenario_swap_gate(elf, level)
+        scenario_resume_keeps_receive(elf, level)
+        scenario_worker_off_core1(elf, level)
         scenario_hle_front(elf, level)
         scenario_throttle(elf, level)
         scenario_log_cost(elf, level)

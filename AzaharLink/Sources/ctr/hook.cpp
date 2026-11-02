@@ -518,6 +518,7 @@ extern "C" u32 azl_handback_site(Handle, u32 tramp_return) {
     if (!g_old_3ds) {
         return 0;
     }
+    NoteReceiveSite(g_sites, g_site_count, g_ledger, tramp_return);
     const u32 now = static_cast<u32>(platform::NowMs());
     if (!g_home_seen || static_cast<u32>(now - g_home_ms) > kHomeWindowMs) {
         __atomic_fetch_add(&g_swap_stats.no_home, 1u, __ATOMIC_RELAXED);
@@ -736,7 +737,7 @@ void ResumeSvcHooks() {
     }
     WaitPatchLock();
     const GameTextMemory memory;
-    ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);
+    ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);
     ReleasePatchLock();
 }
 

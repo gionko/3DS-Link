@@ -56,6 +56,10 @@ void azl_c_log (const char * fmt, ...) __attribute__ ((format (printf, 1, 2)));
 void azl_c_soc_call (int kind, unsigned long long ticks); /* kinds: 0 recv with data, 1 recv empty, 2 send, 3 poll */
 void azl_c_room_datagram (unsigned bytes, unsigned long long gapTicks);
 void azl_c_rcvbuf_result (int asked, int got);
+/* Around every socket call that moves bytes through the plugin's memory, so that none is under way when an Old 3DS swaps the plugin's block out (azl/swap_gate.hpp):
+   the kernel writes the service's answer into that memory, and stops the console if it is gone. A thread stops at the enter while the gate is closed. */
+void azl_c_soc_enter (void);
+void azl_c_soc_leave (void);
 
 /* Monotonic milliseconds from the ARM11 system tick. */
 static enet_uint32
@@ -115,8 +119,13 @@ enet_address_set_host (ENetAddress * address, const char * name)
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
 
-    if (getaddrinfo (name, NULL, & hints, & resultList) != 0)
-        return -1;
+    azl_c_soc_enter ();
+    {
+        const int resolved = getaddrinfo (name, NULL, & hints, & resultList);
+        azl_c_soc_leave ();
+        if (resolved != 0)
+            return -1;
+    }
 
     for (result = resultList; result != NULL; result = result -> ai_next)
     {
@@ -158,6 +167,7 @@ int
 enet_socket_bind (ENetSocket socket, const ENetAddress * address)
 {
     struct sockaddr_in sin;
+    int result;
 
     memset (& sin, 0, sizeof (struct sockaddr_in));
 
@@ -174,7 +184,10 @@ enet_socket_bind (ENetSocket socket, const ENetAddress * address)
        sin.sin_addr.s_addr = INADDR_ANY;
     }
 
-    return bind (socket, (struct sockaddr *) & sin, sizeof (struct sockaddr_in));
+    azl_c_soc_enter ();
+    result = bind (socket, (struct sockaddr *) & sin, sizeof (struct sockaddr_in));
+    azl_c_soc_leave ();
+    return result;
 }
 
 int
@@ -182,8 +195,12 @@ enet_socket_get_address (ENetSocket socket, ENetAddress * address)
 {
     struct sockaddr_in sin;
     socklen_t sinLength = sizeof (struct sockaddr_in);
+    int result;
 
-    if (getsockname (socket, (struct sockaddr *) & sin, & sinLength) == -1)
+    azl_c_soc_enter ();
+    result = getsockname (socket, (struct sockaddr *) & sin, & sinLength);
+    azl_c_soc_leave ();
+    if (result == -1)
       return -1;
 
     address -> host = (enet_uint32) sin.sin_addr.s_addr;
@@ -224,7 +241,10 @@ typedef struct
 static int
 azl_rcvbuf_set (void * ctx, int size, int * err)
 {
-    const int rc = setsockopt (((AzlRcvbufSocket *) ctx) -> socket, SOL_SOCKET, SO_RCVBUF, (char *) & size, sizeof (int));
+    int rc;
+    azl_c_soc_enter ();
+    rc = setsockopt (((AzlRcvbufSocket *) ctx) -> socket, SOL_SOCKET, SO_RCVBUF, (char *) & size, sizeof (int));
+    azl_c_soc_leave ();
     * err = rc == 0 ? 0 : errno;
     return rc;
 }
@@ -234,7 +254,11 @@ azl_rcvbuf_get (void * ctx)
 {
     int got = -1;
     socklen_t len = sizeof (int);
-    if (getsockopt (((AzlRcvbufSocket *) ctx) -> socket, SOL_SOCKET, SO_RCVBUF, (char *) & got, & len) != 0)
+    int rc;
+    azl_c_soc_enter ();
+    rc = getsockopt (((AzlRcvbufSocket *) ctx) -> socket, SOL_SOCKET, SO_RCVBUF, (char *) & got, & len);
+    azl_c_soc_leave ();
+    if (rc != 0)
         return -1;
     return got;
 }
@@ -299,7 +323,9 @@ enet_socket_set_option (ENetSocket socket, ENetSocketOption option, int value)
             break;
 
         case ENET_SOCKOPT_REUSEADDR:
+            azl_c_soc_enter ();
             result = setsockopt (socket, SOL_SOCKET, SO_REUSEADDR, (char *) & value, sizeof (int));
+            azl_c_soc_leave ();
             break;
 
         case ENET_SOCKOPT_RCVBUF:
@@ -321,7 +347,9 @@ enet_socket_set_option (ENetSocket socket, ENetSocketOption option, int value)
             break;
 
         case ENET_SOCKOPT_NODELAY:
+            azl_c_soc_enter ();
             result = setsockopt (socket, IPPROTO_TCP, TCP_NODELAY, (char *) & value, sizeof (int));
+            azl_c_soc_leave ();
             break;
 
         default:
@@ -340,7 +368,9 @@ enet_socket_get_option (ENetSocket socket, ENetSocketOption option, int * value)
     {
         case ENET_SOCKOPT_ERROR:
             len = sizeof (int);
+            azl_c_soc_enter ();
             result = getsockopt (socket, SOL_SOCKET, SO_ERROR, value, & len);
+            azl_c_soc_leave ();
             break;
 
         default:
@@ -361,7 +391,9 @@ enet_socket_connect (ENetSocket socket, const ENetAddress * address)
     sin.sin_port = ENET_HOST_TO_NET_16 (address -> port);
     sin.sin_addr.s_addr = address -> host;
 
+    azl_c_soc_enter ();
     result = connect (socket, (struct sockaddr *) & sin, sizeof (struct sockaddr_in));
+    azl_c_soc_leave ();
     if (result == -1 && errno == EINPROGRESS)
       return 0;
 
@@ -427,6 +459,7 @@ enet_socket_send (ENetSocket socket,
         total += buffers [i].dataLength;
     }
 
+    azl_c_soc_enter (); /* (before the clock: a stop at the gate is not time in the call) */
     startTick = svcGetSystemTick ();
 
     if (address != NULL)
@@ -442,6 +475,7 @@ enet_socket_send (ENetSocket socket,
     else
         sentLength = send (socket, gather, total, 0);
 
+    azl_c_soc_leave ();
     savedErrno = errno;
     azl_c_soc_call (2, svcGetSystemTick () - startTick);
     errno = savedErrno;
@@ -468,12 +502,14 @@ enet_socket_receive (ENetSocket socket,
     int recvLength, savedErrno;
     unsigned long long startTick, now;
 
+    azl_c_soc_enter (); /* (before the clock: a stop at the gate is not time in the call) */
     startTick = svcGetSystemTick ();
 
     if (bufferCount == 1)
     {
         recvLength = recvfrom (socket, buffers [0].data, buffers [0].dataLength, 0,
                                (struct sockaddr *) & sin, & sinLength);
+        azl_c_soc_leave ();
     }
     else
     {
@@ -482,6 +518,7 @@ enet_socket_receive (ENetSocket socket,
 
         recvLength = recvfrom (socket, scatter, sizeof (scatter), 0,
                                (struct sockaddr *) & sin, & sinLength);
+        azl_c_soc_leave ();
         if (recvLength > 0)
         {
             remaining = (size_t) recvLength;
@@ -554,10 +591,12 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
     if (* condition & ENET_SOCKET_WAIT_RECEIVE)
       pollSocket.events |= POLLIN;
 
+    azl_c_soc_enter (); /* (before the clock: a stop at the gate is not time in the call) */
     {
         const unsigned long long startTick = svcGetSystemTick ();
         int savedErrno;
         pollCount = poll (& pollSocket, 1, (int) timeout);
+        azl_c_soc_leave ();
         savedErrno = errno;
         azl_c_soc_call (3, svcGetSystemTick () - startTick);
         errno = savedErrno;

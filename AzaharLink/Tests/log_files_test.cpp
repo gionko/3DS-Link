@@ -1653,6 +1653,74 @@ static void TestSharedCounters() {
     std::memset(&g_stats, 0, sizeof(g_stats));
 }
 
+/// The swap of the plugin's block on an Old 3DS: the gate closes while the writer is in a pass, and the writer must leave the card. On a slow card the two writes of a pass
+/// and the flush outlast what the swap can wait.
+class StopAfterWrites : public DirFiles {
+public:
+    void Write(void* file, const char* data, std::size_t size) override {
+        DirFiles::Write(file, data, size);
+        if (size >= 32 * 1024) {
+            ++big_writes;
+            if (stop_after != 0 && big_writes >= stop_after) {
+                flag = 1;
+            }
+        }
+    }
+    volatile u32 flag = 0;
+    int big_writes = 0;
+    int stop_after = 0;
+};
+
+static void TestCaptureStopsAtTheGate() {
+    std::printf("the swap of the block: the capture's pass does not begin with the gate closed, and stops after the write in hand\n");
+    const std::vector<u8> payload(1500, 7);
+    const fs::path dir = MakeTempDir("gatestop");
+    StopAfterWrites files;
+    LogFiles log(&files, dir.string() + "/", platform::NowMs());
+    log.SetStopCapture(&files.flag);
+    CHECK(log.SetLevel(1, true));
+    DebugReset();
+    for (int i = 0; i < 300; ++i) { // (more than 64 KB of text: a pass would make several writes)
+        DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
+    }
+    const u32 queued = DebugBytesQueued();
+    CHECK(queued > 200 * 1024);
+
+    // closed before the pass: nothing goes to the card, the ring keeps it all, and the writer is told to come back
+    files.flag = 1;
+    const int writes_before = files.writes;
+    CHECK(log.DrainDebug(false));
+    CHECK_EQ(files.writes, writes_before);
+    CHECK_EQ(DebugBytesQueued(), queued);
+
+    // closed during the first write: no second one
+    files.flag = 0;
+    files.stop_after = 1;
+    CHECK(log.DrainDebug(false));
+    CHECK_EQ(files.big_writes, 1);
+    const u32 left = DebugBytesQueued();
+    CHECK(left > 0 && left < queued);
+
+    // open again: the rest is written
+    files.stop_after = 0;
+    files.flag = 0;
+    for (int i = 0; i < 40 && DebugBytesQueued() != 0; ++i) {
+        log.DrainDebug(false);
+    }
+    CHECK_EQ(DebugBytesQueued(), 0u);
+    CHECK(files.big_writes > 1);
+
+    // the end of a launch is not stopped: the last pass takes what it takes
+    for (int i = 0; i < 100; ++i) {
+        DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
+    }
+    files.flag = 1;
+    log.DrainDebug(true);
+    CHECK_EQ(DebugBytesQueued(), 0u);
+    CHECK(log.SetLevel(0, false));
+    fs::remove_all(dir);
+}
+
 /// The end of a launch on a slow card with a full ring (the Zelda session of 2026-10-14: a full 128 GB card, ~40 KB/s, ring at
 /// 465-480 KB): the capture stops writing after BeginShutdown's deadline, the main log - written first - has its last lines and
 /// says how much of the capture was not written; a switch-off from the menu (no BeginShutdown) still drains everything.
@@ -1769,6 +1837,7 @@ int main() {
     TestCaptureCadence();
     TestNobodyWaitsForTheWriter();
     TestTheEndOfALaunchIsBounded();
+    TestCaptureStopsAtTheGate();
     TestCaptureFileHasTheDietAndTheMarkers();
     TestStatusNumbers();
     TestCpuNumbers();

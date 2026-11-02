@@ -83,7 +83,8 @@ struct World {
         return HandBackSite(mem, sites.data(), Count(), ledger, &state, Return(i), now);
     }
     u32 Suspend() { return SuspendSites(mem, sites.data(), Count(), ledger, &state, &stats); }
-    u32 Resume() { return ResumeSites(mem, sites.data(), Count(), ledger, &state, &stats); }
+    u32 Resume(u32 now = 5000) { return ResumeSites(mem, sites.data(), Count(), ledger, &state, now, &stats); }
+    void Note(u32 i) { NoteReceiveSite(sites.data(), Count(), ledger, Return(i)); }
     u32 Rearm(u32 now) { return RearmSites(mem, sites.data(), Count(), ledger, &state, now, &stats); }
 };
 
@@ -311,6 +312,122 @@ void TestWholeSwap() {
     CHECK(w.Rearm(100000) == 0);
 }
 
+// The thread that brings the block back wakes up after its own svc: the word after it must still be the game's when it does.
+void TestResumeLeavesTheReceiveSites() {
+    World w(10);
+    w.Note(3);
+    w.Note(3); // (once is enough, whatever the game calls)
+    w.Note(7);
+    CHECK(w.Hooked(3) && w.Hooked(7)); // (noting changes no site)
+    CHECK(w.ledger.receive[0] == 4 && w.ledger.receive[1] == 8 && w.ledger.receive[2] == 0);
+
+    CHECK(w.Suspend() == 10);
+    CHECK(w.ledger.receive[0] == 4); // (the sites stay known over the swap: the hooks are out when the thread goes there)
+    CHECK(w.Resume(5000) == 8);
+    CHECK(w.stats.hooked_again == 8 && w.stats.kept_out == 2);
+    CHECK(w.state == kHooksActive);
+    for (u32 i = 0; i < 10; ++i) {
+        if (i == 3 || i == 7) {
+            CHECK(w.Original(i));
+            CHECK(w.mem.At(w.sites[i].address + 4) == 0xE1A00000 + i); // the word the thread wakes up at
+        } else {
+            CHECK(w.Hooked(i));
+        }
+    }
+    // they take the hook later, and not before
+    CHECK(w.Rearm(5000 + kRearmDelayMs - 1) == 0);
+    CHECK(w.Original(3));
+    CHECK(w.Rearm(5000 + kRearmDelayMs) == 2);
+    CHECK(w.Hooked(3) && w.Hooked(7));
+    CHECK(w.stats.rearmed == 2);
+    CHECK(!LedgerAny(w.ledger));
+    CHECK(w.ledger.receive[0] == 4); // (... and they stay known for the next swap)
+
+    // the next swap: the same
+    CHECK(w.Suspend() == 10);
+    CHECK(w.Resume(9000) == 8);
+    CHECK(w.Original(3) && w.Original(7));
+    CHECK(w.Rearm(9000 + kRearmDelayMs) == 2);
+    CHECK(w.Hooked(3));
+}
+
+// A site that is `svc; bx lr` is every call of the game: out of the hook, a fake session would go to the kernel.
+void TestResumeHooksASharedWrapper() {
+    World w(3);
+    w.sites[1].original[1] = kBxLrWord;
+    w.Note(1);
+    CHECK(w.ledger.receive[0] == 0);
+    w.Suspend();
+    CHECK(w.Resume() == 3);
+    CHECK(w.Hooked(1));
+    CHECK(w.stats.kept_out == 0);
+}
+
+// A site another plugin changed is left alone by a resume, noted or not.
+void TestResumeLeavesAForeignReceiveSite() {
+    World w(3);
+    w.Note(2);
+    w.Suspend();
+    w.mem.At(w.sites[2].address) = 0x12345678;
+    CHECK(w.Resume() == 2);
+    CHECK(w.stats.kept_out == 0);
+    CHECK(w.mem.At(w.sites[2].address) == 0x12345678);
+    CHECK(!LedgerAny(w.ledger));
+}
+
+// What the ledger held before the resume is not the resume's: only the sites it leaves out wait for the re-arm.
+void TestResumeClearsTheLedger() {
+    World w(3);
+    w.Suspend();
+    w.ledger.slot[0] = 2; // (site 1, in the ledger for no reason)
+    w.Resume();
+    CHECK(!LedgerAny(w.ledger));
+    CHECK(w.Hooked(1));
+}
+
+// More receive sites than slots: the ones that are not known simply go back into the hook, as before.
+void TestManyReceiveSites() {
+    World w(kMaxHandedBack + 4);
+    for (u32 i = 0; i < w.Count(); ++i) {
+        w.Note(i);
+    }
+    w.Suspend();
+    CHECK(w.Resume() == 4);
+    CHECK(w.stats.kept_out == kMaxHandedBack);
+    CHECK(w.Hooked(kMaxHandedBack) && w.Original(0));
+    // a trampoline that is not ours notes nothing
+    World other(2);
+    NoteReceiveSite(other.sites.data(), other.Count(), other.ledger, 0x1234);
+    CHECK(other.ledger.receive[0] == 0);
+}
+
+void TestConcurrentNotes() {
+    World w(6);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&w, t] {
+            for (int i = 0; i < 2000; ++i) {
+                w.Note(static_cast<u32>((t + i) % 6));
+            }
+        });
+    }
+    for (std::thread& t : threads) {
+        t.join();
+    }
+    u32 known = 0;
+    for (u32 i = 0; i < kMaxHandedBack; ++i) {
+        known += w.ledger.receive[i] != 0;
+    }
+    CHECK(known == 6); // (each once: no copies from two threads at the same site)
+    for (u32 s = 0; s < 6; ++s) {
+        u32 copies = 0;
+        for (u32 i = 0; i < kMaxHandedBack; ++i) {
+            copies += w.ledger.receive[i] == s + 1;
+        }
+        CHECK(copies == 1);
+    }
+}
+
 void TestConcurrentHandBacks() {
     // the ledger is claimed with a compare-and-swap: game threads that come at once, on different sites (a site's two words are racy by nature,
     // the ledger is not), never lose or double an entry
@@ -357,6 +474,12 @@ int main() {
     TestStateOrder();
     TestRearm();
     TestWholeSwap();
+    TestResumeLeavesTheReceiveSites();
+    TestResumeHooksASharedWrapper();
+    TestResumeLeavesAForeignReceiveSite();
+    TestResumeClearsTheLedger();
+    TestManyReceiveSites();
+    TestConcurrentNotes();
     TestConcurrentHandBacks();
     std::printf("hook_swap_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

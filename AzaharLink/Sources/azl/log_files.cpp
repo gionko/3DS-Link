@@ -361,6 +361,9 @@ bool LogFiles::DrainDebug(bool final) {
     // nothing). A pass writes what it formatted every 64 KB, so the buffer stays at 68 KB (heap, and only with the log
     // on). Until 2026-10-20 the writes were 16 KB and each was flushed: four times the calls into the file system, and a
     // flush costs the card as much as a small write.
+    if (!final && stop_capture_ && __atomic_load_n(stop_capture_, __ATOMIC_ACQUIRE) != 0) {
+        return true; // (SetStopCapture: the writer comes back soon, once it may)
+    }
     NoteCapturePass(platform::NowMs());
     constexpr std::size_t kWriteBytes = 64 * 1024;   // one write to the card: the most a "service call" of this pass is
     constexpr std::size_t kPassBytes = 256 * 1024;   // ... and the most text one pass of the writer puts on the card
@@ -410,6 +413,10 @@ bool LogFiles::DrainDebug(bool final) {
         }
         written += out.size();
         WriteDebug(out);
+        if (more && !final && stop_capture_ && __atomic_load_n(stop_capture_, __ATOMIC_ACQUIRE) != 0) { // (SetStopCapture: the rest stays in the ring)
+            cut = true;
+            break;
+        }
         // The launch is ending (BeginShutdown) and the card cannot keep up: stop after the write in hand and leave the rest of the
         // ring - the game must be able to leave, and the main log's last lines must reach the file (Close() writes them first and
         // then says how much of the capture was not written). A switch-off from the menu has no deadline and drains everything.

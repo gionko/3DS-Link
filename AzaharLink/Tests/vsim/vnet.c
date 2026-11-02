@@ -185,6 +185,8 @@ static void spend(int kind, double us) {
 /* the plugin's own counters of the soc calls (Sources/azl/log.cpp): not needed here */
 void azl_c_soc_call(int kind, unsigned long long ticks) { (void)kind; (void)ticks; }
 void azl_c_room_datagram(unsigned bytes, unsigned long long gap) { (void)bytes; (void)gap; }
+void azl_c_soc_enter(void) {}
+void azl_c_soc_leave(void) {}
 void azl_c_rcvbuf_result(int asked, int got) { (void)asked; (void)got; }
 void azl_c_log(const char* fmt, ...) { (void)fmt; }
 

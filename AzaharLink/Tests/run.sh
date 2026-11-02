@@ -98,6 +98,9 @@ g++ $CXXFLAGS Tests/reloc_test.cpp Sources/azl/arm_reloc.cpp -o "$OUT/reloc_test
 # the re-hook) over an array that plays the game's text; the same source with ThreadSanitizer (the ledger of the sites handed back is claimed by compare-and-swap from game threads)
 g++ $CXXFLAGS Tests/hook_swap_test.cpp Sources/azl/svc_patch.cpp Sources/azl/arm_reloc.cpp -o "$OUT/hook_swap_test"
 g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/hook_swap_test.cpp Sources/azl/svc_patch.cpp Sources/azl/arm_reloc.cpp -o "$OUT/hook_swap_test_tsan"
+# swap_gate_test: the gate of the plugin's own threads around that swap (azl/swap_gate.hpp: no service call of theirs under way when the block goes); the same source with ThreadSanitizer
+g++ $CXXFLAGS Tests/swap_gate_test.cpp -o "$OUT/swap_gate_test"
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/swap_gate_test.cpp -o "$OUT/swap_gate_test_tsan"
 g++ $CXXFLAGS Tests/gsp_wrapper_test.cpp -o "$OUT/gsp_wrapper_test"
 g++ $CXXFLAGS Tests/soc_plan_test.cpp -o "$OUT/soc_plan_test"
 g++ $CXXFLAGS Tests/text_search_guard_test.cpp Sources/ctr/text_search_guard.cpp -o "$OUT/text_search_guard_test"
@@ -247,5 +250,7 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/reloc_test" $RELOC_GAME_CODE   # RELOC_GAME_CODE=<decompressed .code> adds the game sweep
   "$OUT/hook_swap_test"
   "$OUT/hook_swap_test_tsan"
+  "$OUT/swap_gate_test"
+  "$OUT/swap_gate_test_tsan"
   "$OUT/gsp_wrapper_test" $GSP_GAME_CODE   # GSP_GAME_CODE="<decompressed .code> <text size> <expected bl address>" runs the search over a game
 fi

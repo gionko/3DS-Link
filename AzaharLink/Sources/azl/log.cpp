@@ -9,6 +9,7 @@
 #include "azl/platform.hpp"
 #include "azl/printf_lite.hpp"
 #include "azl/stats.hpp"
+#include "azl/swap_gate.hpp"
 
 namespace azl {
 
@@ -1284,6 +1285,19 @@ extern "C" void azl_c_soc_call(int kind, unsigned long long ticks) {
 
 extern "C" void azl_c_room_datagram(unsigned bytes, unsigned long long gap_ticks) {
     azl::StatsRoomDatagram(bytes, gap_ticks);
+}
+
+// For the C sources (the ENet platform layer): the gate around the socket calls of the network thread (azl/swap_gate.hpp).
+namespace azl {
+SwapGate g_swap_gate;
+}
+
+extern "C" void azl_c_soc_enter(void) {
+    azl::GateEnter(azl::g_swap_gate, azl::kGateNet);
+}
+
+extern "C" void azl_c_soc_leave(void) {
+    azl::GateLeave(azl::g_swap_gate, azl::kGateNet);
 }
 
 // For the C sources (the ENet platform layer): what SO_RCVBUF the soc service really gave the room
