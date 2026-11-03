@@ -991,22 +991,55 @@ def scenario_power_handback(elf, level):
     p32(uc, elf.find('g_home_seen'), 0)
     seen = elf.find('g_home_seen')
     stats = elf.find('g_swap_stats')
+    told = sim.alloc(16, 4)                                   # the observer of the trail: its lines are made before the call
+    uc.mem_write(told, struct.pack('<I', 0xE12FFF1E))
+    sim.hooks[told] = ('aptobs', 'apt')
+    p32(uc, elf.find('g_apt_observer'), told)
     sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1D0041])
     sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('APT:U'))) + [5, 0])
     sim.enter('azl_svc32_entry', 0x14801F, 'getservice APT:U')
     apt = 0x1D0041
+    sim.apt_calls.clear()
     # what the dump shows: no HOME button, so the plugin makes the svc itself and the thread sleeps in the kernel inside the plugin's code
     sim.kernel = srv_reply([0x000D0040, 0])
     sim.set_request([0x000D0080, 0x300])
     n32 = sim.svc_log.count(0x32)
     sim.enter('azl_svc32_entry', apt, 'receive parameter, before the power button')
     check(sim.svc_log.count(0x32) == n32 + 1, 'power: before the notification the plugin makes the svc itself')
+    made = [c for c in sim.apt_calls if c[0] == 8]
+    if level > 0:
+        check(len(made) == 1 and made[0][2] == n32, 'power: the trail is told that the plugin makes the call, before it does (%r)' % (made,))
+    else:
+        check(made == [], 'power: at debug 0 the trail is told nothing')
     check(r32(uc, site) == 0xE51FF004 and r32(uc, site + 4) == tramp, 'power: before the notification the call site stays in the hook')
-    for word, armed, what in ((7, 0, 'shutdown'), (0x1BC00008, 1, 'the power button, as a console says it')):
+    for word, armed, what in ((7, 0, 'shutdown'), (0x0607, 0, 'shutdown, with bits in the second byte'), (0x0608, 1, 'the power button, with bits in the second byte (issue 5)'), (0x1BC00008, 1, 'the power button, as a console says it')):
         sim.kernel = srv_reply([0x000B0080, 0, word])
         sim.set_request([0x000B0040, 0x300])
         sim.enter('azl_svc32_entry', apt, 'apt inquire, %s' % what)
         check(r32(uc, seen) == armed, 'power: after the notification of %s the hand-back is %s' % (what, 'armed' if armed else 'not armed'))
+        if level > 0:
+            check(sim.apt_calls[-1][:2] == (1, word), 'power: the trail gets the word as it came (%r)' % (sim.apt_calls[-1:],))
+    # the two calls of the transition, as they came back
+    input_buffer = sim.alloc(16, 4)
+    uc.mem_write(input_buffer, struct.pack('<H', 0x1234))
+    sim.apt_calls.clear()
+    sim.kernel = srv_reply([0x004B0082, 0])
+    sim.set_request([0x004B00C2, 7, 2, 0, 0x00002002, input_buffer])
+    sim.enter('azl_svc32_entry', apt, 'apt applet utility')
+    if level > 0:
+        check(sim.apt_calls[-2:] and [c[:2] for c in sim.apt_calls[-2:]] == [(19, 0x12340007), (20, 0)], 'power: the trail gets the AppletUtility and its result (%r)' % (sim.apt_calls[-2:],))
+    else:
+        check(sim.apt_calls == [], 'power: at debug 0 the AppletUtility is not looked at')
+    # a failed call leaves an old word in cmd[2]: it arms nothing
+    p32(uc, seen, 0)
+    sim.kernel = srv_reply([0x000B0080, 0xC8A0CFF0, 0x0608])
+    sim.set_request([0x000B0040, 0x300])
+    sim.enter('azl_svc32_entry', apt, 'apt inquire that failed')
+    check(r32(uc, seen) == 0, 'power: a failed InquireNotification does not arm the hand-back')
+    sim.kernel = srv_reply([0x000B0080, 0, 0x0608])
+    sim.set_request([0x000B0040, 0x300])
+    sim.enter('azl_svc32_entry', apt, 'apt inquire again')
+    check(r32(uc, seen) == 1, 'power: the same word from a call that succeeded arms it')
     sim.set_request([0x000D0080, 0x300])
     sim.reset_game_stack(False)
     sim.scenario = 'power hand-back'
@@ -1033,6 +1066,42 @@ def scenario_power_handback(elf, level):
     check(uc.reg_read(UC_ARM_REG_LR) == game_lr, "power: lr is the game's")
     check(r32(uc, site) == original[0] and r32(uc, site + 4) == original[1], "power: the call site has the game's own svc and next instruction")
     check(r32(uc, stats + 4 * 8) == 1 and r32(uc, stats + 4 * 9) == 0, 'power: one call handed back, none refused')
+
+
+def scenario_game_failure(elf, level):
+    """A call of the game that failed for good, with the log on (NoteGameFailure): one line of words for the trail, on the thread that made the call. An insisting thread does not fill the ring,
+    and err:f always gets its line, before the call, and a moment for it to reach the card."""
+    sim = Sim(elf, level, hle=True)
+    uc = sim.uc
+    told = sim.alloc(16, 4)
+    uc.mem_write(told, struct.pack('<I', 0xE12FFF1E))
+    sim.hooks[told] = ('aptobs', 'apt')
+    p32(uc, elf.find('g_apt_observer'), told)
+    sim.kernel = lambda s, n: 0xD8E007F7
+    sim.set_request([0x004B00C2, 7, 1, 2, 3, 4, 5])
+    r0, depth, ok = sim.enter('azl_svc32_entry', 0, 'handle 0')
+    check(r0 == 0xD8E007F7, 'failure: the result of the call goes back to the game untouched')
+    record('a failed call: its line for the trail (the observer is a stub)', level, depth, 340, 'log')
+    calls = list(sim.apt_calls)
+    if level == 0:
+        check(calls == [], 'failure: at debug 0 nothing is told')
+    else:
+        kinds = [c[0] for c in calls]
+        values = [c[1] for c in calls]
+        check(kinds[0] == 11 and values[0] == 0 and kinds[-1] == 14 and all(k == 13 for k in kinds[1:-1]), 'failure: the handle, the words, the end (%r)' % (kinds,))
+        check(values[8:15] == [0x004B00C2, 7, 1, 2, 3, 4, 5], 'failure: the thread, its priority and core, the hook, the last session, then the command buffer (%r)' % (values,))
+        check(len(calls) <= 30, 'failure: the line fits the ring of the trail (%d of 32)' % len(calls))
+        n = len(sim.apt_calls)
+        sim.enter('azl_svc32_entry', 0, 'handle 0 again')
+        check(len(sim.apt_calls) == n, 'failure: a thread that insists is not told again within 100 ms')
+        sim.apt_calls.clear()
+        sim.kernel = None
+        sim.set_request([0x00010800, 1, 0xD8E007F7, 0x00123450])
+        sleeps = sim.svc_log.count(0x0A)
+        n32 = sim.svc_log.count(0x32)
+        sim.enter('azl_svc32_entry', 0x1B002A, 'err:f')
+        check(sim.apt_calls and sim.apt_calls[0][:2] == (12, 0x1B002A) and all(c[2] == n32 for c in sim.apt_calls), 'failure: err:f is told before the call is made')
+        check(sim.svc_log.count(0x0A) == sleeps + 1 and sim.svc_log.count(0x32) == n32 + 1, 'failure: err:f gives the trail a moment, then the call is made')
 
 
 def scenario_resume_keeps_receive(elf, level):
@@ -2303,6 +2372,7 @@ def main():
         scenario_apt(elf, level)
         scenario_handback(elf, level)
         scenario_power_handback(elf, level)
+        scenario_game_failure(elf, level)
         scenario_swap_gate(elf, level)
         scenario_resume_keeps_receive(elf, level)
         scenario_worker_off_core1(elf, level)

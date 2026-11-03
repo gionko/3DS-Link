@@ -14,18 +14,33 @@ constexpr u32 kAptSignalSleepEnter = 5;
 constexpr u32 kAptSignalWakeup = 6;
 
 /// What the observer of the whole sleep protocol is told (ctr/hook.hpp, SetAptObserver; azl/sleep_crumbs.hpp keeps the
-/// trail): a notification that arrived (the value is its number), the game's answer to the sleep query (0 reject, 1 accept,
+/// trail): a notification that arrived (the value is the reply word as it came), the game's answer to the sleep query (0 reject, 1 accept,
 /// 2 later), and the game's acknowledgement of a sleep (told BEFORE the call is made: it may not come back).
 constexpr u32 kAptNoteNotification = 1;
 constexpr u32 kAptNoteReplyQuery = 2;
 constexpr u32 kAptNoteReplyComplete = 3;
+// (4 to 7 are the framework's, azl/sleep_crumbs.hpp.) The call that raises the swap on an Old 3DS, told before it is made (its value: the trampoline's return, or the call site it goes back to):
+constexpr u32 kAptNoteReceiveMade = 8;     ///< the plugin makes it itself: no HOME or power button seen just now
+constexpr u32 kAptNoteReceiveHanded = 9;   ///< it goes back to the game's own call site
+constexpr u32 kAptNoteReceiveRefused = 10; ///< it should have gone back and could not
+// A call of the game that failed for good, told as one line of words (kAptNoteWord ..., kAptNoteEnd): an invalid handle (the value: the handle), or the fatal error the game reports to err:f (the value: the session).
+constexpr u32 kAptNoteBadHandle = 11;
+constexpr u32 kAptNoteFatal = 12;
+constexpr u32 kAptNoteWord = 13;
+constexpr u32 kAptNoteEnd = 14;
+// (15 to 17 are the memory regions, azl/sleep_crumbs.hpp.) Two calls of the transition, as they came back:
+constexpr u32 kAptNoteReceiveReply = 18;   ///< APT:ReceiveParameter(application): sender << 16 | command, or kAptReceiveFailed
+constexpr u32 kAptNoteUtility = 19;        ///< APT:AppletUtility: the first 16 bits of the input << 16 | the id; its result comes next
+constexpr u32 kAptNoteUtilityResult = 20;
+constexpr u32 kAptReceiveFailed = 0xFFFFFFFF;
+constexpr u32 kAptNoteLimit = 21;          ///< the lines of these two calls reached their limit (once)
 
 enum class AptSleepEvent { None, Enter, Wake };
 
-/// The APT signal of InquireNotification's reply word: libctru's APT_Signal values are small numbers, and some games get
-/// bits above them (0x1BC00001 for the HOME button in Mario Party: The Top 100): only the low 16 bits are the signal.
+/// The APT signal of InquireNotification's reply word. Only the low byte is the signal: the bytes above it change from call to call: 0x1BC00001, 0x00000601 and 0x0007E901 for the HOME button, 0x18000008 and 0x00000608 for the power button (all from real consoles).
+/// With 16 bits, 0x608 was no power button: no hand-back, and the game's thread woke up in the plugin's freed memory (Old 3DS, issue 5, Pokemon Alpha Sapphire, 1.1.0).
 inline u32 AptSignalOf(u32 reply_word) {
-    return reply_word & 0xFFFFu;
+    return reply_word & 0xFFu;
 }
 
 /// The signals after which the game goes to the HOME menu's side of the system: the HOME button (1 and 2) and the power button (8 and 9, about 0.6 s apart on a
@@ -41,7 +56,7 @@ inline AptSleepEvent AptSleepEventOf(u32 request_header, const u32* reply) {
     if (request_header != kAptInquireNotificationHeader || static_cast<s32>(reply[1]) < 0) {
         return AptSleepEvent::None;
     }
-    // The signal is the low 16 bits: Mario Party: The Top 100 gets 0x1BC00001 for the HOME button (hardware, 2026-10-14).
+    // The signal is the low byte: see AptSignalOf.
     const u32 signal = AptSignalOf(reply[2]);
     if (signal == kAptSignalSleepEnter) {
         return AptSleepEvent::Enter;

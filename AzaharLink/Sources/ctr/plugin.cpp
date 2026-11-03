@@ -80,6 +80,8 @@ constexpr int kEventSleepExit = 2;
 constexpr int kEventSwapEnter = 5;
 constexpr int kEventSwapExit = 6;
 constexpr u32 kLogStopTimeoutMs = 400;
+// SWAP_ENTER (Old 3DS, HOME), with the log on: how long the trail gets to put the event on the card before the threads stop.
+constexpr u32 kSwapTrailWaitMs = 40;
 // SWAP_ENTER (Old 3DS, HOME): how long the plugin waits for the game's threads that are inside the hook to leave it before it lets Luma3DS free the plugin's block.
 // Luma3DS itself waits 10 s for the answer (waitForReplyTimeout); the threads that matter leave in microseconds, the budget is for a call that waits in a real service.
 constexpr u32 kSwapDrainTimeoutMs = 1500;
@@ -794,7 +796,11 @@ void Plugin::StartCrumbs() {
             char stamp[24];
             FormatConsoleClock(osGetTime(), stamp);
             log_files_->WriteCrumb(std::string("sleep: the trail of this launch begins | tick ") +
-                                   std::to_string(static_cast<u32>(platform::NowMs())) + " ms | written at console clock " + stamp);
+                                   std::to_string(static_cast<u32>(platform::NowMs())) + " ms | written at console clock " + stamp + " | AzaharLink " + kVersion);
+            for (const std::string& line : lines) { // (what happened before this turn)
+                log_files_->WriteCrumb(line);
+            }
+            crumb_written_.store(crumbs_.taken());
         }
         while (!crumb_stop_.load()) {
             const s64 wait_ns = crumbs_.watching() ? static_cast<s64>(SleepCrumbs::kPollMs) * 1000000LL : -1;
@@ -808,6 +814,7 @@ void Plugin::StartCrumbs() {
             for (const std::string& line : lines) {
                 log_files_->WriteCrumb(line);
             }
+            crumb_written_.store(crumbs_.taken());
         }
     };
     // 0x20, above the game's threads; 0x2F (the network thread's) if the process may not have that
@@ -1548,6 +1555,9 @@ void Plugin::NoteProcessEvent(int event) {
             NoteSleepEvent(event == kEventSleepEnter ? SleepCrumbs::kFwEnter : SleepCrumbs::kFwExit, 0);
         }
         if (event == kEventSwapEnter) {
+            // The trail first, on the card: a crash from here to SWAP_EXIT leaves it, and the memory of the regions at each swap shows what the HOME menu has to work with.
+            NoteSwapToTrail(SleepCrumbs::kFwSwapEnter, event_count_[event] + 1);
+            WaitForTrail(kSwapTrailWaitMs);
             // Old 3DS, HOME: Luma3DS is waiting for the framework's answer, which this callback precedes, and frees the plugin's block as soon as it has it.
             // Every call site goes back to the game's own words and the threads still inside the hook are waited for (the thread that raised the swap
             // is not one of them: it went back to the game's code, azl_handback_site). The line about it comes with the event's, from the writer.
@@ -1556,11 +1566,46 @@ void Plugin::NoteProcessEvent(int event) {
             // hook may wait for what a thread stopped at the gate holds.
             CloseSwapGate(kSwapGateTimeoutMs);
         } else if (event == kEventSwapExit) {
-            ResumeSvcHooks(); // (the block is back, byte for byte: the sites take their old trampolines again)
-            OpenSwapGate();
+            if (!swap_back_done_.exchange(false)) { // (done by OnSwapBack, before the game's thread woke up: a second pass would start the 2 s of the hand-back again)
+                ResumeSvcHooks(); // (the block is back, byte for byte: the sites take their old trampolines again)
+                OpenSwapGate();
+            }
+            NoteSwapToTrail(SleepCrumbs::kFwSwapExit, event_count_[event] + 1);
         }
         // Last: the writer reports an event once, when it sees the count change, and the HOME button has just woken it. Counted before the gate closes, it could print the numbers of the swap before this one.
         event_count_[event] = event_count_[event] + 1;
+    }
+}
+
+// Old 3DS, the block is back: Luma3DS has mapped it, unlocked the plugin's threads and told the framework (PLG_OK), and only then lets the game's thread that raised the swap go on.
+// Here the framework's thread runs at the priority Luma's answer gave it (__wrap_PLGLDR__Reply, below), above the game's threads: the call sites go back in the hook before any
+// of them runs. At SWAP_EXIT, later, the game's thread could already be inside its own svc at a call site while that site was rewritten: on waking up it ran the trampoline's
+// address in place of the instruction after its svc, lost that instruction, and a session it had just opened stayed 0 (0xD8E007F7 on handle 0: Pokemon, My Hero Academia).
+void Plugin::OnSwapBack() {
+    const u64 start = platform::NowUs();
+    ResumeSvcHooks();
+    const u32 took_us = static_cast<u32>(platform::NowUs() - start);
+    OpenSwapGate();
+    swap_back_done_.store(true);
+    NoteSleepEvent(SleepCrumbs::kFwSwapBack, took_us);
+}
+
+void Plugin::NoteSwapToTrail(u32 kind, u32 number) {
+    NoteSleepEvent(kind, number);
+    if (g_debug_level > 0) {
+        NoteSleepEvent(SleepCrumbs::kMemSystem, SleepCrumbs::PackRegion(osGetMemRegionUsed(MEMREGION_SYSTEM), osGetMemRegionSize(MEMREGION_SYSTEM)));
+        NoteSleepEvent(SleepCrumbs::kMemApplication, SleepCrumbs::PackRegion(osGetMemRegionUsed(MEMREGION_APPLICATION), osGetMemRegionSize(MEMREGION_APPLICATION)));
+        NoteSleepEvent(SleepCrumbs::kMemBase, SleepCrumbs::PackRegion(osGetMemRegionUsed(MEMREGION_BASE), osGetMemRegionSize(MEMREGION_BASE)));
+    }
+}
+
+void Plugin::WaitForTrail(u32 timeout_ms) {
+    if (g_debug_level <= 0 || crumb_wake_ == 0) {
+        return;
+    }
+    const u32 target = crumbs_.pushed();
+    for (u32 waited = 0; waited < timeout_ms && static_cast<s32>(crumb_written_.load() - target) < 0; waited += 2) {
+        svcSleepThread(2000000LL);
     }
 }
 
@@ -1719,6 +1764,13 @@ void Plugin::EarlyInit() {
         const bool new_layout = region >= (100ll << 20);
         Log("console: application memory region %lld MiB (%s memory layout)", region >> 20,
             new_layout ? "New 3DS" : "Old 3DS");
+        // Which kernel this log is about (a report is read against that version), and the hardware itself: a New 3DS can show the Old layout.
+        s64 luma = 0;
+        s64 is_new = 0;
+        svcGetSystemInfo(&luma, 0x10000, 0);
+        const bool new_hardware = svcGetSystemInfo(&is_new, 0x10001, 0) == 0;
+        Log("console: %s hardware, kernel 0x%08lx, firm 0x%08lx, Luma3DS 0x%08lx", new_hardware ? "New 3DS" : "Old 3DS",
+            static_cast<unsigned long>(osGetKernelVersion()), static_cast<unsigned long>(osGetFirmVersion()), static_cast<unsigned long>(luma));
         // The plugin's own memory: the block Luma loaded it into (3gx MemorySize), shared with the game's
         // mapping so that it is not charged to the game's commit. Luma takes it from the APPLICATION region of
         // a New 3DS and from the SYSTEM region of an Old 3DS.
@@ -2832,3 +2884,25 @@ std::vector<std::string> Plugin::TakeNotifications() {
 
 } // namespace ctr
 } // namespace azl
+
+// The framework's answer to Luma3DS. With 3 (the plugin is ready for the swap of its block, an Old 3DS only: Luma sends that event nowhere else) the call returns
+// once the block is back, and Luma has unlocked this thread before it lets the game's thread go on. The thread goes up to the priority the framework created it with,
+// so that putting the call sites back in the hook finishes before a game's thread runs on this core (Plugin::OnSwapBack); then its own priority again.
+constexpr s32 kReplySwap = 3;
+constexpr s32 kSwapBackPriority = 0x1A;
+
+extern "C" void __real_PLGLDR__Reply(s32 event);
+extern "C" void __wrap_PLGLDR__Reply(s32 event) {
+    if (event != kReplySwap) {
+        __real_PLGLDR__Reply(event);
+        return;
+    }
+    s32 priority = 0;
+    const bool raised = R_SUCCEEDED(svcGetThreadPriority(&priority, CUR_THREAD_HANDLE)) &&
+                        R_SUCCEEDED(svcSetThreadPriority(CUR_THREAD_HANDLE, kSwapBackPriority));
+    __real_PLGLDR__Reply(event);
+    azl::ctr::Plugin::Get().OnSwapBack();
+    if (raised) {
+        svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
+    }
+}

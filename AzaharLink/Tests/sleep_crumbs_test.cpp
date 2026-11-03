@@ -256,12 +256,89 @@ static void TestTwoProducersAndTheThread() {
     CHECK_EQ(repeated, 0);
 }
 
+// What an Old 3DS needs from the trail: the word as it came, the swap with the memory, the APT:ReceiveParameter decision, a failed call.
+static void TestOld3dsLines() {
+    SleepCrumbs crumbs;
+    std::vector<std::string> lines;
+    crumbs.Poll(1000, Os(1000), &lines);
+    lines.clear();
+    crumbs.Push(kAptNoteNotification, 0x608, 2000);
+    crumbs.Push(kAptNoteNotification, 1, 2001);
+    crumbs.Push(kAptNoteNotification, 0x1BC00005, 2002); // a sleep with bits above the signal still arms the watch
+    crumbs.Poll(2100, Os(2100), &lines);
+    CHECK_EQ(lines.size(), std::size_t(3));
+    if (lines.size() == 3) {
+        CHECK(Has(lines[0], "sleep: APT notification 8 (power button), reply word 0x00000608 | tick 2000 ms"));
+        CHECK(Has(lines[1], "sleep: APT notification 1 (home button) | tick 2001 ms"));
+        CHECK(Has(lines[2], "sleep: APT notification 5 (sleep begins), reply word 0x1bc00005 | tick 2002 ms"));
+    }
+    CHECK(crumbs.watching());
+    lines.clear();
+    CHECK_EQ(crumbs.pushed(), crumbs.taken());
+    crumbs.Push(SleepCrumbs::kFwSwapEnter, 3, 3000);
+    crumbs.Push(SleepCrumbs::kMemSystem, SleepCrumbs::PackRegion(40u << 20, 44u << 20), 3000);
+    crumbs.Push(SleepCrumbs::kMemApplication, SleepCrumbs::PackRegion(64u << 20, 64u << 20), 3000);
+    crumbs.Push(SleepCrumbs::kMemBase, SleepCrumbs::PackRegion(21u << 20, 20u << 20), 3000); // (used over total: never a huge number)
+    CHECK(crumbs.pushed() != crumbs.taken());
+    crumbs.Push(SleepCrumbs::kFwSwapExit, 3, 4000);
+    crumbs.Push(kAptNoteReceiveMade, 0x070D37C8, 4001);
+    crumbs.Push(kAptNoteReceiveHanded, 0x00123450, 4002);
+    crumbs.Push(kAptNoteReceiveRefused, 0x070D37C8, 4003);
+    crumbs.Poll(4100, Os(4100), &lines);
+    CHECK_EQ(crumbs.pushed(), crumbs.taken());
+    CHECK_EQ(lines.size(), std::size_t(8));
+    if (lines.size() == 8) {
+        CHECK(Has(lines[0], "framework event SWAP_ENTER #3:"));
+        CHECK(Has(lines[1], "memory region SYSTEM: 40960 of 45056 KB used, 4096 KB free"));
+        CHECK(Has(lines[2], "memory region APPLICATION: 65536 of 65536 KB used, 0 KB free"));
+        CHECK(Has(lines[3], "memory region BASE: 21504 of 20480 KB used, 0 KB free"));
+        CHECK(Has(lines[4], "framework event SWAP_EXIT #3:"));
+        CHECK(Has(lines[5], "by the plugin itself (trampoline return 0x070d37c8)"));
+        CHECK(Has(lines[6], "handed back to the game's own call at 0x00123450"));
+        CHECK(Has(lines[7], "the hand-back was refused (trampoline return 0x070d37c8)"));
+    }
+    lines.clear();
+    crumbs.Push(SleepCrumbs::kFwSwapBack, 2017, 4499);
+    crumbs.Push(kAptNoteLimit, 0, 4499);
+    crumbs.Push(kAptNoteReceiveReply, 0x01010003, 4500);
+    crumbs.Push(kAptNoteReceiveReply, kAptReceiveFailed, 4501);
+    crumbs.Push(kAptNoteUtility, 0x12340007, 4502);
+    crumbs.Push(kAptNoteUtilityResult, 0, 4502);
+    crumbs.Poll(4600, Os(4600), &lines);
+    CHECK_EQ(lines.size(), std::size_t(5));
+    if (lines.size() == 5) {
+        CHECK(Has(lines[0], "call sites in the hook again in 2017 us, before the game's thread runs"));
+        CHECK(Has(lines[1], "reached their limit for this launch (64)"));
+        CHECK(Has(lines[2], "APT:ReceiveParameter answered: sender 0x00000101, command 3"));
+        CHECK(Has(lines[3], "APT:ReceiveParameter failed"));
+        CHECK(Has(lines[4], "APT:AppletUtility id 7 (input 0x00001234) -> 0x00000000"));
+    }
+    lines.clear();
+    crumbs.Push(kAptNoteBadHandle, 0, 5000);
+    crumbs.Push(kAptNoteWord, 0x2A, 5000);
+    crumbs.Push(kAptNoteWord, 0x004B00C2, 5000);
+    crumbs.Poll(5001, Os(5001), &lines);
+    CHECK(lines.empty()); // (the line waits for its words, across turns of the thread)
+    crumbs.Push(kAptNoteEnd, 0, 5000);
+    crumbs.Push(kAptNoteFatal, 0x123, 5100);
+    crumbs.Push(kAptNoteWord, 0xD8E007F7, 5100);
+    crumbs.Push(kAptNoteEnd, 0, 5100);
+    crumbs.Poll(5200, Os(5200), &lines);
+    CHECK_EQ(lines.size(), std::size_t(2));
+    if (lines.size() == 2) {
+        CHECK(Has(lines[0], "a call of the game on handle 0x00000000 answered invalid handle: 0x0000002a 0x004b00c2 | the words:"));
+        CHECK(Has(lines[1], "fatal error to err:f (session 0x00000123;"));
+        CHECK(Has(lines[1], " 0xd8e007f7 | the words:"));
+    }
+}
+
 int main() {
     TestEventsBecomeLines();
     TestWakeMarker();
     TestNoWakeInAMinute();
     TestRingOverflowAndLimit();
     TestTwoProducersAndTheThread();
+    TestOld3dsLines();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

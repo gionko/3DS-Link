@@ -273,6 +273,8 @@ bool WorthLogging(Handle handle, u32 command) {
 constexpr u32 kAptInquireNotification = 0x000B0040;
 constexpr u32 kAptReplySleepQuery = 0x003E0080;
 constexpr u32 kAptReplySleepNotificationComplete = 0x003F0040;
+constexpr u32 kAptReceiveParameter = 0x000D0080;
+constexpr u32 kAptAppletUtility = 0x004B00C2; // (utility id, input size, output size, static buffer descriptor, input)
 constexpr u32 kMaxAptLines = 120;
 
 // The HOME button and the power button as the game's APT session tells them (InquireNotification, AptSignalPrecedesSwap). On an Old 3DS the swap of the plugin's memory follows within a moment, and
@@ -304,11 +306,49 @@ void SetHomeObserver(HomeObserver observer) {
     g_home_observer = observer;
 }
 
+// The two calls of the transition to and from the HOME menu, with the log on: what the system answered, for the trail. Out of line: the other APT commands do not pay for these locals.
+u32 g_receive_notes = 0;
+constexpr u32 kMaxReceiveNotes = 64;
+
+// One more line for the trail, while there is room; the last one says that the limit is reached.
+inline bool TakeReceiveNote() {
+    if (g_receive_notes > kMaxReceiveNotes) {
+        return false;
+    }
+    if (++g_receive_notes > kMaxReceiveNotes) {
+        g_apt_observer(kAptNoteLimit, 0);
+        return false;
+    }
+    return true;
+}
+
+__attribute__((noinline)) Result PassThroughAptNoted(Handle handle, u32 header) {
+    u32* cmd = getThreadCommandBuffer();
+    const u32 id = cmd[1];
+    u32 input = 0;
+    if (header == kAptAppletUtility && cmd[2] >= 2 && cmd[5] != 0) {
+        input = *reinterpret_cast<const u16*>(cmd[5]); // (the kernel would refuse the call with a bad pointer: the game's own buffer)
+    }
+    const Result rc = svcSendSyncRequest(handle);
+    if (TakeReceiveNote()) { // (a game that polls these must not use up the lines of the trail)
+        if (header == kAptAppletUtility) {
+            g_apt_observer(kAptNoteUtility, input << 16 | (id & 0xFFFF));
+            g_apt_observer(kAptNoteUtilityResult, R_SUCCEEDED(rc) ? cmd[1] : static_cast<u32>(rc));
+        } else {
+            g_apt_observer(kAptNoteReceiveReply, R_SUCCEEDED(rc) && static_cast<s32>(cmd[1]) >= 0 ? cmd[2] << 16 | (cmd[3] & 0xFFFF) : kAptReceiveFailed);
+        }
+    }
+    return rc;
+}
+
 Result PassThroughApt(Handle handle) {
     u32* cmd = getThreadCommandBuffer();
     const u32 header = cmd[0];
     if (header != kAptInquireNotification && header != kAptReplySleepQuery &&
         header != kAptReplySleepNotificationComplete) {
+        if (g_debug_level > 0 && g_apt_observer && (header == kAptAppletUtility || (header == kAptReceiveParameter && cmd[1] == 0x300))) {
+            return PassThroughAptNoted(handle, header);
+        }
         return svcSendSyncRequest(handle);
     }
     const u32 app_id = cmd[1];
@@ -323,16 +363,17 @@ Result PassThroughApt(Handle handle) {
     static u32 lines = 0;
     if (header == kAptInquireNotification) {
         const u32 raw = cmd[2]; // after the call
-        const u32 id = AptSignalOf(raw); // (the low 16 bits: Mario Party: The Top 100 gets 0x1BC00001 for the HOME button)
+        const u32 id = AptSignalOf(raw); // (the low byte: the bits above it change from call to call)
         if (id == 0) {
             return rc; // (polled all the time: only the notifications themselves are of interest)
         }
-        if (AptSignalPrecedesSwap(id)) {
+        const bool answered = R_SUCCEEDED(rc) && static_cast<s32>(cmd[1]) >= 0; // (a failed call leaves in cmd[2] what an earlier one left: with 8 bits that can look like a button)
+        if (answered && AptSignalPrecedesSwap(id)) {
             g_home_ms = static_cast<u32>(platform::NowMs());
             g_home_seen = 1;
         }
-        if (g_apt_observer && g_debug_level > 0 && R_SUCCEEDED(rc)) {
-            g_apt_observer(kAptNoteNotification, id); // (before the sleep observer below acts on it)
+        if (g_apt_observer && g_debug_level > 0 && answered) {
+            g_apt_observer(kAptNoteNotification, raw); // (the word as it came; before the sleep observer below acts on it)
         }
         // The game's call is over and its answer is untouched; what the observer does with it is up to it.
         if (g_sleep_observer && R_SUCCEEDED(rc)) {
@@ -347,10 +388,10 @@ Result PassThroughApt(Handle handle) {
                 break;
             }
         }
-        // The HOME button: the log is what a post-mortem has when the game dies while it is closed, so the writer is
+        // The HOME and the power button: the log is what a post-mortem has when the game dies while it is closed, so the writer is
         // woken to put it on the card now (the observer only signals an event: no SD write on this thread). After the
         // lines of this notification, so that the flush it asks for has them.
-        const bool home = g_home_observer && g_debug_level > 0 && (id == 1 || id == 2);
+        const bool home = g_home_observer && g_debug_level > 0 && AptSignalPrecedesSwap(id);
         if (g_debug_level <= 0 || lines >= kMaxAptLines) {
             if (home) {
                 g_home_observer(); // (the sleep observer above works at every level; the lines are the log's)
@@ -397,6 +438,10 @@ Result PassThroughApt(Handle handle) {
     return rc;
 }
 
+// The last session the game opened through the hook, and when (with the log on): a call that later fails on handle 0 says with these whether the hook saw that session being opened.
+u32 g_last_service = 0;
+u32 g_last_service_ms = 0;
+
 // srv:GetServiceHandle: which real services the game opens (and the traced ones are remembered by session).
 // Out of line, with a frame of its own: the common path below does not pay for these locals.
 __attribute__((noinline)) Result PassThroughGetService(Handle handle) {
@@ -407,6 +452,8 @@ __attribute__((noinline)) Result PassThroughGetService(Handle handle) {
     const Result service_rc = R_SUCCEEDED(rc) ? cmd[1] : rc;
     const Handle session = R_SUCCEEDED(service_rc) ? cmd[3] : 0;
     if (g_debug_level > 0) {
+        g_last_service = session;
+        g_last_service_ms = static_cast<u32>(platform::NowMs());
         if (g_trace_lines < kMaxTraceLines) {
             ++g_trace_lines;
             LogLine line;
@@ -465,6 +512,65 @@ __attribute__((noinline)) Result PassThroughTraced(Handle handle, const TracedSe
     return rc;
 }
 
+// A call of the game that failed for good, with the log on: what a dump does not say, written down before the game goes on to its error screen. One line of the trail (AzaharLink.sleep.log): the thread,
+// the command buffer and the words of the stack that look like code: above the plugin's frames are the trampoline's return and the game's own lr. At most 8 invalid handles in a launch, 100 ms apart
+// (a thread that insists fills the ring in microseconds, and the writes are slow); a fatal error always, and it gives the thread of the trail time to write it: what follows the call may stop the process.
+constexpr u32 kKernelInvalidHandle = 0xD8E007F7;
+constexpr u32 kErrfThrow = 0x00010800; // err:f ThrowFatalError: type, result, pc, process, title in the words after the header
+constexpr u32 kFailureGapMs = 100;
+u32 g_failures_noted = 0;
+u32 g_failure_ms = 0;
+u32 g_resume_end_ms = 0; // (the call sites were last put back in the hook at this time: ResumeSvcHooks)
+u32 g_failure_busy = 0; // (one line at a time: two threads would mix their words)
+
+__attribute__((noinline)) void NoteGameFailure(u32 kind, Handle handle) {
+    if (!g_apt_observer) {
+        return;
+    }
+    const u32 now = static_cast<u32>(platform::NowMs());
+    if (kind != kAptNoteFatal && (g_failures_noted >= 8 || (g_failures_noted != 0 && now - g_failure_ms < kFailureGapMs))) {
+        return;
+    }
+    if (__atomic_exchange_n(&g_failure_busy, 1u, __ATOMIC_ACQUIRE) != 0) {
+        return;
+    }
+    if (kind != kAptNoteFatal) {
+        ++g_failures_noted;
+        g_failure_ms = now;
+    }
+    const u32* const cmd = getThreadCommandBuffer();
+    const u32* stack;
+    __asm__ volatile("mov %0, sp" : "=r"(stack));
+    u32 thread_id = 0;
+    svcGetThreadId(&thread_id, CUR_THREAD_HANDLE);
+    g_apt_observer(kind, handle);
+    s32 priority = -1;
+    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+    g_apt_observer(kAptNoteWord, thread_id);
+    g_apt_observer(kAptNoteWord, static_cast<u32>(priority));
+    g_apt_observer(kAptNoteWord, static_cast<u32>(svcGetProcessorID()));
+    g_apt_observer(kAptNoteWord, g_hooks_state);
+    g_apt_observer(kAptNoteWord, now - g_resume_end_ms);
+    g_apt_observer(kAptNoteWord, g_last_service);
+    g_apt_observer(kAptNoteWord, now - g_last_service_ms);
+    for (u32 i = 0; i < 7; ++i) {
+        g_apt_observer(kAptNoteWord, cmd[i]);
+    }
+    u32 kept = 0;
+    for (u32 i = 0; i < 40 && kept < 14; ++i) {
+        const u32 word = stack[i];
+        if ((word >= kGameTextBase && word < 0x04000000) || (word >= 0x07000000 && word < 0x07200000)) {
+            g_apt_observer(kAptNoteWord, word);
+            ++kept;
+        }
+    }
+    g_apt_observer(kAptNoteEnd, 0);
+    __atomic_store_n(&g_failure_busy, 0u, __ATOMIC_RELEASE);
+    if (kind == kAptNoteFatal) {
+        svcSleepThread(50000000LL);
+    }
+}
+
 // What every IPC call of every thread of the game that no service of ours answers goes through. The common case -
 // a call to a real service nobody traces - keeps this frame small on purpose: it is the one that runs on the
 // srv-notification thread of Tri Force Heroes (464 bytes), and the branches with locals are out of line.
@@ -484,7 +590,13 @@ Result PassThrough(Handle handle) {
     }
     // Log on: every IPC request of the game (raw words in the ring: no formatting on this thread, whatever its stack is).
     const u32 arg = cmd[1];
+    if (header == kErrfThrow) {
+        NoteGameFailure(kAptNoteFatal, handle); // (before the call: it does not come back)
+    }
     const Result rc = svcSendSyncRequest(handle);
+    if (static_cast<u32>(rc) == kKernelInvalidHandle) {
+        NoteGameFailure(kAptNoteBadHandle, handle);
+    }
     DebugIpc(handle, header, arg, R_SUCCEEDED(rc) ? cmd[1] : static_cast<u32>(rc));
     return rc;
 }
@@ -512,7 +624,13 @@ extern "C" Result azl_hook_CloseHandle(Handle handle) {
 // Called by azl_svc32_entry (svc_entry.s) before it makes an APT:ReceiveParameter(application) call, with the trampoline's return address: the call at whose end
 // Luma3DS's kernel raises the swap of the plugin's block on an Old 3DS, on the calling thread, which it then puts to sleep until the block is gone and back.
 // Returns the call site the game's thread must go back to (its svc and next instruction are the game's own again) to make the call itself, or 0 to make it here.
-// A few loads on every path but the one answer: no printf, no wait, and the frame is held by Tests/stack_usage.sh.
+// A few loads on every path but the one answer (with the log on, a line for the trail: its ring and an event signal): no printf, no wait, and the frame is held by Tests/stack_usage.sh.
+inline void NoteReceiveCall(u32 kind, u32 where) {
+    if (g_apt_observer && g_debug_level > 0 && TakeReceiveNote()) { // (a game that polls this call must not use up the lines of the trail)
+        g_apt_observer(kind, where); // (SWAP_ENTER waits for the trail: the crash this is about comes at the end of the call, with the line on the card)
+    }
+}
+
 extern "C" u32 azl_handback_site(Handle, u32 tramp_return) {
     __atomic_fetch_add(&g_swap_stats.asked, 1u, __ATOMIC_RELAXED);
     if (!g_old_3ds) {
@@ -522,11 +640,13 @@ extern "C" u32 azl_handback_site(Handle, u32 tramp_return) {
     const u32 now = static_cast<u32>(platform::NowMs());
     if (!g_home_seen || static_cast<u32>(now - g_home_ms) > kHomeWindowMs) {
         __atomic_fetch_add(&g_swap_stats.no_home, 1u, __ATOMIC_RELAXED);
+        NoteReceiveCall(kAptNoteReceiveMade, tramp_return);
         return 0;
     }
     const GameTextMemory memory;
     const u32 site = HandBackSite(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, tramp_return, now);
     __atomic_fetch_add(site ? &g_swap_stats.handbacks : &g_swap_stats.handback_refused, 1u, __ATOMIC_RELAXED);
+    NoteReceiveCall(site ? kAptNoteReceiveHanded : kAptNoteReceiveRefused, site ? site : tramp_return);
     return site;
 }
 // <<< game-thread code
@@ -739,6 +859,7 @@ void ResumeSvcHooks() {
     const GameTextMemory memory;
     ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);
     ReleasePatchLock();
+    g_resume_end_ms = static_cast<u32>(platform::NowMs());
 }
 
 void RearmHandedBackSites() {

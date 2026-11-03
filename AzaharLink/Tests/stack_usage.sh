@@ -83,6 +83,9 @@ budget hook "azl_hook_CloseHandle" 24
 # the frames above did not move. Its own frame is paid only by an APT:ReceiveParameter(application), on the game's APT thread (the chain test measures the whole path: 92 bytes
 # below the entry SP, the entry's extra push included).
 budget hook "azl_handback_site" 48
+# (A call of the game that failed for good, with the log on: its line for the trail, out of line behind two compares of PassThrough. Tests/chain_sim runs it.)
+budget hook "azl::ctr::NoteGameFailure" 56
+budget hook "azl::ctr::PassThroughAptNoted" 48
 # (0.1.16: DebugIpc writes its record from registers, with no record or array on the stack - 64 bytes before, with the diet and
 # the lanes in it 40 - so the pure pass-through path at debug 1 is 24 bytes shallower than the hotfix's; Tests/chain_sim pins that)
 budget log "azl::DebugIpc" 48

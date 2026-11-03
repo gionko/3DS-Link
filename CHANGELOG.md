@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.1 - 2026-11-03
+
+**On an Old 3DS: two crashes when coming back from HOME or the power button, and a debug log that says much more. Not tried on an Old 3DS yet. Games on a New 3DS behave as in 1.1.0.**
+
+> Two users tried 1.1.0 on an Old 3DS ([issue 5](https://github.com/gionko/3DS-Link/issues/5) and the GBAtemp thread) and sent logs, dumps and photos. Two crashes came out of them, in Pokémon Alpha Sapphire and in My Hero Academia. This package was tried on two New 2DS XL in a room with Super Street Fighter IV (HOME, the power button, the lid, with the debug log on): nothing broke.
+
+### At a glance
+
+| Area | Before | Now | Since |
+|---|---|---|---|
+| Old 3DS: the power button during a game, when the system's answer carries other bits (`0x608`) | not recognized: the game could wake up in memory that is gone | recognized; a fix, **not tried on an Old 3DS** | 1.1.1 |
+| Old 3DS: `0xD8E007F7` when the game comes back from HOME or the power menu, or when it is closed from HOME | seen on 1.0.15 and on 1.1.0, now and then | a fix, **not tried on an Old 3DS** (see below) | 1.1.1 |
+| A failed call to ask for the notification | its old answer could look like a button | ignored | 1.1.1 |
+| The debug log on an Old 3DS | little about the swap, and the lines of a crash could be lost | the swap and the memory at each one, the calls around it, the calls that fail for good, written to the card at once | 1.1.1 |
+| New 3DS family | | with the debug log off, the games run as in 1.1.0; with it on, more lines. The lid's sleep is recognized with those bits too, which only matters with *End session on sleep* on | |
+
+### Not fixed or not tried
+
+| What | Notes |
+|---|---|
+| These fixes on an Old 3DS or Old 2DS | **not tried**: these paths do not run on a New 3DS |
+| `0xD8C3FBF3` from the HOME menu, once, at the tenth HOME | seen once on 1.1.0. **Not fixed, and not known if the plugin has anything to do with it** |
+| The `kernel panic` at HOME | not reported on 1.1.0 so far, but the attempts of those reports left no log: **not settled** |
+
+### Technical notes
+
+<details>
+<summary>0xD8E007F7 on handle 0: an instruction lost when the plugin hooks the game again</summary>
+
+On an Old 3DS the plugin puts the game's own `svc` instructions back before Luma takes its memory away, and hooks them again when the memory is back. Hooking a call site writes two words. Luma lets the plugin's threads run before the game's thread that went to HOME, but the plugin only hooked the game again later, when the framework's callback ran. By then the game's thread was opening one session after another. If it was asleep in its own `svc` at a call site while that site was rewritten, it woke up and ran the second word in place of the instruction that checked the result: the session it had just opened was never saved, and the next call went out on handle 0.
+
+The sites now go back in the hook as soon as the memory is back, at a higher priority, before the game's thread runs. The sequence was reproduced on the PC with the SDK code of five recent games, not on a console. A hook of a single word, which would make this impossible, is for a later version.
+
+</details>
+
 ## 1.1.0 - 2026-11-02
 
 **Three fixes for the HOME button and the power button on an Old 3DS, not tried on one yet. Nothing changes for the games on a New 3DS.**

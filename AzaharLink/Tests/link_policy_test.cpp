@@ -553,7 +553,15 @@ static void TestAptSleepEvents() {
     }
     CHECK(AptSignalPrecedesSwap(AptSignalOf(0x1BC00008))); // the reply word of a real console for the power button, bits above the signal included
     CHECK(AptSignalPrecedesSwap(AptSignalOf(0x1BC00001)));
-    // bits above the signal (Mario Party: The Top 100 got 0x1BC00001 for the HOME button on a console, 2026-10-14): the signal is the low 16 bits
+    // the words of real consoles with bits in the second byte too: at 16 bits these were no button at all (issue 5: the game's thread woke up in the freed block)
+    CHECK(AptSignalPrecedesSwap(AptSignalOf(0x00000608)));
+    CHECK(AptSignalPrecedesSwap(AptSignalOf(0x00000601)));
+    CHECK(AptSignalPrecedesSwap(AptSignalOf(0x0007E901)));
+    CHECK_EQ(AptSignalOf(0x00000608), 8u);
+    CHECK_EQ(AptSignalOf(0x0007E901), 1u);
+    CHECK(!AptSignalPrecedesSwap(AptSignalOf(0x00000607)));
+    CHECK(!AptSignalPrecedesSwap(AptSignalOf(0x00000600)));
+    // bits above the signal (Mario Party: The Top 100 got 0x1BC00001 for the HOME button on a console, 2026-10-14): the signal is the low byte
     const u32 enter_hi[] = {0x000B0080, 0, 0x1BC00005}, wake_hi[] = {0x000B0080, 0, 0x1BC00006}, home_hi[] = {0x000B0080, 0, 0x1BC00001},
               only_hi[] = {0x000B0080, 0, 0x1BC00000};
     CHECK(AptSleepEventOf(0x000B0040, enter_hi) == AptSleepEvent::Enter);

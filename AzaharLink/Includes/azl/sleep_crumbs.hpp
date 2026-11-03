@@ -30,6 +30,12 @@ public:
     /// The framework's own events, besides the APT ones of azl/apt_sleep.hpp (kAptNote*).
     static constexpr u32 kFwEnter = 4;
     static constexpr u32 kFwExit = 5;
+    static constexpr u32 kFwSwapEnter = 6;   ///< the block of the plugin goes (Old 3DS); the value: the how-manieth
+    static constexpr u32 kFwSwapExit = 7;    ///< ... and is back
+    static constexpr u32 kMemSystem = 15;    ///< a memory region as PackRegion says, with the swap's events
+    static constexpr u32 kMemApplication = 16;
+    static constexpr u32 kMemBase = 17;
+    static constexpr u32 kFwSwapBack = 22;   ///< the block is back and the call sites are in the hook again; the value: how long that took, in us
     static constexpr u32 kSlots = 32;        ///< events waiting for the thread (more between two of its turns: the oldest go)
     static constexpr u32 kMaxLines = 400;    ///< lines written in one launch
     static constexpr u32 kPollMs = 250;      ///< the thread's turn while a sleep is watched (else it waits for an event)
@@ -39,7 +45,7 @@ public:
     // This runs on whatever thread sees the event - the game's APT thread inside the svc hook above all: a few stores, no
     // allocation, no format (Tests/policy_check.sh, Tests/callgraph_check.py).
     // >>> game-thread code (Tests/policy_check.sh: no printf family, no Log()/DebugEvent() with a format, no big buffer)
-    /// Notes one event. `kind`: kAptNote* (azl/apt_sleep.hpp) or kFwEnter / kFwExit; `value`: its number.
+    /// Notes one event. `kind`: kAptNote* (azl/apt_sleep.hpp) or kFw* / kMem* here; `value`: what the kind says it is.
     void Push(u32 kind, u32 value, u32 tick_ms) {
         const u32 i = head_.fetch_add(1, std::memory_order_relaxed);
         Slot& slot = slots_[i % kSlots];
@@ -49,6 +55,19 @@ public:
         slot.seq.store(i + 1, std::memory_order_release); // (last: the thread reads a slot only when this says it is whole)
     }
     // <<< game-thread code
+
+    /// Used and total bytes of a memory region in one word, in units of 4 KB (a region is at most 256 MiB).
+    static u32 PackRegion(u32 used_bytes, u32 total_bytes) {
+        return (used_bytes / 4096) << 16 | (total_bytes / 4096);
+    }
+
+    /// The events noted so far, and those the thread has taken (only the thread may call taken()): what it took is written when its turn ends.
+    u32 pushed() const {
+        return head_.load(std::memory_order_acquire);
+    }
+    u32 taken() const {
+        return tail_;
+    }
 
     /// True while a sleep is being watched for its wake-up: the thread then takes a turn every kPollMs.
     bool watching() const {
@@ -105,6 +124,23 @@ private:
         return id < sizeof(kNames) / sizeof(kNames[0]) ? kNames[id] : "?";
     }
 
+    static std::string Hex(u32 value) {
+        static const char kDigits[] = "0123456789abcdef";
+        std::string text = "0x";
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            text += kDigits[(value >> shift) & 0xF];
+        }
+        return text;
+    }
+
+    void AddRegion(std::vector<std::string>* lines, u32 tick_ms, u64 now_os_ms, const char* name, u32 packed) {
+        const u32 used_kb = (packed >> 16) * 4;
+        const u32 total_kb = (packed & 0xFFFF) * 4;
+        Add(lines, tick_ms, now_os_ms,
+            std::string("memory region ") + name + ": " + std::to_string(used_kb) + " of " + std::to_string(total_kb) + " KB used, " +
+                std::to_string(total_kb > used_kb ? total_kb - used_kb : 0) + " KB free");
+    }
+
     /// One line: "sleep: <text> | tick <ms> ms | written at console clock <time>" (`tick_ms`: the event's own).
     void Add(std::vector<std::string>* lines, u32 tick_ms, u64 now_os_ms, const std::string& text) {
         if (lines_ >= kMaxLines) {
@@ -121,13 +157,16 @@ private:
     /// An event of the ring: its line, and what it means for the watch.
     void Event(u32 kind, u32 value, u32 event_tick_ms, u32 now_tick_ms, u64 now_os_ms, std::vector<std::string>* lines) {
         switch (kind) {
-        case kAptNoteNotification:
+        case kAptNoteNotification: {
+            const u32 signal = AptSignalOf(value); // (the value is the word as it came)
             Add(lines, event_tick_ms, now_os_ms,
-                "APT notification " + std::to_string(value) + " (" + NotificationName(value) + ")");
-            if (value == kAptSignalSleepEnter) {
+                "APT notification " + std::to_string(signal) + " (" + NotificationName(signal) + ")" +
+                    (value != signal ? ", reply word " + Hex(value) : std::string()));
+            if (signal == kAptSignalSleepEnter) {
                 Arm(now_tick_ms);
             }
             break;
+        }
         case kAptNoteReplyQuery:
             Add(lines, event_tick_ms, now_os_ms,
                 std::string("the game answers the sleep query: ") +
@@ -143,6 +182,62 @@ private:
             break;
         case kFwExit:
             Add(lines, event_tick_ms, now_os_ms, "framework event SLEEP_EXIT");
+            break;
+        case kFwSwapEnter:
+            Add(lines, event_tick_ms, now_os_ms, "framework event SWAP_ENTER #" + std::to_string(value) + ": Luma3DS takes the plugin's block away next");
+            break;
+        case kFwSwapExit:
+            Add(lines, event_tick_ms, now_os_ms, "framework event SWAP_EXIT #" + std::to_string(value) + ": the plugin's block is back");
+            break;
+        case kFwSwapBack:
+            Add(lines, event_tick_ms, now_os_ms,
+                "the plugin's block is back: call sites in the hook again in " + std::to_string(value) + " us, before the game's thread runs");
+            break;
+        case kAptNoteLimit:
+            Add(lines, event_tick_ms, now_os_ms, "the lines about APT:ReceiveParameter and APT:AppletUtility reached their limit for this launch (64)");
+            break;
+        case kMemSystem:
+            AddRegion(lines, event_tick_ms, now_os_ms, "SYSTEM", value);
+            break;
+        case kMemApplication:
+            AddRegion(lines, event_tick_ms, now_os_ms, "APPLICATION", value);
+            break;
+        case kMemBase:
+            AddRegion(lines, event_tick_ms, now_os_ms, "BASE", value);
+            break;
+        case kAptNoteReceiveMade:
+            Add(lines, event_tick_ms, now_os_ms, "APT:ReceiveParameter by the plugin itself (trampoline return " + Hex(value) + "): no HOME or power button seen in the last 10 s");
+            break;
+        case kAptNoteReceiveHanded:
+            Add(lines, event_tick_ms, now_os_ms, "APT:ReceiveParameter handed back to the game's own call at " + Hex(value));
+            break;
+        case kAptNoteReceiveRefused:
+            Add(lines, event_tick_ms, now_os_ms, "APT:ReceiveParameter: the hand-back was refused (trampoline return " + Hex(value) + "): the plugin makes the call");
+            break;
+        case kAptNoteReceiveReply:
+            Add(lines, event_tick_ms, now_os_ms,
+                value == kAptReceiveFailed ? std::string("APT:ReceiveParameter failed")
+                                           : "APT:ReceiveParameter answered: sender " + Hex(value >> 16) + ", command " + std::to_string(value & 0xFFFF));
+            break;
+        case kAptNoteUtility:
+            utility_ = value;
+            break;
+        case kAptNoteUtilityResult:
+            Add(lines, event_tick_ms, now_os_ms,
+                "APT:AppletUtility id " + std::to_string(utility_ & 0xFFFF) + " (input " + Hex(utility_ >> 16) + ") -> " + Hex(value));
+            break;
+        case kAptNoteBadHandle:
+            words_ = "a call of the game on handle " + Hex(value) + " answered invalid handle:";
+            break;
+        case kAptNoteFatal:
+            words_ = "the game reports a fatal error to err:f (session " + Hex(value) + "; cmd[1] type, cmd[2] result, cmd[3] pc):";
+            break;
+        case kAptNoteWord:
+            words_ += " " + Hex(value);
+            break;
+        case kAptNoteEnd:
+            Add(lines, event_tick_ms, now_os_ms, words_ + " | the words: thread id, priority, core, hook state (1: suspended), ms since the call sites were back in the hook, last session opened through the hook, ms since then, cmd[0..6], then what looks like code on its stack");
+            words_.clear();
             break;
         default:
             break;
@@ -206,6 +301,8 @@ private:
     u32 arm_tick_ms_ = 0;
     u32 woke_tick_ms_ = 0;
     u32 alive_said_ = 0;
+    std::string words_;   ///< the line of a failed call while its words arrive
+    u32 utility_ = 0;     ///< the APT:AppletUtility whose result comes next
     std::atomic<bool> watching_{false};
 };
 

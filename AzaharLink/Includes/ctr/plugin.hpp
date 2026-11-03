@@ -27,7 +27,7 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.1.0"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.0: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.1.1"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.1: Tests/set_version.py writes all of them)
 
 /// "Mon DD YYYY HH:MM:SS" of the last build that changed any object: Sources/ctr/build_id.cpp, which the Makefile recompiles
 /// after every other object. The log header prints it instead of plugin.cpp's own __DATE__ / __TIME__, which stay as old as
@@ -128,6 +128,9 @@ public:
     /// A process event of the framework (sleep, home, swap, exit). Only flag stores: it runs on the
     /// framework's small keep-alive thread; the log writer reports it.
     void NoteProcessEvent(int event);
+    /// Old 3DS: the plugin's block is back (the framework's reply to Luma3DS about the swap has returned) and the game's thread that raised the swap
+    /// does not run yet. The call sites go back in the hook here, not at SWAP_EXIT, which comes too late (Sources/ctr/plugin.cpp, __wrap_PLGLDR__Reply).
+    void OnSwapBack();
 
     /// The game's APT session got "the console goes to sleep now" / "it woke up" (see ctr/hook.cpp). Called on the
     /// game's thread, so short and without waits or IPC. With `sleep_stop=1` in the settings (0, the default, only
@@ -198,6 +201,9 @@ private:
     long HeapFreeBytes() const;
     void StartLogWriter();
     void WakeLogWriter();
+    /// The swap of the plugin's block in the trail: the event and the memory regions. WaitForTrail gives the thread a moment to put it on the card (the log on only).
+    static void NoteSwapToTrail(u32 kind, u32 number);
+    void WaitForTrail(u32 timeout_ms);
     /// The breadcrumb thread (azl/sleep_crumbs.hpp): started with the log on, once; it never writes with the log off.
     void StartCrumbs();
     /// Reports the process events the framework signalled since the last call.
@@ -275,6 +281,8 @@ private:
     platform::Thread crumb_thread_;
     volatile Handle crumb_wake_ = 0; ///< signalled by NoteSleepEvent (set once, before the thread starts)
     std::atomic<bool> crumb_stop_{false};
+    std::atomic<bool> swap_back_done_{false}; ///< OnSwapBack did what SWAP_EXIT would do
+    std::atomic<u32> crumb_written_{0}; ///< the trail's events that are on the card (SleepCrumbs::taken after the writes of a turn)
 
     // The numbers of the last statistics window, for the status page of the menu (written by the writer thread,
     // read by the menu).

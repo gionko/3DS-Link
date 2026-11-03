@@ -36,10 +36,12 @@ ASFLAGS		:=	$(ARCH)
 # startup search for the GSP call inside the game's code (Kirby Triple Deluxe / Planet Robobot).
 # --wrap=svcCreateThread and --wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv (the mangled CTRPluginFramework::Scheduler::Initialize) keep the
 # framework's syscore worker off core 1 on an Old 3DS (ctr/thread_core.hpp).
+# --wrap=PLGLDR__Reply puts the call sites back in the hook when the plugin's block comes back on an Old 3DS, before the game's thread wakes up (ctr/plugin.cpp).
 LDFLAGS		:= -T $(TOPDIR)/3gx.ld $(ARCH) -Os -Wl,--gc-sections,--strip-discarded,--strip-debug \
 				-Wl,--wrap=srvGetServiceHandle -Wl,--wrap=free \
 				-Wl,--wrap=_ZN18CTRPluginFramework7Process11GetTextSizeEv \
-				-Wl,--wrap=svcCreateThread -Wl,--wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv
+				-Wl,--wrap=svcCreateThread -Wl,--wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv \
+				-Wl,--wrap=PLGLDR__Reply
 
 LIBS		:= -lctrpf -lctru
 LIBDIRS		:= 	$(CTRPFLIB) $(CTRULIB) $(PORTLIBS)
