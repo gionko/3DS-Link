@@ -270,14 +270,14 @@ static void TestIniValues() {
         }
     }
 
-    // The whole file: 15 keys in the fixed order, LF, and the lines the writer keeps after them
+    // The whole file: 18 keys in the fixed order, LF, and the lines the writer keeps after them
     {
         const std::string text = ini::Render(ini::Fields());
         CHECK_EQ(text,
                  std::string("enabled=1\nhost=\nport=24872\nnickname=\npassword=\ntunnel=1\nautoconnect=1\nradio_like=1\n"
                              "socket_buffers=1\nnet_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\n"
-                             "sleep_stop=0\n"));
-        CHECK_EQ(text.size(), 177u);
+                             "sleep_stop=0\nchat=1\nchat_key=L+Left+Select\nchat_pos=bottom-left\n"));
+        CHECK_EQ(text.size(), 228u);
         CHECK(text.find('\r') == std::string::npos);
         std::size_t at = 0;
         for (int i = 0; i < ini::kKeyCount; ++i) {
@@ -290,17 +290,47 @@ static void TestIniValues() {
         f.host = "a\nb";
         f.sleep_stop = 2;
         f.rcvbuf_kb = 32;
+        f.chat_pos = ini::kChatPosTopRight;
         const std::string two = ini::Render(f, {"# note", "future=7"});
         CHECK(two.find("host=a b\n") != std::string::npos); // a stray line break would corrupt the file
-        CHECK(two.find("rcvbuf_kb=32\nsleep_stop=2\n# note\nfuture=7\n") != std::string::npos);
+        CHECK(two.find("rcvbuf_kb=32\nsleep_stop=2\nchat=1\nchat_key=L+Left+Select\nchat_pos=top-right\n# note\nfuture=7\n") != std::string::npos);
         // what does not fit under the limit is left out, whole lines only
         const std::string small = ini::Render(ini::Fields(), {"aaaaaaaaaa", "bbbbbbbbbb"}, text.size() + 12);
         CHECK(small.find("aaaaaaaaaa\n") != std::string::npos && small.find("bbbbbbbbbb") == std::string::npos);
     }
+    // chat_pos: the four words both ways, a slip is the default (bottom-left), a field out of the table is written as the default
+    CHECK(ini::kChatPosDefault == ini::kChatPosBottomLeft && ini::kKeyCount == 18);
+    CHECK(std::string(ini::kKeyNames[ini::kKeyCount - 1]) == "chat_pos");
+    for (int v = 0; v < ini::kChatPosCount; ++v) {
+        CHECK(ini::ParseChatPos(ini::ChatPosWord(v)) == v);
+        CHECK(ini::NextChatPos(ini::NextChatPos(v, 0), -1) == v);
+    }
+    CHECK(ini::ParseChatPos(" TOP-LEFT\r") == ini::kChatPosTopLeft && ini::ParseChatPos("") == ini::kChatPosBottomLeft);
+    CHECK(ini::ParseChatPos("3") == ini::kChatPosBottomLeft && ini::ParseChatPos("top left") == ini::kChatPosBottomLeft);
+    CHECK(std::string(ini::ChatPosWord(7)) == "bottom-left" && std::string(ini::ChatPosLabel(-3)) == "Bottom left");
+    CHECK(std::string(ini::ChatPosLabel(ini::kChatPosBottomRight)) == "Bottom right");
+    {
+        ini::Fields odd;
+        odd.chat_pos = 12;
+        CHECK(ini::Render(odd).find("chat_pos=bottom-left\n") != std::string::npos);
+    }
     CHECK(std::string(ini::kMenuKeyOff) == "off");
-    CHECK(std::string(ini::kDefaultMenuKey) == "L+R+Select");
+    CHECK(std::string(ini::kDefaultMenuKey) == "L+Right+Select");
+    // the old default (any case, blanks around) becomes the new one; a chord the user wrote, and off, stay as they are
+    CHECK(ini::MenuKeyFromFile("L+R+Select") == "L+Right+Select" && ini::MenuKeyFromFile(" l+r+select\r") == "L+Right+Select");
+    CHECK(ini::MenuKeyFromFile("L+R+Start") == "L+R+Start" && ini::MenuKeyFromFile("off") == "off" && ini::MenuKeyFromFile("L+Right+Select") == "L+Right+Select");
     CHECK(ini::MenuKeyIsOff(ini::kMenuKeyOff));
     CHECK(!ini::MenuKeyIsOff(ini::kDefaultMenuKey));
+    // the menu's chord and the chat's (review of the chat, defect 47): Select always in, the words of ParseKeys in any case, and a pair
+    // where one holds the other clashes, not only the same chord (L+Select for the menu took the chat's L+Left+Select)
+    CHECK(ini::ChordBits("") == 1u && ini::ChordBits("off") == 1u && ini::ChordBits("Select") == 1u);
+    CHECK(ini::ChordBits("L+R") == ini::ChordBits("r, l+SELECT") && ini::ChordBits("L+R") != ini::ChordBits("L"));
+    CHECK(ini::ChordBits("Start+A+B+X+Y+L+R+Up+Down+Left+Right+Select") == 0xFFFu);
+    CHECK(!ini::ChordsNested(ini::kDefaultMenuKey, ini::kDefaultChatKey) && !ini::ChordsNested(ini::kOldDefaultMenuKey, ini::kDefaultChatKey));
+    CHECK(ini::ChordsNested("L+Left+Select", "l+left") && ini::ChordsNested("L+Select", ini::kDefaultChatKey));
+    CHECK(ini::ChordsNested(ini::kDefaultChatKey, "L+Select") && ini::ChordsNested("L+Left+Select+A", ini::kDefaultChatKey));
+    CHECK(ini::ChordsNested("Left", ini::kDefaultChatKey) && !ini::ChordsNested("R+Select", ini::kDefaultChatKey));
+    CHECK(!ini::ChordsNested("L+Up+Select", "L+Down+Select") && ini::ChordsNested("Select", "X+Select"));
 }
 
 // ---- 2. the log at level 0 ------------------------------------------------------------------------------------------
@@ -567,20 +597,41 @@ static void TestCrumbFile() {
         CHECK(Contains(all, "sleep: after the switch on\n"));
         CHECK(log.SetLevel(0, false));
     }
-    // a launch that finds the trail of earlier ones over 128 KB starts it afresh; a smaller one is appended to
+    // a launch that finds the trail of earlier ones over 128 KB moves it aside as AzaharLink.sleep.1.log (the one before it goes) and
+    // starts a new one: the launch before a crash keeps its trail; a smaller one is appended to
     {
         DirFiles files;
-        {
-            FILE* f = std::fopen((dir / "AzaharLink.sleep.log").string().c_str(), "wb");
-            const std::string big(200 * 1024, 'x');
-            std::fwrite(big.data(), 1, big.size(), f);
+        const auto write_file = [](const fs::path& p, const std::string& text) {
+            FILE* f = std::fopen(p.string().c_str(), "wb");
+            std::fwrite(text.data(), 1, text.size(), f);
             std::fclose(f);
+        };
+        const std::string big = std::string(200 * 1024 - 18, 'x') + "the launch before\n";
+        write_file(dir / "AzaharLink.sleep.log", big);
+        write_file(dir / "AzaharLink.sleep.1.log", "an older trail\n");
+        {
+            LogFiles log(&files, dir.string() + "/", platform::NowMs());
+            CHECK(log.SetLevel(1, false));
+            log.WriteCrumb("sleep: a new launch");
+            CHECK(ReadAll(dir / "AzaharLink.sleep.log") == "sleep: a new launch\n");
+            CHECK(ReadAll(dir / "AzaharLink.sleep.1.log") == big); // (moved whole: the older one went)
+            CHECK(log.SetLevel(0, false));
         }
-        LogFiles log(&files, dir.string() + "/", platform::NowMs());
-        CHECK(log.SetLevel(1, false));
-        log.WriteCrumb("sleep: a new launch");
-        CHECK(ReadAll(dir / "AzaharLink.sleep.log") == "sleep: a new launch\n");
-        CHECK(log.SetLevel(0, false));
+        {
+            // a smaller file is appended to, nothing moved; the lines of a turn go in one write and one flush
+            LogFiles log(&files, dir.string() + "/", platform::NowMs());
+            CHECK(log.SetLevel(1, false));
+            const std::string turn[3] = {"sleep: one", "sleep: two", "sleep: three"};
+            const int writes = files.writes, flushes = files.flushes;
+            log.WriteCrumbs(turn, 3);
+            CHECK_EQ(files.writes - writes, 1);
+            CHECK_EQ(files.flushes - flushes, 1);
+            log.WriteCrumbs(turn, 0); // (a turn with no line writes nothing)
+            CHECK_EQ(files.writes - writes, 1);
+            CHECK(ReadAll(dir / "AzaharLink.sleep.log") == "sleep: a new launch\nsleep: one\nsleep: two\nsleep: three\n");
+            CHECK(ReadAll(dir / "AzaharLink.sleep.1.log") == big);
+            CHECK(log.SetLevel(0, false));
+        }
     }
     fs::remove_all(dir);
 }
@@ -683,6 +734,42 @@ static void TestQueueHasItsRoomFromTheStart() {
     CHECK_EQ(g_allocations.load() - after_flush, 0ul);
     CHECK(log.SetLevel(0, false));
     SetLogSink([](const char*) {});
+    fs::remove_all(dir);
+}
+
+// The queue is full (the card did not keep up): the lines past max_pending are dropped, counted, and the next flush says how many; the
+// stats line reads the total since the start.
+static void TestQueueFullIsCounted() {
+    std::printf("the main log's queue full: the lines dropped are counted, said by the next flush and kept in a total\n");
+    const fs::path dir = MakeTempDir("full");
+    DirFiles files;
+    LogFileLimits limits;
+    limits.max_pending = 2 * 1024;
+    LogFiles log(&files, dir.string() + "/", platform::NowMs(), limits);
+    g_debug_level = 0;
+    CHECK(log.SetLevel(1, false));
+    const std::string line(100, 'f');
+    // (113 bytes a line with its stamp "[    0.xxx] ": a line goes in while the queue holds less than 2 KB, 19 of them, 21 are dropped)
+    for (int i = 0; i < 40; ++i) {
+        log.Append(line.c_str());
+    }
+    CHECK_EQ(log.queue_full_total(), 0u); // (counted by the writer's next flush)
+    log.Flush();
+    CHECK_EQ(log.queue_full_total(), 21u);
+    std::string text = ReadAll(dir / "AzaharLink.log");
+    // (the report goes in past the full queue: said at once, not dropped and counted as one more)
+    CHECK(Contains(text, "log: 21 lines were dropped: the queue of the main log was full (2 KB waiting for the card)"));
+    std::size_t kept = 0;
+    for (std::size_t at = text.find(line); at != std::string::npos; at = text.find(line, at + 1)) {
+        ++kept;
+    }
+    CHECK_EQ(kept, std::size_t{19});
+    log.Append("one more");
+    log.Flush();
+    CHECK_EQ(log.queue_full_total(), 21u); // (nothing dropped since: the total stays, no new report)
+    text = ReadAll(dir / "AzaharLink.log");
+    CHECK(Contains(text, "one more") && !Contains(text, "log: 1 lines were dropped"));
+    CHECK(log.SetLevel(0, false));
     fs::remove_all(dir);
 }
 
@@ -1187,6 +1274,25 @@ static void TestCaptureFileHasTheDietAndTheMarkers() {
     }
     log.DrainDebug(true);
     CHECK(Contains(ReadAll(dir / "AzaharLink.debug.log"), "cmd=0x00080082 arg=0x5 -> 0x00000000 x3 from "));
+    // a traced service's command (the lines of "svc REAL") is under the same diet when its session's handle is given: three whole lines,
+    // then one count with the service's name; a failure is always whole, and with no handle every call is
+    for (u32 i = 0; i < 10; ++i) {
+        DebugSvcReal("frd:u", 0x19, i, 0, 0x260042);
+    }
+    DebugSvcReal("frd:u", 0x19, 0x63, 0xD8E007F7u, 0x260042);
+    for (u32 i = 0; i < 5; ++i) {
+        DebugSvcReal("ac:u", 0x0D, 0x40 + i, 0);
+    }
+    log.DrainDebug(true);
+    {
+        const std::string text = ReadAll(dir / "AzaharLink.debug.log");
+        CHECK(Contains(text, "svc REAL frd:u cmd 0x0019 arg 0x2 -> 0x00000000\n"));
+        CHECK(!Contains(text, "svc REAL frd:u cmd 0x0019 arg 0x3 -> 0x00000000\n"));
+        CHECK(Contains(text, "svc REAL frd:u cmd 0x0019 arg 0x9 -> 0x00000000 x7 from "));
+        CHECK(Contains(text, "svc REAL frd:u cmd 0x0019 arg 0x63 -> 0xd8e007f7\n"));
+        CHECK(Contains(text, "svc REAL ac:u cmd 0x000d arg 0x44 -> 0x00000000\n"));
+        CHECK(!Contains(text, "svc REAL ac:u cmd 0x000d arg 0x44 -> 0x00000000 x"));
+    }
 
     // a hole: frames beyond the ring, drained, one more frame
     const std::vector<u8> payload(1500, 7);
@@ -1237,11 +1343,13 @@ static void TestStatusNumbers() {
     s.soc_ticks[kSocSend] = 8 * AZL_TICKS_PER_MS;       // mean 0.1 ms
     s.soc_max_ticks[kSocSend] = 1 * AZL_TICKS_PER_MS;
     // the game's threads inside the UDS commands: 300 ms of wall time, 15 ms of it waiting for the engine's lock (of the 20 ms
-    // all threads waited, 5 ms were the network thread's); 50 ms in the frame callback; 20 ms in the writer (CPU)
+    // all threads waited, 5 ms were the network thread's); 50 ms in the frame callback; 10 ms in the chat's OSD callback (drawn at the
+    // present, outside the frame callback: defect 34, the stats line's total did not hold it); 20 ms in the writer (CPU)
     s.ipc_sum_ticks = 300 * AZL_TICKS_PER_MS;
     s.lock_wait_ticks = 20 * AZL_TICKS_PER_MS;
     s.lock_wait_net_ticks = 5 * AZL_TICKS_PER_MS;
     s.t_cb = 50 * AZL_TICKS_PER_MS;
+    s.t_chat_osd = 10 * AZL_TICKS_PER_MS;
     s.t_writer = 20 * AZL_TICKS_PER_MS;
     s.loop_gap_max = 31;
     s.ring_peak_units = 12;
@@ -1257,13 +1365,21 @@ static void TestStatusNumbers() {
     CHECK_EQ(n.fps10, 598u);      // 299 frames in 5 s = 59.8
     CHECK_EQ(n.fps_min10, 250u);  // 40 ms = 25.0 fps
     // CPU only: the network thread 300 ms in 5 s = 60.0 ms per second (the soc calls and the poll are its waiting and are not
-    // in it); the game threads 300 - 15 ms of lock wait = 285 ms = 57.0; the frame callback 10.0; the writer 4.0
+    // in it); the game threads 300 - 15 ms of lock wait = 285 ms = 57.0; the frame callback 10.0 and the chat's OSD callback 2.0 (the
+    // status page's "frame" holds both); the writer 4.0
     CHECK(n.net10 >= 600 - 2 && n.net10 <= 600 + 2);
     CHECK(n.uds10 >= 570 - 2 && n.uds10 <= 570 + 2);
-    CHECK_EQ(n.frame10, 100u);
+    CHECK_EQ(n.frame10, 120u);
     CHECK_EQ(n.writer10, 40u);
     CHECK_EQ(n.plugin10, n.net10 + n.uds10 + n.frame10); // (the writer's figure is wall time of a thread that waits for the core: shown, not added)
-    CHECK(n.plugin10 >= 1270 - 4 && n.plugin10 <= 1270 + 4);
+    CHECK(n.plugin10 >= 1290 - 4 && n.plugin10 <= 1290 + 4);
+    {
+        // the stats line's figures: the chat's drawing apart from the frame callback, and in the total
+        const CpuNumbers c = MakeCpuNumbers(s, 5000);
+        CHECK_EQ(c.frame10, 100u);
+        CHECK_EQ(c.chat10, 20u);
+        CHECK_EQ(c.plugin10, c.net10 + c.uds10 + c.frame10 + c.chat10);
+    }
     CHECK_EQ(n.loop_pause_ms, 31u);
     CHECK_EQ(n.soc_mean_us, static_cast<u32>((160 + 8) * AZL_TICKS_PER_MS / (400 + 80) / 268)); // recv and send, every call timed
     CHECK(n.soc_max_us >= 9000 && n.soc_max_us <= 9200);
@@ -1281,7 +1397,7 @@ static void TestStatusNumbers() {
 
     const std::string text = FormatStatusNumbers(n);
     CHECK(Contains(text, "Last 5 s: 59.8 fps (slowest 25.0)"));
-    CHECK(Contains(text, "Plugin CPU ms/s 127.0: net 60.0, uds 57.0,\n  frame 10.0, log 4.0 wall\n"));
+    CHECK(Contains(text, "Plugin CPU ms/s 129.0: net 60.0, uds 57.0,\n  frame 12.0, log 4.0 wall\n"));
     CHECK(!Contains(text, "Plugin ms/s")); // (it said ms/s of wall clock before 0.1.16)
     CHECK(Contains(text, "Net loop: longest pause 31 ms"));
     CHECK(Contains(text, "soc calls: mean 0.3, max 9.1 ms\n  over 20 ms: 2, over 100 ms: 1\n"));
@@ -1444,6 +1560,10 @@ static void TestTakeStats() {
     g_stats.t_net_events = 1001;
     g_stats.t_net_send = 1002;
     g_stats.t_cb = 1003;
+    g_stats.t_chat_osd = 1013;
+    StatsNoteChatOsd(5); // (three draws of the chat's OSD callback: their sum, their count and the longest)
+    StatsNoteChatOsd(9);
+    StatsNoteChatOsd(3);
     g_stats.t_writer = 1004;
     g_stats.ipc_sum_ticks = 1005;
     g_stats.t_net_wall = 1006;
@@ -1457,6 +1577,9 @@ static void TestTakeStats() {
     CHECK_EQ(w.t_net_events, 1001u);
     CHECK_EQ(w.t_net_send, 1002u);
     CHECK_EQ(w.t_cb, 1003u);
+    CHECK_EQ(w.t_chat_osd, 1013u + 5 + 9 + 3);
+    CHECK_EQ(w.chat_osd_draws, 3u);
+    CHECK_EQ(w.chat_osd_max_ticks, 9u);
     CHECK_EQ(w.t_writer, 1004u);
     CHECK_EQ(w.ipc_sum_ticks, 1005u);
     CHECK_EQ(w.t_net_wall, 1006u);
@@ -1828,6 +1951,7 @@ int main() {
     TestCrumbFile();
     TestSwitching();
     TestQueueHasItsRoomFromTheStart();
+    TestQueueFullIsCounted();
     TestSwitchOffWhileTheWriterRuns();
     TestRotation();
     TestCardNotReadyYet();

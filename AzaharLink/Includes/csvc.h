@@ -83,8 +83,12 @@ void svcInvalidateEntireInstructionCache(void);
  * @param srcProcessHandle Handle of the process to map the memory from (source)
  * @param srcAddress Start address of the memory block in the source process
  * @param size Size of the block of the memory to map (truncated to a multiple of 0x1000 bytes)
+ * @param flags Extended flags (bit 0: map as PRIVATE, 0xBB05, instead of SHARED, 0x5806)
+ * libctrpf's stub is this later six-argument form: it puts a magic number in r0 and the flags in r5, and a Luma3DS from before that form
+ * takes the magic number for a handle and fails. (Declared with five arguments, the flags were whatever the caller's stack held.) The
+ * plugin's input mirror calls the first form itself (Sources/ctr/input_mirror.cpp, MapProcessMemoryEx5), which every Luma3DS takes.
 */
-Result svcMapProcessMemoryEx(Handle dstProcessHandle, u32 destAddress, Handle srcProcessHandle, u32 srcAddress, u32 size);
+Result svcMapProcessMemoryEx(Handle dstProcessHandle, u32 destAddress, Handle srcProcessHandle, u32 srcAddress, u32 size, u32 flags);
 
 /**
  * @brief Unmaps a block of process memory.

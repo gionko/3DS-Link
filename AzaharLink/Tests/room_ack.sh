@@ -37,7 +37,7 @@ MSYS_NO_PATHCONV=1 docker exec $P bash -c '
   CFLAGS="-O1 -g -IIncludes -DHAS_FCNTL=1 -DHAS_POLL=1 -DHAS_SOCKLEN_T=1 -DHAS_GETADDRINFO=1 -DHAS_GETNAMEINFO=1 -DHAS_INET_PTON=1 -DHAS_INET_NTOP=1 -DHAS_MSGHDR_FLAGS=1 -w"
   for f in callbacks compress host list packet peer protocol; do gcc $CFLAGS -c Sources/enet/$f.c -o $O/enet_$f.o; done
   gcc $CFLAGS -c third_party/enet/unix.c -o $O/enet_unix.o
-  CORE="Sources/azl/crypto.cpp Sources/azl/log.cpp Sources/azl/platform.cpp Sources/azl/room_proto.cpp Sources/azl/uds_frames.cpp Sources/azl/uds_engine.cpp Sources/azl/room_client.cpp Sources/azl/ndm_hle.cpp Sources/azl/arm_reloc.cpp Sources/azl/svc_patch.cpp Sources/azl/log_files.cpp"
+  CORE="Sources/azl/crypto.cpp Sources/azl/log.cpp Sources/azl/platform.cpp Sources/azl/room_proto.cpp Sources/azl/uds_frames.cpp Sources/azl/uds_engine.cpp Sources/azl/room_client.cpp Sources/azl/ndm_hle.cpp Sources/azl/log_files.cpp"
   CNT=; grep -q ENetAzlCounters Includes/enet/enet.h && CNT=-DP5A_COUNTERS=1
   g++ -std=c++17 -O1 -g -w -IIncludes -pthread $CNT Tests/room_ack_probe.cpp Tests/mono_clock.cpp $CORE $O/enet_*.o -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_time_get -o $O/room_ack_probe
   g++ -std=c++17 -O2 -w -pthread Tests/udp_gate.cpp -o $O/udp_gate'

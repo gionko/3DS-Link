@@ -65,6 +65,37 @@ inline std::vector<std::string> RoomMemberLines(const std::vector<RoomMemberRow>
     return lines;
 }
 
+/// Who came into the room and who left it, for the chat (ChatSink::OnPresence): the nicknames of the members `now` has and `before`
+/// has not (joined), then those of `before` that `now` has not (left), told apart by their MAC, in the order of the lists. `self`:
+/// our own MAC, never told (the room lists us too).
+struct RoomMemberChange {
+    std::string nickname;
+    bool joined = true;
+};
+inline std::vector<RoomMemberChange> RoomMemberChanges(const std::vector<RoomMemberRow>& before, const std::vector<RoomMemberRow>& now,
+                                                       const Mac& self) {
+    const auto has = [](const std::vector<RoomMemberRow>& list, const Mac& mac) {
+        for (const RoomMemberRow& m : list) {
+            if (m.mac == mac) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<RoomMemberChange> out;
+    for (const RoomMemberRow& m : now) {
+        if (m.mac != self && !has(before, m.mac)) {
+            out.push_back({m.nickname, true});
+        }
+    }
+    for (const RoomMemberRow& m : before) {
+        if (m.mac != self && !has(now, m.mac)) {
+            out.push_back({m.nickname, false});
+        }
+    }
+    return out;
+}
+
 /// The lines for the players that played in `before` and play nothing in `now` (told apart by their MAC): "room: 'Friend-A-PC'
 /// [Kirby Battle Royale] stopped playing (still in the room, MAC 02:00:00:00:00:02): the game's session drops it". A player that
 /// was not in `before`, one that left the room, and one that did not play before get no line here.

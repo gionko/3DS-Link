@@ -204,9 +204,9 @@ LoadResult LoadSettings(Settings& cfg) {
             }
         } else if (key == "menu_key") {
             if (!value.empty()) {
-                cfg.menu_key = value; // (a chord, or off/none: carried as it is)
+                cfg.menu_key = azl::ini::MenuKeyFromFile(value); // (a chord, or off/none: carried as it is; the old default is the new one)
                 if (!azl::ini::MenuKeyIsOff(value)) {
-                    cfg.menu_chord = value;
+                    cfg.menu_chord = cfg.menu_key;
                 }
             }
         } else if (key == "game_name") {
@@ -217,6 +217,14 @@ LoadResult LoadSettings(Settings& cfg) {
             cfg.rcvbuf_kb = azl::ini::RcvbufKb(value);
         } else if (key == "sleep_stop") {
             cfg.sleep_stop = azl::ini::SleepStop(value);
+        } else if (key == "chat") {
+            cfg.chat = azl::ini::ParseBool(value, true);
+        } else if (key == "chat_key") {
+            if (!value.empty()) {
+                cfg.chat_key = value;
+            }
+        } else if (key == "chat_pos") {
+            cfg.chat_pos = azl::ini::ParseChatPos(value);
         } else if (cfg.unknown_lines.size() < kMaxUnknownLines && l.size() <= kMaxUnknownLineLen) {
             cfg.unknown_lines.push_back(l);
         }
@@ -236,7 +244,7 @@ bool HasAllKeys(const Settings& cfg) {
 bool SaveSettings(const Settings& cfg) {
     MakeDirChain(kPluginDataDir);
 
-    // The same writer as the plugin's: all 15 keys, always, in one order (azl/ini_values.hpp).
+    // The same writer as the plugin's: all 18 keys, always, in one order (azl/ini_values.hpp).
     azl::ini::Fields fields;
     fields.enabled = cfg.enabled;
     fields.host = cfg.host;
@@ -253,6 +261,9 @@ bool SaveSettings(const Settings& cfg) {
     fields.debug = cfg.debug;
     fields.rcvbuf_kb = cfg.rcvbuf_kb;
     fields.sleep_stop = cfg.sleep_stop;
+    fields.chat = cfg.chat;
+    fields.chat_key = cfg.chat_key;
+    fields.chat_pos = cfg.chat_pos;
     std::vector<std::string> extra;
     for (const std::string& line : cfg.unknown_lines) {
         if (line.size() <= kMaxUnknownLineLen) {

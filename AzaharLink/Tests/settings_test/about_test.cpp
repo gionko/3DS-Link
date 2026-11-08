@@ -306,7 +306,7 @@ static void TestCreditsList() {
     CHECK(WrapLines(about::kThanksNote, kNoteCols) <= kNoteLines);
 
     // Whom the user asked to be thanked, by name, and the rest of what the audit found (README, third_party, titleshare, the Makefiles, the tools, the guide).
-    for (const char* wanted : {"Azahar Emulator", "FBI", "3dbrew", "devkitPro", "libctru", "citro2d, citro3d", "Luma3DS", "CTRPluginFramework", "ENet", "GodMode9", "makerom, ctrtool", "bannertool", "Pillow"}) {
+    for (const char* wanted : {"Azahar Emulator", "FBI", "3dbrew", "devkitPro", "libctru", "citro2d, citro3d", "Luma3DS", "CTRPluginFramework", "ENet", "GodMode9", "makerom, ctrtool", "bannertool", "Pillow", "Spleen"}) {
         CHECK(names.count(wanted) == 1);
     }
     // the tools that build the app are named where they are (devkitPro's three, and tex3ds), GodMode9's script and the Citra project in the notes of the entries that own them
@@ -469,6 +469,15 @@ static void TestCreditsAreReal() {
     }
     if (read("ConfigApp/guide/guide_logic.hpp", &here)) {
         CHECK(Contains(text, "annson24"));
+    }
+    // Spleen: the chat's font carries its copyright and license, and is of the release the entry names; CREDITS.md has the whole license.
+    if (read("Includes/azl/font_spleen.inc", &here)) {
+        const about::Credit* spleen = Find("Spleen");
+        CHECK(Contains(text, "Copyright (c) 2018-2024, Frederic Cambus") && Contains(text, "Redistribution and use in source and binary forms"));
+        CHECK(Contains(text, "from the BDF files of Spleen 2.1.0") && spleen && Contains(spleen->use, "release 2.1.0"));
+    }
+    if (read("CREDITS.md", &here)) {
+        CHECK(Contains(text, "Copyright (c) 2018-2024, Frederic Cambus") && Contains(text, "Redistributions in binary form must reproduce the above copyright"));
     }
     // the plugin that is built with CTRPluginFramework: its framework header is the one the sources include
     if (read("Sources/main.cpp", &here)) {

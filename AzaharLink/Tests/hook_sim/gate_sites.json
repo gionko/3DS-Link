@@ -1,0 +1,130 @@
+{
+  "sites": [
+    {
+      "name": "lb2-usa-stub",
+      "game": "LEGO Batman 2 USA 000400000005A200",
+      "source": "Luma dump (code 00206FD0-00207030): a user's dump 1 (1.1.1); the two words of the 1.1.1 hook put back: svc 0x32; bx lr, as in the EUR copy at 0x00206F00",
+      "kind": "stub",
+      "svc": "0x32",
+      "site": "0x00207010",
+      "words": [
+        "EF000032",
+        "E12FFF1E",
+        "E92D0011",
+        "E59D0008",
+        "E59D400C",
+        "EF000025",
+        "E59D2000",
+        "E5821000"
+      ],
+      "caller": "arm",
+      "restored": {
+        "0x00207010": "EF000032",
+        "0x00207014": "E12FFF1E"
+      }
+    },
+    {
+      "name": "mhxx-stub-thumb-caller",
+      "game": "Monster Hunter XX 0004000000197100",
+      "source": "written by hand: svc 0x32; bx lr with 184 Thumb blx callers (read from the code in an earlier session, the code.bin is not on disk); the words after it are udf",
+      "kind": "stub",
+      "svc": "0x32",
+      "site": "0x002E3FB8",
+      "words": [
+        "EF000032",
+        "E12FFF1E",
+        "E7F000F0",
+        "E7F000F0"
+      ],
+      "caller": "thumb"
+    },
+    {
+      "name": "kirby-td-stub",
+      "game": "Kirby Triple Deluxe EUR 000400000010C000",
+      "source": "code.bin",
+      "kind": "stub",
+      "svc": "0x32",
+      "site": "0x001A7314",
+      "words": [
+        "EF000032",
+        "E12FFF1E",
+        "E5C01012",
+        "E12FFF1E",
+        "E5801000",
+        "E12FFF1E"
+      ],
+      "caller": "arm"
+    },
+    {
+      "name": "kirby-td-closehandle-stub",
+      "game": "Kirby Triple Deluxe EUR 000400000010C000",
+      "source": "code.bin",
+      "kind": "stub",
+      "svc": "0x23",
+      "site": "0x0016FE74",
+      "words": [
+        "EF000023",
+        "E12FFF1E",
+        "E52D0004",
+        "EF000017",
+        "E59D2000",
+        "E5821000"
+      ],
+      "caller": "arm"
+    },
+    {
+      "name": "ssf4-ands-bmi",
+      "game": "Super Street Fighter IV 3D EUR 0004000000033C00",
+      "source": "code.bin",
+      "kind": "inline",
+      "svc": "0x32",
+      "site": "0x0034F6D4",
+      "words": [
+        "EF000032",
+        "E2101102",
+        "4A000002",
+        "E5D40008",
+        "E5C50000",
+        "E5940004",
+        "E8BD8070"
+      ],
+      "end": "0x0034F6EC"
+    },
+    {
+      "name": "tekken-ands-bmi",
+      "game": "Tekken 3D Prime W 000400000007E900",
+      "source": "code.bin",
+      "kind": "inline",
+      "svc": "0x32",
+      "site": "0x0010123C",
+      "words": [
+        "EF000032",
+        "E2101102",
+        "4A000004",
+        "E594000C",
+        "E5850000",
+        "E5940010",
+        "E5860000",
+        "E5940004",
+        "E8BD8070"
+      ],
+      "end": "0x0010125C"
+    },
+    {
+      "name": "dbz-and-cmp-ldrge",
+      "game": "DBZ Extreme Butoden update 1.1.0 0004000E00169600",
+      "source": "code.bin",
+      "kind": "inline",
+      "svc": "0x32",
+      "site": "0x00108B3C",
+      "words": [
+        "EF000032",
+        "E2001102",
+        "E3510000",
+        "A5940004",
+        "E8BD8010"
+      ],
+      "end": "0x00108B4C"
+    }
+  ]
+}

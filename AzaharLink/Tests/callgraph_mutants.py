@@ -6,6 +6,9 @@ copy. About 25 seconds per build. Run by hand (it needs Docker and Python 3, not
 
     python Tests/callgraph_mutants.py [name-fragment ...]      (from anywhere; with fragments, only the mutants whose
                                                                 name contains one of them)
+    python Tests/callgraph_mutants.py --patterns                (no Docker: every mutant's text is found once in the tree;
+                                                                Tests/policy_check.sh runs it, a stale one is a mutant that
+                                                                never runs)
 """
 import os
 import shutil
@@ -20,10 +23,10 @@ image = 'pablomk7/libctrpf:0.8.0'
 
 mutants = [
     ('unchanged', None, None, None),
-    ('snprintf in a helper above the first marker of hook.cpp, called by PassThrough', 'Sources/ctr/hook.cpp',
-     'Result PassThrough(Handle handle) {\n    u32* cmd = getThreadCommandBuffer();\n',
+    ('snprintf in a helper above the first marker of hook.cpp, called by PassThroughPre', 'Sources/ctr/hook.cpp',
+     '__attribute__((noinline)) u64 PassThroughPre(Handle handle, u32* ctx) {\n    u32* cmd = getThreadCommandBuffer();\n',
      '__attribute__((noinline)) static void Probe(u32 v) { char t[8]; __builtin_snprintf(t, sizeof(t), "%u", (unsigned)v); volatile char sink = t[0]; (void)sink; }\n'
-     'Result PassThrough(Handle handle) {\n    u32* cmd = getThreadCommandBuffer();\n    Probe(cmd[0]);\n'),
+     '__attribute__((noinline)) u64 PassThroughPre(Handle handle, u32* ctx) {\n    u32* cmd = getThreadCommandBuffer();\n    Probe(cmd[0]);\n'),
     ('snprintf in AptSleepEventOf', 'Includes/azl/apt_sleep.hpp', '    if (signal == kAptSignalSleepEnter) {\n',
      '    char which[16];\n    __builtin_snprintf(which, sizeof(which), "%u", (unsigned)reply[2]);\n'
      '    volatile char sink = which[0];\n    (void)sink;\n    if (signal == kAptSignalSleepEnter) {\n'),
@@ -31,8 +34,8 @@ mutants = [
      '        enter_ms_ = now_ms;\n        char t[8];\n        __builtin_snprintf(t, sizeof(t), "%u", (unsigned)now_ms);\n'
      '        volatile char sink = t[0];\n        (void)sink;\n        ++apt_enters_;\n'),
     ('snprintf in NdmHle::CloseSession (called by ForgetFakeHandle, not marked)', 'Sources/azl/ndm_hle.cpp',
-     '    SessionObj& s = sessions_[si];\n    // 0x106eb4, in the same order.\n',
-     '    SessionObj& s = sessions_[si];\n    { char t[8]; __builtin_snprintf(t, sizeof(t), "%d", si); volatile char sink = t[0]; (void)sink; }\n    // 0x106eb4, in the same order.\n'),
+     'void NdmHle::CloseSession(int si) {\n    if (!session_open(si)) {\n        return;\n    }\n    SessionObj& s = sessions_[si];\n',
+     'void NdmHle::CloseSession(int si) {\n    if (!session_open(si)) {\n        return;\n    }\n    SessionObj& s = sessions_[si];\n    { char t[8]; __builtin_snprintf(t, sizeof(t), "%d", si); volatile char sink = t[0]; (void)sink; }\n'),
     ('snprintf in platform::NowMs', 'Sources/azl/platform.cpp',
      '    return azl_ticks_to_ms(svcGetSystemTick());\n}\n\nu64 NowUs() {\n    return azl_ticks_to_us(svcGetSystemTick());',
      '    char tag[8];\n    __builtin_snprintf(tag, sizeof(tag), "%u", (unsigned)svcGetSystemTick());\n    volatile char sink = tag[0];\n'
@@ -85,6 +88,30 @@ mutants = [
      '    DebugRecord rec = MakeRecord(kDbgCommand, lane);\n'),
     ('snprintf in a kernel operation of the engine (CtrKernelOps::SignalEvent, reached through a vtable)',
      'Includes/ctr/kernel_ops.hpp', None, None),  # (placeholder: filled in below from the real text)
+    # ---- the chat's OSD callback: called by the framework through a pointer on the game's thread that presents a frame, at every frame ----
+    ('O15 Log with a format in a helper of the chat\'s OSD callback (OnChatOsd, a root of its own)', 'Sources/ctr/chat_overlay.cpp',
+     'bool OnChatOsd(const Screen& scr) {\n    if (!GateTryPass(g_swap_gate, kGateOsd)) {\n        return false;\n    }\n',
+     'volatile int g_mut_o15 = 0;\n'
+     '__attribute__((noinline)) void MutO15(u32 v) { Log("chat: osd %lu", static_cast<unsigned long>(v)); }\n'
+     'bool OnChatOsd(const Screen& scr) {\n    if (!GateTryPass(g_swap_gate, kGateOsd)) {\n        return false;\n    }\n'
+     '    if (g_mut_o15) { MutO15(scr.Stride); }\n'),
+    ('O16 a 1.5 KB buffer in a helper of the chat\'s OSD callback (every frame small, the chain over its ceiling)', 'Sources/ctr/chat_overlay.cpp',
+     'bool OnChatOsd(const Screen& scr) {\n    if (!GateTryPass(g_swap_gate, kGateOsd)) {\n        return false;\n    }\n',
+     'volatile int g_mut_o16 = 0;\n'
+     '__attribute__((noinline)) void MutO16(u32 v) { volatile u8 scratch[1536]; scratch[v % 1536] = 1; g_mut_o16 = scratch[(v + 7) % 1536]; }\n'
+     'bool OnChatOsd(const Screen& scr) {\n    if (!GateTryPass(g_swap_gate, kGateOsd)) {\n        return false;\n    }\n'
+     '    if (g_mut_o16) { MutO16(scr.Stride); }\n'),
+    # ---- the waits (the persistent gate, step 6): a wait a game thread can reach that is not in WAITS_ALLOWED, a svc of the game made by the plugin ----
+    ('W1 a sleep in a helper of PassThroughPre (a wait that does not end when the gate closes)', 'Sources/ctr/hook.cpp',
+     '__attribute__((noinline)) u64 PassThroughPre(Handle handle, u32* ctx) {\n    u32* cmd = getThreadCommandBuffer();\n',
+     'volatile int g_mut_w1 = 0;\n__attribute__((noinline)) static void MutW1() { svcSleepThread(30000000LL); }\n'
+     '__attribute__((noinline)) u64 PassThroughPre(Handle handle, u32* ctx) {\n    u32* cmd = getThreadCommandBuffer();\n    if (g_mut_w1) { MutW1(); }\n'),
+    ('W2 a 30 ms sleep in the engine\'s Teardown (past the cut of the formatters: the HLE proper)', 'Sources/azl/uds_engine.cpp',
+     'void UdsEngine::Teardown(NetworkStatusChangeReason reason, bool send_deauth) {\n',
+     'volatile int g_mut_w2 = 0;\nvoid UdsEngine::Teardown(NetworkStatusChangeReason reason, bool send_deauth) {\n    if (g_mut_w2) { platform::SleepMs(30); }\n'),
+    ('W3 the plugin makes the game\'s CloseHandle itself in azl_pre23 (the gate makes it)', 'Sources/ctr/hook.cpp',
+     '    g_traced.Closed(handle); // the value may be reused for another object\n',
+     '    g_traced.Closed(handle); // the value may be reused for another object\n    { volatile int w3 = 0; if (w3) { svcCloseHandle(handle); } }\n'),
 ]
 
 
@@ -114,6 +141,22 @@ def disassemble(tmp):
     return r.returncode == 0
 
 
+def pattern_count(rel, old):
+    return open(os.path.join(root, rel), 'rb').read().decode('utf-8').replace('\r\n', '\n').count(old)
+
+
+if sys.argv[1:] == ['--patterns']:
+    stale = 0
+    for name, rel, old, new in mutants:
+        if rel is None or old is None:
+            continue
+        n = pattern_count(rel, old)
+        if n != 1:
+            print('STALE %s -> its text is found %d times in %s (expected once)' % (name, n, rel))
+            stale += 1
+    print('%d of the call graph mutants with a stale text' % stale)
+    sys.exit(1 if stale else 0)
+
 wanted = sys.argv[1:]
 failed = 0
 ran = 0
@@ -137,7 +180,12 @@ for name, rel, old, new in mutants:
             raw = open(p, 'rb').read().decode('utf-8')
             crlf = '\r\n' in raw
             s = raw.replace('\r\n', '\n')
-            assert s.count(old) == 1, (name, s.count(old))
+            if s.count(old) != 1:
+                # A stale pattern is a mutant that never ran: counted as not caught, and the others still run.
+                print('BAD  %s -> the pattern is found %d times in %s (expected once)' % (name, s.count(old), rel))
+                failed += 1
+                ran += 1
+                continue
             s = s.replace(old, new)
             open(p, 'wb').write((s.replace('\n', '\r\n') if crlf else s).encode('utf-8'))
         ok, tail = build(tmp)

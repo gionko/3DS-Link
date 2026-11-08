@@ -35,6 +35,39 @@ public:
     virtual bool WaitEvent(u32 handle, s64 timeout_ns) = 0;
     virtual void CloseEvent(u32 handle) = 0;
     virtual void SleepNs(s64 ns) = 0;
+    /// True while the swap of the plugin's block (Old 3DS: HOME, power, an applet) waits for the game threads to leave the plugin's
+    /// code (ctr/gate_flag.hpp). A wait that a game thread makes inside the engine or the hub then ends at once, with the answer of its own
+    /// limit: the swap waits 1.5 s at the most, and after that the code the thread sleeps in is gone. Looked at between the slices of each
+    /// wait: WaitEventGuarded (ConnectToNetwork) every kGateSliceMs, the scan every 20 ms, the hub's queue every slice of its own (and at
+    /// once with DlpHub::WakeForSwap). The PC's kernels: never.
+    virtual bool GateClosing() {
+        return false;
+    }
+    /// The slice of WaitEventGuarded (under the 20 ms the gate's design allows a wait that does not look at the gate).
+    static constexpr u32 kGateSliceMs = 10;
+    /// WaitEvent for up to `timeout_ns`, in slices of kGateSliceMs: false at the timeout, and at once when GateClosing(). The long wait of
+    /// a game thread (ConnectToNetwork's 5 s). Virtual so that a test kernel can hold or cut it short; `asked` counts what was asked of
+    /// WaitEvent, so a test kernel that does not sleep still gets to the end.
+    virtual bool WaitEventGuarded(u32 handle, s64 timeout_ns) {
+        const u64 total_ms = static_cast<u64>(timeout_ns / 1000000);
+        const u64 started = platform::NowMs();
+        u64 asked = 0;
+        for (;;) {
+            const u64 elapsed = platform::NowMs() - started;
+            const u64 waited = elapsed > asked ? elapsed : asked;
+            if (waited >= total_ms) {
+                return false;
+            }
+            const u64 slice = total_ms - waited < kGateSliceMs ? total_ms - waited : kGateSliceMs;
+            if (WaitEvent(handle, static_cast<s64>(slice) * 1000000)) {
+                return true;
+            }
+            asked += slice;
+            if (GateClosing()) {
+                return false;
+            }
+        }
+    }
 };
 
 /// What a game asks a scan to do (the input words of RecvBeaconBroadcastData / ScanOnConnection). The
@@ -335,6 +368,7 @@ private:
     /// The scan both scan commands (`command` 0x0F / 0x22) run: waits first, with mu_ NOT held, then
     /// reports what was heard.
     u32 ScanBeacons(u32 command, u8* out, u32 out_size, const ScanParams& scan);
+    /// The scan's wait (game thread): the window, the game's cancel event, or GateClosing(), whichever comes first.
     void WaitForScan(const ScanParams& scan, u64 window_ms);
     /// True if a beacon of `host` was heard lately: only then is it a host we know exists.
     bool HostBeaconKnown(const Mac& host) const;

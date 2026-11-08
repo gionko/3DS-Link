@@ -4,6 +4,7 @@
 
 #include <cerrno>
 
+#include "azl/chat_core.hpp"
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
 #include "azl/ticks.h"
@@ -23,6 +24,9 @@ constexpr u32 kConnectRttMs = 100;
 constexpr u32 kLinkStatsIntervalMs = 1000;
 // How long a quick stop waits for the room to acknowledge the last frames the game queued (a Deauthentication) before it leaves.
 constexpr u32 kGoodbyeWaitMs = 120;
+// A client that leaves this soon after its last chat message waits for it the same way (the message is our line already, and the
+// room must have it: a disconnect throws away what ENet holds, and the room what it has not handled yet). One a second at most.
+constexpr u32 kChatGoodbyeMs = 2000;
 // ENet's reliable backlog (bytes sent and not acknowledged plus bytes waiting for the window) beyond
 // which game data stops being queued as reliable: the window is 64 KB, more could only be stale.
 constexpr u32 kMaxReliableBacklog = 65536;
@@ -32,6 +36,7 @@ constexpr u32 kMaxReliableBacklog = 65536;
 // full soc ring (256 datagrams of ~416 B) can deliver in one go.
 constexpr std::size_t kMaxPacketSize = 64 * 1024;
 constexpr std::size_t kMaxWaitingData = 192 * 1024;
+static_assert(chat::kIdChatMessage == room::IdChatMessage, "the chat decodes and sends the room's own chat message");
 
 u32 Ms(u64 v) {
     return v > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<u32>(v);
@@ -223,6 +228,11 @@ void RoomClient::SetStateCallback(std::function<void(State, Error)> cb) {
 void RoomClient::SetRoomInfoCallback(std::function<void(const room::RoomInfo&)> cb) {
     platform::LockGuard lock(mutex_);
     room_info_cb_ = std::move(cb);
+}
+
+void RoomClient::SetChatSink(ChatSink* sink) {
+    chat_sink_.store(sink, std::memory_order_release);
+    cb_generation_.fetch_add(1); // (after the store: a loop that sees the new generation sees the new pointer)
 }
 
 void RoomClient::UpdateGameInfo(const std::string& name, u64 id) {
@@ -508,6 +518,8 @@ void RoomClient::Run(Config config, u32 generation) {
     std::function<void(const WifiPacket&)> wifi_cb;
     std::function<bool(const u8*, std::size_t)> wifi_prefilter;
     std::function<void(u64)> tick;
+    ChatSink* chat = nullptr; // (the chat off: one compare per chat packet of the room, which is dropped unread)
+    u64 chat_sent_ms = 0;     // when ENet took our last chat message (0: none): the goodbye waits for it (kChatGoodbyeMs)
     u32 cb_generation = ~0u;
     std::deque<TxQueue::Item> to_send;
     std::deque<std::vector<u8>> repeat; // the copies of the last round's doubled frames (radio_like=2): sent first thing next round
@@ -541,6 +553,7 @@ void RoomClient::Run(Config config, u32 generation) {
             wifi_cb = wifi_cb_;
             wifi_prefilter = wifi_prefilter_;
             tick = tick_cb_;
+            chat = chat_sink_.load(std::memory_order_acquire);
         }
         const u64 loop_start_ms = azl_ticks_to_ms(round_start);
         const u64 gap = loop_start_ms - last_iteration_ms;
@@ -717,6 +730,18 @@ void RoomClient::Run(Config config, u32 generation) {
                         }
                         break;
                     }
+                    case room::IdChatMessage:
+                        // At most chat::kRateMax a second are decoded, chat::kRatePerMember of one member (Admit counts the
+                        // others): a member who floods the room costs this thread a few compares per packet and leaves the
+                        // others their messages. (The room's status messages, joins and leaves, stay in the default: the
+                        // plugin already says who comes and goes.)
+                        if (chat) {
+                            const u32 chat_ms = static_cast<u32>(azl_ticks_to_ms(service_end));
+                            if (chat->Admit(chat_ms, chat::SenderTag(data, size))) {
+                                chat->OnPacket(data, size, chat_ms);
+                            }
+                        }
+                        break;
                     case room::IdRoomIsFull:
                         fail(Error::RoomIsFull);
                         keep_running = false;
@@ -754,7 +779,7 @@ void RoomClient::Run(Config config, u32 generation) {
                         keep_running = false;
                         break;
                     default:
-                        break; // chat, status messages, moderation: not needed here
+                        break; // status messages, moderation: not needed here (the chat is the case above)
                     }
                 }
                 enet_packet_destroy(event.packet);
@@ -784,6 +809,30 @@ void RoomClient::Run(Config config, u32 generation) {
             platform::NoteNetWait(pause_to_note); // (it is in the wall time of the send section below, which it comes off)
         }
         const u64 now_ms = azl_ticks_to_ms(events_end);
+        bool sent_any = false;
+        if (chat) {
+            // Our chat message, from this thread only and not through tx_ (an Item is a heap vector, and the queue's places are the
+            // handshake's): a packet on the stack, reliable on channel 0 like the room's own, at most one a second, only while
+            // joined (TakeOutgoing refuses it otherwise). The room does not send it back: SentOutgoing keeps it as our line.
+            u8 chat_packet[chat::kPacketMax];
+            const u32 chat_size = chat->TakeOutgoing(static_cast<u32>(now_ms), state() == State::Joined, chat_packet);
+            if (chat_size != 0) {
+                ENetPacket* packet = enet_packet_create(chat_packet, chat_size, EnetPacketFlags(true));
+                // (a packet ENet refuses - the peer no longer connected - is still ours to free, and it is not our line: the
+                // reader would see a message the room never had)
+                bool chat_sent = false;
+                if (packet) {
+                    if (enet_peer_send(server, 0, packet) == 0) {
+                        chat_sent = true;
+                        sent_any = true;
+                        chat_sent_ms = now_ms;
+                    } else {
+                        enet_packet_destroy(packet);
+                    }
+                }
+                chat->SentOutgoing(config.nickname.c_str(), config.nickname.size(), static_cast<u32>(now_ms), chat_sent);
+            }
+        }
         if (tx_pending_.load(std::memory_order_acquire) != 0) { // (the game's thread sets it under the lock: nothing pushed, no lock)
             platform::LockGuard lock(mutex_);
             tx_pending_.store(0, std::memory_order_relaxed);
@@ -795,7 +844,6 @@ void RoomClient::Run(Config config, u32 generation) {
         }
         // The copies of the doubled frames of the LAST round go first (a round later than the originals: a datagram lost on
         // the way loses one copy, the other is a few ms behind it; the receiver drops whichever comes second by its number).
-        bool sent_any = false;
         for (const std::vector<u8>& bytes : repeat) {
             if (ENetPacket* packet = enet_packet_create(bytes.data(), bytes.size(), EnetPacketFlags(false))) {
                 enet_peer_send(server, 0, packet);
@@ -897,31 +945,34 @@ void RoomClient::Run(Config config, u32 generation) {
 
     // (A thread whose session was given up on says no goodbye: it would be saying it for a connection that is not the
     // client's any more, and the next session may already be using the flags and the queue.)
-    const bool live = Live(generation);
-    // When the process is going away: one DISCONNECT datagram, no waiting. Without it the room keeps
-    // this console as a ghost member until ENet's timeout and a quick relaunch is told "name /
-    // MAC / console already in the room".
-    if (live && server->state == ENET_PEER_STATE_CONNECTED && quick_stop_.load()) {
-        // What the game queued just before (the Deauthentications of a Shutdown, of a sleep) goes first: the
-        // disconnect throws away whatever ENet still holds.
-        {
-            platform::LockGuard lock(mutex_);
-            if (!tx_.empty()) {
-                TxQueue::Drops drops;
-                tx_.Take(&to_send, platform::NowMs(), &drops);
-                StatsAdd(g_stats.tx_stale_drops, drops.stale);
+    if (Live(generation) && server->state == ENET_PEER_STATE_CONNECTED) {
+        // When the process is going away (quick): one DISCONNECT datagram, no waiting beyond the goodbye's. Without it the room
+        // keeps this console as a ghost member until ENet's timeout and a quick relaunch is told "name / MAC / console already in
+        // the room". Otherwise a graceful disconnect (best effort, bounded).
+        const bool quick = quick_stop_.load();
+        if (quick) {
+            // What the game queued just before (the Deauthentications of a Shutdown, of a sleep) goes first: the
+            // disconnect throws away whatever ENet still holds.
+            {
+                platform::LockGuard lock(mutex_);
+                if (!tx_.empty()) {
+                    TxQueue::Drops drops;
+                    tx_.Take(&to_send, platform::NowMs(), &drops);
+                    StatsAdd(g_stats.tx_stale_drops, drops.stale);
+                }
+            }
+            for (const TxQueue::Item& item : to_send) {
+                if (ENetPacket* packet = enet_packet_create(item.bytes.data(), item.bytes.size(), EnetPacketFlags(item.reliable))) {
+                    enet_peer_send(server, 0, packet);
+                }
             }
         }
-        for (const TxQueue::Item& item : to_send) {
-            if (ENetPacket* packet = enet_packet_create(item.bytes.data(), item.bytes.size(), EnetPacketFlags(item.reliable))) {
-                enet_peer_send(server, 0, packet);
-            }
-        }
-        if (!to_send.empty()) {
+        // Either disconnect throws away what ENet still holds, and the room what it has received and not handled yet when the
+        // DISCONNECT arrives: the game's goodbye, and our last chat message if it went less than kChatGoodbyeMs ago (it is our
+        // line already), have to be acknowledged first (a moment, not more).
+        if (!to_send.empty() || (chat_sent_ms != 0 && platform::NowMs() - chat_sent_ms < kChatGoodbyeMs)) {
             to_send.clear();
             enet_host_flush(client);
-            // The room throws away what it has received and not handled yet when the DISCONNECT arrives: the
-            // goodbye has to be acknowledged first (a moment, not more).
             // (a deadline, not a count of waits: datagrams that keep arriving must not stretch it)
             for (const u64 until = platform::NowMs() + kGoodbyeWaitMs;
                  platform::NowMs() < until && ReliableBacklog(server) > 0;) {
@@ -935,24 +986,24 @@ void RoomClient::Run(Config config, u32 generation) {
                 }
             }
         }
-        enet_peer_disconnect_now(server, 0);
-        enet_host_flush(client);
-    }
-    // Graceful disconnect (best effort, bounded; skipped when the process is going away).
-    if (live && server->state == ENET_PEER_STATE_CONNECTED && !quick_stop_.load()) {
-        enet_peer_disconnect(server, 0);
-        bool done = false;
-        for (const u64 until = platform::NowMs() + 500; !done && platform::NowMs() < until;) {
-            ENetEvent event;
-            const int served = enet_host_service(client, &event, 50);
-            if (served < 0) {
-                break;
-            }
-            if (served > 0) {
-                if (event.type == ENET_EVENT_TYPE_RECEIVE) {
-                    enet_packet_destroy(event.packet);
-                } else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
-                    done = true;
+        if (quick) {
+            enet_peer_disconnect_now(server, 0);
+            enet_host_flush(client);
+        } else {
+            enet_peer_disconnect(server, 0);
+            bool done = server->state == ENET_PEER_STATE_DISCONNECTED; // (the room let us go during the wait)
+            for (const u64 until = platform::NowMs() + 500; !done && platform::NowMs() < until;) {
+                ENetEvent event;
+                const int served = enet_host_service(client, &event, 50);
+                if (served < 0) {
+                    break;
+                }
+                if (served > 0) {
+                    if (event.type == ENET_EVENT_TYPE_RECEIVE) {
+                        enet_packet_destroy(event.packet);
+                    } else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
+                        done = true;
+                    }
                 }
             }
         }

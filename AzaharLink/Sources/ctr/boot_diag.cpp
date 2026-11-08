@@ -105,6 +105,9 @@ void Limits() {
 }
 
 // The threads of the process: id, priority, ideal core, affinity mask. `known` receives the ids so that the watch can say which are new.
+// WARNING: svcGetThreadList leaks one reference on the process at every call (kernel 11.14: GetThreadList never decrefs), so a game
+// started with this DIAGNOSTIC build stays in memory after HOME -> Close until the console restarts (REGISTRO phase K). Only here,
+// only under AZL_BOOT_DIAG; the delivered plugin never calls it (Tests/policy_check.sh).
 int ThreadList(u32* ids, int max_ids, Result* rc_out) {
     s32 count = 0;
     const Result rc = svcGetThreadList(&count, ids, max_ids, CUR_PROCESS_HANDLE);

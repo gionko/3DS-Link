@@ -30,6 +30,12 @@ constexpr const char* kBoot9FileName = "boot9.bin";
 constexpr const char* kDataDirName = "3DSLink";           // the app's own folder: what the app keeps, made when it is first used
 constexpr const char* kConfigFileName = "3DSLink.cfg";
 constexpr const char* kServersFileName = "servers.txt";
+// The page "Public lobbies": the list from GitHub, the names and passwords the user gave its rooms, the regions of the titles (public_lobbies.hpp).
+constexpr const char* kLobbiesFileName = "public-lobbies.txt";
+constexpr const char* kLobbiesLocalFileName = "public-lobbies-local.txt";
+// What the last pass of "Public lobbies" measured (ping, players): the in-game menu sorts its list by it (it never asks a room itself).
+constexpr const char* kLobbiesPingFileName = "public-lobbies-ping.txt";
+constexpr const char* kTitlesFileName = "titles.txt";
 constexpr const char* kGamesCacheFileName = "titles.cache";
 constexpr const char* kCatalogCacheFileName = "catalog.cache"; // (the name titleshare_host/hostcfg's data_path("catalog.cache") builds)
 constexpr const char* kParkDirName = "park";
@@ -71,6 +77,10 @@ struct Paths {
     std::string datadir;       // the app's own folder: <appdir> when that is called 3DSLink, else <appdir>/3DSLink
     std::string config_file;   // <datadir>/3DSLink.cfg
     std::string servers_file;  // <datadir>/servers.txt
+    std::string lobbies_file;  // <datadir>/public-lobbies.txt
+    std::string lobbies_local; // <datadir>/public-lobbies-local.txt
+    std::string lobbies_ping;  // <datadir>/public-lobbies-ping.txt
+    std::string titles_file;   // <datadir>/titles.txt
     std::string games_cache;   // <datadir>/titles.cache: the name and the icon of every title
     std::string catalog_cache; // <datadir>/catalog.cache: the names of the titles the delivery module reads
     std::string park_dir;      // <datadir>/park: the temporary files of a title being received

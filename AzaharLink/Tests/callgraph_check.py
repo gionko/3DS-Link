@@ -13,7 +13,8 @@ callbacks the hook reaches through a pointer), following direct calls, tail call
 pools, and fails if the printf family (or Log() / DebugEvent(), which end in it) is among them. A mistake the markers do not
 see - a snprintf in a helper that nobody marked, a Log() in a header, a library function that grew a printf - is seen here.
 
-What is a root: the two assembly entries of the hook (azl_svc32_entry: SendSyncRequest, azl_svc23_entry: CloseHandle) and the
+What is a root: what the gate of the hook calls in the plugin (Sources/ctr/gate.s: azl_pre32 / azl_post32 around a SendSyncRequest,
+azl_pre23 / azl_post23 around a CloseHandle; the gate itself is assembly in its own page, Tests/hook_sim/gate_sim.py holds it) and the
 functions the hook calls through a pointer or a vtable, which a listing of direct calls cannot follow: the observers of the
 game's APT session, the sink of the log, the engine's transport and the kernel operations of the engine; and, for the games that have
 the Download Play hub, the hub's functions a game thread runs past the cut and the adapter methods it reaches through the lobby's vtable.
@@ -24,18 +25,26 @@ measures it; moving it to a stack of the plugin's own is the 0.1.16 item). The s
 
 What it cannot see: a call through a pointer that is not in the roots (the list below is the plugin's own: add a new
 callback there), and a library function that formats without calling the printf family (none is known).
+
+The chat's OSD callback (OnChatOsd, registered with OSD::Run) is a root too, and a root of another kind: the framework calls it on the
+game's thread that presents a frame, once per screen and per present, and nothing of the hook reaches it (its address is only in
+ChatFrame, on the plugin's thread). Besides the formatters, its DEEPEST CHAIN of frames is added up here from the machine code (each
+function's prologue: push, vpush, sub sp; a tail call does not stack on its caller) and held to OSD_CHAIN_CEILING; a call through a
+register or a cycle under it is a failure too (the chain could not be bounded). Tests/stack_usage.sh budgets the frames one at a time:
+a helper of the callback with a buffer of its own, or a chain that grows a frame at a time, is seen here.
 """
 import collections
 import re
 import sys
 
-ENTRY_ROOTS = ['azl_svc32_entry', 'azl_svc23_entry']
+ENTRY_ROOTS = ['azl_pre32', 'azl_post32', 'azl_pre23', 'azl_post23']
 
 # Demangled-name patterns of the callbacks the hook reaches through a pointer / a vtable / a std::function
 CALLBACK_ROOTS = [
     r'^azl::ctr::Plugin::OnSleepEnter\(\)$',
     r'^azl::ctr::Plugin::OnHomeButton\(\)$',
     r'^azl::ctr::Plugin::NoteSleepEvent\(unsigned (?:int|long), unsigned (?:int|long)\)$',   # the APT observer (the trail of a sleep)
+    r'^azl::ctr::Plugin::WaitForCloseTrail\(\)$',   # the hook's TrailWaiter (after the close command 12, the log on, a New 3DS only)
     r'^azl::ctr::Plugin::EarlyInit\(\)::\{lambda\(bool\)#1\}::_FUN\(bool\)$',      # the sleep observer
     r'^azl::ctr::Plugin::EarlyInit\(\)::\{lambda\(\)#2\}::_FUN\(\)$',               # the HOME observer
     r'^std::_Function_handler<void \(char const\*\), azl::ctr::Plugin::EarlyInit\(\)::\{lambda\(char const\*\)#1\}>::_M_invoke',
@@ -50,6 +59,18 @@ CALLBACK_ROOTS = [
     # the network thread's; Tests/dlp_chain_report.py proves from the call graph of the sources which ones a game thread reaches.)
     r'^azl::DlpHub::(?:Serve|PollPending|OnGameUdsStarting|OnSessionClosed)\(',
     r'^azl::EngineLobbyNet::(?:NowMs|NowTicks|HostClose|Disconnect|ScanClose)\(',
+    # The chat's OSD callback (Sources/ctr/chat_overlay.cpp, OSD::Run): the framework calls it on the game's thread that presents a frame
+    r'^azl::ctr::\(anonymous namespace\)::OnChatOsd\(CTRPluginFramework::Screen const&\)$',
+]
+
+# The roots that run on a game thread at every frame, with the ceiling of their deepest chain of frames (bytes of the game's stack below the
+# call). OnChatOsd, measured 2026-11-05: 392 = OnChatOsd 48 > DrawOverlayTop 32 > DrawChatLines 112 > DrawBlock 136 > RunColumnBoth 64
+# (> PutPixel 0); the ceiling is that and about 20 % more: a growth past it is a decision, written here. 2026-11-08 (the notifications in
+# the corner opposite the chat, three lines of the whole width): 448 = OnChatOsd 56 > DrawOverlayTop 56 > DrawChatLines 120 > DrawBlock 152 >
+# RunColumnBoth 64, under the ceiling.
+OSD_CHAIN_CEILING = 480
+FRAME_ROOTS = [
+    (r'^azl::ctr::\(anonymous namespace\)::OnChatOsd\(CTRPluginFramework::Screen const&\)$', OSD_CHAIN_CEILING),
 ]
 
 # ... that the compiler may fold into their caller (then they are not in the listing and nothing is lost)
@@ -60,6 +81,52 @@ OPTIONAL_CALLBACK_ROOTS = [
 # Not followed: the HLE proper
 CUT = [r'^azl::ctr::UdsHle::Run\(unsigned char, int, unsigned (?:int|long), unsigned (?:int|long)\*\)$']
 
+# ---- The waits (the persistent gate, analysis/fix-gancio-swap-old-2026-11-05, step 6) ------------------------------------------------
+# On an Old 3DS the swap of the plugin's block (HOME, power, an applet) closes the svc hook's gate and waits 1.5 s for the game's threads
+# counted in it, then the block goes: a game's thread still in the plugin's code then wakes up in memory that is gone. So every wait a game
+# thread can make between pre and post - in pre, in the HLE (here NOT cut at UdsHle::Run: the engine and the hub are followed too) and in
+# post - must end when the gate closes (GateClosing) or be shorter than 20 ms, and a real svc 0x32 / 0x23 of the game is the gate's to make
+# (Sources/ctr/gate.s), not the plugin's. Every function the roots reach that calls one of these is in WAITS_ALLOWED, with what it may call
+# and why; a new caller, or a listed one that calls another of them, fails, and so does an entry that matches nothing any more (the list
+# must not rot). The arguments of a call (how long) are not in the call graph: the texts that decide them are pinned by Tests/policy_check.sh
+# (section "The swap of the plugin's memory on an Old 3DS", 5) and the waits that end at the close are run by Tests/chain_sim and the PC tests.
+WAIT_PRIMITIVES = ('svcSleepThread', 'svcWaitSynchronization', 'svcWaitSynchronizationN', 'LightLock_Lock', 'RecursiveLock_Lock', 'LightEvent_Wait',
+                   'LightSemaphore_Acquire', 'syncArbitrateAddress', 'syncArbitrateAddressWithTimeout', 'svcArbitrateAddress',
+                   '_ZN3azl8platform7SleepMsEm')
+GAME_SVCS = ('svcSendSyncRequest', 'svcCloseHandle')
+SHORT_LOCK = ('held by its other users (the network thread, the writer, the plugin\'s main thread) for the length of a copy or a queue '
+              'operation; the gate closes before the plugin\'s own threads stop (CloseGate before CloseSwapGate), so the holder runs to the unlock')
+WAITS_ALLOWED = [
+    # (demangled-name pattern of the caller, what it may call, why)
+    (r'^azl::ctr::\(anonymous namespace\)::WaitForJoin\(', ('svcSleepThread',),
+     'the join of StartFakeSession: 10 ms slices (kDlpJoinSleepNs), GateClosing() at every slice ends it at once'),
+    (r'^azl::ctr::UdsHle::ThrottleFailing\(', ('svcSleepThread',), '0.5 ms (kFailPauseNs), and not taken at all while the gate closes'),
+    (r'^azl::ctr::NoteGameFailure\(', ('svcSleepThread',), 'a fatal error only (err:f), 50 ms for the trail, not taken while the gate closes'),
+    (r'^azl::ctr::Plugin::WaitForCloseTrail\(', ('svcSleepThread',),
+     'the close command (12) only, with the log on and on a New 3DS only: 2 ms slices up to 200 ms (kCloseTrailWaitMs) for the trail, GateClosing() at each'),
+    (r'^azl::ctr::\(anonymous namespace\)::CtrOps::Settle\(', ('svcSleepThread',),
+     'the input mirror\'s way back: 0.1 ms (kSettleNs; a game thread spins instead)'),
+    (r'^azl::ctr::CtrKernelOps::SleepNs\(', ('svcSleepThread',), 'the engine\'s scan: 20 ms slices with GateClosing() at each (kScanSliceMs)'),
+    (r'^azl::ctr::CtrKernelOps::WaitEvent\(', ('svcWaitSynchronization',),
+     'the engine\'s connect (WaitEventGuarded, 10 ms slices with GateClosing() at each), the scan\'s cancel (0 ms), the hub\'s queue '
+     '(100 ms slices, woken by DlpHub::WakeForSwap at CloseGate\'s first look, GateClosing() at each)'),
+    (r'^azl::ctr::CtrKernelOps::CloseEvent\(', ('svcCloseHandle',), 'an event of the engine\'s or the hub\'s own, not a session of the game; it does not wait'),
+    (r'^azl::DlpHub::Post\(', ('_ZN3azl8platform7SleepMsEm',), 'the slot behind another requester: try_lock every 1 ms, GateClosing() at each'),
+    (r'^azl::DlpHub::(?:PollPending|RunHere|Serve)\(', ('LightLock_Lock',), 'the hub\'s lock, ' + SHORT_LOCK),
+    (r'^azl::ctr::UdsHle::(?:ForgetFakeHandle|MarkInitialized|RunDlpProbe|RunNdm)\(', ('LightLock_Lock',), 'the table of the fake sessions, ' + SHORT_LOCK),
+    (r'^azl::ctr::UdsHle::InterceptGetServiceHandle\(', ('LightLock_Lock', 'svcCloseHandle'),
+     'the table of the fake sessions, ' + SHORT_LOCK + '; the close is of the fake event it made when the table is full, not a session of the game'),
+    (r'^azl::platform::ContendedMutex::lock\(', ('LightLock_Lock',), 'the engine\'s lock (UdsEngine::Guard), ' + SHORT_LOCK),
+    (r'^azl::RoomClient::(?:SendWifiPacket|mac)\(', ('LightLock_Lock',), 'the room client\'s queue, ' + SHORT_LOCK),
+    (r'^azl::ctr::Plugin::OnSleepEnter\(', ('LightLock_Lock',), 'the sleep notification (APT 5), not the swap: the locks of the link policy, ' + SHORT_LOCK),
+    (r'^azl::\(anonymous namespace\)::LockLogBriefly\(', ('LightLock_Lock',), 'only on the log\'s writer thread: a game thread tries 256 times and gives the line up'),
+    (r'^azl::LogFiles::Append\(', ('LightLock_Lock',), 'only on the log\'s writer thread: a game thread tries 256 times and gives the line up'),
+    (r'^(?:abort|PLGLDR__DisplayErrMessage)$', ('svcSleepThread', 'svcSendSyncRequest'),
+     'the end of the process (std::terminate behind an exception that cannot be thrown): it never comes back to the gate'),
+    (r'^(?:__syscall_lock_acquire|__syscall_lock_acquire_recursive|__ctrpf_getThreadVars)$', ('LightLock_Lock', 'RecursiveLock_Lock'),
+     'newlib\'s own locks (the allocator behind operator new, stdio\'s first use behind vsnprintf), ' + SHORT_LOCK),
+]
+
 # What must not be reachable: the printf family of newlib, and the plugin's functions that take a format
 SINK_LIBC = re.compile(r'^(?:_?v?s?n?i?printf(?:_r)?|_?svf?i?printf_r|_?vf?i?printf_r|__sbprintf|v?f?i?printf|_?s?s?v?f?i?scanf(?:_r)?|sscanf|siscanf)$')
 SINK_PLUGIN = re.compile(r'^(?:_ZN3azl3LogEPKcz|_ZN3azl10DebugEventEPKcz|azl_c_log)$')
@@ -68,6 +135,7 @@ HDR = re.compile(r'^([0-9a-f]{8}) <(.+)>:$')
 INS = re.compile(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$')
 TARGET = re.compile(r'^([0-9a-f]+) <([^>+]+)(?:\+0x[0-9a-f]+)?>')
 BRANCH = re.compile(r'^(?:bl|b)(?:eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)?$')
+PLAIN_COND = ('ble', 'blt', 'bls', 'blo')   # `b` with a condition, not `bl`
 
 
 class Function:
@@ -77,12 +145,35 @@ class Function:
         self.calls = collections.OrderedDict()   # name -> 'call' | 'ptr'
         self.indirect = 0                        # calls through a register or a table: not followed
         self.pool = []                           # words of the literal pool(s)
+        self.frame = 0                           # bytes of its prologue: push / stmdb sp! / vpush / sub sp, sp, #n / str rX, [sp, #-4]!
+        self.linked = set()                      # callees reached by a `bl` (the callee's frame sits on this one's)
+        self.reg_calls = 0                       # blx rN / bx rN: calls (or tail calls) through a register (not a switch's jump table)
+
+
+def prologue_bytes(op, rest):
+    if op == 'push' or (op == 'stmdb' and rest.startswith('sp!')):
+        return 4 * len([r for r in rest[rest.index('{') + 1:rest.index('}')].split(',') if r.strip()])
+    if op.startswith('vpush'):
+        regs = rest[rest.index('{') + 1:rest.index('}')].strip()
+        if '-' in regs and ',' not in regs:
+            a, b = regs.split('-')
+            n = int(re.sub(r'\D', '', b)) - int(re.sub(r'\D', '', a)) + 1
+        else:
+            n = len(regs.split(','))
+        return n * (8 if regs.startswith('d') else 4)
+    m = re.match(r'^sp,\s*sp,\s*#(\d+)', rest)
+    if op == 'sub' and m:
+        return int(m.group(1))
+    if op == 'str' and re.match(r'^\w+,\s*\[sp,\s*#-4\]!', rest):
+        return 4
+    return 0
 
 
 def parse_listing(lines):
     funcs = collections.OrderedDict()
     by_addr = {}
     cur = None
+    idx, called = 0, False
     for line in lines:
         line = line.rstrip('\n')
         m = HDR.match(line)
@@ -90,6 +181,7 @@ def parse_listing(lines):
             cur = Function(m.group(2), int(m.group(1), 16))
             funcs[cur.name] = cur
             by_addr.setdefault(cur.addr, cur.name)
+            idx, called = 0, False
             continue
         if cur is None:
             continue
@@ -98,17 +190,25 @@ def parse_listing(lines):
             continue
         op, rest = m.group(2), m.group(3)
         rest = rest.split('@')[0].strip()
+        idx += 1
         if BRANCH.match(op):
             t = TARGET.match(rest)
+            links = op.startswith('bl') and op not in PLAIN_COND
             if t and t.group(2) != cur.name:
                 cur.calls.setdefault(t.group(2), 'call')
+                if links:
+                    cur.linked.add(t.group(2))
+            called = called or links
         elif op == 'blx' or (op.startswith('bx') and rest != 'lr'):
             t = TARGET.match(rest)
             if t:
                 if t.group(2) != cur.name:
                     cur.calls.setdefault(t.group(2), 'call')
+                    cur.linked.add(t.group(2))
             else:
                 cur.indirect += 1
+                cur.reg_calls += 1
+            called = True
         elif op in ('ldr', 'mov', 'add') and rest.startswith('pc,'):
             cur.indirect += 1
         elif op == '.word':
@@ -116,6 +216,8 @@ def parse_listing(lines):
                 cur.pool.append(int(rest.split()[0], 0))
             except ValueError:
                 pass
+        elif idx <= 14 and not called:
+            cur.frame += prologue_bytes(op, rest)
     # the address of a function kept in a literal pool is a call that goes through a register (or a pointer that is
     # stored for later): an edge too, so that a function whose address is only passed around is not missed
     for f in funcs.values():
@@ -192,6 +294,125 @@ def analyse(funcs, dem, quiet=False):
     return problems, violations, parent, cut_reached, indirect
 
 
+def chain_depth(funcs, root):
+    """(bytes, path, trouble) of the deepest chain of frames from `root`, read from the machine code: a function costs its prologue plus the
+    deepest of its callees, a tail call (a plain `b` to another function: the caller's frame is popped first) costs the callee alone. A call
+    through a register or a cycle makes the chain unbounded: `trouble` names them (the bytes are then the deepest of what could be followed)."""
+    memo, active, trouble = {}, set(), []
+
+    def depth(n):
+        if n in memo:
+            return memo[n]
+        f = funcs.get(n)
+        if f is None:
+            trouble.append('%s is not in the listing' % n)
+            return (0, [n])
+        if n in active:
+            trouble.append('a cycle through %s' % n)
+            return (0, [n])
+        if f.reg_calls:
+            trouble.append('%s calls through a register (%d)' % (n, f.reg_calls))
+        active.add(n)
+        best = (f.frame, [n])
+        for c, kind in f.calls.items():
+            if kind != 'call':
+                continue   # (an address in the literal pool: a pointer that is passed or stored, not a call made here)
+            below, path = depth(c)
+            val = f.frame + below if c in f.linked else below
+            if val > best[0]:
+                best = (val, [n] + path)
+        active.discard(n)
+        memo[n] = best
+        return best
+
+    total, path = depth(root)
+    return total, path, trouble
+
+
+def check_frame_roots(funcs, dem, quiet=False):
+    """The roots that run at every frame of a game thread (FRAME_ROOTS): their deepest chain against its ceiling. Returns the failures."""
+    bad = []
+    for pat, ceiling in FRAME_ROOTS:
+        r = re.compile(pat)
+        roots = [n for n in funcs if r.search(dem.get(n, n))]
+        if not roots:
+            bad.append('no function matches the per-frame root %s (renamed? update FRAME_ROOTS)' % pat)
+        for n in roots:
+            total, path, trouble = chain_depth(funcs, n)
+            chain = ' > '.join('%s %d' % (short(dem, p, 48), funcs[p].frame if p in funcs else 0) for p in path)
+            if trouble:
+                bad.append('the chain under %s cannot be bounded: %s' % (short(dem, n), '; '.join(sorted(set(trouble)))))
+            elif total > ceiling:
+                bad.append("the deepest chain under %s is %d bytes of the game's stack, ceiling %d: %s" % (short(dem, n), total, ceiling, chain))
+            elif not quiet:
+                print('callgraph: the deepest chain under %s is %d bytes (ceiling %d): %s' % (short(dem, n, 56), total, ceiling, chain))
+    return bad
+
+
+def reachable_uncut(funcs, dem):
+    """Every function the roots reach, the HLE proper included (no cut), not followed into the wait primitives and the game's svc wrappers.
+    Returns {name: parent}."""
+    callback_re = [re.compile(p) for p in CALLBACK_ROOTS + OPTIONAL_CALLBACK_ROOTS]
+    roots = [r for r in ENTRY_ROOTS if r in funcs]
+    roots += [n for n in funcs if n not in roots and any(r.search(dem.get(n, n)) for r in callback_re)]
+    stop = set(WAIT_PRIMITIVES) | set(GAME_SVCS)
+    parent = {r: None for r in roots}
+    queue = collections.deque(roots)
+    while queue:
+        n = queue.popleft()
+        if n in stop:
+            continue
+        f = funcs.get(n)
+        if not f:
+            continue
+        for c in f.calls:
+            if c not in parent:
+                parent[c] = n
+                queue.append(c)
+    return parent
+
+
+def check_waits(funcs, dem, quiet=False):
+    """The waits and the game's svc a game thread can reach from the gate's pre/post and the callbacks, against WAITS_ALLOWED. Returns the
+    number of failures (printed)."""
+    parent = reachable_uncut(funcs, dem)
+    stop = set(WAIT_PRIMITIVES) | set(GAME_SVCS)
+    allowed = [(re.compile(p), set(calls), why) for p, calls, why in WAITS_ALLOWED]
+    used = [0] * len(allowed)
+    bad = 0
+    callers = 0
+    for n in parent:
+        f = funcs.get(n)
+        if f is None or n in stop:
+            continue
+        waits = sorted(c for c in f.calls if c in stop)
+        if not waits:
+            continue
+        callers += 1
+        name = dem.get(n, n)
+        hits = [i for i, (r, _c, _w) in enumerate(allowed) if r.search(name)]
+        for i in hits:
+            used[i] += 1
+        may = set().union(*(allowed[i][1] for i in hits)) if hits else set()
+        extra = [w for w in waits if w not in may]
+        if extra:
+            path = [n]
+            while parent[path[-1]] is not None:
+                path.append(parent[path[-1]])
+            print('callgraph check FAILED: a game thread can reach %s in %s, which is not in WAITS_ALLOWED (a wait must end when the gate '
+                  'closes or be under 20 ms; the game\'s svc is the gate\'s):' % (', '.join(dem.get(w, w) for w in extra), short(dem, n)))
+            print('    ' + '\n <- '.join(short(dem, p) for p in path))
+            bad += 1
+    for i, (p, _calls, _why) in enumerate(WAITS_ALLOWED):
+        if not used[i]:
+            print('callgraph check FAILED: the entry %s of WAITS_ALLOWED matches no caller of a wait any more (renamed? take it out)' % p)
+            bad += 1
+    if not quiet and not bad:
+        print('callgraph: %d functions a game thread reaches call a wait or a svc of the game (the HLE followed, no cut): all in the list '
+              'of the guarded or short ones (%d entries)' % (callers, len(WAITS_ALLOWED)))
+    return bad
+
+
 def short(dem, name, width=96):
     return dem.get(name, name)[:width]
 
@@ -210,6 +431,10 @@ def report(funcs, dem, quiet=False):
         bad += 1
         print('callgraph check FAILED: a game thread can reach %s:' % short(dem, path[-1]))
         print('    ' + '\n -> '.join(short(dem, p) for p in path))
+    for p in check_frame_roots(funcs, dem, quiet):
+        print('callgraph check FAILED: ' + p)
+        bad += 1
+    bad += check_waits(funcs, dem, quiet)
     if not quiet:
         print('callgraph: %d functions, %d reachable from the hook entries and its callbacks (not followed past: %s)' % (
             len(funcs), len(parent), ', '.join(sorted(short(dem, c) for c in cut_reached)) or 'nothing reached'))
@@ -224,9 +449,13 @@ def report(funcs, dem, quiet=False):
 
 # ---------------------------------------------------------------------------------------------------------------------
 SELFTEST_LISTING = """
-07000000 <azl_svc32_entry>:
+07000000 <azl_pre32>:
  7000000:	bl	7000100 <hook>
  7000004:	bx	lr
+07000010 <azl_post32>:
+ 7000010:	bx	lr
+07000020 <azl_post23>:
+ 7000020:	bx	lr
 07000100 <hook>:
  7000100:	bl	7000200 <ok_leaf>
  7000104:	beq	7000300 <tail_helper>
@@ -244,7 +473,7 @@ SELFTEST_LISTING = """
  7000504:	bx	lr
 07000600 <vsnprintf>:
  7000600:	bx	lr
-07000700 <azl_svc23_entry>:
+07000700 <azl_pre23>:
  7000700:	bl	7000800 <closer>
  7000704:	bx	lr
 07000800 <closer>:
@@ -259,23 +488,96 @@ SELFTEST_LISTING = """
 07000a00 <snprintf>:
  7000a00:	bx	lr
 """
-SELFTEST_NM = """07000000 T azl_svc32_entry
+SELFTEST_NM = """07000000 T azl_pre32
+07000010 T azl_post32
+07000020 T azl_post23
 07000100 T hook
 07000200 T ok_leaf
 07000300 T tail_helper
 07000400 T HleRun
 07000500 T HleFormats
 07000600 T vsnprintf
-07000700 T azl_svc23_entry
+07000700 T azl_pre23
 07000800 T closer
 07000900 T pointer_taken
 07000a00 T snprintf
 """
 
 
+SELFTEST_CHAIN = """
+08000000 <osd>:
+ 8000000:	push	{r4, r5, r6, lr}
+ 8000004:	sub	sp, sp, #8
+ 8000008:	bl	8000100 <draw>
+ 800000c:	bl	8000300 <leaf>
+ 8000010:	pop	{r4, r5, r6, pc}
+08000100 <draw>:
+ 8000100:	push	{r4, lr}
+ 8000104:	vpush	{d8-d9}
+ 8000108:	sub	sp, sp, #16
+ 800010c:	bl	8000200 <big>
+ 8000110:	sub	sp, sp, #64
+ 8000114:	pop	{r4, pc}
+08000200 <big>:
+ 8000200:	push	{r4, lr}
+ 8000204:	sub	sp, sp, #1536
+ 8000208:	pop	{r4, pc}
+08000300 <leaf>:
+ 8000300:	bx	lr
+08000400 <tailer>:
+ 8000400:	push	{r4, lr}
+ 8000404:	pop	{r4, lr}
+ 8000408:	b	8000200 <big>
+08000500 <byreg>:
+ 8000500:	push	{r4, lr}
+ 8000504:	blx	r3
+ 8000508:	pop	{r4, pc}
+08000600 <loop_a>:
+ 8000600:	push	{r4, lr}
+ 8000604:	bl	8000700 <loop_b>
+ 8000608:	pop	{r4, pc}
+08000700 <loop_b>:
+ 8000700:	push	{r4, lr}
+ 8000704:	bl	8000600 <loop_a>
+ 8000708:	pop	{r4, pc}
+"""
+
+
+SELFTEST_WAITS = """
+09000000 <azl_pre32>:
+ 9000000:	bl	9000100 <guarded_wait>
+ 9000004:	b	9000200 <HleRun>
+09000010 <azl_post32>:
+ 9000010:	bx	lr
+09000020 <azl_post23>:
+ 9000020:	bx	lr
+09000030 <azl_pre23>:
+ 9000030:	bl	9000500 <svcCloseHandle>
+ 9000034:	bx	lr
+09000100 <guarded_wait>:
+ 9000100:	bl	9000400 <svcSleepThread>
+ 9000104:	bx	lr
+09000200 <HleRun>:
+ 9000200:	bl	9000300 <engine_lock>
+ 9000204:	bx	lr
+09000300 <engine_lock>:
+ 9000300:	bl	9000600 <LightLock_Lock>
+ 9000304:	bx	lr
+09000400 <svcSleepThread>:
+ 9000400:	svc	0x0000000a
+ 9000404:	bx	lr
+09000500 <svcCloseHandle>:
+ 9000500:	svc	0x00000023
+ 9000504:	bx	lr
+09000600 <LightLock_Lock>:
+ 9000600:	bl	9000400 <svcSleepThread>
+ 9000604:	bx	lr
+"""
+
+
 def selftest():
-    global CALLBACK_ROOTS, CUT
-    saved = (CALLBACK_ROOTS, CUT)
+    global CALLBACK_ROOTS, CUT, FRAME_ROOTS, WAITS_ALLOWED
+    saved = (CALLBACK_ROOTS, CUT, FRAME_ROOTS, WAITS_ALLOWED)
     failures = []
 
     def expect(cond, what):
@@ -301,7 +603,7 @@ def selftest():
         CUT = []
         problems2, violations2, parent2, _, _ = analyse(funcs, dem)
         paths = [p for p in violations2 if p[-1] == 'vsnprintf']
-        expect(paths and paths[0] == ['azl_svc32_entry', 'hook', 'tail_helper', 'HleRun', 'HleFormats', 'vsnprintf'],
+        expect(paths and paths[0] == ['azl_pre32', 'hook', 'tail_helper', 'HleRun', 'HleFormats', 'vsnprintf'],
                'the path to a formatter is reported (%r)' % (paths,))
         # a function that is a root is followed from there even though the cut hides it from the entries (the Download Play hub's functions are
         # roots for that reason: UdsHle::Run is the cut and everything a dlp command does is behind it)
@@ -314,8 +616,58 @@ def selftest():
         CALLBACK_ROOTS = [r'^NoSuchCallback$']
         problems3, _, _, _, _ = analyse(funcs, dem)
         expect(any('NoSuchCallback' in p for p in problems3), 'a callback root that matches nothing is reported')
+        # the deepest chain of a per-frame root: prologues added up, a tail call not stacked, a buffer in a helper over the ceiling
+        osd = parse_listing(SELFTEST_CHAIN.split('\n'))
+        odem = {n: n for n in osd}
+        expect(osd['osd'].frame == 24 and osd['draw'].frame == 40 and osd['big'].frame == 1544,
+               'the prologues are read (push, vpush, sub sp; not past the first call) (%r)' % ({n: f.frame for n, f in osd.items()},))
+        total, path, trouble = chain_depth(osd, 'osd')
+        expect(not trouble and total == 24 + 40 + 1544 and path == ['osd', 'draw', 'big'],
+               'the deepest chain is the sum of its frames (%r %r %r)' % (total, path, trouble))
+        expect(chain_depth(osd, 'tailer')[0] == 1544, 'a tail call does not stack on its caller (%r)' % (chain_depth(osd, 'tailer'),))
+        expect(any('register' in t for t in chain_depth(osd, 'byreg')[2]), 'a call through a register leaves the chain unbounded')
+        expect(any('cycle' in t for t in chain_depth(osd, 'loop_a')[2]), 'a cycle leaves the chain unbounded')
+        FRAME_ROOTS = [(r'^osd$', 1700)]
+        expect(not check_frame_roots(osd, odem, quiet=True), 'a chain within its ceiling passes')
+        FRAME_ROOTS = [(r'^osd$', 1600)]
+        expect(any('1608 bytes' in p for p in check_frame_roots(osd, odem, quiet=True)), 'a chain over its ceiling fails')
+        FRAME_ROOTS = [(r'^byreg$', 1600)]
+        expect(any('cannot be bounded' in p for p in check_frame_roots(osd, odem, quiet=True)), 'an unbounded chain fails')
+        FRAME_ROOTS = [(r'^NoSuchFrameRoot$', 100)]
+        expect(any('NoSuchFrameRoot' in p for p in check_frame_roots(osd, odem, quiet=True)), 'a per-frame root that matches nothing fails')
+        # the waits: followed past the cut, every caller of a wait or of the game's svc in the list, nothing more, no entry left over
+        import contextlib
+        import io
+        wl = parse_listing(SELFTEST_WAITS.split('\n'))
+        wdem = {n: n for n in wl}
+        CALLBACK_ROOTS = []
+        CUT = [r'^HleRun$']
+        everything = [(r'^guarded_wait$', ('svcSleepThread',), 'x'), (r'^engine_lock$', ('LightLock_Lock',), 'x'),
+                      (r'^azl_pre23$', ('svcCloseHandle',), 'x')]
+
+        def waits(allowed):
+            global WAITS_ALLOWED
+            WAITS_ALLOWED = allowed
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                n = check_waits(wl, wdem, quiet=True)
+            return n, out.getvalue()
+
+        n, _ = waits(everything)
+        expect(n == 0, 'every wait in the list: no failure (%d)' % n)
+        n, out = waits(everything[:1] + everything[2:])
+        expect(n == 1 and 'LightLock_Lock in engine_lock' in out and 'HleRun' in out,
+               'a lock behind the cut of the formatters (the HLE proper) is followed and fails when it is not in the list (%r)' % out)
+        n, out = waits(everything[:2])
+        expect(n == 1 and 'svcCloseHandle in azl_pre23' in out, 'a svc of the game made by the plugin fails when it is not in the list (%r)' % out)
+        n, out = waits([(r'^guarded_wait$', ('LightLock_Lock',), 'x')] + everything[1:])
+        expect(n == 1 and 'svcSleepThread in guarded_wait' in out, 'a listed caller that makes another wait than its own fails (%r)' % out)
+        n, out = waits(everything + [(r'^NoSuchWaiter$', ('svcSleepThread',), 'x')])
+        expect(n == 1 and 'NoSuchWaiter' in out, 'an entry that matches no caller any more fails (%r)' % out)
+        expect('LightLock_Lock' in reachable_uncut(wl, wdem) and 'svcSleepThread' in reachable_uncut(wl, wdem),
+               'the primitives are reached, and not followed (LightLock_Lock calls svcSleepThread: not its own failure)')
     finally:
-        CALLBACK_ROOTS, CUT = saved
+        CALLBACK_ROOTS, CUT, FRAME_ROOTS, WAITS_ALLOWED = saved
     print('callgraph selftest: %s' % ('%d failure(s)' % len(failures) if failures else 'ok'))
     return 1 if failures else 0
 

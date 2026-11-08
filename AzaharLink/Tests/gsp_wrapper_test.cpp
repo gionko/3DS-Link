@@ -245,9 +245,61 @@ static void SweepGame(const char* path, u32 text_size, u32 expected) {
     }
 }
 
+// The framework's own svc 0x32 words (FindFrameworkSites) and the filter of the hook's sites (IsHookSite), as InstallSvcHooks runs them: the
+// svc of a libctru wrapper and of an SDK wrapper with its header stay out of the hook (without them the framework aborts at the game's start,
+// the class of LEGO Batman 2 and Balloon Fight); a plain svc 0x32, a svc 0x23, the svc of an SDK prologue with no header and the svc of a
+// libctru wrapper cut by the end of the text are the hook's.
+static void TestFrameworkSites() {
+    Image image(0x400);
+    const u32 ctru = kBase + 0x40, sdk = kBase + 0x100, plain32 = kBase + 0x1A0, plain23 = kBase + 0x1A4, bare = kBase + 0x200;
+    for (u32 i = 0; i < kGspWrapperCtruWords; ++i) {
+        image.Put(ctru + 4 * i, kGspWrapperCtru[i]);
+    }
+    for (u32 i = 0; i < kGspWrapperSdkWords; ++i) {
+        image.Put(sdk + 4 * i, kGspWrapperSdk[i]);
+        image.Put(bare + 4 * i, kGspWrapperSdk[i]);
+    }
+    image.Put(sdk + kGspWrapperSdkSvcOffset, kSvcSendSyncRequestWord);
+    image.Put(sdk + 0x30, kGspRegisterInterruptHeader);
+    image.Put(bare + kGspWrapperSdkSvcOffset, kSvcSendSyncRequestWord); // (no header in its window: not the framework's)
+    image.Put(plain32, kSvcSendSyncRequestWord);
+    image.Put(plain23, kSvcCloseHandleWord);
+    const u32 cut = image.End() - 4 * (kGspWrapperCtruWords - 2); // a libctru wrapper the end of the text cuts: its svc is inside, the pattern is not
+    for (u32 i = 0; cut + 4 * i < image.End(); ++i) {
+        image.Put(cut + 4 * i, kGspWrapperCtru[i]);
+    }
+    g_wild_reads = 0;
+    u32 framework[8];
+    const u32 count = FindFrameworkSites(Read, &image, kBase, image.End(), framework, 8);
+    CHECK(g_wild_reads == 0);
+    CHECK(count == 2 && framework[0] == ctru + kGspWrapperCtruSvcOffset && framework[1] == sdk + kGspWrapperSdkSvcOffset);
+    std::vector<u32> hooked;
+    u32 left = 0;
+    for (u32 addr = kBase; addr + 4 <= image.End(); addr += 4) {
+        bool framework_site = false;
+        if (IsHookSite(image.Get(addr), addr, framework, count, &framework_site)) {
+            hooked.push_back(addr);
+        }
+        left += framework_site ? 1 : 0;
+    }
+    const std::vector<u32> want = {plain32, plain23, bare + kGspWrapperSdkSvcOffset, cut + kGspWrapperCtruSvcOffset};
+    CHECK(hooked == want);
+    CHECK(left == 2);
+    // a svc 0x23 at a framework's address is still the hook's (the framework hooks only its svc 0x32), and nothing else is a site
+    bool framework_site = true;
+    CHECK(IsHookSite(kSvcCloseHandleWord, framework[0], framework, count, &framework_site) && !framework_site);
+    CHECK(!IsHookSite(kNop, plain32, framework, count, &framework_site) && !framework_site);
+    CHECK(!IsHookSite(0xEF000033, plain32, framework, count, &framework_site) && !framework_site);
+    // at most `max`, the first ones
+    u32 one[1];
+    CHECK(FindFrameworkSites(Read, &image, kBase, image.End(), one, 1) == 1 && one[0] == ctru + kGspWrapperCtruSvcOffset);
+    std::printf("framework sites: %u found, %zu sites of the hook, the framework's left as they are\n", count, hooked.size());
+}
+
 int main(int argc, char** argv) {
     TestBlTarget();
     TestFind();
+    TestFrameworkSites();
     if (argc > 1) {
         SweepGame(argv[1], argc > 2 ? static_cast<u32>(std::strtoul(argv[2], nullptr, 0)) : 0,
                   argc > 3 ? static_cast<u32>(std::strtoul(argv[3], nullptr, 0)) : 0);

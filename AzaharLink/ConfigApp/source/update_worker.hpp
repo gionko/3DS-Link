@@ -40,6 +40,15 @@ std::string FailureText(const Status& status);
 // The year the console's clock says.
 int ConsoleYear();
 
+// The lists of the page "Public lobbies" (public_lobbies.hpp): the job that fetches them says how it went here, apart from the update's Status.
+struct ListsStatus {
+    enum class Stage { Idle, Running, Done, Failed };
+    Stage stage = Stage::Idle;
+    NetResult net = NetResult::Ok;
+    bool list_changed = false;   // a new list waits in <list>.new (the page applies it: public_lobbies.hpp, Remember)
+    bool titles_changed = false; // new titles wait in <titles>.new (the list said they changed)
+};
+
 class Worker {
 public:
     static Worker& Get();
@@ -49,6 +58,14 @@ public:
     // Starts downloading and installing `version`. `path` is the file to replace (Target::File3dsx). False: a job is still running.
     bool StartInstall(Target target, const std::string& version, const std::string& path);
     Status Read() const;
+    // Fetches the list of public rooms and, when its "#titles" line differs from the one of the file at `titles_path`, the titles too. What came
+    // is never written over the files the page uses: a whole list that differs from `list_path` goes to `list_path`.new, the titles to
+    // `titles_path`.new, and the page applies them on its own thread (so a page that closed before the end loses nothing: the next one applies
+    // them). False: a job is still running (try again later).
+    bool StartLists(const std::string& list_path, const std::string& titles_path);
+    ListsStatus ReadLists() const;
+    // The job of the lists is running (its .new files are being written).
+    bool ListsRunning() const;
     // A request stops at its next step. (An install that has begun is never cut: AM takes the file whole or not at all.)
     void Cancel();
     // Cancel, and wait for the thread at most `timeout_ms`: before the sockets are closed under it. True when no thread is left.
@@ -61,6 +78,7 @@ public:
 private:
     Worker();
     bool Begin(Stage first);
+    bool Spawn();
     Impl* impl_;
 };
 

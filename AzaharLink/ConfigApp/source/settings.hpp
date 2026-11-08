@@ -14,7 +14,7 @@
 
 namespace setup {
 
-constexpr const char* kVersion = "1.1.1";
+constexpr const char* kVersion = "1.1.2";
 // The places that are not the app's to choose: Luma3DS loads plugins from this folder (a title's copy of the plugin goes to
 // sdmc:/luma/plugins/<title id>/, games.hpp), and the plugin reads its settings and writes its logs in sdmc:/3ds/3DSLink, whatever folder
 // the app itself is in (kIniPath and the folder are in paths.hpp with the other fixed places). Until 2026-10-19 the settings were in
@@ -43,7 +43,10 @@ struct Settings {
     std::string game_name;
     int debug = 0; // 0 no log at all (no file is written), 1 everything (AzaharLink.log + AzaharLink.debug.log); a 2 reads as 1
     int rcvbuf_kb = azl::ini::kRcvbufKbDefault; // not shown by the app (an advanced fallback: 8, 16, 32 or 64), but a field of its own: it is written, never lost
-    int sleep_stop = azl::ini::kSleepStopDefault; // the row "End session on sleep": 0 off, 1 a client, 2 a host too
+    int sleep_stop = azl::ini::kSleepStopDefault; // not shown since 1.1.1 (0 off, 1 a client, 2 a host too): written, never lost
+    bool chat = true;                           // the row "In-game chat"
+    std::string chat_key = azl::ini::kDefaultChatKey; // the row "Chat keys"
+    int chat_pos = azl::ini::kChatPosDefault;   // the row "Chat position" (azl::ini::ChatPos; the file holds the word)
     std::vector<std::string> unknown_lines;
     unsigned keys_seen = 0; // not in the file: bit i = the key azl::ini::kKeyNames[i] was in the file that LoadSettings read
     bool moved_from_old_place = false; // not in the file: LoadSettings found the file in sdmc:/luma/plugins and moved it to kIniPath
@@ -65,7 +68,7 @@ std::string MenuChordText(const std::string& chord);
 LoadResult LoadSettings(Settings& cfg);
 // True when /luma/plugins exists: the first-run file is only written where the plugin could be installed.
 bool PluginsDirExists();
-// True when the file LoadSettings read had every one of the 15 keys (a file of 0.1.14 or older lacks two).
+// True when the file LoadSettings read had every key of azl::ini::kKeyNames (a file of 0.1.14 or older lacks two; one written before the chat, chat_pos).
 bool HasAllKeys(const Settings& cfg);
 
 // The three values of the sleep row, in the order A (and D-pad right) cycles through them: 0, 1, 2. D-pad left goes back.
@@ -88,7 +91,7 @@ std::string PluginVersionText(u32 word);
 // ---------------------------------------------------------------------------------------------
 
 // The longest name a room can be given, and what it may hold: A-Z a-z 0-9 space . _ - (like a nickname). Empty = the room has no name.
-constexpr std::size_t kMaxServerNameChars = 12;
+constexpr std::size_t kMaxServerNameChars = 64;
 bool ValidServerName(const std::string& name);
 
 // One room: the host (a name or an IPv4 address), its UDP port, a name the user gave it (may be empty) and its password (may be empty: a room

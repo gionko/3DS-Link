@@ -76,7 +76,7 @@ def points(v):
     major, minor, micro = parse(v)
     fmt = dict(v=v, major=major, minor=minor, micro=micro, w3gx=word3gx(v), tmd=tmd(v))
     table = [
-        ('Includes/ctr/plugin.hpp', r'constexpr const char\* kVersion = "[0-9.]+";[^\n]*',
+        ('Includes/ctr/plugin.hpp', r'constexpr const char\* kVersion = "[0-9.]+";[^\r\n]*',  # (not the CR: plugin.hpp is CRLF since the lobby merge)
          'constexpr const char* kVersion = "{v}"; // (the log header and the menu text; the menu\'s ints and plgInfo say {v}: Tests/set_version.py writes all of them)', 1),
         ('Sources/main.cpp', r'PluginMenu\("AzaharLink", \d+, \d+, \d+,', 'PluginMenu("AzaharLink", {major}, {minor}, {micro},', 1),
         ('CTRPluginFramework.plgInfo', r'(?m)^(    )Major: \d+', r'\1Major: {major}', 1),

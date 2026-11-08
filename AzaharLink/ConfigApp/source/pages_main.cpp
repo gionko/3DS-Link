@@ -9,6 +9,7 @@
 #include "pages.hpp"
 #include "plugin_resource.hpp"
 #include "titles.hpp"
+#include "zombie_census.hpp"
 
 using namespace ui;
 
@@ -142,6 +143,14 @@ public:
             return;
         }
         ListPage::Update(in);
+        if (zombie_census::TakeNotice()) {
+            // (zombie_census.cpp: a closed game is still in memory; a game that sizes its heap to the byte would panic at its next launch)
+            PushPage(pages::NewMessagePage("A game is still in memory",
+                                           "A closed game is still in memory. Restart the console before starting another game.",
+                                           "After HOME > Close the system did not free the game's memory. Starting a game now can make it crash. "
+                                           "The details are in sdmc:/3ds/3DSLink/3DSLink-census.log."));
+            return;
+        }
         if (!g.plugin_notice.empty()) {
             g.ShowToast(g.plugin_notice, g.plugin_notice_color, 7000);
             g.plugin_notice.clear();

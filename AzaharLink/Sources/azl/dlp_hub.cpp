@@ -3,6 +3,21 @@
 
 namespace azl {
 
+namespace {
+
+/// Gives back post_mutex_, taken by Post with try_lock (a wait that the closing of the svc hook's gate can end).
+struct PostUnlock {
+    explicit PostUnlock(platform::Mutex& m) : m_(m) {}
+    ~PostUnlock() {
+        m_.unlock();
+    }
+    PostUnlock(const PostUnlock&) = delete;
+    PostUnlock& operator=(const PostUnlock&) = delete;
+    platform::Mutex& m_;
+};
+
+} // namespace
+
 DlpHub::DlpHub(UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& resolver)
     : net_(engine), lobby_(&net_, cfg), resolver_(resolver), kernel_(kernel) {
     lobby_.SetExternalPoll(true);  // (the network work is the network thread's: Tick)
@@ -132,12 +147,23 @@ bool DlpHub::PollPending(u32* cmd) {
     return svc_.PollPending(cmd);
 }
 
+// The swap of the plugin's block (KernelOps::GateClosing) waits for this thread to leave the plugin's code, 1.5 s at the most: every wait
+// below ends when it sees the gate closing - before the slot (refused like a dead network thread), behind another requester (the slot is
+// polled, not waited for), queued (taken back, like at kQueuedMs) - and WakeForSwap() wakes the queued one at once. Only a request the
+// network thread is RUNNING is waited for: it is not blocked on anything, and the slot (and the command words it writes) are its until Done.
 bool DlpHub::Post(Op op, DlpKind kind, u32* cmd, const u32* sbuf, DlpOutcome* outcome) {
-    if (event_ == 0 || !NetAlive()) {
+    if (event_ == 0 || !NetAlive() || kernel_->GateClosing()) {
         failed_fast_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    platform::LockGuard post(post_mutex_);  // (one request at a time; no other lock is held by this thread)
+    while (!post_mutex_.try_lock()) {  // (one request at a time; no other lock is held by this thread)
+        if (kernel_->GateClosing()) {
+            failed_fast_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        platform::SleepMs(1);
+    }
+    PostUnlock post(post_mutex_);
     if (!NetAlive()) {  // (the requester ahead of us was cancelled, or Stop() came: nobody serves us either - not another kQueuedMs of waiting)
         failed_fast_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -166,7 +192,7 @@ bool DlpHub::Post(Op op, DlpKind kind, u32* cmd, const u32* sbuf, DlpOutcome* ou
         if (state == kDone) {
             break;
         }
-        if (state == kQueued && platform::NowMs() >= deadline) {
+        if (state == kQueued && (platform::NowMs() >= deadline || kernel_->GateClosing())) {
             u32 expected = kQueued;
             if (state_.compare_exchange_strong(expected, kFree, std::memory_order_acq_rel)) {
                 cancelled_.fetch_add(1, std::memory_order_relaxed);
@@ -207,6 +233,14 @@ void DlpHub::OnSessionClosed(DlpKind kind) {
 }
 
 // <<< game-thread code
+
+void DlpHub::WakeForSwap() {
+    // The requester waits on event_ in slices of kSliceMs and looks at GateClosing() after each: the signal ends its slice now. A signal
+    // nobody takes is reset by the next Post before it queues (ClearEvent), and a request the network thread took meanwhile signals again at Done.
+    if (event_ != 0 && state_.load(std::memory_order_acquire) == kQueued) {
+        kernel_->SignalEvent(event_);
+    }
+}
 
 void DlpHub::FreeEngine() {
     if (net_.engine_held()) {

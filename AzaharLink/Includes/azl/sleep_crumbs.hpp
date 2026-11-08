@@ -7,7 +7,8 @@
 // (AzaharLink.sleep.log) with a flush, so that a freeze leaves the last thing that happened:
 //   the notifications the system sent (3 query, 4 cancelled, 5 begins, 6 wake-up, HOME, power),
 //   the game's answer to the query and its acknowledgement of the sleep (noted BEFORE the call: it may not return),
-//   the framework's SLEEP_ENTER / SLEEP_EXIT,
+//   the framework's SLEEP_ENTER / SLEEP_EXIT (and, for the close of a game, its HOME_ENTER / HOME_EXIT / EXIT with Luma3DS's plugin word, the word after
+//   every APT:ReceiveParameter, and the termination request srv gives the game),
 //   a wake marker: the thread compares the console's clock with the tick (the tick stops during a sleep, osGetTime() does
 //   not) and says when the clock ran ahead - and that it was still alive 1 s and 5 s later.
 // Read the file like this: "3, 5 and no acknowledgement" - the game's wind-down hung; "acknowledged, no wake" - the system
@@ -35,7 +36,21 @@ public:
     static constexpr u32 kMemSystem = 15;    ///< a memory region as PackRegion says, with the swap's events
     static constexpr u32 kMemApplication = 16;
     static constexpr u32 kMemBase = 17;
-    static constexpr u32 kFwSwapBack = 22;   ///< the block is back and the call sites are in the hook again; the value: how long that took, in us
+    static constexpr u32 kFwSwapBack = 22;   ///< the block is back and the svc hook's gate is open again; the value: how long that took, in us
+    // The framework's HOME_ENTER, HOME_EXIT and EXIT of the process (not kFwExit, the end of a sleep), with the log on; the value: Luma3DS's plugin word at
+    // the callback (kLumaPluginWordAddress, azl/apt_sleep.hpp: 0x00010001 at HOME_ENTER, 0x00010002 at HOME_EXIT, 0x00000003 at EXIT - Luma3DS writes the
+    // state EXITING, events cleared, before it tells the plugin).
+    static constexpr u32 kFwProcHomeEnter = 23;
+    static constexpr u32 kFwProcHomeExit = 24;
+    static constexpr u32 kFwProcExit = 25;
+    // The exit guard (azl/exit_guard.hpp, REGISTRO phase Q), pushed on the exiting game's thread and waited for (kTrailWaitMs) before the svc:
+    // the word when the game called svcExitProcess, Rosalina's reply and event words (reply << 16 | event, 16 bits each), how long the guard waited
+    // (bit 31: it replied to Rosalina for the framework), the word at the last look, and what it does (exitguard::Action).
+    static constexpr u32 kExitGuardEnter = 29;
+    static constexpr u32 kExitGuardRosalina = 30;
+    static constexpr u32 kExitGuardWaited = 31;
+    static constexpr u32 kExitGuardWordLast = 32;
+    static constexpr u32 kExitGuardAction = 33;
     static constexpr u32 kSlots = 32;        ///< events waiting for the thread (more between two of its turns: the oldest go)
     static constexpr u32 kMaxLines = 400;    ///< lines written in one launch
     static constexpr u32 kPollMs = 250;      ///< the thread's turn while a sleep is watched (else it waits for an event)
@@ -55,6 +70,17 @@ public:
         slot.seq.store(i + 1, std::memory_order_release); // (last: the thread reads a slot only when this says it is whole)
     }
     // <<< game-thread code
+
+    /// Luma3DS's plugin word as a line says it: "0x00010002 (state 2 in the HOME menu, events HOME)". The events HOME and EXIT together (0x0003xxxx) are
+    /// the case Luma3DS handles in no branch: they can only be seen after a call of the game, never at a callback of the framework.
+    static std::string LumaWordText(u32 word) {
+        static const char* const kStates[] = {"none", "running", "in the HOME menu", "exiting"};
+        static const char* const kEvents[] = {"none", "HOME", "EXIT", "HOME and EXIT together"};
+        const u32 state = word & 0xFFFF;
+        const u32 events = word >> 16;
+        return Hex(word) + " (state " + std::to_string(state) + " " + (state < 4 ? kStates[state] : "?") + ", events " +
+               (events < 4 ? std::string(kEvents[events]) : Hex(events)) + ")";
+    }
 
     /// Used and total bytes of a memory region in one word, in units of 4 KB (a region is at most 256 MiB).
     static u32 PackRegion(u32 used_bytes, u32 total_bytes) {
@@ -191,10 +217,51 @@ private:
             break;
         case kFwSwapBack:
             Add(lines, event_tick_ms, now_os_ms,
-                "the plugin's block is back: call sites in the hook again in " + std::to_string(value) + " us, before the game's thread runs");
+                "the plugin's block is back: the svc hook's gate open again in " + std::to_string(value) + " us");
             break;
         case kAptNoteLimit:
             Add(lines, event_tick_ms, now_os_ms, "the lines about APT:ReceiveParameter and APT:AppletUtility reached their limit for this launch (64)");
+            break;
+        case kAptNoteCloseLimit:
+            Add(lines, event_tick_ms, now_os_ms, "the lines after the close command reached their own limit (32)");
+            break;
+        case kFwProcHomeEnter:
+            Add(lines, event_tick_ms, now_os_ms, "framework event HOME_ENTER of the process, Luma3DS's plugin word " + LumaWordText(value));
+            break;
+        case kFwProcHomeExit:
+            Add(lines, event_tick_ms, now_os_ms, "framework event HOME_EXIT of the process, Luma3DS's plugin word " + LumaWordText(value));
+            break;
+        case kFwProcExit:
+            Add(lines, event_tick_ms, now_os_ms, "framework event EXIT of the process, Luma3DS's plugin word " + LumaWordText(value));
+            break;
+        case kExitGuardEnter:
+            Add(lines, event_tick_ms, now_os_ms, "exit guard: the game calls svcExitProcess, Luma3DS's plugin word " + LumaWordText(value));
+            break;
+        case kExitGuardRosalina:
+            Add(lines, event_tick_ms, now_os_ms,
+                "exit guard: Rosalina's reply word " + std::to_string(static_cast<int16_t>(value >> 16)) +
+                    (static_cast<int16_t>(value >> 16) == -1 ? " (PLG_WAIT: it waits for the plugin)" : "") + ", event word " +
+                    std::to_string(static_cast<int16_t>(value & 0xFFFF)));
+            break;
+        case kExitGuardWaited:
+            Add(lines, event_tick_ms, now_os_ms,
+                "exit guard: waited " + std::to_string(value & 0x7FFFFFFF) + " ms" +
+                    ((value >> 31) != 0 ? ", then replied to Rosalina for the framework (it had not answered the HOME event)" : ""));
+            break;
+        case kExitGuardWordLast:
+            Add(lines, event_tick_ms, now_os_ms, "exit guard: the word at the last look " + LumaWordText(value));
+            break;
+        case kExitGuardAction:
+            Add(lines, event_tick_ms, now_os_ms,
+                value == 2 ? std::string("exit guard: word set to running (state 1, no event): the kernel raises EXIT on it, Rosalina frees the block")
+                           : std::string("exit guard: nothing to do"));
+            break;
+        case kAptNoteReceiveWord:
+            Add(lines, event_tick_ms, now_os_ms, "after APT:ReceiveParameter, Luma3DS's plugin word " + LumaWordText(value));
+            break;
+        case kAptNoteSrvNotification:
+            Add(lines, event_tick_ms, now_os_ms,
+                "srv notification " + Hex(value) + (value == 0x100 ? " (the system asks the game to terminate)" : "") + " received by the game");
             break;
         case kMemSystem:
             AddRegion(lines, event_tick_ms, now_os_ms, "SYSTEM", value);
@@ -204,15 +271,6 @@ private:
             break;
         case kMemBase:
             AddRegion(lines, event_tick_ms, now_os_ms, "BASE", value);
-            break;
-        case kAptNoteReceiveMade:
-            Add(lines, event_tick_ms, now_os_ms, "APT:ReceiveParameter by the plugin itself (trampoline return " + Hex(value) + "): no HOME or power button seen in the last 10 s");
-            break;
-        case kAptNoteReceiveHanded:
-            Add(lines, event_tick_ms, now_os_ms, "APT:ReceiveParameter handed back to the game's own call at " + Hex(value));
-            break;
-        case kAptNoteReceiveRefused:
-            Add(lines, event_tick_ms, now_os_ms, "APT:ReceiveParameter: the hand-back was refused (trampoline return " + Hex(value) + "): the plugin makes the call");
             break;
         case kAptNoteReceiveReply:
             Add(lines, event_tick_ms, now_os_ms,

@@ -237,7 +237,22 @@ public:
                 Say("No connection", "This console is not connected to the WiFi.");
                 return;
             }
-            update::Worker::Get().StartCheck(); // (false: the check of this start is still running, and its answer is as good)
+            if (!update::Worker::Get().StartCheck()) {
+                // The thread is busy. With the list of public rooms it gives way (it is fetched again when its page opens), and the check is
+                // asked again at the next frame; with no check ever made there is no answer to show either. Otherwise the check of this start
+                // is still running, and its answer is as good.
+                const bool lists = update::Worker::Get().ListsRunning();
+                if (lists) {
+                    update::Worker::Get().Cancel();
+                }
+                if (lists || update::Worker::Get().Read().stage == update::Stage::Idle) {
+                    started_ = false;
+                    if ((in.down & KEY_B) || Tapped(in, box_.ok)) {
+                        PopPage();
+                    }
+                    return;
+                }
+            }
         }
         const update::Status status = update::Worker::Get().Read();
         if (status.stage == update::Stage::Checked) {
@@ -330,7 +345,15 @@ bool PollUpdateAtStart(const ui::Input& in) {
             g_at_start_since = NowMs();
         }
         if (g.soc_ok() && g.net.known && g.net.wifi) {
-            update::Worker::Get().StartCheck();
+            if (!update::Worker::Get().StartCheck()) {
+                const bool lists = update::Worker::Get().ListsRunning();
+                if (lists) {
+                    update::Worker::Get().Cancel(); // (the list of public rooms gives way: the check is started at a next frame)
+                }
+                if (lists || update::Worker::Get().Read().stage == update::Stage::Idle) {
+                    return false;
+                }
+            }
             g_at_start = AtStart::Asking;
         } else if (NowMs() - g_at_start_since > kWaitForWifiMs) {
             g_at_start = AtStart::Over;

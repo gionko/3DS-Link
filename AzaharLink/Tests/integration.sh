@@ -9,6 +9,9 @@
 #   - room_integration again, linked with the plugin's own ENet platform layer (Sources/enet/enet_3ds.c):
 #     the in-process part only (Tests/enet3ds/build.sh), and enet_path_test (the data path of ENet) against the same layer,
 #   - room_routing_probe: how the real room routes a frame (broadcast MAC, a member's MAC, an unknown MAC),
+#   - chat_room_probe: the chat through RoomClient (azl/chat_core.hpp): A sends and B keeps it with the nick, no echo to A, 20 in
+#     0.2 s -> 2 decoded (one member's share) and one of A amid them kept, 5000 characters -> the room's 500 bytes -> 128 with "...",
+#     one of ours a second, a chat switched off,
 #   - dlp_room_probe: the fake Download Play lobby over the real room (the whole lobby then the game's UDS, four players, a client that leaves and a creator that goes),
 #   - ipc_test: libctru's real uds.c / ndm.c -> UdsHle -> the room (32-bit, fake kernel),
 #   - ffe_replay_test: the FFE golden replay through UdsHle against an Azahar host model and two Azahar client models,
@@ -51,8 +54,10 @@ RC=0
 MSYS_NO_PATHCONV=1 docker run --rm --network $NET -v "$(cd .. && (pwd -W 2>/dev/null || pwd)):/src" -w /src/AzaharLink \
     -e BUILD_ONLY=1 -e R1=$R1 -e R2=$R2 $BUILD_IMAGE bash -c '
       bash Tests/run.sh && /tmp/azl_tests/room_integration $R1 24872 $R2 24872 &&
+      /tmp/azl_tests/lobby_probe_test $R1 24872 $R2 24872 &&
       bash Tests/enet3ds/build.sh && /tmp/azl_e3ds/room_integration_3ds --tx-queue && /tmp/azl_e3ds/enet_path_test_3ds &&
       /tmp/azl_tests/room_routing_probe $R1 24872 &&
+      /tmp/azl_tests/chat_room_probe $R1 24872 &&
       /tmp/azl_tests/dlp_room_probe $R1 24872 &&
       bash Tests/ipc_test/build.sh && /tmp/azl_tests32/ipc_test $R1 24872 &&
       /tmp/azl_tests32/ffe_replay_test && /tmp/azl_tests32/trace_replay_test && /tmp/azl_tests32/result_closure_test &&

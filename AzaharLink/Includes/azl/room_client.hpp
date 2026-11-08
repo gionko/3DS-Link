@@ -14,6 +14,8 @@
 
 namespace azl {
 
+class ChatSink; // azl/chat_core.hpp
+
 /// The ENet flags a frame of the room goes out with: reliable (the handshake, unicast game data) or UNSEQUENCED (beacons, broadcast
 /// game data: never held behind a reliable packet the room is waiting for).
 u32 EnetPacketFlags(bool reliable);
@@ -158,6 +160,16 @@ public:
     void SetStateCallback(std::function<void(State, Error)> cb);
     /// Called from the network thread every time the room sends its information (members, games).
     void SetRoomInfoCallback(std::function<void(const room::RoomInfo&)> cb);
+    /// The chat's block (azl/chat_core.hpp), or nullptr (the chat off: its packets are dropped unread, as they always were). The
+    /// network thread takes it at its next round: it decodes the room's chat messages into it (at most chat::kRateMax a second)
+    /// and sends what its box holds, while joined. The block must outlive every network thread that may have seen it: the
+    /// plugin's is never freed.
+    void SetChatSink(ChatSink* sink);
+    /// The chat's block while the chat is on (nullptr: off). For the callbacks this client calls on its network thread (the room's list
+    /// of members: Plugin::NoteRoomMembers), the ring's one writer.
+    ChatSink* chat_sink() const {
+        return chat_sink_.load(std::memory_order_acquire);
+    }
 
     /// Changes the game shown next to our name in the room (any time after Start()).
     void UpdateGameInfo(const std::string& name, u64 id);
@@ -198,6 +210,7 @@ private:
     std::function<void(const WifiPacket&)> wifi_cb_;
     std::function<bool(const u8*, std::size_t)> wifi_prefilter_;
     std::function<void(u64)> tick_cb_;
+    std::atomic<ChatSink*> chat_sink_{nullptr}; // (no lock: one pointer; the setter bumps cb_generation_ after it)
     std::atomic<u32> cb_generation_{0}; // bumped by every setter above: the network loop copies the callbacks again
     std::function<void(State, Error)> state_cb_;
     std::function<void(const room::RoomInfo&)> room_info_cb_;

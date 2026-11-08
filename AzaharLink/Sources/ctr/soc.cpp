@@ -24,6 +24,7 @@
 #include "azl/soc_plan.hpp"
 #include "azl/stats.hpp"
 #include "csvc.h"
+#include "ctr/kernel_books.hpp"
 
 extern "C" Result __real_srvGetServiceHandle(Handle* out, const char* name);
 extern "C" int azl_enet_rcvbuf_bytes; // Sources/enet/enet_3ds.c: the SO_RCVBUF ENet asks for
@@ -92,8 +93,16 @@ u32 FreeSpanEnd(u32 addr) {
 
 enum class Try { Allocated, Next, Stop };
 
+// The charge of a block outside the budget that was not had, taken back.
+void UnchargeBack(u32 size) {
+    if (!UnchargeBooks(size)) {
+        Log("soc: WARNING the charge of 0x%lx bytes could not all be taken back (the line before says how much was): what was not is lost to"
+            " the budget of the applications until a reboot", static_cast<unsigned long>(size));
+    }
+}
+
 // svcQueryMemory says where there is room, the kernel has the last word. `outside_budget`: from the SYSTEM region and charged to nobody
-// (Luma's svcControlMemoryUnsafe, the same state 0xBB05: what svcCreateMemoryBlock wants), see ChargeBooks().
+// (Luma's svcControlMemoryUnsafe, the same state 0xBB05: what svcCreateMemoryBlock wants), see ChargeBooks() (ctr/kernel_books.cpp).
 Try TryAt(u32 base, u32 size, bool outside_budget, u32* address) {
     MemInfo info{};
     PageInfo page;
@@ -113,19 +122,36 @@ Try TryAt(u32 base, u32 size, bool outside_budget, u32* address) {
     }
     u32 out = 0;
     const MemPerm rw = static_cast<MemPerm>(MEMPERM_READ | MEMPERM_WRITE);
+    // A block outside the budget goes on the kernel's books BEFORE it is taken (and comes off them if it is not had): a process that dies in
+    // between keeps `size` too many on current, which only that much of the budget pays until a reboot, never a sum of the private blocks
+    // above current, which gives the whole budget back to nobody (books_math.hpp).
+    if (outside_budget && !ChargeBooks(size)) {
+        Log("soc: the kernel's books could not be charged with 0x%lx bytes (the line before says why): no block from the SYSTEM region",
+            static_cast<unsigned long>(size));
+        return Try::Stop;
+    }
     const Result rc = outside_budget
                           ? svcControlMemoryUnsafe(&out, base, size, static_cast<MemOp>(MEMOP_ALLOC | MEMOP_REGION_SYSTEM), rw)
                           : svcControlMemory(&out, base, 0, size, MEMOP_ALLOC, rw);
     if (R_SUCCEEDED(rc)) {
         if (out != base) { // never seen; do not keep a block somewhere we did not plan
             u32 ignored = 0;
-            svcControlMemory(&ignored, out, 0, size, MEMOP_FREE, static_cast<MemPerm>(0));
+            if (outside_budget) {
+                // (svcControlMemory's FREE would take `size` off the books as well, Kernel11 SvcControlMemory: a block the kernel never charged)
+                svcControlMemoryUnsafe(&ignored, out, size, MEMOP_FREE, static_cast<MemPerm>(0));
+                UnchargeBack(size);
+            } else {
+                svcControlMemory(&ignored, out, 0, size, MEMOP_FREE, static_cast<MemPerm>(0));
+            }
             Log("soc: heap alloc at 0x%08lx returned 0x%08lx, released", static_cast<unsigned long>(base),
                 static_cast<unsigned long>(out));
             return Try::Next;
         }
         *address = out;
         return Try::Allocated;
+    }
+    if (outside_budget) {
+        UnchargeBack(size);
     }
     Log("soc: heap alloc of 0x%lx bytes at 0x%08lx failed (0x%08lx)", static_cast<unsigned long>(size),
         static_cast<unsigned long>(base), static_cast<unsigned long>(rc));
@@ -175,95 +201,6 @@ bool AllocateBlock(u32 size, bool outside_budget, Placement* result) {
         }
     }
     return false;
-}
-
-// A late block must not be there while the game sizes its heap, at its entry point. That is long past when the sockets start (the plugin's
-// main() comes seconds later): this is the proof, cheap and bounded, not a wait anybody should see. Menu thread.
-void WaitForGameHeap() {
-    for (int i = 0; i < 40; ++i) {
-        MemInfo info{};
-        PageInfo page;
-        if (R_SUCCEEDED(svcQueryMemory(&info, &page, socplan::kRegionBase)) && info.state != MEMSTATE_FREE) {
-            return;
-        }
-        svcSleepThread(50 * 1000 * 1000);
-    }
-    Log("soc: the game has no heap after 2 s, going on");
-}
-
-// A block outside the game's budget (a late title on a console where it has left nothing: Monster Hunter XX on an Old 3DS holds 80 MiB of an 80 MiB region,
-// budget included) is charged to nobody, but it is a private block all the same: when the process ends the kernel adds up its private blocks and gives
-// the sum back to the budget, and a sum above the books gives back NOTHING: the next game would find no
-// budget until a reboot. Freeing the block at the end would not do: after HOME on an Old 3DS the plugin is swapped out and, if the game is closed there, Luma does
-// not even tell it (PluginLoader__HandleKernelEvent), and nothing runs when a process is killed. So the books are put right when the block is taken, and any end
-// balances by itself. They may then stand above the limit by the block: such a game has no budget left anyway.
-//
-// KResourceLimit (Luma's kernel.h): KAutoObject (vtable, refcount), s32 limit[10], s32 current[10]. The offsets are checked on the live object against
-// what the kernel's own calls say: anything else and the block is not taken.
-constexpr u32 kBooksLimits = 0x08;
-constexpr u32 kBooksCurrent = 0x30;
-constexpr int kBooksChecked = 4;
-constexpr int kBooksNames[kBooksChecked] = {RESLIMIT_COMMIT, RESLIMIT_THREAD, RESLIMIT_EVENT, RESLIMIT_MUTEX};
-
-struct KernelBooks {
-    volatile s32* limits;
-    volatile s32* current;
-    s32 read_limits[kBooksChecked];
-    s32 read_commit;
-    s32 add;
-};
-KernelBooks g_books;
-
-// In kernel mode (svcCustomBackdoor): these two touch the words above and call nothing.
-__attribute__((noinline)) s32 KernelReadBooks() {
-    for (int i = 0; i < kBooksChecked; ++i) {
-        g_books.read_limits[i] = g_books.limits[kBooksNames[i]];
-    }
-    g_books.read_commit = g_books.current[RESLIMIT_COMMIT];
-    return 0;
-}
-
-__attribute__((noinline)) s32 KernelChargeBooks() {
-    g_books.current[RESLIMIT_COMMIT] += g_books.add;
-    return 0;
-}
-
-bool FindBooks() {
-    Handle h = 0;
-    if (R_FAILED(svcGetResourceLimit(&h, CUR_PROCESS_HANDLE))) {
-        return false;
-    }
-    u32 object = 0;
-    char name[32] = "";
-    bool ok = R_SUCCEEDED(svcTranslateHandle(&object, name, h)) && std::strcmp(name, "KResourceLimit") == 0 && object >= 0x80000000;
-    s64 limits[kBooksChecked] = {};
-    s64 commit = -1;
-    if (ok) {
-        ResourceLimitType names[kBooksChecked];
-        for (int i = 0; i < kBooksChecked; ++i) {
-            names[i] = static_cast<ResourceLimitType>(kBooksNames[i]);
-        }
-        ok = R_SUCCEEDED(svcGetResourceLimitLimitValues(limits, h, names, kBooksChecked)) &&
-             R_SUCCEEDED(svcGetResourceLimitCurrentValues(&commit, h, names, 1));
-    }
-    if (ok) {
-        g_books.limits = reinterpret_cast<volatile s32*>(object + kBooksLimits);
-        g_books.current = reinterpret_cast<volatile s32*>(object + kBooksCurrent);
-        svcCustomBackdoor(reinterpret_cast<void*>(KernelReadBooks));
-        ok = commit == g_books.read_commit;
-        for (int i = 0; i < kBooksChecked; ++i) {
-            ok = ok && limits[i] == g_books.read_limits[i];
-        }
-    }
-    svcCloseHandle(h);
-    Log("soc: the kernel's books of this process: %s (object 0x%08lx, class '%s', commit %ld KB)", ok ? "found" : "NOT where they should be",
-        static_cast<unsigned long>(object), name, static_cast<long>(commit / 1024));
-    return ok;
-}
-
-void ChargeBooks(u32 size) {
-    g_books.add = static_cast<s32>(size);
-    svcCustomBackdoor(reinterpret_cast<void*>(KernelChargeBooks));
 }
 
 void AdoptBlock(const Placement& p, u32 size, bool outside_budget) {
@@ -318,11 +255,11 @@ bool ReserveSocketMemory() {
             }
         }
     }
-    // A late title that has left nothing to charge: the block comes from where the plugin's own block comes from on an Old 3DS.
+    // A late title that has left nothing to charge: the block comes from where the plugin's own block comes from on an Old 3DS, on the
+    // kernel's books before it is taken (TryAt).
     if (g_reserve_late && FindBooks()) {
         Placement p{};
         if (AllocateBlock(socplan::kSocBlockSize, true, &p)) {
-            ChargeBooks(socplan::kSocBlockSize);
             AdoptBlock(p, socplan::kSocBlockSize, true);
             return true;
         }

@@ -10,7 +10,10 @@
 
 #include "../titleshare_host/delivery.h"
 #include "copyworker.hpp"
+#include "heap_alloc.hpp"
+#include "lobby_scan.hpp"
 #include "pages.hpp"
+#include "tour.hpp"
 #include "paths.hpp"
 #include "session.hpp"
 #include "settings.hpp"
@@ -18,6 +21,7 @@
 #include "titles.hpp"
 #include "ui.hpp"
 #include "update_worker.hpp"
+#include "zombie_census.hpp"
 
 using ui::g;
 
@@ -85,6 +89,8 @@ int main(int argc, char** argv) {
     g.first_start = setup::IsFirstStart(g.paths);
     if (!g.first_start) {
         g.OpenDataFolder();
+        heap_alloc::WriteStartLog(g.paths.datadir); // (what the memory at start was: heap_alloc.cpp)
+        zombie_census::Run(g.paths.datadir);        // (a closed game still in memory: zombie_census.cpp)
     }
     if (session::CfguOk()) {
         u8 language = 1;
@@ -100,12 +106,14 @@ int main(int argc, char** argv) {
 
     // The start-up flow (the first start's question, scan and checks; the Plugin Loader question) runs on this page and hands over to the main page.
     ui::SetRootPage(pages::NewStartupPage());
+    tour::Begin(); // (only a test build has it: see tour.hpp)
 
     int net_countdown = 60;
     int sd_countdown = 600;
     bool copy_hold = false;
     while (aptMainLoop() && !g.quit) {
         g.input.Poll();
+        zombie_census::Tick(g.paths.datadir); // (cheap: only while a closed game was found, every 5 s)
         if (--net_countdown <= 0) {
             net_countdown = 60;
             g.net = setup::ReadNetwork(g.ac_ready, g.soc_ok());
@@ -163,6 +171,20 @@ int main(int argc, char** argv) {
             gfx::BeginBottom();
             page.DrawBottom();
             gfx::EndFrame();
+            if (tour::AfterFrame()) {
+                g.quit = true;
+            }
+            if (tour::HomeOff()) {
+                g.home_blocked = true; // (the badge only, for the screenshots: see tour.hpp)
+            }
+            const std::string open = tour::TakeOpen(); // (a test build that walks the app: see tour.hpp)
+            if (open == "servers") {
+                ui::PushPage(pages::NewServersPage());
+            } else if (open == "lobbies") {
+                ui::PushPage(pages::NewLobbiesPage());
+            } else if (open == "settings") {
+                ui::PushPage(pages::NewConfigPage());
+            }
         } else {
             gspWaitForVBlank(); // never spin: the frame could not start, wait for the next one
         }
@@ -173,6 +195,7 @@ int main(int argc, char** argv) {
         setup::SaveSettings(g.cfg);
     }
     FinishCopies();
+    lobbies::Scanner::Get().Shutdown(3000); // (the asking of the public rooms: before the sockets go)
     update::Worker::Get().Shutdown(); // (before the sockets go; an install that has begun is finished, a request is stopped)
     g.home_holds = 0;
     g.ApplyHome();

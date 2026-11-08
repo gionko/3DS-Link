@@ -55,10 +55,10 @@ is a chain with CUTS, and every cut is a statement that something else proves:
     such flavour: it posts a request or leaves a bit for the next Tick, and proof 3 holds the graph to that.
 
 THE BUDGET (Tests/chain_sim/chain_sim.py, read from the file when --repo is given): every number there is "bytes below the SP at
-azl_svc32_entry". A thread of 464 bytes has 20 of them above that point (the game's wrapper frame 16, the trampoline's push 4);
-azl_svc32_entry costs up to 36 (push {r1-r4, r12, lr} 24, push {r4, r12} 8, alignment up to 4), then the hook's frames. The HLE
-proper (what UdsHle::Run reaches) is held to HLE_CEILING (320 at debug 0, 520 at debug 1), a path that writes a log line to
-BUDGET_LOG (340). In the real build the entry of a dlp command is azl_svc32_entry > azl_hook_SendSyncRequest >
+azl_gate_32" (the gate of the hook, Sources/ctr/gate.s). A thread of 464 bytes has 20 of them above that point (the game's wrapper frame
+16, the push of the site's stub 4); the gate costs up to 44 (push {r1-r3, r12, lr} 20, a pad word for the eight bytes 4, the saved flags 4,
+the context of pre and post 16), then the hook's frames. The HLE proper (what UdsHle::Run reaches) is held to HLE_CEILING (320 at debug 0,
+520 at debug 1), a path that writes a log line to BUDGET_LOG (340). In the real build the entry of a dlp command is the gate > azl_pre32 >
 HandleSendSyncRequest > [RunTraced at debug 1] > Run > RunDlp, then the hub.
 """
 import argparse
@@ -75,12 +75,12 @@ sys.setrecursionlimit(50000)
 # ======================================================================================================================
 # 0. What the tool knows about the plugin (everything plugin-specific is in this section)
 # ======================================================================================================================
-HLE_CEILING = {0: 320, 1: 520}   # Tests/chain_sim/chain_sim.py: the HLE proper, bytes below the SP at azl_svc32_entry
+HLE_CEILING = {0: 320, 1: 520}   # Tests/chain_sim/chain_sim.py: the HLE proper, bytes below the SP at azl_gate_32
 BUDGET_LOG = 340                  # ... the paths that write a log line (the close path of a fake session)
 THREAD_FREE = 464                 # the smallest game thread seen (Tri Force Heroes' srv thread): bytes below its call
-ABOVE_ENTRY = 20                  # of those 464: the game's wrapper frame (16) and the trampoline's push (4), above the entry SP
+ABOVE_ENTRY = 20                  # of those 464: the game's wrapper frame (16) and the push of the site's stub (4), above the entry SP
 BUDGET_THREAD = THREAD_FREE - ABOVE_ENTRY   # 444
-ASM_ENTRY = 36                    # azl_svc32_entry / azl_svc23_entry: 24 + 8 + up to 4 of alignment (Sources/ctr/svc_entry.s)
+ASM_ENTRY = 44                    # azl_gate_32 / azl_gate_23: 20 + 4 (flags) + 16 (the context) + up to 4 of alignment (Sources/ctr/gate.s)
 ASSUMED_RESOLVER_MAP = 76         # the game's address mapper when it cannot be resolved to MapGameAddress (DESIGN-FASE3 sez. 5.3: 76)
 CLOCK_METHODS = ('NowMs', 'NowTicks')   # the only LobbyNet methods a game thread may call
 
@@ -703,8 +703,8 @@ def case_label(gr):
 # The functions the rows are made of, by demangled name. A name that matches nothing is an ERROR ("renamed? update SPEC"): a gate that
 # silently measures nothing is not a gate.
 SPEC = collections.OrderedDict([
-    ('hook', r'^azl_hook_SendSyncRequest$'),
-    ('close_hook', r'^azl_hook_CloseHandle$'),
+    ('hook', r'^azl_pre32$'),          # what the gate calls before a SendSyncRequest
+    ('close_hook', r'^azl_pre23$'),    # ... and before a CloseHandle
     ('handle', r'^azl::ctr::UdsHle::HandleSendSyncRequest\('),
     ('rundlp', r'^azl::ctr::UdsHle::RunDlp\('),
     ('runndm', r'^azl::ctr::UdsHle::RunNdm\('),
@@ -1079,7 +1079,7 @@ class TreeReport:
             p('   machine-code estimator checked against the compiler on %d functions of the plugin: %d equal, mean absolute error %.1f '
               'bytes, worst %d' % (len(both), exact, sum(abs(a - b) for a, b in both) / max(len(both), 1), max([abs(a - b) for a, b in both] or [0])))
         p('   ceilings (Tests/chain_sim/chain_sim.py): HLE proper %d / %d, a path that logs %d, anything on the smallest thread %d; '
-          'the entry azl_svc32_entry costs up to %d' % (self.limits['hle'][0], self.limits['hle'][1], self.limits['log'], BUDGET_THREAD, ASM_ENTRY))
+          'the gate (azl_gate_32) costs up to %d' % (self.limits['hle'][0], self.limits['hle'][1], self.limits['log'], BUDGET_THREAD, ASM_ENTRY))
         if self.problems and any(pr.startswith('SPEC') for pr in self.problems):
             for pr in self.problems:
                 p('  PROBLEM: ' + pr)
@@ -1089,7 +1089,7 @@ class TreeReport:
 
         # --- the prefixes ---------------------------------------------------------------------------------------------------------
         p()
-        p('THE FRAMES THE HOOK PAYS BEFORE THE HUB (bytes below the SP of azl_svc32_entry; the entry itself: %d worst case)' % ASM_ENTRY)
+        p('THE FRAMES THE HOOK PAYS BEFORE THE HUB (bytes below the SP of azl_gate_32; the gate itself: %d worst case)' % ASM_ENTRY)
         shown = set()
         for r in self.rows:
             if r.prefix in shown or r.problem:
@@ -1335,7 +1335,7 @@ def selftest_tree():
         return lines[n - 1].index(token) + 1
     LOBBY, IPC = 'Includes/azl/dlp_lobby.hpp', 'Includes/azl/dlp_ipc.hpp'
     names = {
-        'hook': 'azl_hook_SendSyncRequest', 'close_hook': 'azl_hook_CloseHandle', 'hsr': 'azl::ctr::UdsHle::HandleSendSyncRequest(unsigned long, long*)',
+        'hook': 'azl_pre32', 'close_hook': 'azl_pre23', 'hsr': 'azl::ctr::UdsHle::HandleSendSyncRequest(unsigned long, long*)',
         'run': 'azl::ctr::UdsHle::RunDlp(unsigned char, unsigned long, unsigned long*)',
         'rn': 'azl::ctr::UdsHle::RunNdm(int, unsigned long, unsigned long*)',
         'udsd': 'azl::ctr::UdsHle::Dispatch(unsigned long*)', 'nhc': 'azl::ctr::UdsHle::NoteHandleClosed(unsigned long)',

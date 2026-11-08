@@ -1,6 +1,7 @@
 // Page: Azahar Emulator Room. The rooms the user has saved (at most 10, the most recently used first). A room is ONE thing with four parts: its name, its
 // address, its port and its password; each room keeps its own password. A uses a room (it is written to AzaharLink.ini at once, with its
 // password), Y changes the room under the cursor (the same four fields as when it was added) or, on the last row, adds one, X removes one.
+// Under the saved rooms, "Public lobbies" opens the public rooms (pages_lobbies.cpp): its dot says that the room in use is one of them.
 // The list itself is servers.txt in the app's data folder. A room that is new or whose address, port or password changed is tested at once (a
 // short popup with the steps of the connection test): when it answers it becomes the room in use, when it does not the user is asked whether
 // to use it anyway.
@@ -20,8 +21,8 @@ class RoomFormPage : public ListPage {
 public:
     using SavedFn = std::function<void(const setup::Server& room)>;
 
-    // `room` is what the form starts with (an empty room for a new one); `is_new` only changes the words.
-    RoomFormPage(const setup::Server& room, bool is_new, SavedFn saved) : room_(room), is_new_(is_new), saved_(std::move(saved)) {
+    // `room` is what the form starts with (an empty room for a new one); `form` changes the words and, for a public room, keeps the address.
+    RoomFormPage(const setup::Server& room, pages::RoomForm form, SavedFn saved) : room_(room), form_(form), saved_(std::move(saved)) {
         port_text_ = std::to_string(room_.port);
     }
 
@@ -29,11 +30,16 @@ public:
         DrawTitleBarStatus(gfx::kTopW, Title());
         DrawCard(10, 32, 380, 70);
         gfx::FillRect(10, 32, 3, 70, col::kAccent);
-        gfx::DrawText(26, 46, 0.55f, col::kAccent, is_new_ ? "Add a room" : "Change the room");
-        gfx::DrawWrapped(26, 60, 354, 0.43f, col::kText,
-                         "A room has a name, an address, a port and a password, all in one place. Fill them in (A on a row), then press Y to "
-                         "save: the room is tested at once.",
-                         3);
+        const char* heading = form_ == pages::RoomForm::Add          ? "Add a room"
+                              : form_ == pages::RoomForm::Change     ? "Change the room"
+                                                                     : "A public room among yours";
+        const char* text = form_ == pages::RoomForm::Favourite
+                               ? "Its address, port and password come with the list of public rooms: only its name can be changed here. Press Y to "
+                                 "save."
+                               : "A room has a name, an address, a port and a password, all in one place. Fill them in (A on a row), then press Y to "
+                                 "save: the room is tested at once.";
+        gfx::DrawText(26, 46, 0.55f, col::kAccent, heading);
+        gfx::DrawWrapped(26, 60, 354, 0.43f, col::kText, text, 3);
         if (const Row* row = Selected()) {
             DrawNote(10, 108, 380, 90, *row);
         }
@@ -71,7 +77,8 @@ protected:
         name.label = "Name";
         name.value = room_.name.empty() ? "none" : gfx::Clean(room_.name);
         name.note_title = "Name of the room";
-        name.note = "Up to 12 letters, digits, space . _ - (it can stay empty: the list then shows the address).";
+        name.note = Fmt("Up to %u letters, digits, space . _ - (it can stay empty: the list then shows the address).",
+                        static_cast<unsigned>(setup::kMaxServerNameChars));
         rows.push_back(name);
 
         Row host;
@@ -79,9 +86,10 @@ protected:
         host.kind = Kind::Value;
         host.label = "Address";
         host.value = room_.host.empty() ? "not set" : gfx::Clean(room_.host);
-        host.value_color = room_.host.empty() ? col::kWarn : 0;
+        host.value_color = room_.host.empty() ? col::kWarn : (locked() ? col::kDim : 0);
         host.note_title = "Address of the room";
-        host.note = "The IP address (or the name) of the Azahar room's server, without the port.";
+        host.note = locked() ? "The address of a public room comes with the list: it cannot be changed here."
+                             : "The IP address (or the name) of the Azahar room's server, without the port.";
         rows.push_back(host);
 
         Row port;
@@ -89,6 +97,7 @@ protected:
         port.kind = Kind::Value;
         port.label = "Port";
         port.value = port_text_;
+        port.value_color = locked() ? col::kDim : 0;
         port.note_title = "Port";
         port.note = Fmt("The UDP port of the room, 1 to 65535. The usual one is %u.", static_cast<unsigned>(azl::room::kDefaultPort));
         rows.push_back(port);
@@ -98,8 +107,11 @@ protected:
         pass.kind = Kind::Value;
         pass.label = "Password";
         pass.value = room_.password.empty() ? "none" : "set";
+        pass.value_color = locked() ? col::kDim : 0;
         pass.note_title = "Password of the room";
-        pass.note = "Only needed when this room is password protected. Each room keeps its own: leave it empty otherwise.";
+        pass.note = locked() ? "The password of a public room is the one it was kept with (Public lobbies asks it when the room wants one): it "
+                               "cannot be changed here."
+                             : "Only needed when this room is password protected. Each room keeps its own: leave it empty otherwise.";
         rows.push_back(pass);
 
         Row test;
@@ -118,15 +130,20 @@ protected:
             return;
         }
         std::string input;
+        if (locked() && (row.id == kHost || row.id == kPort || row.id == kPassword)) {
+            g.ShowToast("A public room: only its name can be changed.", col::kWarn, 4000);
+            return;
+        }
         switch (row.id) {
         case kName:
             input = room_.name;
-            if (g.EditText("Name of the room (up to 12 letters, empty = none)", input, static_cast<int>(setup::kMaxServerNameChars), true)) {
+            if (g.EditText(Fmt("Name of the room (up to %u letters, empty = none)", static_cast<unsigned>(setup::kMaxServerNameChars)).c_str(), input,
+                           static_cast<int>(setup::kMaxServerNameChars), true)) {
                 input = TrimSpaces(input);
                 if (setup::ValidServerName(input)) {
                     room_.name = input;
                 } else {
-                    g.ShowToast("Invalid name: up to 12 of A-Z a-z 0-9 space . _ -", col::kOff, 5000);
+                    g.ShowToast(Fmt("Invalid name: up to %u of A-Z a-z 0-9 space . _ -", static_cast<unsigned>(setup::kMaxServerNameChars)), col::kOff, 5000);
                 }
             }
             break;
@@ -187,9 +204,13 @@ private:
         }
     }
 
+    bool locked() const {
+        return form_ == pages::RoomForm::Favourite; // (a public room's address, port and password come with the list)
+    }
+
     setup::Server room_;
     std::string port_text_;
-    bool is_new_;
+    pages::RoomForm form_;
     SavedFn saved_;
 };
 
@@ -198,6 +219,19 @@ private:
 // ---------------------------------------------------------------------------------------------
 
 class ServersPage : public ListPage {
+public:
+    ServersPage() {
+        public_in_use_ = pages::RefreshPublicRoomName();
+    }
+    void OnResume() override {
+        public_in_use_ = pages::RefreshPublicRoomName(); // (a public room may have been chosen meanwhile)
+        if (from_lobbies_) {
+            // (back from Public lobbies the cursor is on its row again: a favourite added there moved the row one down)
+            from_lobbies_ = false;
+            list_.sel = static_cast<int>(g.servers.size());
+        }
+    }
+
 protected:
     const char* Title() const override {
         return "Azahar Emulator Room";
@@ -254,12 +288,28 @@ protected:
                        "A: use this room (its password too). Y: change it. X: remove it.";
             rows.push_back(row);
         }
+        Row lobbies;
+        lobbies.id = kPublic;
+        lobbies.kind = Kind::Link;
+        lobbies.label = "Public lobbies";
+        lobbies.mark = public_in_use_ ? Mark::Dot : Mark::Slot;
+        lobbies.gap = servers.empty() ? 0.0f : 6.0f;
+        // (the warning is here, before the page opens: the page itself gives its whole top screen to the rooms)
+        lobbies.note_title = "Public rooms: use them at your own risk";
+        lobbies.note_color = col::kOff;
+        lobbies.note = std::string(public_in_use_ ? "The room in use is a public room (the dot): " + gfx::Clean(RoomLabel()) + ".\n" : "") +
+                       "Other people put these Azahar rooms online: they are not part of 3DS Link. Nobody knows who is inside, whether they "
+                       "cheat, or whether somebody uses software against your console. Your nickname and your console's MAC can be seen by "
+                       "the room.\n\nA room with a low ping plays better: the game runs smoother, with less lag. In general the best range is "
+                       "15 to 38 ms.";
+        rows.push_back(lobbies);
+
         Row add;
         add.id = kAdd;
         add.kind = Kind::Action;
         add.label = "Add a room...";
-        add.mark = servers.empty() ? Mark::None : Mark::Slot;
-        add.gap = servers.empty() ? 0.0f : 6.0f;
+        add.mark = Mark::Slot;
+        add.gap = 0.0f;
         add.note_title = "Add a room";
         add.note = std::string(servers.empty() ? "No room saved yet.\n" : "") +
                    "A page with the room's name, address, port and password. The new room is tested at once and, when it answers, used from "
@@ -273,13 +323,18 @@ protected:
         }
         if (row.id == kAdd) {
             AddServer();
+        } else if (row.id == kPublic) {
+            from_lobbies_ = true;
+            PushPage(pages::NewLobbiesPage());
         } else if (row.id >= kServerBase) {
             Use(static_cast<std::size_t>(row.id - kServerBase));
         }
     }
 
 private:
-    enum Id { kAdd = 1, kServerBase = 100 };
+    enum Id { kAdd = 1, kPublic = 2, kServerBase = 100 };
+    bool public_in_use_ = false;
+    bool from_lobbies_ = false; // Public lobbies was opened: the cursor goes back to its row when it closes
 
     // The ini keeps the room 3DS Link joins (with its password); the list only remembers rooms.
     void Select(const setup::Server server) { // (by value: the list is rearranged below)
@@ -295,6 +350,7 @@ private:
         }
         list_.sel = 0; // the room is on top now: the cursor goes with it
         list_.follow = true;
+        public_in_use_ = pages::RefreshPublicRoomName();
     }
 
     void Use(std::size_t index) {
@@ -324,7 +380,9 @@ private:
             return;
         }
         const setup::Server room = g.servers.entries()[index];
-        PushPage(new RoomFormPage(room, false, [this, index](const setup::Server& changed) { Saved(static_cast<int>(index), changed); }));
+        // (a public room kept with X on Public lobbies: only its name can change)
+        const pages::RoomForm form = pages::InPublicList(room.host, room.port) ? pages::RoomForm::Favourite : pages::RoomForm::Change;
+        PushPage(new RoomFormPage(room, form, [this, index](const setup::Server& changed) { Saved(static_cast<int>(index), changed); }));
     }
 
     void AddServer() {
@@ -332,7 +390,7 @@ private:
             g.ShowToast("10 rooms: remove one first (X)", col::kWarn, 4000);
             return;
         }
-        PushPage(new RoomFormPage(setup::Server(), true, [this](const setup::Server& room) { Saved(-1, room); }));
+        PushPage(new RoomFormPage(setup::Server(), pages::RoomForm::Add, [this](const setup::Server& room) { Saved(-1, room); }));
     }
 
     // The form was saved: the room is in the list (new, or in the place of the one that was changed) and, when it is new or its address, port
@@ -375,7 +433,7 @@ private:
                 } else {
                     Select(room);
                 }
-            } else if (outcome == pages::ProbeOutcome::Failed) {
+            } else if (outcome == pages::ProbeOutcome::Failed || outcome == pages::ProbeOutcome::WrongPassword) {
                 if (was_active) {
                     g.ShowToast("Saved, but the room could not be reached.", col::kWarn, 5000);
                     return;
@@ -402,6 +460,10 @@ namespace pages {
 
 ui::Page* NewServersPage() {
     return new ServersPage;
+}
+
+ui::Page* NewRoomFormPage(const setup::Server& room, RoomForm form, std::function<void(const setup::Server& room)> saved) {
+    return new RoomFormPage(room, form, std::move(saved));
 }
 
 } // namespace pages

@@ -114,6 +114,7 @@ void RoomProbe::Start(const std::string& host, u16 port, const std::string& pass
     console_mac_ = setup::ReadConsoleMac();
     nickname_ = g.EffectiveNickname();
     error_.clear();
+    error_code_ = RoomClient::Error::None;
     hint_.clear();
     closed_note_.clear();
     info_ = azl::room::RoomInfo();
@@ -239,6 +240,7 @@ void RoomProbe::UpdateSession() {
                 closed_note_ = RoomClient::ErrorName(err);
                 return;
             }
+            error_code_ = err;
             Fail(RoomClient::ErrorName(err), HintFor(err),
                  (err == RoomClient::Error::CouldNotConnect || err == RoomClient::Error::NetworkUnavailable) ? 0 : step);
         } else if (now - start_ms_ > 1000) {
@@ -312,13 +314,16 @@ public:
             return;
         }
         const bool close_key = (in.down & (KEY_A | KEY_B)) || Tapped(in, Button());
+        // (while the test runs only B, or the button, cancels it: an A pressed again before the end - the A that chose the room, twice - is
+        // not a "no", and the room is used when the test ends)
+        const bool cancel_key = (in.down & KEY_B) || Tapped(in, Button());
         if (!ended_) {
-            if (close_key) {
+            if (cancel_key) {
                 Finish(ProbeOutcome::Cancelled);
             } else if (probe_.phase() == RoomProbe::Phase::Done) {
                 Finish(ProbeOutcome::Reached);
             } else if (probe_.phase() == RoomProbe::Phase::Failed) {
-                Finish(ProbeOutcome::Failed);
+                Finish(probe_.error_code() == RoomClient::Error::WrongPassword ? ProbeOutcome::WrongPassword : ProbeOutcome::Failed);
             }
         }
         // A cancelled test closes by itself when the room is left; one that ended on its own waits to be read.
@@ -347,18 +352,31 @@ public:
         DrawCard(8, kCardY, 304, kCardH); // (the card holds its button)
         gfx::FillRect(8, kCardY, 3, kCardH, col::kAccent);
         gfx::DrawText(22, 34, 0.55f, col::kAccent, "Testing the room");
-        gfx::DrawFitted(22, 52, 0.46f, 0.34f, 280, col::kText, gfx::Clean(server_.Label() + (server_.name.empty() ? "" : "  " + server_.Text())));
+        // (a long name is cut with "..." before its type gets too small to read: the whole name is under the steps when the room answers)
+        gfx::DrawFitted(22, 52, 0.46f, 0.40f, 280, col::kText, gfx::Clean(server_.Label() + (server_.name.empty() ? "" : "  " + server_.Text())));
         DrawProbeStep(probe_, 30, 74, 0, "Reach the room (UDP " + std::to_string(server_.port) + ")");
         DrawProbeStep(probe_, 30, 92, 1, "Join with the console's name and MAC");
         DrawProbeStep(probe_, 30, 110, 2, "Receive the room's member list");
-        if (probe_.phase() == RoomProbe::Phase::Failed || (ended_ && outcome_ == ProbeOutcome::Failed)) {
+        if (probe_.phase() == RoomProbe::Phase::Failed || (ended_ && (outcome_ == ProbeOutcome::Failed || outcome_ == ProbeOutcome::WrongPassword))) {
             gfx::DrawFitted(22, 132, 0.48f, 0.36f, 280, col::kOff, gfx::Clean(probe_.error()));
             gfx::DrawWrapped(22, 146, 280, 0.38f, col::kDim, gfx::Clean(probe_.hint()), 3);
         } else if (outcome_ == ProbeOutcome::Reached && ended_) {
             gfx::DrawText(22, 132, 0.48f, col::kOn, "The room answers");
             const azl::room::RoomInfo& info = probe_.info();
             const std::string who = info.name.empty() ? std::string() : gfx::Clean(info.name) + ", ";
-            gfx::DrawText(22, 148, 0.42f, col::kDim, who + std::to_string(info.members.size()) + (info.members.size() == 1 ? " player" : " players"));
+            // (the name of a public room can be long: two lines inside the card, the end cut with "...")
+            const float top = 148.0f - gfx::LineHeight(0.42f) * 0.5f;
+            const float used = gfx::DrawWrapped(22, top, 280, 0.42f, col::kDim,
+                                                who + std::to_string(info.members.size()) + (info.members.size() == 1 ? " player" : " players"), 2);
+            if (done_) {
+                // (a test that chooses the room, not the one of the form's Test row: what is left to do is to play)
+                // (above the button: two lines after a short name, one shorter line after a long one)
+                const bool one_line = used > gfx::LineHeight(0.42f) * 1.5f;
+                gfx::DrawWrapped(22, top + used + 4.0f, 280, 0.42f, col::kOn,
+                                 one_line ? "All set: A, then START (Save & exit) and play."
+                                          : "All set: press A, then START (Save & exit), start your game and play in this room.",
+                                 one_line ? 1 : 2);
+            }
         } else if (ended_) {
             gfx::DrawText(22, 132, 0.46f, col::kDim, "Leaving the room...");
         }

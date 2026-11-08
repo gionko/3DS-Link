@@ -1532,9 +1532,13 @@ constexpr u32 kNodeNotFound = 0xC90113FA;
 constexpr u32 kConnectTimeout = 0xC92113FE;
 
 // The 5 s ceiling of ConnectToNetwork would make every refused join a long test.
+// (The engine waits through WaitEventGuarded, in slices of kGateSliceMs: the ceiling is the whole wait's.)
 struct ShortWaitKernel : FakeKernel {
     bool WaitEvent(u32 h, s64 ns) override {
         return FakeKernel::WaitEvent(h, std::min<s64>(ns, cap_ns));
+    }
+    bool WaitEventGuarded(u32 h, s64 ns) override {
+        return FakeKernel::WaitEventGuarded(h, std::min<s64>(ns, cap_ns));
     }
     s64 cap_ns = 300000000; // (a test that needs a join to stay open raises it)
 };
@@ -2368,6 +2372,77 @@ double MsSince(const std::chrono::steady_clock::time_point& t0) {
 }
 
 } // namespace
+
+// The swap of the plugin's block on an Old 3DS closes the svc hook's gate and waits 1.5 s at the most for the game threads counted in it
+// (KernelOps::GateClosing): the two long waits a game thread makes in the engine end at once then. ConnectToNetwork (5 s) ends as a
+// timeout within a slice of kGateSliceMs; a scan (up to 10 s) ends within one of its slices and answers what it heard.
+static void TestGateClosingEndsTheEngineWaits() {
+    std::printf("uds engine: ConnectToNetwork and a scan end at once when the svc hook's gate closes (the swap of the plugin's block)\n");
+    struct GateKernel : FakeKernel {
+        bool WaitEvent(u32 h, s64 ns) override {
+            s64 seen = max_wait_ns.load();
+            while (ns > seen && !max_wait_ns.compare_exchange_weak(seen, ns)) {
+            }
+            return FakeKernel::WaitEvent(h, ns);
+        }
+        void SleepNs(s64 ns) override {
+            slept_ns += ns;
+            if (++sleeps == close_after_sleeps) {
+                closing = true;
+            }
+        }
+        bool GateClosing() override {
+            return closing.load();
+        }
+        std::atomic<bool> closing{false};
+        std::atomic<s64> max_wait_ns{0};
+        std::atomic<s64> slept_ns{0};
+        std::atomic<int> sleeps{0};
+        int close_after_sleeps = -1;
+    } kernel;
+    g_rules.Reset();
+    UdsEngine::Transport tr;
+    tr.send = [](WifiPacket& p) {
+        p.transmitter_address = Mac{0, 0x1F, 0x32, 0, 0, 9};
+        g_rules.Inspect(p);
+    };
+    tr.get_mac = [] { return Mac{0, 0x1F, 0x32, 0, 0, 9}; };
+    UdsEngine engine(&kernel, tr);
+    u32 ev;
+    CHECK_EQ(engine.Initialize(NodeInfo{}, kTestSharedMemory, kTestVersion, &ev), 0u);
+    NetworkInfo ni = MakeNetworkInfo(4, 0);
+    ni.host_mac_address = {1, 2, 3, 4, 5, 6}; // nobody answers
+    // the gate closes 60 ms into the wait
+    std::thread closer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        kernel.closing = true;
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_EQ(engine.ConnectToNetwork(reinterpret_cast<u8*>(&ni), sizeof(ni), 1), res::Make(res::Timeout, res::Canceled, res::Status));
+    const double ms = MsSince(t0);
+    closer.join();
+    std::printf("  the connect ended %.0f ms after it began (the gate closed at 60 ms; without the guard: 5000)\n", ms);
+    CHECK(ms >= 55 && ms < 1000);
+    CHECK(kernel.max_wait_ns.load() <= static_cast<s64>(KernelOps::kGateSliceMs) * 1000000);
+    CHECK(engine.status() == NetworkStatus::NotConnected);
+
+    // a scan of 3 channels x 110 ms: the gate closes at the third slice of 20 ms, and the scan answers at once with what it heard
+    kernel.closing = false;
+    kernel.close_after_sleeps = 3;
+    ScanParams p;
+    const ScanOutcome r = DoScan(engine, p);
+    CHECK_EQ(r.rc, 0u);
+    CHECK_EQ(r.entries, 0u);
+    CHECK_EQ(kernel.sleeps.load(), 3);
+    CHECK(kernel.slept_ns.load() <= 3 * 20000000LL);
+    // ... and with the gate open the same scan takes all its time
+    kernel.closing = false;
+    kernel.close_after_sleeps = -1;
+    kernel.slept_ns = 0;
+    CHECK_EQ(DoScan(engine, p).rc, 0u);
+    CHECK_EQ(kernel.slept_ns.load(), 330000000);
+    CHECK_RULES();
+}
 
 static void TestScanFidelity() {
     std::printf("scan: listens first, hears what arrives, keeps the list, stops for the cancel event\n");
@@ -6391,6 +6466,7 @@ int main() {
     TestConnectWokenLate();
     TestHostBeaconAge();
     TestScanFidelity();
+    TestGateClosingEndsTheEngineWaits();
     TestHostReauth();
     TestRepeatedStartDoesNotAdmitOthers();
     TestRepeatedStartInClosedLobby();

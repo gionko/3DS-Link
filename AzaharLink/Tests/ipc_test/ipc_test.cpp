@@ -89,6 +89,9 @@ struct ShortWaitKernel : FakeKernel {
     bool WaitEvent(u32 h, s64 ns) override {
         return FakeKernel::WaitEvent(h, std::min<s64>(ns, 1000000000));
     }
+    bool WaitEventGuarded(u32 h, s64 ns) override { // (the engine's wait, in slices: the ceiling is the whole wait's)
+        return FakeKernel::WaitEventGuarded(h, std::min<s64>(ns, 1000000000));
+    }
 };
 
 // A peer that is just an engine (what an Azahar player is, as far as the protocol goes).

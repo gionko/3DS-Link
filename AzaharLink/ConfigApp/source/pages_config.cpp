@@ -105,6 +105,100 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
+// Popup: the keys of a chord (the in-game menu's, the chat's)
+// ---------------------------------------------------------------------------------------------
+
+constexpr u32 kChordKeys = KEY_L | KEY_R | KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT | KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START | KEY_SELECT;
+
+// The keys in the words the plugin reads (ParseKeys in Sources/main.cpp), Select last: "L+Right+Select".
+std::string ChordText(u32 keys) {
+    static const struct {
+        u32 key;
+        const char* name;
+    } kNames[] = {{KEY_L, "L"},  {KEY_R, "R"},  {KEY_DUP, "Up"}, {KEY_DDOWN, "Down"}, {KEY_DLEFT, "Left"},   {KEY_DRIGHT, "Right"},
+                  {KEY_A, "A"},  {KEY_B, "B"},  {KEY_X, "X"},    {KEY_Y, "Y"},        {KEY_START, "Start"}, {KEY_SELECT, "Select"}};
+    std::string out;
+    for (const auto& k : kNames) {
+        if (keys & k.key) {
+            out += (out.empty() ? "" : "+") + std::string(k.name);
+        }
+    }
+    return out;
+}
+
+// The new chord is pressed, not typed: the keys held together, taken when they are let go (Select is added: the plugin always wants it).
+// X alone gives back the default, B alone leaves the chord as it was. The key that opened the popup is let go first.
+class ChordPage : public Page {
+public:
+    using SetFn = std::function<void(const std::string& chord)>;
+    ChordPage(const std::string& title, const std::string& fallback, SetFn set) : title_(title), fallback_(fallback), set_(std::move(set)) {}
+
+    void Update(const Input&) override {
+        const u32 held = hidKeysHeld() & kChordKeys;
+        if (!armed_) {
+            armed_ = held == 0;
+            return;
+        }
+        if (held != 0) {
+            taken_ |= held;
+            return;
+        }
+        if (taken_ == 0) {
+            return;
+        }
+        const u32 keys = taken_;
+        taken_ = 0;
+        if (keys == KEY_B) {
+            PopPage();
+        } else if (keys == KEY_X) {
+            Done(fallback_);
+        } else if (__builtin_popcount(keys | KEY_SELECT) < 2) {
+            g.ShowToast("Hold two keys or more together (Select is added by itself).", col::kWarn, 3500);
+        } else {
+            Done(ChordText(keys | KEY_SELECT));
+        }
+    }
+
+    void DrawTop() override {
+        if (Page* below = PageBelow()) {
+            below->DrawTop();
+        }
+        DrawDim(gfx::kTopW);
+    }
+
+    void DrawBottom() override {
+        if (Page* below = PageBelow()) {
+            below->DrawBottom();
+        }
+        DrawDim(gfx::kBottomW);
+        DrawPopupCard(30, 180, title_,
+                      "Hold the new keys together, then let go of them: Select is always added. X alone: the default (" + fallback_ +
+                          "). B alone: leave it as it is.",
+                      5);
+        const u32 now = armed_ ? (hidKeysHeld() & kChordKeys) | taken_ : 0;
+        gfx::DrawText(160, 172, 0.6f, now ? col::kAccent : col::kDim, now ? ChordText(now | KEY_SELECT) : std::string("..."), gfx::Align::Center);
+        DrawFrameBorder(gfx::kBottomW);
+    }
+
+private:
+    void Done(const std::string& chord) {
+        PopPage();
+        set_(chord);
+    }
+
+    std::string title_, fallback_;
+    SetFn set_;
+    bool armed_ = false; // every key was let go once since the popup opened
+    u32 taken_ = 0;      // the keys held since the last time none was
+};
+
+// The menu's chord and the chat's: not the same, and neither within the other (azl::ini::ChordsNested: holding L+Left+Select would open
+// a menu on L+Select first, and the chat would never open).
+bool ChordsClash(const std::string& a, const std::string& b) {
+    return azl::ini::ChordsNested(a, b);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Page: Settings
 // ---------------------------------------------------------------------------------------------
 
@@ -144,33 +238,16 @@ protected:
                                  "whatever this switch says.";
         add(autoconnect);
 
-        // Three values (ini key radio_like 0, 1, 2): A and D-pad right go Off -> Broadcast -> All (twice) -> Off, left goes back.
-        Row radio;
-        radio.id = kRadio;
-        radio.kind = Kind::Value;
-        radio.label = "Radio-like data";
-        radio.value = setup::RadioLikeText(g.cfg.radio_like);
-        radio.note_title = "Radio-like data";
-        radio.note = "How game data goes through the room. Broadcast: beacons and broadcast data are sent without retries, like the "
-                     "real radio (no freezes on a weak WiFi link). All (twice): unicast data too, each frame sent twice to a console "
-                     "that runs 3DS Link (it drops the copy; an Azahar player gets it once, with retries), and what the room sends is "
-                     "taken as it arrives. Off: everything is resent until it arrives (can stall). A or right = next value, left = "
-                     "previous. Applies from the next title start.";
-        add(radio);
-
-        // Three values, so not a switch: A and D-pad right go Off -> Client only -> Always -> Off, D-pad left goes back
-        // (ini key sleep_stop 0, 1, 2).
-        Row sleep_row;
-        sleep_row.id = kSleep;
-        sleep_row.kind = Kind::Value;
-        sleep_row.label = "End session on sleep";
-        sleep_row.value = setup::SleepStopText(g.cfg.sleep_stop);
-        sleep_row.note_title = "End session on sleep (lid)";
-        sleep_row.note = "What closing the lid does to the title's session. Off: nothing (it is only logged); the title's "
-                         "clock stays behind for about 90 s. Client only: the session ends like on a real console and you join "
-                         "again after waking; a hosting console is left alone. Always: the host too (it once froze a "
-                         "console). A or right = next value, left = previous. Applies from the next title start.";
-        add(sleep_row);
+        // (the test belongs with the joining of the room; Radio-like data and End session on sleep are not rows any more since 1.1.1: their
+        // keys keep their values in the ini, radio_like=1 and sleep_stop=0 for a new file)
+        Row test;
+        test.id = kTest;
+        test.kind = Kind::Link;
+        test.label = "Test the connection";
+        test.note_title = "Test the connection";
+        test.note = "Joins the room from here, shows who is in it, then leaves. Checks the address, the password "
+                    "and the WiFi. A room that passes goes to the top of your list of rooms.";
+        add(test);
 
         // ONE switch for every log: the plugin's (ini debug) and the title delivery's (it writes its log only when this is on).
         Row debug;
@@ -186,18 +263,6 @@ protected:
                      "(64 MiB a file, 8 files). OFF: no log file at all. Logging slows a title: judge the speed with it OFF.";
         add(debug);
 
-        Row menu;
-        menu.id = kMenu;
-        menu.kind = Kind::Toggle;
-        menu.label = "In-game menu";
-        menu.on = setup::MenuOn(g.cfg);
-        menu.note_title = "In-game menu";
-        menu.note = "ON: the plugin's menu opens in a title with " +
-                    setup::MenuChordText(menu.on ? g.cfg.menu_key : g.cfg.menu_chord) +
-                    ". OFF: it never opens; everything is set from this app and the ini file, the room is always "
-                    "joined at title start, and errors still appear on screen. Applies from the next title start.";
-        add(menu);
-
         // The emergency switch of 3DS Link Delivery, in the app's own file (3DSLink.cfg), never in the plugin's ini. It is here, on a page of its own, so that it is
         // reachable whatever the Download Play part does.
         Row dlp_switch;
@@ -209,17 +274,68 @@ protected:
         dlp_switch.note = dlp::kSwitchNote;
         add(dlp_switch);
 
-        Row test;
-        test.id = kTest;
-        test.kind = Kind::Link;
-        test.label = "Test the connection";
-        test.gap = 6.0f;
-        test.note_title = "Test the connection";
-        test.note = "Joins the room from here, shows who is in it, then leaves. Checks the address, the password "
-                    "and the WiFi. A room that passes goes to the top of your list of rooms.";
-        add(test);
+        Row menu;
+        menu.id = kMenu;
+        menu.kind = Kind::Toggle;
+        menu.label = "In-game menu";
+        menu.on = setup::MenuOn(g.cfg);
+        menu.gap = 6.0f; // (the in-game menu and the chat: a block of their own)
+        menu.note_title = "In-game menu";
+        menu.note = "ON: the plugin's menu opens in a title with " +
+                    setup::MenuChordText(menu.on ? g.cfg.menu_key : g.cfg.menu_chord) +
+                    ": the room you are in, another room (your rooms, the public lobbies), the chat's switch and corner, the debug log. OFF: it never opens; everything is "
+                    "set from this app, the room is always joined at title start, and errors still appear on screen. Applies from the "
+                    "next title start.";
+        add(menu);
+
+        Row menu_keys;
+        menu_keys.id = kMenuKeys;
+        menu_keys.kind = Kind::Value;
+        menu_keys.label = "Menu keys";
+        menu_keys.value = setup::MenuChordText(menu.on ? g.cfg.menu_key : g.cfg.menu_chord);
+        menu_keys.dim = !menu.on;
+        menu_keys.note_title = "Menu keys";
+        menu_keys.note = std::string("The keys that open the in-game menu, held together. A: press the new ones. The default is ") +
+                         azl::ini::kDefaultMenuKey + ", beside Rosalina's L + Down + Select.";
+        add(menu_keys);
+
+        Row chat;
+        chat.id = kChat;
+        chat.kind = Kind::Toggle;
+        chat.label = "In-game chat";
+        chat.on = g.cfg.chat;
+        chat.note_title = "In-game chat";
+        chat.note = "ON: the messages of the room's chat show over the title, and " + setup::MenuChordText(g.cfg.chat_key) +
+                    " opens the chat to write. OFF: nothing of the chat is shown or kept. It can be switched in a title too, from the "
+                    "in-game menu.";
+        add(chat);
+
+        Row chat_keys;
+        chat_keys.id = kChatKeys;
+        chat_keys.kind = Kind::Value;
+        chat_keys.label = "Chat keys";
+        chat_keys.value = setup::MenuChordText(g.cfg.chat_key);
+        chat_keys.dim = !g.cfg.chat;
+        chat_keys.note_title = "Chat keys";
+        chat_keys.note = std::string("The keys that open the chat in a title, held together. A: press the new ones. The default is ") +
+                         azl::ini::kDefaultChatKey + ", the mirror of the menu's.";
+        add(chat_keys);
+
+        Row chat_pos;
+        chat_pos.id = kChatPos;
+        chat_pos.kind = Kind::Value;
+        chat_pos.label = "Chat position";
+        chat_pos.value = azl::ini::ChatPosLabel(g.cfg.chat_pos);
+        chat_pos.dim = !g.cfg.chat;
+        chat_pos.note_title = "Chat position";
+        chat_pos.note = std::string("The corner of the top screen where the messages of the chat show. The plugin's notifications show in the "
+                                    "opposite corner, so they never cover the chat. A or right: the next corner, left: the one before. It can "
+                                    "be changed in a title too, from the in-game menu. The default is ") +
+                        azl::ini::ChatPosLabel(azl::ini::kChatPosDefault) + ".";
+        add(chat_pos);
 
         Row check;
+        check.gap = 6.0f;
         check.id = kCheck;
         check.kind = Kind::Link;
         check.label = "Installation check";
@@ -274,13 +390,43 @@ protected:
                 g.Save();
             }
             break;
-        case kRadio:
-            g.cfg.radio_like = step < 0 ? setup::PrevRadioLike(g.cfg.radio_like) : setup::NextRadioLike(g.cfg.radio_like);
+        case kMenuKeys:
+            if (step == 0) {
+                PushPage(new ChordPage("Menu keys", azl::ini::kDefaultMenuKey, [](const std::string& chord) {
+                    if (ChordsClash(chord, g.cfg.chat_key)) {
+                        g.ShowToast("Those keys clash with the chat's: choose others.", col::kWarn, 4000);
+                        return;
+                    }
+                    g.cfg.menu_chord = chord;
+                    if (setup::MenuOn(g.cfg)) {
+                        g.cfg.menu_key = chord;
+                    }
+                    g.Save();
+                    g.ShowToast("Menu keys: " + chord, col::kOn, 3000);
+                }));
+            }
+            break;
+        case kChat:
+            if (SetSwitch(g.cfg.chat, step)) {
+                g.Save();
+            }
+            break;
+        case kChatPos:
+            g.cfg.chat_pos = azl::ini::NextChatPos(g.cfg.chat_pos, step);
             g.Save();
             break;
-        case kSleep:
-            g.cfg.sleep_stop = step < 0 ? setup::PrevSleepStop(g.cfg.sleep_stop) : setup::NextSleepStop(g.cfg.sleep_stop);
-            g.Save();
+        case kChatKeys:
+            if (step == 0) {
+                PushPage(new ChordPage("Chat keys", azl::ini::kDefaultChatKey, [](const std::string& chord) {
+                    if (ChordsClash(chord, setup::MenuOn(g.cfg) ? g.cfg.menu_key : g.cfg.menu_chord)) {
+                        g.ShowToast("Those keys clash with the menu's: choose others.", col::kWarn, 4000);
+                        return;
+                    }
+                    g.cfg.chat_key = chord;
+                    g.Save();
+                    g.ShowToast("Chat keys: " + chord, col::kOn, 3000);
+                }));
+            }
             break;
         case kDebug: {
             bool on = g.cfg.debug > 0;
@@ -349,7 +495,7 @@ protected:
     }
 
 private:
-    enum Id { kAutoconnect = 1, kRadio, kSleep, kDebug, kMenu, kTest, kCheck, kAbout, kNickname, kDlpDelivery, kCheckUpdates, kUpdateAtStart };
+    enum Id { kAutoconnect = 1, kDebug, kMenu, kMenuKeys, kChat, kChatKeys, kChatPos, kTest, kCheck, kAbout, kNickname, kDlpDelivery, kCheckUpdates, kUpdateAtStart };
 
     void EditNickname() {
         std::string input = g.cfg.nickname;

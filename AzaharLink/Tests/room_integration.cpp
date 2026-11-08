@@ -1718,7 +1718,7 @@ static void TestCpuAccounting() {
                 static_cast<unsigned long>(c.other10 % 10),
                 static_cast<unsigned long>(s.soc_calls[kSocPoll] + s.soc_calls[kSocRecvData] + s.soc_calls[kSocSend]));
     CHECK(c.wall10 >= 9500 && c.wall10 <= 10200); // the loop ran the whole window
-    CHECK(c.net10 <= c.wall10);
+    CHECK(c.net10 <= c.wall10 + 300);             // (two clocks, the thread's CPU and the wall: with ENet's unix.c the loop is all CPU and either one wins by a hair - 1000.8 / 999.2 and 1001.0 / 999.4 ms/s on 2026-11-08; the slack of the line below)
     CHECK(accounted <= c.wall10 + 300);           // nothing is counted twice (30 ms per second of slack for the clock reads)
     CHECK(s.t_net_pause == 0);                    // (a socket that works: no pause)
     CHECK(c.plugin10 == c.net10 + c.uds10 + c.frame10 + c.writer10);

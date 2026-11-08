@@ -97,9 +97,9 @@ static void TestMenuKey() {
         CHECK(!setup::MenuOn(again) && again.menu_key == v);
         // switching on: there was never a chord in this file, so the default one
         setup::SetMenuOn(cfg, true);
-        CHECK(setup::MenuOn(cfg) && cfg.menu_key == "L+R+Select");
+        CHECK(setup::MenuOn(cfg) && cfg.menu_key == "L+Right+Select");
         CHECK(setup::SaveSettings(cfg));
-        CHECK(Has(ReadIni(), "menu_key=L+R+Select"));
+        CHECK(Has(ReadIni(), "menu_key=L+Right+Select"));
     }
 
     // a custom chord is untouched by a load and a save, and survives off and on
@@ -120,7 +120,7 @@ static void TestMenuKey() {
     setup::Settings reopened;
     setup::LoadSettings(reopened);
     setup::SetMenuOn(reopened, true);
-    CHECK(reopened.menu_key == "L+R+Select");
+    CHECK(reopened.menu_key == "L+Right+Select");
     // ... but within one run of the app the custom chord comes back
     setup::SetMenuOn(cfg, true);
     CHECK(cfg.menu_key == "L+R+Start");
@@ -164,12 +164,12 @@ static void TestUnknownKeysAndRoundTrip() {
     const std::string saved = ReadIni();
     CHECK(Has(saved, "rcvbuf_kb=32") && Has(saved, "sleep_stop=1"));
     CHECK(Has(saved, "debug=1") && Has(saved, "menu_key=L+R+Start") && Has(saved, "autoconnect=0"));
-    // the 15 keys, each once
+    // the 18 keys, each once
     int lines = 0;
     for (char c : saved) {
         lines += c == '\n';
     }
-    CHECK(lines == 15);
+    CHECK(lines == 18);
     setup::Settings back;
     setup::LoadSettings(back);
     CHECK(back.debug == cfg.debug && back.menu_key == cfg.menu_key && back.host == cfg.host && back.port == cfg.port &&
@@ -181,7 +181,8 @@ static void TestUnknownKeysAndRoundTrip() {
 
 static const char* const kGoldenDefault =
     "enabled=1\nhost=\nport=24872\nnickname=\npassword=\ntunnel=1\nautoconnect=1\nradio_like=1\nsocket_buffers=1\n"
-    "net_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\nsleep_stop=0\n";
+    "net_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\nsleep_stop=0\nchat=1\nchat_key=L+Left+Select\n"
+    "chat_pos=bottom-left\n";
 
 // The file of PROVA 1 as it was on the card: the 13 keys of 0.1.14, written by the Setup app (LF), and a last line that
 // was typed by hand over FTP (no line end).
@@ -190,7 +191,7 @@ static const char* const kProva1Ini =
     "socket_buffers=1\nnet_thread_core=-1\nmenu_key=L+R+Select\ngame_name=\ndebug=1\nsleep_stop=1";
 
 static void TestFirstRunAndDefaults() {
-    std::printf("first run: no file is Missing, the defaults are the ones of the shared header, a save writes all 15 keys\n");
+    std::printf("first run: no file is Missing, the defaults are the ones of the shared header, a save writes all 18 keys\n");
     fs::remove_all("sdmc:");
     fs::create_directory("sdmc:"); // (the card itself: the app creates /3ds/3DSLink)
     setup::Settings d;
@@ -201,9 +202,9 @@ static void TestFirstRunAndDefaults() {
     CHECK(setup::SaveSettings(d));
     CHECK(fs::is_directory("sdmc:/3ds/3DSLink")); // a save creates the folder of the file (the plugin's folder, /luma/plugins, is Luma's to have)
     CHECK(!setup::PluginsDirExists());
-    CHECK(ReadIni() == kGoldenDefault);                       // 177 bytes, LF, the 15 keys in the order of azl::ini::kKeyNames
+    CHECK(ReadIni() == kGoldenDefault);                       // 228 bytes, LF, the 18 keys in the order of azl::ini::kKeyNames
     CHECK(ReadIni() == azl::ini::Render(azl::ini::Fields())); // the app's defaults are the shared defaults
-    CHECK(ReadIni().size() == 177);
+    CHECK(ReadIni().size() == 228);
     CHECK(ReadIni().find('\r') == std::string::npos);
     setup::Settings back;
     CHECK(setup::LoadSettings(back) == setup::LoadResult::Loaded);
@@ -227,7 +228,8 @@ static void TestOldFileGainsTheTwoKeys() {
     CHECK(!setup::HasAllKeys(cfg)); // rcvbuf_kb is missing
     CHECK(setup::SaveSettings(cfg));
     const std::string saved = ReadIni();
-    CHECK(saved.size() == 194);
+    CHECK(saved.size() == 249); // (245 with its L+R+Select: the old default chord is written back as the new one, L+Right+Select)
+    CHECK(Has(saved, "menu_key=L+Right+Select"));
     CHECK(Has(saved, "rcvbuf_kb=64") && Has(saved, "sleep_stop=1") && Has(saved, "debug=1") && Has(saved, "host=10.139.0.1"));
     CHECK(saved.find("rcvbuf_kb=64\nsleep_stop=1\n") != std::string::npos); // the two new lines last, in the table's order
     setup::Settings back;
@@ -285,6 +287,55 @@ static void TestSleepRow() {
     CHECK(LoadFrom("sleep_stop=off\n").sleep_stop == 0);
     CHECK(LoadFrom("sleep_stop=\n").sleep_stop == 0);
     CHECK(LoadFrom("sleep_stop=9\n").sleep_stop == 0);
+}
+
+static void TestChatPosRow() {
+    std::printf("chat_pos: the row goes round the four corners both ways, the word is written and read back, a slip is bottom-left\n");
+    CHECK(azl::ini::kChatPosDefault == azl::ini::kChatPosBottomLeft);
+    setup::Settings cfg = LoadFrom(kGoldenDefault);
+    CHECK(cfg.chat_pos == azl::ini::kChatPosBottomLeft && setup::HasAllKeys(cfg));
+    CHECK(std::string(azl::ini::ChatPosLabel(cfg.chat_pos)) == "Bottom left");
+    // A (step 0) and right (+1) go forwards, left (-1) back: bottom-left -> bottom-right -> top-left -> top-right -> bottom-left
+    const char* const forwards[] = {"bottom-right", "top-left", "top-right", "bottom-left"};
+    for (int i = 0; i < 4; ++i) {
+        cfg.chat_pos = azl::ini::NextChatPos(cfg.chat_pos, i % 2 == 0 ? 0 : 1);
+        CHECK(setup::SaveSettings(cfg));
+        CHECK(Has(ReadIni(), std::string("chat_pos=") + forwards[i]));
+        cfg.chat = !cfg.chat; // another row saved afterwards does not lose it
+        CHECK(setup::SaveSettings(cfg));
+        setup::Settings back;
+        setup::LoadSettings(back);
+        CHECK(back.chat_pos == cfg.chat_pos && back.chat == cfg.chat);
+    }
+    CHECK(cfg.chat_pos == azl::ini::kChatPosBottomLeft); // (four steps: round once)
+    CHECK(azl::ini::NextChatPos(azl::ini::kChatPosBottomLeft, -1) == azl::ini::kChatPosTopRight);
+    CHECK(azl::ini::NextChatPos(azl::ini::kChatPosTopLeft, -1) == azl::ini::kChatPosBottomRight);
+    for (int v = 0; v < azl::ini::kChatPosCount; ++v) {
+        CHECK(azl::ini::NextChatPos(azl::ini::NextChatPos(v, 1), -1) == v);
+    }
+    // what the file may say: the four words in any case, blanks and the CR of a CRLF file around; anything else is bottom-left
+    struct Case {
+        const char* value;
+        int want;
+    };
+    const Case cases[] = {{"top-left", 0},     {"top-right", 1},    {"bottom-left", 2}, {"bottom-right", 3}, {" Top-Right \r", 1},
+                          {"BOTTOM-RIGHT", 3}, {"", 2},             {"1", 2},           {"topleft", 2},      {"top left", 2},
+                          {"top_left", 2},     {"bottom-left-x", 2}, {"left", 2}};
+    for (const Case& c : cases) {
+        CHECK(azl::ini::ParseChatPos(c.value) == c.want);
+        const setup::Settings read = LoadFrom(std::string("chat_pos=") + c.value + "\n");
+        CHECK(read.chat_pos == c.want && read.unknown_lines.empty());
+    }
+    // a file without the key (every file before the chat): the default, and the app completes it
+    setup::Settings old = LoadFrom("enabled=1\nhost=h\nchat=0\nchat_key=L+Up+Select\n");
+    CHECK(old.chat_pos == azl::ini::kChatPosBottomLeft && !old.chat && !setup::HasAllKeys(old));
+    CHECK(setup::SaveSettings(old));
+    CHECK(ReadIni().find("chat=0\nchat_key=L+Up+Select\nchat_pos=bottom-left\n") != std::string::npos);
+    // a field that holds no corner is written as the default word, never past the table
+    old.chat_pos = 9;
+    CHECK(setup::SaveSettings(old) && Has(ReadIni(), "chat_pos=bottom-left"));
+    old.chat_pos = -1;
+    CHECK(setup::SaveSettings(old) && Has(ReadIni(), "chat_pos=bottom-left"));
 }
 
 static void TestSwitchWords() {
@@ -359,7 +410,7 @@ static void TestHandEdits() {
     CHECK(setup::SaveSettings(other));
     const std::string saved = ReadIni();
     CHECK(Has(saved, "# my notes") && Has(saved, "future_key=7") && Has(saved, "sleep_stop=1"));
-    CHECK(saved.find("sleep_stop=1\n# my notes\nfuture_key=7\n") != std::string::npos); // after the keys, in order
+    CHECK(saved.find("sleep_stop=1\nchat=1\nchat_key=L+Left+Select\nchat_pos=bottom-left\n# my notes\nfuture_key=7\n") != std::string::npos); // after the keys, in order
     // a BOM in front of a comment stays out of the line that is kept
     setup::Settings bom_comment = LoadFrom("\xEF\xBB\xBF" "# my notes\nhost=h\n");
     CHECK(bom_comment.unknown_lines.size() == 1 && bom_comment.unknown_lines[0] == "# my notes");
@@ -655,11 +706,11 @@ static std::string NamesOf(const setup::ServerList& list) {
 }
 
 static void TestServerNames() {
-    std::printf("servers: every room has a name (12 characters at most) and an address; old lines read as rooms without a name\n");
-    // the name: up to 12 characters of A-Z a-z 0-9 space . _ - (empty = none)
-    CHECK(setup::kMaxServerNameChars == 12);
+    std::printf("servers: every room has a name (64 characters at most) and an address; old lines read as rooms without a name\n");
+    // the name: up to 64 characters of A-Z a-z 0-9 space . _ - (empty = none)
+    CHECK(setup::kMaxServerNameChars == 64);
     CHECK(setup::ValidServerName("") && setup::ValidServerName("Home PC") && setup::ValidServerName("a.b_c-d 9") && setup::ValidServerName("123456789012"));
-    CHECK(!setup::ValidServerName("1234567890123")); // 13
+    CHECK(setup::ValidServerName(std::string(64, 'a')) && !setup::ValidServerName(std::string(65, 'a'))); // 64, 65
     CHECK(!setup::ValidServerName("pipe|name") && !setup::ValidServerName("colon:x") && !setup::ValidServerName("tab\tx") &&
           !setup::ValidServerName("caf\xC3\xA9") && !setup::ValidServerName("new\nline"));
     setup::Server named = Srv("192.168.1.20", 24999);
@@ -685,7 +736,7 @@ static void TestServerNames() {
     CHECK(Order(old) == "one:24872 two:99 three:24872" && NamesOf(old) == "||Mine");
     CHECK(old.Serialise() == "one\ntwo:99\nthree|Mine\n");
     // a name that is not valid is left out, the room stays; spaces around the parts do not count
-    const setup::ServerList odd = setup::ServerList::Parse("h1|123456789012345\nh2|a|b\nh3 | Spaced \nh4|\nh5|caf\xC3\xA9\n");
+    const setup::ServerList odd = setup::ServerList::Parse("h1|" + std::string(65, 'x') + "\nh2|a|b\nh3 | Spaced \nh4|\nh5|caf\xC3\xA9\n"); // (65: one too many)
     CHECK(Order(odd) == "h1:24872 h2:24872 h3:24872 h4:24872 h5:24872" && NamesOf(odd) == "|a|Spaced||"); // ("h2|a|b" is a name and a password since 0.1.17)
     // the password of a room: after a second bar, as typed (it may hold a bar and blanks), written back only when there is one
     const setup::ServerList pw = setup::ServerList::Parse("r1:99|Home|s3cret pass\nr2||only|bars|here\nr3|Plain\nr4\nr5|Name|\n");
@@ -761,6 +812,7 @@ int main() {
     TestFirstRunAndDefaults();
     TestOldFileGainsTheTwoKeys();
     TestSleepRow();
+    TestChatPosRow();
     TestSwitchWords();
     TestRcvbuf();
     TestHandEdits();

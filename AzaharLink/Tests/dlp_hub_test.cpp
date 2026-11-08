@@ -26,6 +26,7 @@
 //   H9  a slow network thread (40 ms a round) and one stalled for 700 ms mid-sequence: the sequence completes, nothing is lost or doubled
 //   (H10 is in Tests/dlp_adv_lobby_test.cpp: the lobby's external-poll mode.)
 //   X1..X12 (below the H scenarios): what the mutation round of phase 3 found missing (the alive window, a long-running command, Stop(), the events, deferred closes)
+//   X13 the closing of the svc hook's gate (the swap of the plugin's block on an Old 3DS) ends every wait of a game thread in the hub
 //   F1a..F1d the commands that succeed in every state (FKCL Finalize / StopScan / StopSession, SRVR Finalize / EndAccepting) when the request cannot be served
 //            (network thread silent / alive but stalled / never ticked / stopped), F2 the Stop()/Post race, F3 OnGameUdsStarting with a request in flight,
 //            F4 a Tick longer than kAliveMs, F5 SetPlayerName, F6 SetFriendSeed (the descriptions are above F1a). `F1` runs F1a..F1d.
@@ -153,6 +154,7 @@ static std::atomic<u32> g_exec_slow_ms{0};
 static std::atomic<bool> g_no_event{false};
 static std::atomic<bool> g_sticky_events{false};
 static std::atomic<bool> g_relaxed_events{false};  // (X8) events built on relaxed atomics only: a signal and a wait order NOTHING
+static std::atomic<bool> g_gate_closing{false};    // (X13) the swap of the plugin's block has closed the svc hook's gate (KernelOps::GateClosing)
 
 struct Direct {  // the test is the game here
     Direct() { ++t_direct; }
@@ -462,6 +464,7 @@ public:
         }
     }
     void SleepNs(s64 ns) override { inner_->SleepNs(ns); }
+    bool GateClosing() override { return g_gate_closing.load(); }
     u32 waits() const { return waits_.load(); }
     u32 timeouts() const { return timeouts_.load(); }
     u32 signals() const { return signals_.load(); }
@@ -2839,6 +2842,98 @@ static void X12() {
     g_watchdog->Disarm();
 }
 
+/// X13: the swap of the plugin's block (Old 3DS: HOME, power, an applet) closes the svc hook's gate and waits 1.5 s at the most for the game
+/// threads counted in it: no game thread may stay in the hub's waits then (2 s in the queue, the slot without a limit). With the network
+/// thread alive but stalled: a queued request is taken back at once with WakeForSwap (and within its slice without it), a requester behind it
+/// gives up the slot, a new request is refused before it queues, and the end of a session is left to the next Tick without waiting.
+static void X13() {
+    std::printf("X13: the closing of the svc hook's gate ends every wait of a game thread in the hub\n");
+    g_watchdog->Arm(60, "X13");
+    Fix f({"Alice"});
+    Node& a = f.n(0);
+    Game g1(a), g2(a);
+    TCHECK_EQ(g1.SvInit(3).res(), 0u);
+    auto stall = [&] {  // (the network thread has just ticked: "alive" for kAliveMs, and it serves nothing)
+        f.net(0).Pause(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        f.net(0).Pause(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    // 1. a queued request, the gate closes, WakeForSwap: back at once with the failure (it never runs)
+    stall();
+    u32 w0 = a.kernel.waits();
+    Rep r1, r2;
+    std::atomic<u64> done1{0}, done2{0};
+    std::thread th1([&] {
+        t_game = true;
+        r1 = g1.SvAccepting(0, 6);
+        done1.store(platform::NowMs());
+    });
+    TCHECK(WaitFor(500, [&] { return a.kernel.waits() > w0; }));  // (queued, waiting on the event)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    g_gate_closing.store(true);
+    u64 t_close = platform::NowMs();
+    a.hub.WakeForSwap();
+    th1.join();
+    std::printf("  a queued request came back %u ms after the gate closed (WakeForSwap)\n", static_cast<u32>(done1.load() - t_close));
+    TCHECK(done1.load() - t_close < 20u);
+    TCHECK_EQ(r1.hdr(), Plain(5));
+    TCHECK_EQ(r1.res(), R_WIRELESS_OFF);
+    TCHECK_EQ(a.hub.cancelled(), 1u);
+    // 2. while the gate is closed: a request is refused before it queues (no wait at all), and a closed session is left to the next Tick
+    w0 = a.kernel.waits();
+    u64 t0 = platform::NowMs();
+    r1 = g1.SvAccepting(0, 6);
+    TCHECK(Ms(t0) < 20u);
+    TCHECK_EQ(r1.res(), R_WIRELESS_OFF);
+    TCHECK_EQ(a.hub.failed_fast(), 1u);
+    t0 = platform::NowMs();
+    a.hub.OnSessionClosed(kFk);  // (the searcher's role: nothing to end here, the creator's stays for step 4)
+    TCHECK(Ms(t0) < 20u);
+    TCHECK_EQ(a.hub.deferred_closes(), 1u);
+    TCHECK_EQ(a.hub.failed_fast(), 2u);  // (the close was refused before the slot too)
+    TCHECK_EQ(a.kernel.waits(), w0);
+    g_gate_closing.store(false);
+    // 3. two requesters (one queued, one behind it for the slot), the gate closes and nobody calls WakeForSwap: the one behind gives up within
+    // a few milliseconds, the queued one at the end of its slice
+    stall();
+    w0 = a.kernel.waits();
+    std::thread th3([&] {
+        t_game = true;
+        r1 = g1.SvAccepting(0, 6);
+        done1.store(platform::NowMs());
+    });
+    TCHECK(WaitFor(500, [&] { return a.kernel.waits() > w0; }));
+    std::thread th4([&] {
+        t_game = true;
+        r2 = g2.FkInit();
+        done2.store(platform::NowMs());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // (the second one is polling the slot)
+    g_gate_closing.store(true);
+    t_close = platform::NowMs();
+    th4.join();
+    th3.join();
+    std::printf("  behind the slot: back %u ms after the gate closed; queued, no WakeForSwap: %u ms\n", static_cast<u32>(done2.load() - t_close),
+                static_cast<u32>(done1.load() - t_close));
+    TCHECK(done2.load() - t_close < 20u);
+    TCHECK(done1.load() - t_close < DlpHub::kSliceMs + 50u);
+    TCHECK_EQ(r1.res(), R_WIRELESS_OFF);
+    TCHECK_EQ(r2.hdr(), Plain(1));
+    TCHECK_EQ(r2.res(), R_WIRELESS_OFF);
+    TCHECK_EQ(a.hub.cancelled(), 2u);
+    TCHECK_EQ(a.hub.failed_fast(), 3u);
+    // 4. the gate opens again (the block is back): the next request is served as ever, the cancelled ones never ran
+    g_gate_closing.store(false);
+    f.net(0).Pause(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TCHECK_EQ(g1.ServerState(), 1u);
+    r1 = g1.SvAccepting(0, 6);
+    TCHECK_EQ(r1.res(), 0u);
+    TCHECK_EQ(g1.ServerState(), 2u);
+    g_watchdog->Disarm();
+}
+
 // =====================================================================================================================
 // F scenarios: the regressions of the fixes made after the review of phase 3 (the third round of the hub test).
 //   F1a..F1d  the commands that succeed in every state - FKCL Finalize 0x02 / StopScan 0x06 / StopSession 0x10, SRVR Finalize 0x02 / EndAccepting 0x06 -
@@ -3407,7 +3502,7 @@ int main(int argc, char** argv) {
                                    {"H4", H4, 120},  {"H5", H5, 150},  {"H6", H6, 260},   {"H7", H7, 120}, {"H8", H8, 120},
                                    {"H9", H9, 220}, {"X1", X1, 80}, {"X2", X2, 80}, {"X3", X3, 80}, {"X4", X4, 80},
                                    {"X5", X5, 80}, {"X6", X6, 80}, {"X7", X7, 80}, {"X8", X8, 80}, {"X9", X9, 100},
-                                   {"X10", X10, 100}, {"X11", X11, 80}, {"X12", X12, 80}, {"F1a", F1a, 60}, {"F1b", F1b, 90},
+                                   {"X10", X10, 100}, {"X11", X11, 80}, {"X12", X12, 80}, {"X13", X13, 60}, {"F1a", F1a, 60}, {"F1b", F1b, 90},
                                    {"F1c", F1c, 60},  {"F1d", F1d, 60}, {"F2", F2, 60},   {"F3", F3, 60},   {"F4", F4, 60},
                                    {"F5", F5, 90},    {"F6", F6, 90},    {"F4b", F4b, 60}};
     std::printf("dlp_hub_test: the hub of the fake Download Play lobby, real threads, real engines\n");

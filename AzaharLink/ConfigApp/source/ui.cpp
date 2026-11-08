@@ -1,6 +1,7 @@
 #include "ui.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include "azl/platform.hpp"
 #include "copyworker.hpp"
 #include "pages.hpp"
+#include "tour.hpp"
 #include "plugin_resource.hpp"
 #include "titles.hpp"
 
@@ -158,6 +160,14 @@ void InputPoller::Poll() {
         up_n = (down & KEY_UP) ? 1 : 0;
         down_n = (down & KEY_DOWN) ? 1 : 0;
     }
+    if (tour::Active()) {
+        // (a test build that walks the app for its screenshots: the script's keys, nothing else)
+        down = held = repeat = tour::Keys();
+        up = 0;
+        up_n = (down & KEY_UP) ? 1 : 0;
+        down_n = (down & KEY_DOWN) ? 1 : 0;
+        blocked_ = false;
+    }
 
     if (blocked_) {
         // After an applet: ignore everything until the buttons and the stylus were released, so
@@ -241,12 +251,16 @@ void App::Save() {
     }
 }
 
-void App::SaveServers() {
+bool App::SaveServers() {
     if (!servers_writable) {
         ShowToast("The servers file could not be read: it is left as it is.", col::kWarn, 6000);
-    } else if (!setup::SaveServers(paths.servers_file, servers)) {
-        ShowToast("Could not write the list of rooms!", col::kOff, 8000);
+        return false;
     }
+    if (!setup::SaveServers(paths.servers_file, servers)) {
+        ShowToast("Could not write the list of rooms!", col::kOff, 8000);
+        return false;
+    }
+    return true;
 }
 
 void App::SaveAppConfig() {
@@ -281,6 +295,7 @@ void App::OpenDataFolder() {
     // The saved rooms. Without a file the list starts with the room the settings name; a file that could not be read is never written over.
     const setup::LoadResult servers_loaded = setup::LoadServers(paths.servers_file, servers);
     servers_writable = servers_loaded != setup::LoadResult::Unreadable;
+    pages::RefreshPublicRoomName(); // (the main page names a public room in use by its name)
     if (servers_loaded == setup::LoadResult::Missing && !cfg.host.empty()) {
         setup::Server current;
         current.host = cfg.host;
@@ -318,6 +333,9 @@ void App::RefreshBoot9() {
 }
 
 bool App::EditText(const char* hint, std::string& value, int max_chars, bool allow_empty, bool numeric) {
+    if (tour::TakeText(value)) {
+        return true;
+    }
     SwkbdState swkbd;
     swkbdInit(&swkbd, numeric ? SWKBD_TYPE_NUMPAD : SWKBD_TYPE_NORMAL, numeric ? 1 : 2, max_chars);
     swkbdSetValidation(&swkbd, allow_empty ? SWKBD_ANYTHING : SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
@@ -437,6 +455,14 @@ std::string RoomName() {
     active.host = g.cfg.host;
     active.port = g.cfg.port;
     const int at = g.cfg.host.empty() ? -1 : g.servers.Find(active);
+    if (at < 0 && !g.public_room_key.empty()) {
+        // (a public room has the name the list gives it)
+        std::string key = g.cfg.host + ":" + std::to_string(g.cfg.port);
+        for (char& c : key) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return key == g.public_room_key ? g.public_room_name : std::string();
+    }
     return at < 0 ? std::string() : g.servers.entries()[static_cast<std::size_t>(at)].name;
 }
 
@@ -782,6 +808,31 @@ void DrawRows(const ListView& v, const std::vector<Row>& rows) {
         }
         left += r.indent;
         const u32 label_color = r.dim ? col::kDim : (r.label_color ? r.label_color : col::kText);
+        if (r.lobby) {
+            // A public room: [mark] name [squares] [padlock] ping players
+            // (the players over their bar, both as wide as "100/100": a smaller type than the name's)
+            gfx::DrawFitted(kLobbyPlayersRight, yc - (r.fill >= 0.0f ? 2.0f : 0.0f), 0.38f, 0.3f, kLobbyPlayersW, r.dim ? col::kDim : col::kText, r.players,
+                            gfx::Align::Right);
+            if (r.fill >= 0.0f) {
+                const float bar_x = kLobbyPlayersRight - kLobbyPlayersW;
+                gfx::FillRect(bar_x, yc + 7.0f, kLobbyPlayersW, 2.0f, col::kTrack);
+                gfx::FillRect(bar_x, yc + 7.0f, std::floor(kLobbyPlayersW * Clamp(r.fill, 0.0f, 1.0f)), 2.0f, r.fill >= 1.0f ? col::kOff : col::kOn);
+            }
+            gfx::DrawText(kLobbyPingRight, yc, 0.42f, r.ping_color ? r.ping_color : col::kDim, r.ping, gfx::Align::Right);
+            float edge = kLobbyPingRight - std::max(gfx::TextWidth("9999", 0.42f), gfx::TextWidth(r.ping, 0.42f)) - 7.0f;
+            if (r.lock) {
+                const u32 lock_color = r.lock == 2 ? col::kOn : col::kDim;
+                const float lx = edge - 9.0f;
+                gfx::StrokeRect(lx + 1.5f, yc - 6.0f, 5.0f, 5.0f, 1.5f, lock_color);
+                gfx::FillRect(lx, yc - 2.0f, 8.0f, 7.0f, lock_color);
+                edge = lx - 5.0f;
+            }
+            if (r.lobby_marks) {
+                edge = DrawLobbyMarks(edge, yc, r.lobby_marks) - 3.0f;
+            }
+            DrawRowLabel(r, left, yc, label_scale, edge - left, label_color, selected, v.sel_since);
+            continue;
+        }
         // The room for the label depends on what sits at the right of the row and on the font, so
         // the label shrinks (or is shortened) instead of running into it.
         if (r.kind == Kind::Toggle) {
@@ -885,7 +936,7 @@ float DrawHomeOffBadge(float right_edge, float yc) {
 
 } // namespace
 
-void DrawTitleBar(float width, const char* title, const std::string& right) {
+void DrawTitleBar(float width, const char* title, const std::string& right, float badge_right) {
     DrawBarBackground(width);
     gfx::DrawText(14, kBarH * 0.5f, 0.56f, col::kBarText, title);
     float edge = width - 10.0f;
@@ -894,7 +945,7 @@ void DrawTitleBar(float width, const char* title, const std::string& right) {
         edge -= gfx::TextWidth(right, 0.45f) + 10.0f;
     }
     if (g.home_blocked && width < 330.0f) {
-        DrawHomeOffBadge(edge, kBarH * 0.5f);
+        DrawHomeOffBadge(badge_right > 0.0f ? badge_right : edge, kBarH * 0.5f);
     }
 }
 
@@ -968,6 +1019,57 @@ float DrawKindMarks(float right_edge, float yc, unsigned tags) {
         x -= 3.0f;
     }
     return x;
+}
+
+namespace {
+
+struct LobbyMark {
+    unsigned bit;
+    u32 color;
+    const char* word;
+};
+const LobbyMark kLobbyMarks[5] = {{kLobbyFull, col::kOff, "Full"},
+                                  {kLobbyRegion, col::kWarn, "Other region"},
+                                  {kLobbyFavourite, col::kAccent, "Favourite"},
+                                  {kLobbyGone, col::kDim, "Left the list"},
+                                  {kLobbyVersion, gfx::Rgba(205, 110, 230), "Other version"}};
+
+// One square of a public room, its top left corner at (x, yc - 4): on whole pixels, like the bars of the kinds of title.
+void DrawLobbySquare(float x, float yc, u32 color) {
+    const float py = std::floor(yc) - 4.0f;
+    gfx::FillRect(x, py, 8.0f, 8.0f, gfx::Mix(col::kPanel, color, 0.6f));
+    gfx::StrokeRect(x, py, 8.0f, 8.0f, 1.0f, color);
+}
+
+} // namespace
+
+float DrawLobbyMarks(float right_edge, float yc, unsigned marks) {
+    float x = right_edge;
+    for (int i = 4; i >= 0; --i) {
+        if (marks & kLobbyMarks[i].bit) {
+            x = std::floor(x - 8.0f);
+            DrawLobbySquare(x, yc, kLobbyMarks[i].color);
+            x -= 3.0f;
+        }
+    }
+    return x;
+}
+
+void DrawLobbyLegend(float x, float yc, float max_w) {
+    float scale = 0.4f;
+    float total = 0.0f;
+    for (const LobbyMark& m : kLobbyMarks) {
+        total += 12.0f + gfx::TextWidth(m.word, scale) + 10.0f;
+    }
+    if (total > max_w) {
+        scale *= max_w / total; // (a font with wider letters: the legend shrinks instead of running out)
+    }
+    for (const LobbyMark& m : kLobbyMarks) {
+        DrawLobbySquare(std::floor(x), yc, m.color);
+        x += 12.0f;
+        gfx::DrawText(x, yc, scale, col::kText, m.word);
+        x += gfx::TextWidth(m.word, scale) + 10.0f;
+    }
 }
 
 void DrawKindLegend(float right_x, float yc) {
@@ -1047,8 +1149,8 @@ void DrawButton(const Rect& r, const char* key, const char* label, bool enabled,
     gfx::DrawText(x + chip_w + gap, yc, label_scale, enabled ? col::kText : col::kDim, label);
 }
 
-void DrawListChrome(const char* title, const std::string& right) {
-    DrawTitleBar(gfx::kBottomW, title, right);
+void DrawListChrome(const char* title, const std::string& right, float badge_right) {
+    DrawTitleBar(gfx::kBottomW, title, right, badge_right);
     DrawFooterBackground();
     DrawFrameBorder(gfx::kBottomW);
 }
@@ -1320,7 +1422,7 @@ void ListPage::DrawTop() {
 
 void ListPage::DrawBottom() {
     DrawRows(list_, rows_);
-    DrawListChrome(BarTitle(), BarRight());
+    DrawListChrome(BarTitle(), BarRight(), BarBadgeRight());
     DrawFooter(BuildFooter());
 }
 

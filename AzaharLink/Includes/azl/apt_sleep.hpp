@@ -19,10 +19,8 @@ constexpr u32 kAptSignalWakeup = 6;
 constexpr u32 kAptNoteNotification = 1;
 constexpr u32 kAptNoteReplyQuery = 2;
 constexpr u32 kAptNoteReplyComplete = 3;
-// (4 to 7 are the framework's, azl/sleep_crumbs.hpp.) The call that raises the swap on an Old 3DS, told before it is made (its value: the trampoline's return, or the call site it goes back to):
-constexpr u32 kAptNoteReceiveMade = 8;     ///< the plugin makes it itself: no HOME or power button seen just now
-constexpr u32 kAptNoteReceiveHanded = 9;   ///< it goes back to the game's own call site
-constexpr u32 kAptNoteReceiveRefused = 10; ///< it should have gone back and could not
+// (4 to 7 are the framework's, azl/sleep_crumbs.hpp. 8 to 10 were who made the call that raises the swap on an Old 3DS, up to 1.1.2: free since the
+// persistent gate, which makes every real svc of the game itself.)
 // A call of the game that failed for good, told as one line of words (kAptNoteWord ..., kAptNoteEnd): an invalid handle (the value: the handle), or the fatal error the game reports to err:f (the value: the session).
 constexpr u32 kAptNoteBadHandle = 11;
 constexpr u32 kAptNoteFatal = 12;
@@ -34,11 +32,72 @@ constexpr u32 kAptNoteUtility = 19;        ///< APT:AppletUtility: the first 16 
 constexpr u32 kAptNoteUtilityResult = 20;
 constexpr u32 kAptReceiveFailed = 0xFFFFFFFF;
 constexpr u32 kAptNoteLimit = 21;          ///< the lines of these two calls reached their limit (once)
+// (22 to 25 are the framework's, azl/sleep_crumbs.hpp.) The close of the game, with the log on (REGISTRO, phase N: a game closed from the HOME menu that left
+// Luma3DS's plugin block behind, with nothing in the logs after the close command):
+constexpr u32 kAptNoteReceiveWord = 26;    ///< after APT:ReceiveParameter(application): Luma3DS's plugin word (kLumaPluginWordAddress), a line of its own
+constexpr u32 kAptNoteSrvNotification = 27; ///< srv:ReceiveNotification gave the game the termination request (the value: the id, 0x100)
+constexpr u32 kAptNoteCloseLimit = 28;     ///< the lines after a close command reached their own limit (once)
+
+/// Luma3DS's word of the plugin loader in the configuration page (read-only in every process, like 0x1FF80040): the state in the low 16 bits (0 none,
+/// 1 running, 2 in the HOME menu, 3 exiting), the events Luma3DS raised and has not handled yet in the high 16 (1 HOME, 2 EXIT; rosalina globals.h).
+constexpr u32 kLumaPluginWordAddress = 0x1FF800F0;
+
+/// The command of APT:ReceiveParameter that closes the application: libctru's APTCMD_WAKEUP_CANCEL 12, the HOME menu's Close. 10 (APTCMD_WAKEUP_EXIT,
+/// a library applet that exited) and 11 (APTCMD_WAKEUP_PAUSE, the return from the HOME menu: right after every HOME button in the real trails, with the
+/// game playing on) close nothing: taken for closes, a plain HOME round trip spent the lines of the close before the close came.
+constexpr u32 kAptCommandCloseFromHome = 12;
+inline bool AptCommandCloses(u32 command) {
+    return command == kAptCommandCloseFromHome;
+}
+
+/// The lines of APT:ReceiveParameter and APT:AppletUtility of a launch: kNormal, then the limit's line; once a close command came, kAfterClose more of
+/// their own (a game that polls these used the 64 up before it was closed, and the lines after the close are the ones a lost close needs). Take says
+/// what to write: the line (kNoteWrite), and before it the line of a limit reached (kNoteLimit, kNoteCloseLimit: once each).
+struct AptNoteBudget {
+    static constexpr u32 kNormal = 64;
+    static constexpr u32 kAfterClose = 32;
+    static constexpr u32 kNoteWrite = 1;
+    static constexpr u32 kNoteLimit = 2;
+    static constexpr u32 kNoteCloseLimit = 4;
+    u32 normal = 0;
+    u32 after_close = 0;
+    bool closing = false;
+
+    // >>> game-thread code (Tests/policy_check.sh: no printf family, no Log()/DebugEvent() with a format, no big buffer)
+    /// `close`: this line is a ReceiveParameter that brought a close command (it is written, and so are the next kAfterClose).
+    u32 Take(bool close) {
+        if (close) {
+            closing = true;
+        }
+        if (normal < kNormal) {
+            ++normal;
+            return kNoteWrite;
+        }
+        u32 out = 0;
+        if (normal == kNormal) {
+            ++normal;
+            out |= kNoteLimit;
+        }
+        if (!closing) {
+            return out;
+        }
+        if (after_close < kAfterClose) {
+            ++after_close;
+            return out | kNoteWrite;
+        }
+        if (after_close == kAfterClose) {
+            ++after_close;
+            out |= kNoteCloseLimit;
+        }
+        return out;
+    }
+    // <<< game-thread code
+};
 
 enum class AptSleepEvent { None, Enter, Wake };
 
 /// The APT signal of InquireNotification's reply word. Only the low byte is the signal: the bytes above it change from call to call: 0x1BC00001, 0x00000601 and 0x0007E901 for the HOME button, 0x18000008 and 0x00000608 for the power button (all from real consoles).
-/// With 16 bits, 0x608 was no power button: no hand-back, and the game's thread woke up in the plugin's freed memory (Old 3DS, issue 5, Pokemon Alpha Sapphire, 1.1.0).
+/// With 16 bits, 0x608 was no power button, and the game's thread woke up in the plugin's freed memory (Old 3DS, issue 5, Pokemon Alpha Sapphire, 1.1.0).
 inline u32 AptSignalOf(u32 reply_word) {
     return reply_word & 0xFFu;
 }

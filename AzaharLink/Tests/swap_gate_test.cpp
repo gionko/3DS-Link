@@ -194,6 +194,52 @@ void TestWeightsApart() {
     // (each kind counts up to 255 threads before it reaches the next: one thread each today)
     CHECK(kGateWriter / kGateNet >= 16);
     CHECK(kGateTrail / kGateWriter >= 16);
+    CHECK((kGateOsd & (kGateNet | kGateWriter | kGateTrail)) == 0);
+    CHECK(kGateOsd / kGateTrail >= 16);
+    CHECK(kGateOsd != 0); // (the top byte: 255 game threads at most in the callback before it wraps)
+}
+
+// The chat's OSD callback runs on the game's thread: it passes or skips, it never stops.
+void TestOsdPass() {
+    // a New 3DS: the gate is off, the thread goes on and nothing is counted (its GateLeave counts nothing either)
+    SwapGate off;
+    off.park = nullptr; // (a stop would crash)
+    CHECK(GateTryPass(off, kGateOsd));
+    CHECK(off.inside == 0);
+    GateLeave(off, kGateOsd);
+    CHECK(off.inside == 0);
+    // an Old 3DS, the gate open: counted while inside
+    SwapGate g = MakeOn();
+    g.park = nullptr;
+    CHECK(GateTryPass(g, kGateOsd));
+    CHECK(g.inside == kGateOsd);
+    // the close waits for it within its budget, and gives up at the budget if it never leaves
+    g_clock = FakeClock{};
+    g_clock.on_step = [](u32 step) {
+        if (step == 3) {
+            GateLeave(g_swap_gate, kGateOsd);
+        }
+    };
+    g_swap_gate = g;
+    CHECK(GateCloseAndDrain(g_swap_gate, 1000000, kNow, kStep) == 0);
+    CHECK(g_clock.steps == 3);
+    CHECK(g_swap_gate.stats.inside_start == kGateOsd);
+    CHECK(g_swap_gate.stats.inside_left == 0);
+    // closed: the callback skips its frame, is not counted and never parks
+    CHECK(!GateTryPass(g_swap_gate, kGateOsd));
+    CHECK(g_swap_gate.inside == 0);
+    CHECK(g_swap_gate.stops == 0);
+    GateOpen(g_swap_gate);
+    CHECK(GateTryPass(g_swap_gate, kGateOsd));
+    GateLeave(g_swap_gate, kGateOsd);
+    CHECK(g_swap_gate.inside == 0);
+    // one that stays inside past the budget: the close returns with its weight left
+    g_clock = FakeClock{};
+    CHECK(GateTryPass(g_swap_gate, kGateOsd));
+    CHECK(GateCloseAndDrain(g_swap_gate, 5000, kNow, kStep) == kGateOsd);
+    CHECK(g_swap_gate.stats.inside_left / kGateOsd == 1);
+    g_swap_gate = SwapGate{};
+    g_clock = FakeClock{};
 }
 
 // The promise itself, with real threads: from the moment the close returns with nobody left until the gate opens, no thread is in a call. The call is a flag
@@ -227,6 +273,27 @@ void Worker(SwapGate* g, u32 who, std::atomic<bool>* stop) {
     }
 }
 
+// The game's thread in the OSD callback: it skips a frame when the gate is closed, never stops.
+void OsdWorker(SwapGate* g, std::atomic<bool>* stop) {
+    while (!stop->load(std::memory_order_relaxed)) {
+        if (!GateTryPass(*g, kGateOsd)) {
+            std::this_thread::yield();
+            continue;
+        }
+        g_in_call.fetch_add(1);
+        if (g_block_gone.load()) {
+            g_crashes.fetch_add(1);
+        }
+        std::this_thread::yield();
+        if (g_block_gone.load()) {
+            g_crashes.fetch_add(1);
+        }
+        g_in_call.fetch_sub(1);
+        GateLeave(*g, kGateOsd);
+        g_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void TestRealThreads() {
     SwapGate g;
     g.on = 1;
@@ -236,6 +303,7 @@ void TestRealThreads() {
     threads.emplace_back(Worker, &g, kGateNet, &stop);
     threads.emplace_back(Worker, &g, kGateWriter, &stop);
     threads.emplace_back(Worker, &g, kGateTrail, &stop);
+    threads.emplace_back(OsdWorker, &g, &stop);
     auto now = []() {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     };
@@ -282,6 +350,7 @@ int main() {
     TestParkLoop();
     TestScope();
     TestWeightsApart();
+    TestOsdPass();
     TestRealThreads();
     std::printf("swap_gate_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

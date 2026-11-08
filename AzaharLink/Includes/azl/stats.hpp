@@ -143,6 +143,8 @@ struct Stats {
     u32 pass_calls;    ///< IPC calls of the game to real services that went straight through the hook
     u32 hle_declined;  ///< nwm::UDS / ndm:u sessions the game was left to get from the REAL service (no event, no slot)
     u32 hle_throttled; ///< failing replies of the fake sessions that waited 0.5 ms (a game thread polling a command that fails)
+    u32 chat_osd_draws;      ///< the chat over the game: the OSD callback's calls that drew (lines or keyboard; timed only with the log on) ...
+    u32 chat_osd_max_ticks;  ///< ... and the longest of them (game thread, single writer: plain)
 
     // ---- The time sums, 64-bit, in system ticks (268.1 per us). They stay at the END of the struct: TakeStats() clears
     // everything before this point with one memset and these one by one, atomically.
@@ -156,6 +158,7 @@ struct Stats {
     Ticks64 t_net_send;        ///< network thread: the game's frames into ENet, flush, the engine's tick (the flush's soc
                                ///< calls, lock waits and error pauses out)
     Ticks64 t_cb;              ///< CTRPF frame callback (once per game frame)
+    Ticks64 t_chat_osd;        ///< the chat's OSD callback on the game's thread, at the present (not in t_cb; with the log on)
     Ticks64 t_writer;          ///< log writer thread: its passes, the SD card out
     Ticks64 ipc_sum_ticks;     ///< game threads inside the UDS / ndm commands, scans and connects out (the engine-lock waits
                                ///< of those threads are taken off when the figure is made: see MakeCpuNumbers)
@@ -170,7 +173,7 @@ struct Stats {
     Ticks64 frame_gap_sum;     ///< sum of the intervals between two frame callbacks
 };
 // TakeStats() treats everything from t_net_service on as a time sum: nothing else may be added after it.
-static_assert(sizeof(Stats) - offsetof(Stats, t_net_service) == (13 + kSocKinds) * sizeof(Ticks64),
+static_assert(sizeof(Stats) - offsetof(Stats, t_net_service) == (14 + kSocKinds) * sizeof(Ticks64),
               "the 64-bit sums are the end of Stats, and TakeStats clears each of them");
 
 extern Stats g_stats;
@@ -187,6 +190,20 @@ inline void StatsAdd(u32& counter, u32 n = 1) {
 inline void StatsAdd64(Ticks64& sum, u64 n) {
     __atomic_fetch_add(&sum, n, __ATOMIC_RELAXED);
 }
+
+/// One call of the chat's OSD callback that drew, `ticks` long (the game's thread, inside the swap's gate). Out of line (Sources/azl/log.cpp):
+/// inline, its 64-bit add took 16 bytes more of the callback's frame, under the drawing's chain on the game's stack.
+void StatsNoteChatOsd(u32 ticks);
+
+/// How many CTRPF OSD::Notify calls the chat has made (Sources/ctr/chat_overlay.cpp): each wakes CTRPF's notification
+/// workers, which the zombie probe suspects (the chat is the one path that leaves the game in memory, review ~10%). The
+/// plugin's thread is the only writer; the forced res line and the chat's cost line read it. Debug diagnostics only.
+void StatsNoteChatOsdNotify();
+unsigned long StatsChatOsdNotifies();
+/// The plugin's own OSD::Notify calls (room joined, warnings: main.cpp's PluginWork, through ChatNoteNotify), counted
+/// apart from the chat's so a session without the chat has its own figure to compare against.
+void StatsNotePluginOsdNotify();
+unsigned long StatsPluginOsdNotifies();
 
 /// A queued -> PullPacket latency (ms) into its bucket of Stats::pull_latency (called under the engine's lock).
 inline void NotePullLatency(u32 ms) {
@@ -298,8 +315,9 @@ void DebugEvent(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 // of it): no format string, no formatter, no buffer on the caller's stack. ----
 /// "ipc h=0x<handle> cmd=0x<header:8> arg=0x<arg> -> 0x<result:8>": any IPC request that no service of ours answers.
 void DebugIpc(u32 handle, u32 header, u32 arg, u32 result);
-/// "svc REAL <service> cmd 0x<command:4> arg 0x<arg> -> 0x<result:8>": a command of a traced real service.
-void DebugSvcReal(const char* service, u32 command, u32 arg, u32 result);
+/// "svc REAL <service> cmd 0x<command:4> arg 0x<arg> -> 0x<result:8>": a command of a traced real service. Under the diet of
+/// DebugIpc when `handle` (the session's) is given: past three calls a second that succeed, one count line a second.
+void DebugSvcReal(const char* service, u32 command, u32 arg, u32 result, u32 handle = 0);
 /// A text line of the capture built piece by piece (azl/line.hpp), pushed when the object goes out of scope. The text
 /// sits in one static buffer, under the ring's lock, which the object holds: build nothing else (no Log, no second
 /// DebugLine) while one is alive. At level 0, or without a ring, every append does nothing and nothing is locked.
@@ -395,9 +413,10 @@ struct CpuNumbers {
     u32 net10 = 0;      ///< the three together
     u32 uds10 = 0;      ///< game threads inside the UDS / ndm commands (the engine-lock waits of those threads taken off)
     u32 frame10 = 0;    ///< the frame callback
+    u32 chat10 = 0;     ///< the chat's OSD callback (the lines and the keyboard drawn over the game, at its present: not in the frame callback)
     u32 writer10 = 0;   ///< the log writer's passes, the SD card out: WALL time of the lowest-priority thread (what it waited for the core
                         ///< is in it: Tekken showed more than a core), so it is not in the total
-    u32 plugin10 = 0;   ///< net + uds + frame = the CPU of the plugin in ms per second, an upper bound (the writer is out: see above)
+    u32 plugin10 = 0;   ///< net + uds + frame + chat = the CPU of the plugin in ms per second, an upper bound (the writer is out: see above)
     // not CPU:
     u32 soc10 = 0;      ///< waiting for the soc process: recv and send calls
     u32 poll10 = 0;     ///< ... and idle in poll()
@@ -419,7 +438,7 @@ struct StatusNumbers {
     u32 plugin10 = 0;            ///< ms of CPU the plugin used per second (x10), waiting not counted: all of it ...
     u32 net10 = 0;               ///< ... the network thread (ENet, frames, queue; the soc calls are waiting, not in it) ...
     u32 uds10 = 0;               ///< ... the game's threads inside the UDS commands ...
-    u32 frame10 = 0;             ///< ... the frame callback ...
+    u32 frame10 = 0;             ///< ... the frame callback and the chat's OSD callback ...
     u32 writer10 = 0;            ///< ... and the log writer thread
     u32 loop_pause_ms = 0;       ///< longest pause between two rounds of the network loop
     u32 soc_mean_us = 0;         ///< soc calls (recv, send; not the poll wait): mean and longest ...

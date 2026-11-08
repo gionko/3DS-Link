@@ -657,8 +657,31 @@ static void TestRoomMemberPlays() {
     CHECK(RoomMemberStoppedLines({}, {}).empty());
 }
 
+// Who came and who left for the chat (ChatSink::OnPresence): by MAC, joins first, ourselves never.
+static void TestRoomMemberChanges() {
+    std::printf("room members: the changes the chat tells, by MAC, never our own\n");
+    const Mac self = {0x00, 0x1F, 0x32, 0x01, 0x02, 0x03};
+    const RoomMemberRow a{kMacA, "Friend-A", "SUPER STREET FIGHTER IV"};
+    const RoomMemberRow b{kMacB, "Friend-D", ""};
+    const RoomMemberRow me{self, "Gionko", "TEKKEN"};
+    CHECK(RoomMemberChanges({a, me}, {a, me}, self).empty());
+    RoomMemberRow a2 = a;
+    a2.game = "";                                          // (the same member, another title: not a change)
+    a2.nickname = "Friend-A";
+    CHECK(RoomMemberChanges({a, me}, {a2, me}, self).empty());
+    const auto in = RoomMemberChanges({me}, {me, a, b}, self);
+    CHECK(in.size() == 2 && in[0].nickname == "Friend-A" && in[0].joined && in[1].nickname == "Friend-D" && in[1].joined);
+    const auto out = RoomMemberChanges({me, a, b}, {b, me}, self);
+    CHECK(out.size() == 1 && out[0].nickname == "Friend-A" && !out[0].joined);
+    const auto both = RoomMemberChanges({a, me}, {b, me}, self);
+    CHECK(both.size() == 2 && both[0].nickname == "Friend-D" && both[0].joined && both[1].nickname == "Friend-A" && !both[1].joined);
+    CHECK(RoomMemberChanges({}, {me}, self).empty());     // (we are listed too: never told)
+    CHECK(RoomMemberChanges({me}, {}, self).empty());
+}
+
 int main() {
     TestRoomMemberLines();
+    TestRoomMemberChanges();
     TestRoomMemberPlays();
     TestLossGuard();
     TestRejoinSchedule();

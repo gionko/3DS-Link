@@ -12,10 +12,11 @@ namespace {
 constexpr const char* kLogName = "AzaharLink.log";
 constexpr const char* kDebugName = "AzaharLink.debug.log";
 constexpr const char* kCrumbName = "AzaharLink.sleep.log";
+constexpr const char* kCrumbOldName = "AzaharLink.sleep.1.log"; ///< the trail of the launches before, moved aside (OpenCrumbLocked)
 /// How many numbers in a row without a file end the look for blocks: more than are ever kept, so the look finds the highest
 /// block whatever was deleted by hand below it, and stops soon after it.
 constexpr int kBlockScanGap = 64;
-constexpr u64 kCrumbMaxBytes = 128 * 1024; ///< a launch that finds the trail's file larger than this starts it afresh
+constexpr u64 kCrumbMaxBytes = 128 * 1024; ///< a launch that finds the trail's file larger than this moves it aside, starts a new one
 constexpr std::size_t kQueueReserve = 16 * 1024; ///< bytes of main-log lines the queue holds before it has to grow
 } // namespace
 
@@ -86,7 +87,9 @@ void LogFiles::RotateLocked(Kind kind) {
 }
 
 // >>> game-thread code (Tests/policy_check.sh: no printf family, no Log()/DebugEvent() with a format, no big buffer)
-void LogFiles::Append(const char* line) {
+// `report`: a line that says what was dropped (ReportBusyDrops, the writer's): it goes in even with the queue full, one line past the
+// limit, or the report of a full queue would itself be dropped and counted, and say "1 line" at the next flush.
+__attribute__((always_inline)) inline void LogFiles::AppendLine(const char* line, bool report) {
     // Called from any thread, including the game's own threads (small stacks): never touch the file system here,
     // just queue the line. The log writer thread puts it on the SD card.
     const u64 elapsed = platform::NowMs() - start_ms_;
@@ -113,12 +116,18 @@ void LogFiles::Append(const char* line) {
         }
         log_mutex_.lock();
     }
-    if (pending_.size() < limits_.max_pending) {
+    if (report || pending_.size() < limits_.max_pending) {
         pending_.append(prefix, stamp.size());
         pending_ += line;
         pending_ += '\n';
+    } else {
+        __atomic_fetch_add(&queue_full_, 1u, __ATOMIC_RELAXED); // (a hole in the log is never silent: ReportBusyDrops says it)
     }
     log_mutex_.unlock();
+}
+
+void LogFiles::Append(const char* line) {
+    AppendLine(line, false);
 }
 // <<< game-thread code
 
@@ -176,15 +185,21 @@ void LogFiles::OpenCrumbLocked() {
     }
     crumb_file_ = files_->OpenAppend(dir_ + kCrumbName);
     if (crumb_file_ && files_->Size(crumb_file_) >= kCrumbMaxBytes) {
-        // (the trail of earlier launches is not what a test is after: start afresh rather than grow for ever)
+        // (not grown for ever, and not erased either: the trail of the launch before a crash is the one file that reached the card, so
+        // the full file is moved aside as AzaharLink.sleep.1.log - the one before it goes - and this launch starts a new one)
         files_->Close(crumb_file_);
-        files_->Remove(dir_ + kCrumbName);
+        files_->Remove(dir_ + kCrumbOldName);
+        files_->Rename(dir_ + kCrumbName, dir_ + kCrumbOldName);
         crumb_file_ = files_->OpenAppend(dir_ + kCrumbName);
     }
 }
 
 void LogFiles::WriteCrumb(const std::string& line) {
-    if (g_debug_level <= 0) {
+    WriteCrumbs(&line, 1);
+}
+
+void LogFiles::WriteCrumbs(const std::string* lines, std::size_t count) {
+    if (g_debug_level <= 0 || count == 0) {
         return;
     }
     platform::LockGuard lock(crumb_mutex_);
@@ -192,7 +207,18 @@ void LogFiles::WriteCrumb(const std::string& line) {
     if (!crumb_file_) {
         return;
     }
-    const std::string text = line + '\n';
+    // (one write and one flush for all the lines of a turn of the breadcrumb thread, not one of each a line: a flush costs the card as
+    // much as a small write, and the card is the game's too)
+    std::size_t size = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        size += lines[i].size() + 1;
+    }
+    std::string text;
+    text.reserve(size);
+    for (std::size_t i = 0; i < count; ++i) {
+        text += lines[i];
+        text += '\n';
+    }
     files_->Write(crumb_file_, text.data(), text.size());
     files_->Flush(crumb_file_); // (at once: the trail is what is read after a freeze)
 }
@@ -238,13 +264,21 @@ void LogFiles::Open() {
 }
 
 void LogFiles::ReportBusyDrops() {
+    const u32 full = __atomic_exchange_n(&queue_full_, 0u, __ATOMIC_RELAXED);
+    if (full != 0) {
+        __atomic_fetch_add(&queue_full_total_, full, __ATOMIC_RELAXED);
+        char line[160];
+        std::snprintf(line, sizeof(line), "log: %lu lines were dropped: the queue of the main log was full (%lu KB waiting for the card)",
+                      static_cast<unsigned long>(full), static_cast<unsigned long>(limits_.max_pending / 1024));
+        AppendLine(line, true);
+    }
     const u32 busy = LogTakeBusyDrops() + __atomic_exchange_n(&append_busy_, 0u, __ATOMIC_RELAXED);
     if (busy != 0) {
         char line[160];
         std::snprintf(line, sizeof(line),
                       "log: %lu lines of other threads were given up: a lock of the log was busy (a thread above the writer never waits for it)",
                       static_cast<unsigned long>(busy));
-        Append(line); // (a hole in the log is never silent; from the writer this never waits long, and never for a game thread)
+        AppendLine(line, true); // (a hole in the log is never silent; from the writer this never waits long, and never for a game thread)
     }
 }
 

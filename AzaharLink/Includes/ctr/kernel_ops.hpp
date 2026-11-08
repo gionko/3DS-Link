@@ -4,6 +4,7 @@
 #include <3ds.h>
 
 #include "azl/uds_engine.hpp"
+#include "ctr/gate_flag.hpp"
 
 namespace azl {
 namespace ctr {
@@ -43,6 +44,9 @@ public:
     }
     void SleepNs(s64 ns) override {
         svcSleepThread(ns);
+    }
+    bool GateClosing() override {
+        return ctr::GateClosing();
     }
 };
 

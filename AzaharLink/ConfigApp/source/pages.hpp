@@ -6,6 +6,7 @@
 //   InstallCheckPage    what the installation has and lacks, and what A does about it (pages_check.cpp)
 //   MainPage            the main page (pages_main.cpp)
 //   ServersPage         the saved rooms: use, add, remove, rename (pages_servers.cpp)
+//   LobbiesPage         the public rooms: their ping, who plays what, use one, keep one among the saved rooms (pages_lobbies.cpp)
 //   EnableGamePage      which titles run with 3DS Link: their icons, names and switches (pages_enable.cpp)
 //   DeliveryPage        Titles Delivery: send titles, receive titles (pages_delivery.cpp, delivery_run.cpp; declared in
 //                       delivery.hpp with the pages under it)
@@ -33,6 +34,17 @@ ui::Page* NewStartupPage();
 ui::Page* NewInstallCheckPage(std::function<void(bool go_on)> on_close = nullptr, bool first_start_summary = false);
 ui::Page* NewMainPage();
 ui::Page* NewServersPage();
+ui::Page* NewLobbiesPage();
+// The page of a room's name, address, port and password (pages_servers.cpp). Add and Change are the saved rooms' own; Favourite is a saved room
+// that is a public one (X on Public lobbies put it there): only its name can change, the rest comes with the list. `saved` gets the room when Y
+// saved it (the page is gone by then).
+enum class RoomForm { Add, Change, Favourite };
+// Whether host:port is a room of the list of public rooms on the card (pages_lobbies.cpp).
+bool InPublicList(const std::string& host, u16 port);
+ui::Page* NewRoomFormPage(const setup::Server& room, RoomForm form, std::function<void(const setup::Server& room)> saved);
+// Looks at the public list for the room in use: when it is a public room (and not one of the saved ones) its name goes to g.public_room_name,
+// for the screens that name the room. True when it is one.
+bool RefreshPublicRoomName();
 ui::Page* NewEnableGamePage();
 ui::Page* NewConfigPage();
 ui::Page* NewAboutPage();
@@ -65,7 +77,7 @@ using FolderFn = std::function<bool(const std::string& folder)>;
 ui::Page* NewFolderPage(const std::string& title, const std::string& hint, FolderFn chosen);
 
 // The test of a new room, in a short popup with its three steps (B cancels): `done` gets how it went.
-enum class ProbeOutcome { Reached, Failed, Cancelled };
+enum class ProbeOutcome { Reached, Failed, Cancelled, WrongPassword };
 using ProbeFn = std::function<void(ProbeOutcome outcome)>;
 ui::Page* NewProbePage(const setup::Server& server, ProbeFn done);
 

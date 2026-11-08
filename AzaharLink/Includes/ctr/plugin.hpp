@@ -27,7 +27,7 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.1.1"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.1: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.1.2"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.2: Tests/set_version.py writes all of them)
 
 /// "Mon DD YYYY HH:MM:SS" of the last build that changed any object: Sources/ctr/build_id.cpp, which the Makefile recompiles
 /// after every other object. The log header prints it instead of plugin.cpp's own __DATE__ / __TIME__, which stay as old as
@@ -51,6 +51,9 @@ struct Config {
     int debug = 0;                        ///< 0 no log at all (no file is written), 1 everything (an old 2 reads as 1)
     int rcvbuf_kb = ini::kRcvbufKbDefault; ///< ini key rcvbuf_kb: 8, 16, 32 or 64; it can only LOWER the receive ring
     int sleep_stop = ini::kSleepStopDefault; ///< ini key sleep_stop: 0 the sleep is only logged, 1 it ends the session of a client, 2 of a host too (see OnSleepEnter)
+    bool chat = true;                     ///< ini key chat: the chat of the room over the title (set at runtime by SetChatOn)
+    std::string chat_key = ini::kDefaultChatKey; ///< ini key chat_key: the chord that opens it
+    int chat_pos = ini::kChatPosDefault;  ///< ini key chat_pos: the corner of the chat's lines on the top screen (ini::ChatPos)
 };
 
 class Plugin {
@@ -77,6 +80,9 @@ public:
         return config_;
     }
     bool LoadConfig();
+    /// A file of the app's data folder read whole (the in-game menu's lists: servers.txt, public-lobbies*.txt), only when the user opens
+    /// them in the menu, and never written. False when it is missing or empty; a bigger one is read up to its last whole line within `max_bytes`.
+    static bool ReadDataFile(const char* path, std::size_t max_bytes, std::string& out);
     bool SaveConfig();
 
     /// Joins the configured room (background thread). Returns false if it cannot even start.
@@ -109,6 +115,23 @@ public:
         return config_.debug;
     }
 
+    /// The chat's switch (ini key chat) and its corner (chat_pos), from the in-game menu: kept in the settings, saved to the ini
+    /// and taken at once. The chat reads them through the two atomics on the network thread and the game's thread, where the
+    /// Config (its strings) is the main thread's.
+    void SetChatOn(bool on);
+    void SetChatPos(int pos);
+    bool chat_on() const {
+        return chat_on_.load(std::memory_order_relaxed);
+    }
+    int chat_pos() const {
+        return chat_pos_.load(std::memory_order_relaxed);
+    }
+    /// The chat's block (azl/chat_core.hpp): nullptr until the chat is first on in a session of the plugin, then the same block
+    /// for good (never freed: the network thread and the drawing may hold it). The chat's switch is chat_on(), not this.
+    ChatSink* chat_sink() const {
+        return chat_sink_.load(std::memory_order_acquire);
+    }
+
     /// True when the settings switch the in-game menu off (menu_key=off): it never opens, so everything that
     /// needs it (the room address, joining) has to come from the settings.
     bool menu_off() const {
@@ -128,8 +151,8 @@ public:
     /// A process event of the framework (sleep, home, swap, exit). Only flag stores: it runs on the
     /// framework's small keep-alive thread; the log writer reports it.
     void NoteProcessEvent(int event);
-    /// Old 3DS: the plugin's block is back (the framework's reply to Luma3DS about the swap has returned) and the game's thread that raised the swap
-    /// does not run yet. The call sites go back in the hook here, not at SWAP_EXIT, which comes too late (Sources/ctr/plugin.cpp, __wrap_PLGLDR__Reply).
+    /// Old 3DS: the plugin's block is back and mapped (the framework's reply to Luma3DS about the swap has returned): the svc hook's gate opens
+    /// (Sources/ctr/plugin.cpp, __wrap_PLGLDR__Reply; SWAP_EXIT opens it again, idempotent).
     void OnSwapBack();
 
     /// The game's APT session got "the console goes to sleep now" / "it woke up" (see ctr/hook.cpp). Called on the
@@ -197,6 +220,14 @@ private:
     void LogMemory(const char* when);
     /// With the log on: the application region at the start against the last launch of the same title (AzaharLink.mem).
     void CompareMemoryWithLastLaunch();
+    /// Debug-independent (runs even at debug=0): one synchronous line to AzaharLink.log, and an OSD notice, when the
+    /// APPLICATION region already holds far more than a fresh launch of this game would - a closed game still in memory.
+    /// One comparison and at most one synchronous write; the only probe allowed with the log off.
+    void CheckStartupOccupancy();
+    /// Debug-independent too: the framework's connection to Luma3DS's plugin loader, made before PatchProcess (__wrap_plgLdrInit in
+    /// Sources/ctr/plugin.cpp, azl/plg_guard.hpp). One synchronous line to AzaharLink.log when it took more than one try, came without its
+    /// arbiter or did not come; false when there is none (the plugin then stays out of this launch).
+    bool CheckPluginLoaderLink();
     /// Free bytes of the plugin heap (its fixed capacity minus what is allocated), -1 if the capacity is unknown.
     long HeapFreeBytes() const;
     void StartLogWriter();
@@ -204,6 +235,15 @@ private:
     /// The swap of the plugin's block in the trail: the event and the memory regions. WaitForTrail gives the thread a moment to put it on the card (the log on only).
     static void NoteSwapToTrail(u32 kind, u32 number);
     void WaitForTrail(u32 timeout_ms);
+    void RaiseRosalinaReplyWait();
+    /// Plugin::Tick: Luma3DS's plugin word read through its alias; its changes in the log (debug=1), and a synchronous line the first time
+    /// it reads 0 with the plugin running (Rosalina lost this game: no HOME, no EXIT; REGISTRO, phase Q).
+    void WatchLumaWord(u64 now_ms);
+    /// The exit guard (azl/exit_guard.hpp), run by the trampoline (Sources/ctr/exit_tramp.s) on the exiting game's thread, on its own stack.
+    static void RunExitGuard();
+    /// The hook's TrailWaiter (ctr/hook.hpp): after the close command (12), on the game's thread, the trail gets kCloseTrailWaitMs at most to put
+    /// the close on the card. The log on only, a New 3DS only (an Old 3DS's HOME goes through the swap), ended at once by the gate's close.
+    static void WaitForCloseTrail();
     /// The breadcrumb thread (azl/sleep_crumbs.hpp): started with the log on, once; it never writes with the log off.
     void StartCrumbs();
     /// Reports the process events the framework signalled since the last call.
@@ -229,6 +269,9 @@ private:
     /// The console woke up (the game's notification, or the framework's event when the game never showed us the
     /// sleep): the next attempt to join is at once. Main thread, once per frame.
     void HandleWake(u64 now_ms);
+    /// The chat on: its block (allocated the first time, then kept) handed to the room client; off: the room client has none (its
+    /// chat packets dropped unread, nothing sent), the block kept for the next time it is on. Nothing at all while the plugin is off.
+    void WireChat(bool on);
 
     bool initialized_ = false;
     bool config_from_old_place_ = false; ///< the settings were read from /luma/plugins/AzaharLink.ini (an older app wrote them there)
@@ -247,6 +290,8 @@ private:
     std::string joined_nickname_;   ///< the nickname used for the current room session
     u64 game_id_ = 0;
     u64 start_ms_ = 0;
+    u64 start_os_ms_ = 0;          ///< the console's clock (osGetTime) at EarlyInit: the trail's first line of the launch
+    u32 process_id_ = 0;           ///< the game's process id, for the same line
     u8 language_ = 1;              ///< console language (CFG_Language), picks the game's title
 
     CtrKernelOps kernel_;
@@ -281,7 +326,6 @@ private:
     platform::Thread crumb_thread_;
     volatile Handle crumb_wake_ = 0; ///< signalled by NoteSleepEvent (set once, before the thread starts)
     std::atomic<bool> crumb_stop_{false};
-    std::atomic<bool> swap_back_done_{false}; ///< OnSwapBack did what SWAP_EXIT would do
     std::atomic<u32> crumb_written_{0}; ///< the trail's events that are on the card (SleepCrumbs::taken after the writes of a turn)
 
     // The numbers of the last statistics window, for the status page of the menu (written by the writer thread,
@@ -316,6 +360,13 @@ private:
 
     std::string startup_issue_;
     u64 last_issue_ms_ = 0;
+    bool startup_issue_once_ = false; ///< the start-up problem is shown once, not every minute (no connection to Luma3DS's plugin loader)
+    bool swap_console_ = true;        ///< an Old 3DS, where Luma3DS swaps the plugin's block out at HOME (EarlyInit; until then: the safe side)
+    bool luma_alias_ = false;           ///< Luma3DS's plugin word is read through its uncached alias (SetupLumaWordAlias)
+    u32 luma_watch_last_ = 0xFFFFFFFFu; ///< the word at the last look of WatchLumaWord
+    u32 luma_watch_lines_ = 0;          ///< its lines this launch (at most kLumaWatchLines)
+    bool luma_lost_noted_ = false;      ///< the synchronous line of a word at 0 written
+    bool rosalina_wait_raised_ = false; ///< Old 3DS: Rosalina's wait for the framework's answer raised from 10 to 15 s (RaiseRosalinaReplyWait)
     u64 last_hint_ms_ = 0;          ///< the last "no room address" reminder (only with the in-game menu off, see Tick)
     int last_notified_error_ = -1;  ///< last room error shown on screen: do not repeat the same one
 
@@ -325,6 +376,11 @@ private:
     Announcer announcer_;           ///< the messages about it, at most one every 5 s
     bool want_connected_ = false;   ///< "Connect to room" as Tick saw it last (main thread)
     std::atomic<bool> session_dropped_{false}; ///< the game's session was ended by a lost link: say so when the room is back
+    // The chat's switch and corner as the other threads read them: the defaults of Config until LoadConfig reads the file, then
+    // what it read, then what the menu sets (SetChatOn, SetChatPos).
+    std::atomic<bool> chat_on_{true};
+    std::atomic<int> chat_pos_{ini::kChatPosDefault};
+    std::atomic<ChatSink*> chat_sink_{nullptr}; ///< see chat_sink(): one new (std::nothrow) in WireChat, never deleted
     SleepWatch sleep_;              ///< where the console is in a sleep (see OnSleepEnter)
 };
 

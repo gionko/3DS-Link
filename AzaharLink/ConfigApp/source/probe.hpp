@@ -62,6 +62,10 @@ public:
     const std::string& hint() const {
         return hint_;
     }
+    // What the room client said when the test failed (None when it failed for another reason).
+    azl::RoomClient::Error error_code() const {
+        return error_code_;
+    }
     // The room closed on us after a successful test ("" when it did not).
     const std::string& closed_note() const {
         return closed_note_;
@@ -93,6 +97,7 @@ private:
     int info_poll_ = 0;
     int failed_step_ = 0;
     bool joined_info_ = false;
+    azl::RoomClient::Error error_code_ = azl::RoomClient::Error::None;
     std::string error_;
     std::string hint_;
     std::string closed_note_;

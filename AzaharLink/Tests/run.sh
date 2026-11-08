@@ -38,7 +38,9 @@
 # and run by Tests/hle_tests.sh (alone) or Tests/integration.sh (with the room server). test_main also covers
 # NdmHle: the firmware's exclusive state, daemon and scheduler counts, sessions and result codes.
 # sleep_crumbs_test covers the trail of a sleep (AzaharLink.sleep.log): the events of the sleep protocol as lines, the wake marker
-# from the console's clock, the ring under overflow and two producers.
+# from the console's clock, the ring under overflow and two producers, and the close of a game (Luma3DS's plugin word at HOME and EXIT, after
+# ReceiveParameter, the termination request, the lines after a close command). plg_guard_test covers the guard of the framework's link to
+# Luma3DS's plugin loader (azl/plg_guard.hpp): the tries with a fake plgLdrInit, the arbiter, the fetch that answers 0 and never connects, the line.
 # line_test covers the text of the code that runs on the game's threads: azl/line.hpp's pieces, LogLine / DebugLine, the
 # raw records of the hook's two pass-through lines and the heads of the UDS/ndm capture against the printf formats they
 # replaced, and the console clock against gmtime (no printf on a game thread: Tests/policy_check.sh, Tests/stack_usage.sh).
@@ -48,6 +50,22 @@
 # Log() / DebugEvent() (azl/printf_lite.hpp) against newlib's, and the formats of every Log() call in the sources.
 # screen_text_test covers what the screen says about the game's memory (the reading, the mode, the limits, when a warning is told and
 # told again) and about frames lost (too slow a reader or no reader at all, from the game's UDS calls).
+# chat_core_test covers the chat of the room (azl/chat_core.hpp): the cleaning and the cut at 128 of what the room relays, a 5000-character
+# message that costs what 128 do, malformed packets, the ring of 5 and its seqlock (two threads; built again with ThreadSanitizer), the rate
+# limit (50 a second -> 4, 2 of one member: a flood leaves the others theirs), the outgoing box (one a second, only while joined) and no
+# allocation (malloc wrapped by the link). chat_room_probe is the same chat through RoomClient against a real room (Tests/integration.sh).
+# osk_test covers the plugin's one on-screen keyboard (azl/osk.hpp and azl/osk_draw.hpp): its table against the system keyboard's
+# measures and the hit-test of every pixel, typing by touch and by the pad, the repeat, shift, caps lock and the pages, the limits, the
+# password's mask, the scroll, no allocation, and its drawing in the five formats (what changes when a key is lit is inside that key).
+# chat_host_test covers the chat over the running game (azl/chat_host.hpp): the notifications and events that close the keyboard (the low
+# byte, answered only) and the rules of the reopening, the chord, the pace (30 jobs a second at most) and the latch of the keys between two
+# jobs, the handshake that frees the keyboard's picture only when no copy reads it (two threads; built again with ThreadSanitizer), the copy
+# onto the framebuffer (words only, the visible pixels only, in the five formats) and what the OSD callback draws, with no allocation.
+# hid_mirror_test covers the input mirror page (azl/hid_mirror.hpp): the mirror made from the real HID page (the pad's and the touch's entries
+# neutral, "released" for 2 samples, the headers, the accelerometer and the gyroscope live), the look that says nothing is held and the wait
+# for the release (50 ms, at most 1 s), the search of the game's mappings by physical address, and the switch and the way back over a
+# simulated kernel (the threads held across every change, the neighbours the kernel would fold the mirror into, the checks after the map and
+# the unmap, the second try, the mirror again or the address left empty at the swap).
 # dlp_lobby_test, dlp_ipc_test, dlp_lobby_sim_test, dlp_adv_lobby_test and dlp_adv_ipc_test cover the fake Download Play lobby (azl/dlp_types.hpp, dlp_lobby.hpp and
 # dlp_ipc.hpp: pure headers, no engine, no kernel, never more than 4 players, no heap): the searcher's and the creator's logic over an in-memory virtual network
 # (every command x state, the four messages lost, doubled and late, the timers on a clock that wraps), the IPC front-end (the words of every command, the records
@@ -84,7 +102,7 @@ gcc $CFLAGS -c third_party/enet/unix.c -o "$OUT/enet_unix.o"
 
 CORE="Sources/azl/crypto.cpp Sources/azl/log.cpp Sources/azl/platform.cpp Sources/azl/room_proto.cpp
       Sources/azl/uds_frames.cpp Sources/azl/uds_engine.cpp Sources/azl/room_client.cpp
-      Sources/azl/ndm_hle.cpp Sources/azl/arm_reloc.cpp Sources/azl/svc_patch.cpp Sources/azl/log_files.cpp"
+      Sources/azl/ndm_hle.cpp Sources/azl/log_files.cpp"
 
 g++ $CXXFLAGS Tests/test_main.cpp $CORE "$OUT"/enet_*.o -o "$OUT/test_main"
 g++ $CXXFLAGS Tests/ring_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/ring_test"
@@ -93,11 +111,18 @@ g++ $CXXFLAGS Tests/link_policy_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/link_pol
 # enet_path_test: the ENet client's data path (what a service call reads, when the acknowledgements go, the counters); the link wraps
 # the platform layer's three socket calls so that the test can count them, and ENet's clock so that it can hold it
 g++ $CXXFLAGS Tests/enet_path_test.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_wait -Wl,--wrap=enet_time_get -o "$OUT/enet_path_test"
-g++ $CXXFLAGS Tests/reloc_test.cpp Sources/azl/arm_reloc.cpp -o "$OUT/reloc_test"
-# hook_swap_test: the logic of the svc hook around the swap of the plugin's memory on an Old 3DS (azl/hook_swap.hpp: the hand-back of the call that raises the swap, the sites out and back,
-# the re-hook) over an array that plays the game's text; the same source with ThreadSanitizer (the ledger of the sites handed back is claimed by compare-and-swap from game threads)
-g++ $CXXFLAGS Tests/hook_swap_test.cpp Sources/azl/svc_patch.cpp Sources/azl/arm_reloc.cpp -o "$OUT/hook_swap_test"
-g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/hook_swap_test.cpp Sources/azl/svc_patch.cpp Sources/azl/arm_reloc.cpp -o "$OUT/hook_swap_test_tsan"
+# hook_swap_test: the plugin's side of the svc hook's persistent gate around the swap of the plugin's memory on an Old 3DS (azl/hook_swap.hpp: the gate's close and open, with real
+# threads through a model of gate.s, and no word of the game's text written after the installation); the same source with ThreadSanitizer (the gate's count and flag)
+g++ $CXXFLAGS Tests/hook_swap_test.cpp -o "$OUT/hook_swap_test"
+# traced_sessions_test: the table of the game's real sessions the hook follows (azl/traced_sessions.hpp), with the HOME loop of issue 5 (closes not seen); the same with ThreadSanitizer
+g++ $CXXFLAGS Tests/traced_sessions_test.cpp -o "$OUT/traced_sessions_test"
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/traced_sessions_test.cpp -o "$OUT/traced_sessions_test_tsan"
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/hook_swap_test.cpp -o "$OUT/hook_swap_test_tsan"
+# gate_plan_test: the plan of the persistent gate's page of the svc hook (azl/gate_plan.hpp): the words of the branches and the stubs and their 32 MB, where the
+# page goes over the address spaces of the launches in our logs (it reads Tests/gate_maps.json) and made-up ones, and WriteGate (one word per call site, once)
+g++ $CXXFLAGS Tests/gate_plan_test.cpp -o "$OUT/gate_plan_test"
+# kernel_books_test: the arithmetic of the kernel's books of the game's process (azl/books_math.hpp: Charge, Raise, Settle) on a made-up KResourceLimit, the end of the process included
+g++ $CXXFLAGS Tests/kernel_books_test.cpp -o "$OUT/kernel_books_test"
 # swap_gate_test: the gate of the plugin's own threads around that swap (azl/swap_gate.hpp: no service call of theirs under way when the block goes); the same source with ThreadSanitizer
 g++ $CXXFLAGS Tests/swap_gate_test.cpp -o "$OUT/swap_gate_test"
 g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/swap_gate_test.cpp -o "$OUT/swap_gate_test_tsan"
@@ -106,9 +131,32 @@ g++ $CXXFLAGS Tests/soc_plan_test.cpp -o "$OUT/soc_plan_test"
 g++ $CXXFLAGS Tests/text_search_guard_test.cpp Sources/ctr/text_search_guard.cpp -o "$OUT/text_search_guard_test"
 g++ $CXXFLAGS Tests/plugin_compare_test.cpp -o "$OUT/plugin_compare_test"
 g++ $CXXFLAGS Tests/screen_text_test.cpp -o "$OUT/screen_text_test"
+g++ $CXXFLAGS Tests/chat_core_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_core_test"
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/chat_core_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_core_test_tsan"
+# chat_draw_test: the chat's lines on the top screen (azl/chat_draw.hpp) and the drawing under them (azl/gfx_surface.hpp, the font of
+# azl/font_spleen.inc) in fake framebuffers of the five formats, with the 3D, every store counted and no allocation; it writes its pictures
+# (BMP) into the folder it is given
+g++ $CXXFLAGS Tests/chat_draw_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_draw_test"
+# osk_test: the on-screen keyboard (azl/osk.hpp, azl/osk_draw.hpp), its state and its drawing, no allocation once it is made; it writes
+# its pictures (BMP) into the folder it is given
+g++ $CXXFLAGS Tests/osk_test.cpp -Wl,--wrap=malloc -o "$OUT/osk_test"
+# chat_host_test: the chat over the running game (azl/chat_host.hpp), no allocation on the game's thread; again with ThreadSanitizer
+g++ $CXXFLAGS Tests/chat_host_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_host_test"
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -pthread -fsanitize=thread Tests/chat_host_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_host_test_tsan"
+# hid_mirror_test: the input mirror page (azl/hid_mirror.hpp): the page's layout, the wait for the release, the search and the switch over a
+# simulated kernel
+g++ $CXXFLAGS Tests/hid_mirror_test.cpp -o "$OUT/hid_mirror_test"
+# zombie_probe_test: the pure logic of the zombie probe (ctr/zombie_probe.hpp): the scheduling-mask classification, the memory-map merge and
+# walk (never loops, the cap marked), the IPC reply handle-transfer decode, the handle classes, the owned objects of the refcount line and the
+# startup-occupancy decision (the console reads that need svcs are not built on a PC)
+g++ $CXXFLAGS -IIncludes Tests/zombie_probe_test.cpp -o "$OUT/zombie_probe_test"
 g++ $CXXFLAGS Tests/log_files_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/log_files_test"
 g++ $CXXFLAGS Tests/line_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/line_test"
 g++ $CXXFLAGS Tests/sleep_crumbs_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/sleep_crumbs_test"
+g++ $CXXFLAGS Tests/plg_guard_test.cpp -o "$OUT/plg_guard_test"
+# The exit guard (azl/exit_guard.hpp, REGISTRO phase Q): the decision table and its loop against a model of Luma3DS's EXIT (k11 ExitProcess.c,
+# Rosalina's whole-word store and == on the events): cases A, B, SSF4, the exit during a wait, normal.
+g++ $CXXFLAGS Tests/exit_guard_test.cpp -o "$OUT/exit_guard_test"
 g++ $CXXFLAGS Tests/capture_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/capture_test"
 # The fake Download Play lobby: header-only modules (Includes/azl/dlp_*.hpp) and the in-memory network of the tests (Tests/dlp_fakenet.hpp, found beside the
 # tests), so there is nothing to link. ASan/UBSan like the rest: each of these tests defines __ubsan_default_options (halt_on_error=1) and so stops at the
@@ -179,6 +227,14 @@ g++ $CXXFLAGS -IConfigApp/guide Tests/settings_test/guide_test.cpp -o "$OUT/guid
 g++ $CXXFLAGS -IConfigApp/source Tests/settings_test/about_test.cpp -o "$OUT/about_test"
 # update_test: the update from GitHub, what needs no console (ConfigApp/source/update_logic.hpp, plain C++ header): the versions, the redirect of GitHub, which file a run replaces, the CIA that came, the summary, the clock, when the question comes, the words; and the keys of 3DSLink.cfg. The requests themselves are Tests/update_http_test.sh
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/update_test.cpp ConfigApp/source/appcfg.cpp ConfigApp/source/fileio.cpp -o "$OUT/update_test"
+# public_lobbies_test: the page "Public lobbies", what needs no console (ConfigApp/source/public_lobbies.hpp, plain C++ header): the list and the user's own file, what a new list keeps, the room in use that left it, the titles and their regions, the order, the ping's colours, the filters, the search, Quick join
+g++ $CXXFLAGS -IConfigApp/source Tests/settings_test/public_lobbies_test.cpp -o "$OUT/public_lobbies_test"
+# heap_plan_test: the memory the app asks for before main() (ConfigApp/source/heap_plan.hpp, plain C++ header: its own __system_allocateHeaps in heap_alloc.cpp), against a made-up kernel: the split of libctru, 8 KB and 5 MiB outside the books, a game still alive, the wait and the cuts, the New, the Old, the minimum, the log line
+g++ $CXXFLAGS -IConfigApp/source Tests/settings_test/heap_plan_test.cpp -o "$OUT/heap_plan_test"
+# zombie_plan_test: the pure part of 3DS Link's look at a closed game still in memory (ConfigApp/source/zombie_plan.hpp; zombie_census.cpp does the system calls)
+g++ $CXXFLAGS -IConfigApp/source Tests/settings_test/zombie_plan_test.cpp -o "$OUT/zombie_plan_test"
+# room_choices_test: the lists of the in-game menu (Includes/azl/room_choices.hpp): the saved rooms and the public lobbies with the user's own names and passwords, and the memory given back
+g++ $CXXFLAGS Tests/room_choices_test.cpp -o "$OUT/room_choices_test"
 # logrot_test: the title delivery module's log names and rotation and what the app tells it (titleshare_host/logrot.c and hostcfg.c, plain C), against the app's own paths
 for f in logrot hostcfg; do
   gcc -O1 -g -Wall -Wextra -c ConfigApp/titleshare_host/$f.c -o "$OUT/th_$f.o"
@@ -193,6 +249,10 @@ g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/
 # (room_integration and room_ack_probe talk to a real room and read ENet's clock: a monotonic one, Tests/mono_clock.cpp - the wall clock of a VM steps by seconds)
 g++ $CXXFLAGS Tests/room_integration.cpp Tests/mono_clock.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/room_integration"
 g++ $CXXFLAGS Tests/room_probe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_probe"
+# chat_room_probe: the chat through RoomClient against a real room (Tests/integration.sh runs it)
+g++ $CXXFLAGS Tests/chat_room_probe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/chat_room_probe"
+# lobby_probe_test: the rooms of "Public lobbies" asked without joining (ConfigApp/source/lobby_probe.cpp), against real rooms: Tests/integration.sh runs it
+g++ $CXXFLAGS -IConfigApp/source Tests/lobby_probe_test.cpp ConfigApp/source/lobby_probe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/lobby_probe_test"
 # dlp_room_probe: the fake lobby over a real room (Tests/integration.sh runs it; it needs the monotonic clock like room_integration)
 g++ $CXXFLAGS Tests/dlp_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_room_probe"
 g++ $CXXFLAGS Tests/room_routing_probe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_routing_probe"
@@ -210,9 +270,21 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/text_search_guard_test"
   "$OUT/plugin_compare_test"
   "$OUT/screen_text_test"
+  "$OUT/chat_core_test"
+  "$OUT/chat_core_test_tsan"
+  mkdir -p "$OUT/chat-shots"
+  "$OUT/chat_draw_test" "$OUT/chat-shots"
+  mkdir -p "$OUT/osk-shots"
+  "$OUT/osk_test" "$OUT/osk-shots"
+  "$OUT/chat_host_test"
+  "$OUT/chat_host_test_tsan"
+  "$OUT/hid_mirror_test"
+  "$OUT/zombie_probe_test"
   "$OUT/log_files_test"
   "$OUT/line_test"
   "$OUT/sleep_crumbs_test"
+  "$OUT/plg_guard_test"
+  "$OUT/exit_guard_test"
   "$OUT/capture_test"
   timeout 1200 "$OUT/dlp_lobby_test"
   timeout 1200 "$OUT/dlp_ipc_test"
@@ -239,13 +311,20 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/guide_test"
   "$OUT/about_test"
   "$OUT/update_test"
+  "$OUT/public_lobbies_test"
+  "$OUT/heap_plan_test"
+  "$OUT/zombie_plan_test"
+  "$OUT/room_choices_test"
   "$OUT/logrot_test"
   "$OUT/log_module_test"
   "$OUT/ncch_icon_test"
   "$OUT/builtin_keys_test"
-  "$OUT/reloc_test" $RELOC_GAME_CODE   # RELOC_GAME_CODE=<decompressed .code> adds the game sweep
   "$OUT/hook_swap_test"
   "$OUT/hook_swap_test_tsan"
+  "$OUT/gate_plan_test"
+  "$OUT/kernel_books_test"
+  "$OUT/traced_sessions_test"
+  "$OUT/traced_sessions_test_tsan"
   "$OUT/swap_gate_test"
   "$OUT/swap_gate_test_tsan"
   "$OUT/gsp_wrapper_test" $GSP_GAME_CODE   # GSP_GAME_CODE="<decompressed .code> <text size> <expected bl address>" runs the search over a game

@@ -12,11 +12,14 @@ this test runs the compiled plugin (the ELF the 3gx is made of) in the Unicorn A
     capture ring is the real DebugInit() one, the sink of the log is the real LogFiles::Append behind a real
     std::function, the HLE front-end is a real UdsHle (its engine is not built: only the commands that do not reach it
     are run) and the game's Nintendo-SDK thread object is laid out like the smallest thread seen (a 512-byte stack inside a
-    0x228-byte object, SP of the dispatcher at obj+0x1F8, a 16-byte wrapper frame and the 4-byte trampoline push);
-  * every scenario enters azl_svc32_entry / azl_svc23_entry exactly like the per-site trampoline does and the test
-    measures how deep the plugin went below the entry SP (the stack under the entry is canary-filled; the object
-    header and the memory below the object are checked for changes), that the game's registers and flags came back,
-    and what the plugin logged (compared with the printf formats of 0.1.15);
+    0x228-byte object, SP of the dispatcher at obj+0x1F8, a 16-byte wrapper frame and the 4-byte push of the site's stub);
+  * every scenario enters through the svc hook's gate as the game does (analysis/fix-gancio-swap-old-2026-11-05, step 4): the
+    REAL gate of the built ELF (azl_gate_begin .. azl_gate_end) copied into a page below 0x01E80000 with its header pointing at the
+    real azl_pre32 / azl_post32 / azl_pre23 / azl_post23, one three-word stub per kind and ONE word `b stub` at a site of the game; the
+    thread runs from the site and ends at site + 4. The test measures how deep the plugin went below the SP at the gate's entry (the
+    stub's `str lr` is the 4 bytes above it; the stack under it is canary-filled; the object
+    header and the memory below the object are checked for changes), that the game's registers, flags, sp and lr came back, that
+    the gate's count of the threads in the plugin is back to 0, and what the plugin logged (compared with the printf formats of 0.1.15);
   * budgets: the pure pass-through path (any IPC call to a service nobody traces: srv:ReceiveNotification above all)
     must stay within 300 bytes below the entry SP at debug 0 AND debug 1; the other paths that run on a game thread
     (GetServiceHandle, APT, traced services, the fake sessions' open / close) must fit the 464 bytes of the smallest
@@ -43,13 +46,21 @@ last one with a check of what it is told and when) and an engine with a game's s
 follows both statically. 0.1.16 adds: the APT observer of the sleep protocol (what it is told, and that the replies are
 told BEFORE their call), and 60 failing replies in a row on a fake session (the throttle of a polling game thread: the
 sleeps happen, the replies do not change).
+The gate of the hook (analysis/fix-gancio-swap-old-2026-11-05): 10,000 calls of the real azl_pre32 with no post (a swap during the call
+skips the post: pre must take nothing that only post gives back); the swap itself during the svc the gate makes (the flag 0 and the
+plugin's block with no access at all while the thread sleeps in it: the thread goes back to the game touching nothing of the block, the
+post skipped and counted), before the call, with the block back before the thread wakes, and 10,000 times over every kind pre sorts
+(scenario_swap_during_svc); the swap's own compiled calls, CloseGate and OpenGate, with threads counted in the gate (the whole wait, the
+flag the only word written: scenario_close_open_gate); and the join wait of StartFakeSession when the swap closes the gate (it must end at
+once, not after its 8 s).
+Nothing of the game's code changes after the installation: no scenario writes a site again.
 """
 import os
 import re
 import struct
 import sys
 
-from unicorn import (UC_ARCH_ARM, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_ARM, Uc, UcError)
+from unicorn import (UC_ARCH_ARM, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_ARM, UC_PROT_ALL, UC_PROT_NONE, Uc, UcError)
 from unicorn.arm_const import *
 
 # ---- the game's thread: a 512-byte stack with 464 bytes free below the srv call (as measured on a console) -----------------
@@ -58,14 +69,18 @@ STACK_LO = OBJ + 0x28
 STACK_TOP = OBJ + 0x228
 DISPATCHER_SP = OBJ + 0x1F8      # SP in the watcher function when it calls the srv wrapper
 WRAPPER_FRAME = 16               # the game's srv wrapper pushes four registers (r4-r6, lr)
-TRAMPOLINE_PUSH = 4              # the per-site trampoline: push {lr}
-ENTRY_SP = DISPATCHER_SP - WRAPPER_FRAME - TRAMPOLINE_PUSH   # SP at azl_svc32_entry
+STUB_PUSH = 4                    # the stub of the site in the gate's page: str lr, [sp, #-4]!
+ENTRY_SP = DISPATCHER_SP - WRAPPER_FRAME - STUB_PUSH   # SP at azl_gate_32
 FREE_BELOW_DISPATCHER = DISPATCHER_SP - STACK_LO             # 464
 HEADER = {off: 0xAAAA0000 + off for off in range(0, 0x28, 4)}   # ten distinct marks: the test only needs a header that must come back unchanged
 ROOMY_LO = 0x00802000            # a thread with a big stack, for the HLE proper
 ROOMY_TOP = 0x00804000
 ROOMY_ENTRY_SP = ROOMY_TOP - 0x100
-STUB_RET = 0x07F00010            # where the trampoline's `bl` returns to
+STUB_RET = 0x07F00010            # where sim.call returns to
+GATE_PAGE = 0x01E7E000           # the gate's page (as ChooseAddress finds it in every launch of Tests/gate_maps.json)
+GATE_SITE32 = 0x00700000         # a site of the game: `b stub` for svc 0x32 ...
+GATE_SITE23 = 0x00700010         # ... and for svc 0x23; the thread ends at site + 4
+GAME_LR = 0x0012F00C             # the game's lr at the site (the gate gives it back)
 PLUGIN_STACK = 0x07E00000        # a big stack for the setup calls (constructors, DebugInit)
 PLUGIN_STACK_TOP = 0x07E40000
 TLS = 0x08100000
@@ -81,9 +96,13 @@ BELOW = 0xEE
 SIM_THREAD_ID = 42
 SIM_THREAD_PRIORITY = 0x30
 
-# What the pure path WRITES below the entry SP (the canary of the emulator measures that): the hotfix's 108 / 176 less the
-# 20 bytes of the game's wrapper and the trampoline
-PURE_WRITTEN = {0: 88, 1: 156}
+# What the pure path WRITES below the entry SP (the canary of the emulator measures that). The hotfix's 108 / 176 less the 20 bytes of the
+# game's wrapper and the site's push were 88 / 156 with the hook of 1.1.2; with the gate (analysis/fix-gancio-swap-old-2026-11-05, step 4,
+# measured 2026-11-06) 104 / 132: the gate's own frame is 40 or 44 bytes (r1-r3, r12, lr, the flags, and the 16-byte context of pre and
+# post, which the entry of 1.1.2 did not have: +16 at debug 0), then azl_pre32 > PassThroughPre (the context is no longer a frame of its
+# own below them: -24 at debug 1).
+# Well under BUDGET_PURE; a growth past these is a decision, written here.
+PURE_WRITTEN = {0: 104, 1: 132}
 BUDGET_PURE = 300                # bytes below the entry SP, pure pass-through path, debug 0 and 1
 # The HLE proper (what Run() reaches: Dispatch, NdmHle, NoteCommand's Log) is not held to a small thread's budget -
 # Tests/stack_usage.sh budgets its frames - but its depth is pinned to a ceiling a little above today's (debug 0: 176 / 224,
@@ -104,7 +123,7 @@ LOG_CALL_CEILING = {0: 48, 1: 320}
 DEBUGEVENT_CALL_CEILING = {0: 48, 1: 320}
 # The printf family of newlib: executed by none of the hook's own paths (see Sim.enter)
 FORMATTERS = ('vsnprintf', '_vsnprintf_r', '_svfprintf_r', 'snprintf', 'sprintf', '_svfiprintf_r', '_vfiprintf_r', 'sniprintf')
-BUDGET_THREAD = FREE_BELOW_DISPATCHER - WRAPPER_FRAME - TRAMPOLINE_PUSH   # 444: what is left under the entry SP
+BUDGET_THREAD = FREE_BELOW_DISPATCHER - WRAPPER_FRAME - STUB_PUSH   # 444: what is left under the entry SP
 BUDGET_LOG = 340                 # the paths that write a line of the main log (through the real LogFiles::Append): 292 now
 
 ARM_REGS = [UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6,
@@ -171,6 +190,11 @@ class Elf:
         return self.symbols[hits[0]]
 
 
+def branch(frm, to, link=False):
+    """`b` (or `bl`) at `frm` to `to`, ARM state (azl/gate_plan.hpp: EncodeBranch)"""
+    return (0xEB000000 if link else 0xEA000000) | (((to - (frm + 8)) >> 2) & 0x00FFFFFF)
+
+
 def p32(uc, addr, value):
     uc.mem_write(addr, struct.pack('<I', value & 0xFFFFFFFF))
 
@@ -209,6 +233,8 @@ class Sim:
         uc.mem_map(HEAP, HEAP_SIZE)
         uc.mem_map(REENT, 0x1000)
         uc.mem_map(STUB_RET & ~0xFFF, 0x1000)
+        uc.mem_map(GATE_PAGE, 0x2000)
+        uc.mem_map(GATE_SITE32 & ~0xFFF, 0x1000)
         uc.reg_write(UC_ARM_REG_C13_C0_3, TLS)
         self.heap_next = HEAP
         self.ticks = 0
@@ -235,7 +261,8 @@ class Sim:
         self.clear_event_fails = False
         self.yields = 0
         self.yield_pending = False
-        self.end_addr = STUB_RET        # where run_game stops: the trampoline's return, or the call site a call was handed back to
+        self.end_addr = STUB_RET        # where run_game stops: site + 4 (Sim.enter)
+        self.gate_closed_in_call = False  # a scenario that closes the gate during a call (its post may be skipped)
         self.win_entry = None       # the depth of ONE function (see window_begin)
         self.win_entry_sp = None
         self.win = None
@@ -277,9 +304,37 @@ class Sim:
             check((self.call(elf.sym('_ZN3azl9DebugInitEv'), []) & 0xFF) == 1, 'DebugInit() gave the capture a ring')
         if hle:
             self.setup_hle()
+        self.install_gate()
         self.log_lines.clear()          # (what the setup logged is not the scenario's)
         if level > 0:
             self.clear_capture()
+
+    def install_gate(self):
+        """The gate as InstallSvcHooks writes it (azl/gate_plan.hpp, WriteGate): the gate's code copied from the ELF into its page, the
+        header at zero but for pre/post (the real ones) and flag = 1, one stub per kind, ONE word `b stub` at each site; g_gate_flag points
+        at the header's flag, as after the installation."""
+        uc, elf = self.uc, self.elf
+        begin, end = elf.sym('azl_gate_begin'), elf.sym('azl_gate_end')
+        code = bytearray(uc.mem_read(begin, end - begin))
+        code[:0x64] = b'\0' * 0x64
+        uc.mem_write(GATE_PAGE, bytes(code))
+        for off, name in ((0x08, 'azl_pre32'), (0x0C, 'azl_post32'), (0x10, 'azl_pre23'), (0x14, 'azl_post23')):
+            p32(uc, GATE_PAGE + off, elf.sym(name))
+        p32(uc, GATE_PAGE, 1)
+        stubs = GATE_PAGE + ((end - begin + 3) & ~3)
+        self.gate_stubs = {}
+        for k, (kind, site, entry) in enumerate(((32, GATE_SITE32, 'azl_gate_32'), (23, GATE_SITE23, 'azl_gate_23'))):
+            stub = stubs + 12 * k
+            gate = GATE_PAGE + elf.sym(entry) - begin
+            for i, w in enumerate((0xE52DE004, branch(stub + 4, gate, True), branch(stub + 8, site + 4))):
+                p32(uc, stub + 4 * i, w)
+            p32(uc, site, branch(site, stub))
+            p32(uc, site + 4, 0xE7F000F0)          # (an undefined instruction: the thread stops before it, at site + 4)
+            self.gate_stubs[kind] = (site, stub)
+        p32(uc, elf.find('g_gate_flag'), GATE_PAGE)
+
+    def gate_word(self, off):
+        return r32(self.uc, GATE_PAGE + off)
 
     # ---- helpers ----
     def alloc(self, size, align=8):
@@ -521,7 +576,7 @@ class Sim:
             p32(uc, OBJ + off, v)
 
     def run_game(self, begin):
-        """Runs the game thread from `begin` until it returns to the trampoline. When it waits or sleeps and `on_yield` is set, the other
+        """Runs the game thread from `begin` until it is back at site + 4 (end_addr). When it waits or sleeps and `on_yield` is set, the other
         thread runs in its place (the registers of the game thread are saved and put back)."""
         uc = self.uc
         pc = begin
@@ -544,11 +599,14 @@ class Sim:
                 pc |= 1
 
     def enter(self, entry_symbol, handle, name, roomy=False):
-        """The game's thread calls the hooked svc through the per-site trampoline. Returns (r0, depth, ok).
+        """The game's thread makes the hooked svc ('gate32': svc 0x32, 'gate23': svc 0x23) at its site: `b stub`, the stub, the gate, the
+        plugin, the svc in the gate, back to site + 4. Returns (r0, depth, ok).
         `roomy`: a thread with a big stack (the HLE proper is run there: it needs more than the small threads have)."""
         uc = self.uc
         stack_lo, stack_top = (ROOMY_LO, ROOMY_TOP) if roomy else (STACK_LO, STACK_TOP)
         entry_sp = ROOMY_ENTRY_SP if roomy else ENTRY_SP
+        site, _stub = self.gate_stubs[{'gate32': 32, 'gate23': 23}[entry_symbol]]
+        skipped0 = self.gate_word(0x20)
         self.reset_game_stack(roomy)
         self.scenario = name
         self.roomy = roomy
@@ -561,16 +619,17 @@ class Sim:
         for r, v in marks.items():
             uc.reg_write(r, v)
         uc.reg_write(UC_ARM_REG_R0, handle)
-        uc.reg_write(UC_ARM_REG_SP, entry_sp)
-        uc.reg_write(UC_ARM_REG_LR, STUB_RET)
+        uc.reg_write(UC_ARM_REG_SP, entry_sp + STUB_PUSH)     # the game's SP at the site: the stub pushes its lr below it
+        uc.reg_write(UC_ARM_REG_LR, GAME_LR)
         cpsr = uc.reg_read(UC_ARM_REG_CPSR)
         flags_in = (cpsr & 0x0FFFFFFF) | 0xA0000000   # N and C set
         uc.reg_write(UC_ARM_REG_CPSR, flags_in)
         self.min_sp = entry_sp
         self.measuring = True
         self.entry_sp = entry_sp
+        self.end_addr = site + 4
         try:
-            self.run_game(self.elf.sym(entry_symbol))
+            self.run_game(site)
         except UcError as e:
             self.measuring = False
             check(False, '%s: emulation error %s at pc=%08x (%s)' % (name, e, self.pc, self.where(self.pc)))
@@ -595,9 +654,16 @@ class Sim:
             if uc.reg_read(r) != v:
                 ok = False
                 check(False, '%s: register %d not preserved (%08x)' % (name, r - UC_ARM_REG_R0, uc.reg_read(r)))
-        if uc.reg_read(UC_ARM_REG_SP) != entry_sp:
+        if uc.reg_read(UC_ARM_REG_SP) != entry_sp + STUB_PUSH or uc.reg_read(UC_ARM_REG_LR) != GAME_LR:
             ok = False
-            check(False, '%s: SP not restored' % name)
+            check(False, '%s: SP or LR not restored (%08x, %08x)' % (name, uc.reg_read(UC_ARM_REG_SP), uc.reg_read(UC_ARM_REG_LR)))
+        # the gate: nobody counted in the plugin any more, and a post skipped only when a scenario closed the gate during the call
+        if self.gate_word(0x04) != 0:
+            ok = False
+            check(False, '%s: the gate still counts %d thread(s) in the plugin' % (name, self.gate_word(0x04)))
+        if self.gate_word(0x20) != skipped0 and self.gate_word(0x00) == 1 and not self.gate_closed_in_call:
+            ok = False
+            check(False, '%s: a post was skipped with the gate open' % name)
         if (uc.reg_read(UC_ARM_REG_CPSR) & 0xF0000000) != (flags_in & 0xF0000000):
             ok = False
             check(False, '%s: condition flags not preserved' % name)
@@ -614,8 +680,11 @@ class Sim:
         low = next((i for i, b in enumerate(stack) if b != CANARY), None)
         depth_sp = entry_sp - self.min_sp
         depth_written = entry_sp - (stack_lo + low) if low is not None else 0
-        # nothing written above the entry SP (the game's own frames): the bytes from entry_sp up are the canary too
-        above = stack[entry_sp - stack_lo:]
+        # nothing written above the entry SP (the game's own frames) but the stub's lr: the bytes from entry_sp + 4 up are the canary too
+        if r32(uc, entry_sp) != GAME_LR:
+            ok = False
+            check(False, '%s: the stub did not keep the game\'s lr at the entry SP (%08x)' % (name, r32(uc, entry_sp)))
+        above = stack[entry_sp + STUB_PUSH - stack_lo:]
         # (the sim does not build the game's frames: the area is canary, and the plugin must not touch it)
         if above != bytes([CANARY]) * len(above):
             ok = False
@@ -720,7 +789,7 @@ def scenario_pure(elf, level):
     sim = Sim(elf, level, hle=True)
     sim.kernel = srv_reply([0x000B0040, 0, 0x100])           # the reply: result 0, notification id 0x100
     sim.set_request([0x000B0000])
-    r0, depth, ok = sim.enter('azl_svc32_entry', 0x14801F, 'pure')
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'pure')
     check(r0 == 0, 'pure pass-through: the result of the svc comes back in r0')
     check(r32(sim.uc, sim.cmd() + 8) == 0x100, 'pure pass-through: the reply words are the kernel\'s')
     check(sim.svc_log.count(0x32) == 1, 'pure pass-through: exactly one svc 0x32')
@@ -728,7 +797,7 @@ def scenario_pure(elf, level):
     # The same call as the emulator's canary sees it (the lowest byte of the thread's stack that was WRITTEN, which is what
     # Tests of the TFH object measure on Azahar): a frame that is reserved but not written does not show there, and a 64-bit
     # argument passed on the stack through the hot frame (AccountCall, 0.1.16 first cut) added 12 bytes to it at debug 0. The
-    # numbers are the hotfix's canary (108 / 176 with the game's wrapper and the trampoline, 20 bytes) less those 20.
+    # numbers are the hotfix's canary (108 / 176 with the game's wrapper and the site's push, 20 bytes) less those 20.
     check(sim.last_written <= PURE_WRITTEN[level],
           'pass-through at debug %d: %d bytes written below the entry SP, the hotfix wrote %d' % (level, sim.last_written, PURE_WRITTEN[level]))
     print('  pass-through (srv ReceiveNotification) at debug %d: %d bytes written, SP down to %d' % (level, sim.last_written, sim.last_sp_depth))
@@ -743,16 +812,16 @@ def scenario_pure(elf, level):
     sim.kernel = lambda s, n: 0xD8E007F7
     sim.set_request([0x00170042, 0xDEADBEEF])
     sim.clear_capture()
-    r0, depth2, ok = sim.enter('azl_svc32_entry', 0x1B002A, 'pure error')
+    r0, depth2, ok = sim.enter('gate32', 0x1B002A, 'pure error')
     check(r0 == 0xD8E007F7, 'pure pass-through: an error result comes back')
     record('pass-through (kernel error)', level, depth2, BUDGET_PURE, 'pure')
     if level > 0:
         check(sim.capture_lines() == ['ipc h=0x1b002a cmd=0x00170042 arg=0xdeadbeef -> 0xd8e007f7'],
               'pure pass-through at debug 1: an error result is logged as the result (%r)' % (sim.capture_lines(),))
-    # CloseHandle through azl_svc23_entry
+    # CloseHandle through the gate's svc 0x23 entry
     sim.kernel = None
-    r0, depth3, ok = sim.enter('azl_svc23_entry', 0x1B002A, 'close')
-    record('CloseHandle (azl_hook_CloseHandle)', level, depth3, BUDGET_PURE, 'pure')
+    r0, depth3, ok = sim.enter('gate23', 0x1B002A, 'close')
+    record('CloseHandle (azl_pre23)', level, depth3, BUDGET_PURE, 'pure')
 
 
 def scenario_diet(elf, level):
@@ -765,7 +834,7 @@ def scenario_diet(elf, level):
     worst = 0
     for i in range(6):
         sim.set_request([0x000B0000, 0x1000 + i])
-        r0, depth, ok = sim.enter('azl_svc32_entry', 0x14801F, 'diet call %d' % i)
+        r0, depth, ok = sim.enter('gate32', 0x14801F, 'diet call %d' % i)
         worst = max(worst, depth)
         check(r0 == 0, 'diet: the result of the svc is not touched by the capture')
     whole = ['ipc h=0x14801f cmd=0x000b0000 arg=0x%x -> 0x00000000' % (0x1000 + i) for i in range(3)]
@@ -776,7 +845,7 @@ def scenario_diet(elf, level):
     # does that must not be deeper than any other), the writer thread writes the line
     sim.ticks += 1200 * 268112
     sim.set_request([0x000B0000, 0x2000])
-    r0, depth, ok = sim.enter('azl_svc32_entry', 0x14801F, 'diet call that finds its second over')
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'diet call that finds its second over')
     record('pass-through, the call that finds the second over', level, depth, BUDGET_PURE, 'pure')
     check(depth <= worst + 8, 'diet: a call that hands a count over is not deeper than the others (%d against %d)' % (depth, worst))
     lines = sim.capture_lines()
@@ -792,7 +861,7 @@ def scenario_diet(elf, level):
     sim.clear_capture()
     for i in range(5):
         sim.set_request([0x00170042, i])
-        sim.enter('azl_svc32_entry', 0x14801F, 'failing call %d' % i)
+        sim.enter('gate32', 0x14801F, 'failing call %d' % i)
     check(len(sim.capture_lines()) == 5 and all(l.endswith('-> 0xd8e007f7') for l in sim.capture_lines()),
           'diet: five failing calls of one kind are five whole lines (%r)' % (sim.capture_lines(),))
     # a hole: the heavy lane is full (the ring's used count is set to the limit), the call is dropped and counted; when there
@@ -802,12 +871,12 @@ def scenario_diet(elf, level):
     sim.clear_capture()
     p32(uc, elf.find('g_dbg_used'), 480 * 1024 - 8)
     sim.set_request([0x000C0000, 7])
-    sim.enter('azl_svc32_entry', 0x14801F, 'call into a full lane')
+    sim.enter('gate32', 0x14801F, 'call into a full lane')
     check(r32(uc, elf.find('g_dbg_used')) == 480 * 1024 - 8, 'lanes: a record the heavy lane has no room for is not written')
     p32(uc, elf.find('g_dbg_tail'), r32(uc, elf.find('g_dbg_head')))
     p32(uc, elf.find('g_dbg_used'), 0)
     sim.set_request([0x000C0000, 8])
-    r0, depth, ok = sim.enter('azl_svc32_entry', 0x14801F, 'call that writes the marker of a hole')
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'call that writes the marker of a hole')
     record('pass-through, the call that writes the marker of a hole', level, depth, BUDGET_PURE, 'pure')
     # (the emulator's canary of Tri Force Heroes' thread once met this call and read 184 bytes against the hotfix's 176: the
     # marker is written word by word from registers now, and the path is no deeper than a plain call)
@@ -825,7 +894,7 @@ def scenario_diet(elf, level):
     p32(uc, elf.find('g_dbg_miss_anyE'), 1)
     sim.clear_capture()
     sim.set_request([0x000C0000, 9])
-    r0, depth, ok = sim.enter('azl_svc32_entry', 0x14801F, 'call that folds in the records given up for the lock')
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'call that folds in the records given up for the lock')
     record('pass-through, the call that folds in the records given up for the lock', level, depth, BUDGET_PURE, 'pure')
     check(depth <= worst + 16, 'lanes: the call that folds in the given-up records is one small frame deeper at the most (%d against %d)' %
           (depth, worst))
@@ -841,7 +910,7 @@ def scenario_getservice(elf, level):
     # srv:GetServiceHandle 'fs:USER' -> 0, handle 0x1b002a: a real service nobody traces
     sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1B002A])
     sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('fs:USER'))) + [7, 0])
-    r0, depth, ok = sim.enter('azl_svc32_entry', 0x14801F, 'getservice')
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'getservice')
     record('srv GetServiceHandle (a real service)', level, depth, BUDGET_LOG, 'log')
     if level > 0:
         check(sim.log_lines == ["srv: the game opened the REAL service 'fs:USER' -> 0x00000000 (handle 0x1b002a)"],
@@ -857,13 +926,13 @@ def scenario_traced(elf, level):
     sim = Sim(elf, level, hle=True)
     sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1C0031])
     sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('ac:u'))) + [4, 0])
-    sim.enter('azl_svc32_entry', 0x14801F, 'getservice ac:u')
+    sim.enter('gate32', 0x14801F, 'getservice ac:u')
     sim.log_lines.clear()
     sim.clear_capture() if level > 0 else None
     # a command of the traced session: ac:u 0x0029 with arg 0x1234 -> result 0
     sim.kernel = srv_reply([0x00290040, 0xC8A01234])
     sim.set_request([0x00290000 | 0x42, 0x1234])
-    r0, depth, ok = sim.enter('azl_svc32_entry', 0x1C0031, 'traced command')
+    r0, depth, ok = sim.enter('gate32', 0x1C0031, 'traced command')
     record('a command of a traced real service (ac:u)', level, depth, BUDGET_LOG, 'log')
     if level > 0:
         check(sim.log_lines == ['svc: REAL ac:u command 0x0029 (arg 0x1234) -> 0xc8a01234'],
@@ -873,199 +942,6 @@ def scenario_traced(elf, level):
     else:
         check(sim.log_lines == [], 'debug 0: a traced command logs nothing')
         check(sim.svc_log.count(0x32) == 2, 'debug 0: the traced command is still passed on')
-
-
-def scenario_handback(elf, level):
-    """APT:ReceiveParameter(application) in the seconds after the HOME button, on an Old 3DS: the swap of the plugin's memory is raised at the end of that
-    call, on the calling thread, which sleeps in the kernel until the block is gone and back, so the call must not be made from the plugin's code
-    (svc_entry.s, azl_handback_site). The real compiled code and the real assembly run: the thread ends at the call site with the registers, flags, sp
-    and lr the game had, the site holds the game's own words again, the counter of the threads in the hook is back to zero, and the path (the extra
-    push of the entry, the question, the site's two stores and the cache calls) stays within the budget of the pure path. The same call goes the
-    normal way when it is not an Old 3DS, when no HOME button was seen, and when the HOME button is old news."""
-    site = 0x00200000
-    original = (0xEF000032, 0xE1A00001)
-    tramp = STUB_RET - 8
-    game_lr = 0x00123454
-    sim = Sim(elf, level, hle=True)
-    uc = sim.uc
-    uc.mem_map(site, 0x1000)
-    p32(uc, site, 0xE51FF004)
-    p32(uc, site + 4, tramp)
-    for i, w in enumerate((site, original[0], original[1], tramp)):
-        p32(uc, elf.find('g_sites') + 4 * i, w)
-    p32(uc, elf.find('g_site_count'), 1)
-    uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', 1))
-    p32(uc, elf.find('g_home_seen'), 1)
-    p32(uc, elf.find('g_home_ms'), 0)
-    stats = elf.find('g_swap_stats')
-    ledger = elf.find('g_ledger')
-    counter = elf.find('azl_hooks_in_flight')
-    handle = 0x1D8031
-    sim.set_request([0x000D0080, 0x300])
-    sim.reset_game_stack(False)
-    sim.scenario = 'hand-back'
-    sim.roomy = False
-    p32(uc, ENTRY_SP, game_lr)                       # the word the trampoline pushed
-    marks = {UC_ARM_REG_R1: 0x11111111, UC_ARM_REG_R2: 0x22222222, UC_ARM_REG_R3: 0x33333333, UC_ARM_REG_R4: 0x44444444,
-             UC_ARM_REG_R5: 0x55555555, UC_ARM_REG_R6: 0x66666666, UC_ARM_REG_R7: 0x77777777, UC_ARM_REG_R8: 0x88888888,
-             UC_ARM_REG_R9: 0x99999999, UC_ARM_REG_R10: 0xAAAAAAAA, UC_ARM_REG_R11: 0xBBBBBBBB, UC_ARM_REG_R12: 0xCCCCCCCC}
-    for r, v in marks.items():
-        uc.reg_write(r, v)
-    uc.reg_write(UC_ARM_REG_R0, handle)
-    uc.reg_write(UC_ARM_REG_SP, ENTRY_SP)
-    uc.reg_write(UC_ARM_REG_LR, STUB_RET)
-    flags_in = (uc.reg_read(UC_ARM_REG_CPSR) & 0x0FFFFFFF) | 0xA0000000
-    uc.reg_write(UC_ARM_REG_CPSR, flags_in)
-    sim.min_sp = ENTRY_SP
-    sim.measuring = True
-    sim.entry_sp = ENTRY_SP
-    sim.end_addr = site
-    svc_before = sim.svc_log.count(0x32)
-    try:
-        sim.run_game(elf.sym('azl_svc32_entry'))
-    except UcError as e:
-        check(False, 'hand-back: emulation error %s at pc=%08x (%s)' % (e, sim.pc, sim.where(sim.pc)))
-        return
-    finally:
-        sim.measuring = False
-        sim.end_addr = STUB_RET
-    check(uc.reg_read(UC_ARM_REG_PC) == site, 'hand-back: the thread is at the call site (pc=%08x)' % uc.reg_read(UC_ARM_REG_PC))
-    check(sim.svc_log.count(0x32) == svc_before, 'hand-back: the plugin did not make the svc 0x32 itself')
-    check(uc.reg_read(UC_ARM_REG_R0) == handle, 'hand-back: r0 is the handle the game had')
-    for r, v in marks.items():
-        check(uc.reg_read(r) == v, 'hand-back: register %d is not the game\'s (%08x)' % (r - UC_ARM_REG_R0, uc.reg_read(r)))
-    check(uc.reg_read(UC_ARM_REG_SP) == ENTRY_SP + 4, 'hand-back: sp is the one the game had at the call site')
-    check(uc.reg_read(UC_ARM_REG_LR) == game_lr, 'hand-back: lr is the game\'s')
-    check((uc.reg_read(UC_ARM_REG_CPSR) & 0xF0000000) == (flags_in & 0xF0000000), 'hand-back: condition flags not preserved')
-    check(r32(uc, site) == original[0] and r32(uc, site + 4) == original[1], 'hand-back: the call site has the game\'s own svc and next instruction')
-    check(r32(uc, counter) == 0, 'hand-back: the counter of the threads in the hook is back to zero (%d)' % r32(uc, counter))
-    check(r32(uc, ledger) == 1, 'hand-back: the site is in the ledger of the sites to hook again')
-    check(r32(uc, stats + 4 * 8) == 1 and r32(uc, stats + 4 * 9) == 0, 'hand-back: one call handed back, none refused')
-    check(r32(uc, stats + 4 * 11) == 1 and r32(uc, stats + 4 * 12) == 0, 'hand-back: one call asked about, none without a HOME button')
-    depth = ENTRY_SP - sim.min_sp
-    record('hand-back (APT ReceiveParameter, Old 3DS)', level, depth, BUDGET_PURE, 'pure')
-    print('  hand-back (APT ReceiveParameter) at debug %d: SP down to %d' % (level, depth))
-    # the same call, not handed back: not an Old 3DS / no HOME button seen / the HOME button is old news
-    def arrange(old_3ds, home_seen, ticks):
-        uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', old_3ds))
-        p32(uc, elf.find('g_home_seen'), home_seen)
-        p32(uc, elf.find('g_home_ms'), 0)
-        sim.ticks = ticks
-
-    for what, state in (('not an Old 3DS', (0, 1, 0)), ('no HOME button seen', (1, 0, 0)), ('the HOME button is old news', (1, 1, 30 * 268112000))):
-        p32(uc, site, 0xE51FF004)
-        p32(uc, site + 4, tramp)
-        p32(uc, ledger, 0)
-        arrange(*state)
-        sim.kernel = srv_reply([0x000D0040, 0])
-        sim.set_request([0x000D0080, 0x300])
-        n32 = sim.svc_log.count(0x32)
-        asked0, no_home0 = r32(uc, stats + 4 * 11), r32(uc, stats + 4 * 12)
-        r0, depth2, ok = sim.enter('azl_svc32_entry', handle, 'receive parameter, %s' % what)
-        check(r32(uc, stats + 4 * 11) == asked0 + 1, 'APT ReceiveParameter (%s): the question is counted' % what)
-        check(r32(uc, stats + 4 * 12) == no_home0 + (0 if what == 'not an Old 3DS' else 1), 'APT ReceiveParameter (%s): counted as without a HOME button only when it is' % what)
-        check(sim.svc_log.count(0x32) == n32 + 1, 'APT ReceiveParameter (%s): the plugin makes the svc itself' % what)
-        check(r32(uc, site) == 0xE51FF004 and r32(uc, site + 4) == tramp, 'APT ReceiveParameter (%s): the call site is left in the hook' % what)
-        check(r32(uc, counter) == 0, 'APT ReceiveParameter (%s): the counter is back to zero' % what)
-        record('APT ReceiveParameter, %s' % what, level, depth2, BUDGET_PURE, 'pure')
-
-
-def scenario_power_handback(elf, level):
-    """The power button on an Old 3DS (a Luma dump of 2026-11-01: a prefetch abort at the `bx lr` of svcSendSyncRequest in the plugin's unmapped memory, with the game's
-    APT:ReceiveParameter on the stack): the notification of the power button must make the next ReceiveParameter go back to its call site, as the HOME button does.
-    The real compiled code from the entry down: before the notification the call stays in the hook, a notification that does not come before a swap (shutdown) changes
-    nothing, and the reply word of a real console for the power button (0x1BC00008, bits above the signal included) arms the hand-back."""
-    site = 0x00200000
-    original = (0xEF000032, 0xE1A00001)
-    tramp = STUB_RET - 8
-    game_lr = 0x00123454
-    sim = Sim(elf, level, hle=True)
-    uc = sim.uc
-    uc.mem_map(site, 0x1000)
-    p32(uc, site, 0xE51FF004)
-    p32(uc, site + 4, tramp)
-    for i, w in enumerate((site, original[0], original[1], tramp)):
-        p32(uc, elf.find('g_sites') + 4 * i, w)
-    p32(uc, elf.find('g_site_count'), 1)
-    uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', 1))
-    p32(uc, elf.find('g_home_seen'), 0)
-    seen = elf.find('g_home_seen')
-    stats = elf.find('g_swap_stats')
-    told = sim.alloc(16, 4)                                   # the observer of the trail: its lines are made before the call
-    uc.mem_write(told, struct.pack('<I', 0xE12FFF1E))
-    sim.hooks[told] = ('aptobs', 'apt')
-    p32(uc, elf.find('g_apt_observer'), told)
-    sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1D0041])
-    sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('APT:U'))) + [5, 0])
-    sim.enter('azl_svc32_entry', 0x14801F, 'getservice APT:U')
-    apt = 0x1D0041
-    sim.apt_calls.clear()
-    # what the dump shows: no HOME button, so the plugin makes the svc itself and the thread sleeps in the kernel inside the plugin's code
-    sim.kernel = srv_reply([0x000D0040, 0])
-    sim.set_request([0x000D0080, 0x300])
-    n32 = sim.svc_log.count(0x32)
-    sim.enter('azl_svc32_entry', apt, 'receive parameter, before the power button')
-    check(sim.svc_log.count(0x32) == n32 + 1, 'power: before the notification the plugin makes the svc itself')
-    made = [c for c in sim.apt_calls if c[0] == 8]
-    if level > 0:
-        check(len(made) == 1 and made[0][2] == n32, 'power: the trail is told that the plugin makes the call, before it does (%r)' % (made,))
-    else:
-        check(made == [], 'power: at debug 0 the trail is told nothing')
-    check(r32(uc, site) == 0xE51FF004 and r32(uc, site + 4) == tramp, 'power: before the notification the call site stays in the hook')
-    for word, armed, what in ((7, 0, 'shutdown'), (0x0607, 0, 'shutdown, with bits in the second byte'), (0x0608, 1, 'the power button, with bits in the second byte (issue 5)'), (0x1BC00008, 1, 'the power button, as a console says it')):
-        sim.kernel = srv_reply([0x000B0080, 0, word])
-        sim.set_request([0x000B0040, 0x300])
-        sim.enter('azl_svc32_entry', apt, 'apt inquire, %s' % what)
-        check(r32(uc, seen) == armed, 'power: after the notification of %s the hand-back is %s' % (what, 'armed' if armed else 'not armed'))
-        if level > 0:
-            check(sim.apt_calls[-1][:2] == (1, word), 'power: the trail gets the word as it came (%r)' % (sim.apt_calls[-1:],))
-    # the two calls of the transition, as they came back
-    input_buffer = sim.alloc(16, 4)
-    uc.mem_write(input_buffer, struct.pack('<H', 0x1234))
-    sim.apt_calls.clear()
-    sim.kernel = srv_reply([0x004B0082, 0])
-    sim.set_request([0x004B00C2, 7, 2, 0, 0x00002002, input_buffer])
-    sim.enter('azl_svc32_entry', apt, 'apt applet utility')
-    if level > 0:
-        check(sim.apt_calls[-2:] and [c[:2] for c in sim.apt_calls[-2:]] == [(19, 0x12340007), (20, 0)], 'power: the trail gets the AppletUtility and its result (%r)' % (sim.apt_calls[-2:],))
-    else:
-        check(sim.apt_calls == [], 'power: at debug 0 the AppletUtility is not looked at')
-    # a failed call leaves an old word in cmd[2]: it arms nothing
-    p32(uc, seen, 0)
-    sim.kernel = srv_reply([0x000B0080, 0xC8A0CFF0, 0x0608])
-    sim.set_request([0x000B0040, 0x300])
-    sim.enter('azl_svc32_entry', apt, 'apt inquire that failed')
-    check(r32(uc, seen) == 0, 'power: a failed InquireNotification does not arm the hand-back')
-    sim.kernel = srv_reply([0x000B0080, 0, 0x0608])
-    sim.set_request([0x000B0040, 0x300])
-    sim.enter('azl_svc32_entry', apt, 'apt inquire again')
-    check(r32(uc, seen) == 1, 'power: the same word from a call that succeeded arms it')
-    sim.set_request([0x000D0080, 0x300])
-    sim.reset_game_stack(False)
-    sim.scenario = 'power hand-back'
-    sim.roomy = False
-    p32(uc, ENTRY_SP, game_lr)
-    uc.reg_write(UC_ARM_REG_R0, apt)
-    uc.reg_write(UC_ARM_REG_SP, ENTRY_SP)
-    uc.reg_write(UC_ARM_REG_LR, STUB_RET)
-    sim.min_sp = ENTRY_SP
-    sim.measuring = True
-    sim.entry_sp = ENTRY_SP
-    sim.end_addr = site
-    n32 = sim.svc_log.count(0x32)
-    try:
-        sim.run_game(elf.sym('azl_svc32_entry'))
-    except UcError as e:
-        check(False, 'power: emulation error %s at pc=%08x (%s)' % (e, sim.pc, sim.where(sim.pc)))
-        return
-    finally:
-        sim.measuring = False
-        sim.end_addr = STUB_RET
-    check(uc.reg_read(UC_ARM_REG_PC) == site, 'power: the thread is at the call site (pc=%08x)' % uc.reg_read(UC_ARM_REG_PC))
-    check(sim.svc_log.count(0x32) == n32, 'power: the plugin did not make the svc 0x32 itself')
-    check(uc.reg_read(UC_ARM_REG_LR) == game_lr, "power: lr is the game's")
-    check(r32(uc, site) == original[0] and r32(uc, site + 4) == original[1], "power: the call site has the game's own svc and next instruction")
-    check(r32(uc, stats + 4 * 8) == 1 and r32(uc, stats + 4 * 9) == 0, 'power: one call handed back, none refused')
 
 
 def scenario_game_failure(elf, level):
@@ -1079,7 +955,7 @@ def scenario_game_failure(elf, level):
     p32(uc, elf.find('g_apt_observer'), told)
     sim.kernel = lambda s, n: 0xD8E007F7
     sim.set_request([0x004B00C2, 7, 1, 2, 3, 4, 5])
-    r0, depth, ok = sim.enter('azl_svc32_entry', 0, 'handle 0')
+    r0, depth, ok = sim.enter('gate32', 0, 'handle 0')
     check(r0 == 0xD8E007F7, 'failure: the result of the call goes back to the game untouched')
     record('a failed call: its line for the trail (the observer is a stub)', level, depth, 340, 'log')
     calls = list(sim.apt_calls)
@@ -1092,64 +968,315 @@ def scenario_game_failure(elf, level):
         check(values[8:15] == [0x004B00C2, 7, 1, 2, 3, 4, 5], 'failure: the thread, its priority and core, the hook, the last session, then the command buffer (%r)' % (values,))
         check(len(calls) <= 30, 'failure: the line fits the ring of the trail (%d of 32)' % len(calls))
         n = len(sim.apt_calls)
-        sim.enter('azl_svc32_entry', 0, 'handle 0 again')
+        sim.enter('gate32', 0, 'handle 0 again')
         check(len(sim.apt_calls) == n, 'failure: a thread that insists is not told again within 100 ms')
         sim.apt_calls.clear()
         sim.kernel = None
         sim.set_request([0x00010800, 1, 0xD8E007F7, 0x00123450])
         sleeps = sim.svc_log.count(0x0A)
         n32 = sim.svc_log.count(0x32)
-        sim.enter('azl_svc32_entry', 0x1B002A, 'err:f')
+        sim.enter('gate32', 0x1B002A, 'err:f')
         check(sim.apt_calls and sim.apt_calls[0][:2] == (12, 0x1B002A) and all(c[2] == n32 for c in sim.apt_calls), 'failure: err:f is told before the call is made')
         check(sim.svc_log.count(0x0A) == sleeps + 1 and sim.svc_log.count(0x32) == n32 + 1, 'failure: err:f gives the trail a moment, then the call is made')
 
 
-def scenario_resume_keeps_receive(elf, level):
-    """The thread that brings the plugin's block back wakes up after its own svc: when the framework puts the hooks back, the word after the svc of APT:ReceiveParameter must still be the game's (the
-    ErrDisp of issue 5, not proven to be this: an APT call with handle 0 right after the swap back). The real compiled code: a ReceiveParameter through the hook notes its site, the swap takes all the
-    sites out, the resume leaves that one to the game and hooks the others, and the frame callback's re-arm hooks it a while later. A site that is `svc; bx lr` is every call of the game: it goes back at once."""
+TRACED_SLOTS = 16          # Sources/ctr/hook.cpp: kMaxTracedSessions
+TRACED_SLOT_BYTES = 24     # azl/traced_sessions.hpp, TracedSession on ARM32: handle, name[12], apt (+3), used
+
+
+def traced_table(sim):
+    """The table of the traced sessions (TracedTable<16>: the slots, the clock, the stats): (the handles of the slots, (stale, evicted, dropped))"""
+    words = struct.unpack('<%dI' % (TRACED_SLOTS * TRACED_SLOT_BYTES // 4 + 4),
+                          bytes(sim.uc.mem_read(sim.elf.find('g_traced'), TRACED_SLOTS * TRACED_SLOT_BYTES + 16)))
+    per = TRACED_SLOT_BYTES // 4
+    return tuple(words[per * i] for i in range(TRACED_SLOTS)), tuple(words[TRACED_SLOTS * per + 1:])
+
+
+def scenario_pre_without_post(elf, level):
+    """A swap of the plugin's block during a call skips that call's post (the gate calls post only while the plugin is there): so nothing pre
+    takes may wait for post to give it back. 10,000 calls of the REAL azl_pre32 with no post, over every kind pre sorts - srv:GetServiceHandle
+    (its post adds the session to the table), a command of a traced session, an APT notification, a plain call - make no svc 0x32, answer the
+    action each kind asks for, and leave the table of the traced sessions (the same sessions, nothing added or freed, its counters) and the count
+    of the trace lines as they were. The hook works as before after them."""
     sim = Sim(elf, level, hle=True)
     uc = sim.uc
-    sites_at = elf.find('g_sites')
-    base = 0x00200000
-    uc.mem_map(base, 0x1000)
-    tramp_lit = STUB_RET - 8
-    # site 0: the game's ReceiveParameter, reached through its trampoline; site 1: any other call; site 2: another trampoline, for the wrapper
-    original = ((0xEF000032, 0xE1A04000), (0xEF000032, 0xE1A05000))
-    for i, (w0, w1) in enumerate(original):
-        site, tramp = base + 0x40 * i, tramp_lit if i == 0 else tramp_lit - 0x40
-        p32(uc, site, 0xE51FF004)
-        p32(uc, site + 4, tramp)
-        for k, w in enumerate((site, w0, w1, tramp)):
-            p32(uc, sites_at + 16 * i + 4 * k, w)
-    p32(uc, elf.find('g_site_count'), 2)
-    uc.mem_write(elf.find('g_old_3ds'), struct.pack('<B', 1))
-    p32(uc, elf.find('g_home_seen'), 0)
-    sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1D0041])
-    sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('APT:U'))) + [5, 0])
-    sim.enter('azl_svc32_entry', 0x14801F, 'getservice APT:U')
-    apt = 0x1D0041
-    # with no HOME button seen the call stays with the hook, and its site is noted
-    sim.kernel = srv_reply([0x000D0040, 0])
-    sim.set_request([0x000D0080, 0x300])
-    sim.enter('azl_svc32_entry', apt, 'receive parameter, noted')
-    ledger = elf.find('g_ledger')
-    receive = ledger + 4 * (8 + 1)
-    check(r32(uc, receive) == 1, 'resume: the site of ReceiveParameter is noted (%d)' % r32(uc, receive))
-    check(r32(uc, base) == 0xE51FF004, 'resume: noting it changes nothing in the site')
-    sim.call(elf.find('SuspendSvcHooks'), [100])
-    for i, (w0, w1) in enumerate(original):
-        check(r32(uc, base + 0x40 * i) == w0 and r32(uc, base + 0x40 * i + 4) == w1, 'resume: site %d is the game\'s during the swap' % i)
-    sim.call(elf.find('ResumeSvcHooks'), [])
-    check(r32(uc, base) == original[0][0] and r32(uc, base + 4) == original[0][1], 'resume: the site of ReceiveParameter still has the game\'s next word when the thread wakes up')
-    check(r32(uc, base + 0x40) == 0xE51FF004, 'resume: the other sites are back in the hook')
-    check(r32(uc, ledger) == 1, 'resume: the site waits in the ledger')
-    sim.call(elf.find('RearmHandedBackSites'), [])
-    check(r32(uc, base) == original[0][0], 'resume: not hooked again at once')
-    sim.ticks += 3 * 268112000
-    sim.call(elf.find('RearmHandedBackSites'), [])
-    check(r32(uc, base) == 0xE51FF004 and r32(uc, base + 4) == tramp_lit, 'resume: hooked again a while later')
-    check(r32(uc, receive) == 1, 'resume: the site stays noted for the next swap')
+    for name, session in (('ac:u', 0x1C0031), ('APT:U', 0x1D0042)):     # two sessions in the table, opened through the hook
+        sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, session])
+        sim.set_request([0x00050100] + list(struct.unpack('<2I', name12(name))) + [len(name), 0])
+        sim.enter('gate32', 0x14801F, 'getservice ' + name)
+    handles0, stats0 = traced_table(sim)
+    check(0x1C0031 in handles0 and 0x1D0042 in handles0, 'pre without post: the two sessions are in the table (%r)' % (handles0,))
+    check(sim.uc.mem_read(elf.find('g_traced') + handles0.index(0x1C0031) * TRACED_SLOT_BYTES + 4, 5) == b'ac:u\0',
+          'pre without post: the layout of the table is the one the test reads')
+    lines0 = r32(uc, elf.find('g_trace_lines'))
+    pre = elf.sym('azl_pre32')
+    ctx = sim.alloc(16)
+    # (the actions of Sources/ctr/hook.cpp: 1 the svc, 2 the debug line of a plain call, 3 GetServiceHandle, 4 a traced command, 5 an APT command
+    #  of the sleep protocol; with the log off the traced and the plain calls need no post)
+    kinds = [
+        ('srv:GetServiceHandle cfg:u', 0x14801F, [0x00050100] + list(struct.unpack('<2I', name12('cfg:u'))) + [5, 0], 3),
+        ('a command of ac:u', 0x1C0031, [0x00290042, 0x1234], 4 if level > 0 else 1),
+        ('APT InquireNotification', 0x1D0042, [0x000B0040, 0x300], 5),
+        ('a plain call', 0x1B002A, [0x00170042, 0xDEADBEEF], 2 if level > 0 else 1),
+    ]
+    n32 = sim.svc_log.count(0x32)
+    wrong = None
+    for i in range(10000):
+        what, handle, words, want = kinds[i % len(kinds)]
+        sim.set_request(words)
+        r0 = sim.call(pre, [handle, STUB_RET + 8, ctx])
+        r1 = uc.reg_read(UC_ARM_REG_R1)
+        if wrong is None and (r0, r1) != (handle, want):
+            wrong = (i, what, r0, r1, want)
+    check(wrong is None, 'pre without post: every pre answers the handle and the action of its kind (%r)' % (wrong,))
+    check(sim.svc_log.count(0x32) == n32, 'pre without post: pre makes no svc 0x32 (%d made)' % (sim.svc_log.count(0x32) - n32))
+    handles1, stats1 = traced_table(sim)
+    check(handles1 == handles0, 'pre without post: the table holds the same sessions (%r -> %r)' % (handles0, handles1))
+    check(stats1 == stats0, 'pre without post: no entry of the table was freed, given up or dropped (%r -> %r)' % (stats0, stats1))
+    check(r32(uc, elf.find('g_trace_lines')) == lines0, 'pre without post: the trace lines are counted by post only')
+    # the hook as before: a command of the traced session, through the entry
+    if level > 0:
+        sim.clear_capture()
+    sim.kernel = srv_reply([0x00290040, 0xC8A01234])
+    sim.set_request([0x00290042, 0x1234])
+    r0, depth, ok = sim.enter('gate32', 0x1C0031, 'traced command after 10,000 pre')
+    check(ok and r0 == 0 and sim.svc_log.count(0x32) == n32 + 1, 'pre without post: the hook passes a call on as before')
+    if level > 0:
+        check(sim.capture_lines() == ['svc REAL ac:u cmd 0x0029 arg 0x1234 -> 0xc8a01234'],
+              'pre without post: the traced command still has its capture line (%r)' % (sim.capture_lines(),))
+    print('  10,000 pre without post at debug %d: table and counters unchanged' % level)
+
+
+def plugin_block(sim):
+    """What the swap of an Old 3DS takes away, as far as a game thread can tell: the plugin's image (the ELF's segments), its heap, its own
+    threads' stacks and the newlib state the sim gives a thread in the plugin (REENT). The gate's page, the game's code, stack and TLS stay."""
+    segs = sim.elf.segments
+    lo = min(s[0] for s in segs) & ~0xFFF
+    hi = (max(s[0] + s[3] for s in segs) + 0xFFF) & ~0xFFF
+    return [(lo, hi - lo), (HEAP, HEAP_SIZE), (PLUGIN_STACK, PLUGIN_STACK_TOP - PLUGIN_STACK), (REENT, 0x1000)]
+
+
+def swap_out(sim):
+    """SWAP_ENTER, as a game thread sees it: the gate's flag goes to 0 (CloseGate), then the block is gone (here: no access of any kind,
+    so a read, a write or a fetch of the plugin's memory stops the emulation with an error)."""
+    p32(sim.uc, GATE_PAGE, 0)
+    for base, size in plugin_block(sim):
+        sim.uc.mem_protect(base, size, UC_PROT_NONE)
+
+
+def swap_in(sim):
+    """The block mapped again, then the gate open (OnSwapBack, after the framework's reply)."""
+    for base, size in plugin_block(sim):
+        sim.uc.mem_protect(base, size, UC_PROT_ALL)
+    p32(sim.uc, GATE_PAGE, 1)
+
+
+def scenario_swap_during_svc(elf, level):
+    """The defect the gate is for (analysis/fix-gancio-swap-old-2026-11-05): on an Old 3DS the HOME button swaps the plugin's block out while a
+    game thread sleeps in a svc of a hooked site, and brings it back later. With the gate the svc is the gate's own, in its page: the swap
+    (flag 0, then the block gone, here with no access at all) happens INSIDE that svc, the thread wakes up on the gate's instructions, skips
+    the post (counted in post_skipped) and goes back to the game at site + 4 with the kernel's answer, touching nothing of the block. The
+    same with the block back before the thread wakes (the post then runs), with the swap before the call (straight to the kernel, for both
+    svc), and 10,000 calls of every kind pre sorts with the swap in every svc: one svc each, every post asked for skipped and counted, the
+    table of the traced sessions and the count of the lines as they were, nobody left counted in the gate. The hook as before after them."""
+    sim = Sim(elf, level, hle=False)
+    uc = sim.uc
+    for name, session in (('ac:u', 0x1C0031), ('APT:U', 0x1D0042)):     # two sessions in the table, opened through the hook
+        sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, session])
+        sim.set_request([0x00050100] + list(struct.unpack('<2I', name12(name))) + [len(name), 0])
+        sim.enter('gate32', 0x14801F, 'getservice ' + name)
+    handles0, stats0 = traced_table(sim)
+    lines0 = r32(uc, elf.find('g_trace_lines'))
+    state = {'when': None, 'swaps': 0}
+
+    def at_svc(s, num):
+        pc = s.uc.reg_read(UC_ARM_REG_PC) - 4
+        if state['when'] is None or num not in (0x32, 0x23) or not GATE_PAGE <= pc < GATE_PAGE + 0x2000:
+            return
+        state['swaps'] += 1
+        swap_out(s)                       # SWAP_ENTER while the thread sleeps in the gate's svc
+        if state['when'] == 'back':
+            swap_in(s)                    # ... and the block back before it wakes up
+    sim.on_svc_seen = at_svc
+
+    def getservice(name, session):
+        sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, session])
+        sim.set_request([0x00050100] + list(struct.unpack('<2I', name12(name))) + [len(name), 0])
+
+    # 1. the block goes during the svc of GetServiceHandle(cfg:u): the post that would put the session in the table is skipped
+    getservice('cfg:u', 0x1E0051)
+    skipped0, n32 = sim.gate_word(0x20), sim.svc_log.count(0x32)
+    state['when'], sim.gate_closed_in_call = 'out', True
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'the swap during the svc of GetServiceHandle')
+    state['when'], sim.gate_closed_in_call = None, False
+    gone = sim.gate_word(0x00) == 0
+    swap_in(sim)
+    check(ok and state['swaps'] == 1 and gone, 'swap during the svc: the thread came back to the game with the block gone (ok %s, swaps %d)' % (ok, state['swaps']))
+    check(r0 == 0 and r32(uc, sim.cmd() + 12) == 0x1E0051, 'swap during the svc: the game has the kernel\'s answer (r0 %08x, handle %08x)' % (r0, r32(uc, sim.cmd() + 12)))
+    check(sim.svc_log.count(0x32) == n32 + 1, 'swap during the svc: one svc 0x32, the gate\'s')
+    check(sim.gate_word(0x20) == skipped0 + 1, 'swap during the svc: the post is skipped and counted (%d -> %d)' % (skipped0, sim.gate_word(0x20)))
+    check(traced_table(sim) == (handles0, stats0), 'swap during the svc: the skipped post took nothing (%r)' % (traced_table(sim),))
+    record('the swap during the svc of GetServiceHandle (post skipped)', level, depth, BUDGET_LOG, 'log')
+    # 2. the block goes and comes back while the thread sleeps: the post runs, as with no swap at all
+    getservice('cfg:u', 0x1E0052)
+    skipped0 = sim.gate_word(0x20)
+    state['when'], sim.gate_closed_in_call = 'back', True
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'the swap and the way back during the svc of GetServiceHandle')
+    state['when'], sim.gate_closed_in_call = None, False
+    handles2, _stats2 = traced_table(sim)
+    check(ok and r0 == 0 and sim.gate_word(0x20) == skipped0, 'swap and back during the svc: the post ran (skipped %d -> %d)' % (skipped0, sim.gate_word(0x20)))
+    check(0x1E0052 in handles2, 'swap and back during the svc: the post put the session in the table (%r)' % (handles2,))
+    # 3. the swap before the call: the thread finds the flag 0 and goes straight to the kernel, both svc, no pre (the block is not there)
+    for kind, handle, words, what in (('gate32', 0x1B002A, [0x00170042, 0xDEADBEEF], 'a plain call'), ('gate23', 0x1C0031, [], 'CloseHandle of ac:u')):
+        sim.kernel = srv_reply([0x00170040, 0])
+        sim.set_request(words)
+        before = (sim.svc_log.count(0x32), sim.svc_log.count(0x23), sim.gate_word(0x20))
+        swap_out(sim)
+        sim.gate_closed_in_call = True
+        r0, depth, ok = sim.enter(kind, handle, 'the swap before the call (%s)' % what)
+        sim.gate_closed_in_call = False
+        after = (sim.svc_log.count(0x32), sim.svc_log.count(0x23), sim.gate_word(0x20))
+        swap_in(sim)
+        want = (before[0] + (kind == 'gate32'), before[1] + (kind == 'gate23'), before[2])
+        check(ok and r0 == 0 and after == want, 'swap before the call (%s): straight to the kernel, one svc, nothing skipped (%r -> %r)' % (what, before, after))
+    # 4. 10,000 calls with the swap in every svc, over every kind pre sorts (the post of 3 of them asked at debug 1, of 2 at debug 0)
+    sim.kernel = lambda s, num: 0
+    kinds = [
+        ('srv:GetServiceHandle cfg:u', 0x14801F, [0x00050100] + list(struct.unpack('<2I', name12('cfg:u'))) + [5, 0], True),
+        ('a command of ac:u', 0x1C0031, [0x00290042, 0x1234], level > 0),
+        ('APT InquireNotification', 0x1D0042, [0x000B0040, 0x300], True),
+        ('a plain call', 0x1B002A, [0x00170042, 0xDEADBEEF], level > 0),
+    ]
+    handles0, stats0 = traced_table(sim)
+    lines0 = r32(uc, elf.find('g_trace_lines'))     # (the post of case 2 wrote its line)
+    site, _stub = sim.gate_stubs[32]
+    n32, skipped0, swaps0 = sim.svc_log.count(0x32), sim.gate_word(0x20), state['swaps']
+    posts = 0
+    wrong = None
+    state['when'] = 'out'
+    for i in range(10000):
+        what, handle, words, post = kinds[i % len(kinds)]
+        sim.set_request(words)
+        uc.reg_write(UC_ARM_REG_R0, handle)
+        uc.reg_write(UC_ARM_REG_SP, ENTRY_SP + STUB_PUSH)
+        uc.reg_write(UC_ARM_REG_LR, GAME_LR)
+        sim.end_addr = site + 4
+        try:
+            sim.run_game(site)
+        except UcError as e:
+            wrong = (i, what, 'emulation error %s at %08x' % (e, sim.pc))
+            swap_in(sim)
+            break
+        swap_in(sim)
+        posts += 1 if post else 0
+        if (uc.reg_read(UC_ARM_REG_SP), uc.reg_read(UC_ARM_REG_LR), uc.reg_read(UC_ARM_REG_R0)) != (ENTRY_SP + STUB_PUSH, GAME_LR, 0):
+            wrong = (i, what, 'sp %08x lr %08x r0 %08x' % (uc.reg_read(UC_ARM_REG_SP), uc.reg_read(UC_ARM_REG_LR), uc.reg_read(UC_ARM_REG_R0)))
+            break
+    state['when'] = None
+    check(wrong is None, '10,000 swaps in the svc: every call back to the game, at site + 4, with the kernel\'s answer (%r)' % (wrong,))
+    check(state['swaps'] - swaps0 == 10000 and sim.svc_log.count(0x32) - n32 == 10000,
+          '10,000 swaps in the svc: one svc each, and the swap in each (%d svc, %d swaps)' % (sim.svc_log.count(0x32) - n32, state['swaps'] - swaps0))
+    check(sim.gate_word(0x20) - skipped0 == posts, '10,000 swaps in the svc: every post asked for is skipped and counted (%d of %d)' % (sim.gate_word(0x20) - skipped0, posts))
+    check(sim.gate_word(0x04) == 0, '10,000 swaps in the svc: nobody is left counted in the gate (%d)' % sim.gate_word(0x04))
+    check(traced_table(sim) == (handles0, stats0), '10,000 swaps in the svc: the table holds the same sessions, nothing freed or dropped (%r)' % (traced_table(sim),))
+    check(r32(uc, elf.find('g_trace_lines')) == lines0, '10,000 swaps in the svc: no line counted (the lines are the post\'s)')
+    # 5. the hook as before
+    if level > 0:
+        sim.clear_capture()
+    sim.kernel = srv_reply([0x00290040, 0xC8A01234])
+    sim.set_request([0x00290042, 0x1234])
+    n32 = sim.svc_log.count(0x32)
+    r0, depth, ok = sim.enter('gate32', 0x1C0031, 'traced command after 10,000 swaps in the svc')
+    check(ok and r0 == 0 and sim.svc_log.count(0x32) == n32 + 1, 'after the swaps: the hook passes a call on as before')
+    if level > 0:
+        check(sim.capture_lines() == ['svc REAL ac:u cmd 0x0029 arg 0x1234 -> 0xc8a01234'],
+              'after the swaps: the traced command has its capture line (%r)' % (sim.capture_lines(),))
+    print('  swap during the svc at debug %d: post skipped and counted, %d posts of 10,000 calls skipped, nothing of the block touched' % (level, posts))
+
+
+WAKE_FN = 0x00A00000             # scenario_close_open_gate: a wake function of four instructions (counts its calls in WAKE_COUNT)
+WAKE_COUNT = 0x00A00100
+
+
+def scenario_close_open_gate(elf, level):
+    """The swap's own calls, compiled (Sources/ctr/hook.cpp CloseGate / OpenGate, what NoteProcessEvent and OnSwapBack run on a console), on the
+    gate's page as the installation leaves it: with a game thread counted in the gate (in_flight 1) that never leaves, CloseGate puts the flag
+    to 0 at once, waits in slices for its whole time (here 500 ms) and gives back 1, the count still there; with two that leave at the third and
+    the fifth slice it gives back 0 after five, and calls the wake function once, with the flag already 0; OpenGate puts the flag back. In all
+    of it nothing is written but the flag (no other word of the header, nothing of the gate's code, the stubs or the sites), and without a page
+    neither call does anything. The pins of policy_check hold the text; this holds the code the plugin runs."""
+    sim = Sim(elf, level)
+    uc = sim.uc
+    close, open_gate = elf.find('3ctr9CloseGate'), elf.find('3ctr8OpenGate')
+    g_gate = elf.find('6g_gateE')
+    uc.mem_map(WAKE_FN, 0x1000)
+    for i, w in enumerate((0xE5901000, 0xE2811001, 0xE5801000, 0xE12FFF1E)):   # ldr r1, [r0]; add r1, r1, #1; str r1, [r0]; bx lr
+        p32(uc, WAKE_FN + 4 * i, w)
+    sim.tick_step = 268112      # (1 ms per read of the clock)
+
+    # no page: nothing at all
+    n = len(sim.svc_log)
+    check(r32(uc, g_gate) == 0, 'close/open: no gate before the installation sets it')
+    check(sim.call(close, [500, WAKE_FN, WAKE_COUNT]) == 0 and len(sim.svc_log) == n and sim.gate_word(0x00) == 1 and r32(uc, WAKE_COUNT) == 0,
+          'close/open: without a page CloseGate does nothing')
+    p32(uc, GATE_PAGE, 0)
+    sim.call(open_gate, [])
+    check(sim.gate_word(0x00) == 0, 'close/open: without a page OpenGate does nothing')
+    p32(uc, GATE_PAGE, 1)
+
+    p32(uc, g_gate, GATE_PAGE)
+    page0 = bytes(uc.mem_read(GATE_PAGE, 0x2000))
+    sites0 = [r32(uc, a) for a in (GATE_SITE32, GATE_SITE32 + 4, GATE_SITE23, GATE_SITE23 + 4)]
+    rw = [(s[0], s[0] + s[3]) for s in elf.segments]
+    writes = []
+
+    def on_write(u, access, address, size, value, user):
+        if address == GATE_PAGE or WAKE_COUNT <= address < WAKE_COUNT + 4 or PLUGIN_STACK <= address < PLUGIN_STACK_TOP:
+            return
+        if GATE_PAGE <= address < GATE_PAGE + 0x2000 or GATE_SITE32 & ~0xFFF <= address < (GATE_SITE32 & ~0xFFF) + 0x1000 \
+                or not any(lo <= address < hi for lo, hi in rw):
+            writes.append((address, size, value))
+    hook = uc.hook_add(UC_HOOK_MEM_WRITE, on_write)
+
+    # 1. a thread counted in the gate that never leaves: the close waits its whole time and gives the count back
+    p32(uc, GATE_PAGE + 4, 1)
+    seen = []
+    sim.on_svc_seen = lambda s, num: seen.append((num, s.gate_word(0x00), s.gate_word(0x04)))
+    left = sim.call(close, [500, 0, 0])
+    sleeps = [x for x in seen if x[0] == 0x0A]
+    check(left == 1 and sim.gate_word(0x04) == 1, 'close: a thread that never leaves is still counted at the end (%d left, in_flight %d)' % (left, sim.gate_word(0x04)))
+    check(sim.gate_word(0x00) == 0, 'close: the flag is 0 at the end')
+    check(sleeps and all(f == 0 and c == 1 for _, f, c in sleeps), 'close: every slice of the wait with the flag 0 and the thread counted (%r)' % (sleeps[:3],))
+    check(450 <= len(sleeps) <= 550, 'close: the close waits its whole time, in slices (%d slices of the 500 ms)' % len(sleeps))
+    # 2. two threads in the gate that leave at the third and the fifth slice, and the wake function
+    sim.call(open_gate, [])
+    check(sim.gate_word(0x00) == 1, 'open: the flag is 1 again')
+    p32(uc, GATE_PAGE + 4, 2)
+    state = {'sleeps': 0, 'flag_at_wake': []}
+
+    def leave(s, num):
+        if num == 0x0A:
+            state['sleeps'] += 1
+            if state['sleeps'] in (3, 5):
+                p32(s.uc, GATE_PAGE + 4, r32(s.uc, GATE_PAGE + 4) - 1)
+    sim.on_svc_seen = leave
+    wake_hook = uc.hook_add(UC_HOOK_CODE, lambda u, a, sz, d: state['flag_at_wake'].append(sim.gate_word(0x00)), begin=WAKE_FN, end=WAKE_FN)
+    left = sim.call(close, [500, WAKE_FN, WAKE_COUNT])
+    uc.hook_del(wake_hook)
+    sim.on_svc_seen = None
+    check(left == 0 and state['sleeps'] == 5, 'close: the close ends when the last thread leaves (%d left after %d slices)' % (left, state['sleeps']))
+    check(r32(uc, WAKE_COUNT) == 1 and state['flag_at_wake'] == [0], 'close: the wake function once, with the flag already 0 (%d calls, flag %r)' % (r32(uc, WAKE_COUNT), state['flag_at_wake']))
+    # 3. the way back
+    sim.call(open_gate, [])
+    sim.call(open_gate, [])
+    uc.hook_del(hook)
+    check(sim.gate_word(0x00) == 1, 'open: the flag is 1 again (twice: idempotent)')
+    page1 = bytes(uc.mem_read(GATE_PAGE, 0x2000))
+    check(page1[8:] == page0[8:], 'close/open: nothing of the page changed but the flag and the count the test set (header, gate, stubs)')
+    check([r32(uc, a) for a in (GATE_SITE32, GATE_SITE32 + 4, GATE_SITE23, GATE_SITE23 + 4)] == sites0, 'close/open: the sites are as the installation wrote them')
+    check(not writes, 'close/open: no write but the flag, the plugin\'s own data and stack (%r)' % (writes[:3],))
+    p32(uc, GATE_PAGE + 4, 0)
+    print('  CloseGate / OpenGate at debug %d: %d slices with a thread that never leaves, 5 with two that leave, only the flag written' % (level, len(sleeps)))
 
 
 def scenario_worker_off_core1(elf, level):
@@ -1320,7 +1447,7 @@ def scenario_apt(elf, level):
     p32(uc, elf.find('g_apt_observer'), stub + 32)
     sim.kernel = srv_reply([0x00050100 | 0x40, 0, 0, 0x1D0041])
     sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('APT:U'))) + [5, 0])
-    sim.enter('azl_svc32_entry', 0x14801F, 'getservice APT:U')
+    sim.enter('gate32', 0x14801F, 'getservice APT:U')
     sim.log_lines.clear()
     if level > 0:
         sim.clear_capture()
@@ -1336,7 +1463,7 @@ def scenario_apt(elf, level):
         sim.kernel = srv_reply([0x000B0080, 0, ident])
         sim.set_request([0x000B0040, 0x300])
         n32 = sim.svc_log.count(0x32)
-        r0, depth, ok = sim.enter('azl_svc32_entry', apt, 'apt inquire %d' % ident)
+        r0, depth, ok = sim.enter('gate32', apt, 'apt inquire %d' % ident)
         worst = max(worst, depth)
         if ident != 0:
             told.append((1, ident, n32 + 1))                   # a notification is told after the call returned
@@ -1358,13 +1485,13 @@ def scenario_apt(elf, level):
     sim.kernel = srv_reply([0x003E0040, 0])
     sim.set_request([0x003E0080, 0x300, 1])
     n32 = sim.svc_log.count(0x32)
-    r0, depth, ok = sim.enter('azl_svc32_entry', apt, 'apt reply sleep query')
+    r0, depth, ok = sim.enter('gate32', apt, 'apt reply sleep query')
     worst = max(worst, depth)
     told.append((2, 1, n32))                                   # the game's answer is told BEFORE its call
     sim.kernel = srv_reply([0x003F0040, 0])
     sim.set_request([0x003F0040, 0x300])
     n32 = sim.svc_log.count(0x32)
-    r0, depth, ok = sim.enter('azl_svc32_entry', apt, 'apt sleep complete')
+    r0, depth, ok = sim.enter('gate32', apt, 'apt sleep complete')
     worst = max(worst, depth)
     told.append((3, 0, n32))                                   # ... and so is its acknowledgement of the sleep (it may not return)
     if level > 0:
@@ -1394,7 +1521,7 @@ def scenario_hle_front(elf, level):
         words = struct.unpack('<2I', name12(svc))
         sim.set_request([0x00050100, words[0], words[1], len(svc), 0])
         before = sim.svc_log.count(0x32)
-        r0, depth, ok = sim.enter('azl_svc32_entry', 0x14801F, 'open ' + svc)
+        r0, depth, ok = sim.enter('gate32', 0x14801F, 'open ' + svc)
         worst = max(worst, depth)
         check(sim.svc_log.count(0x32) == before, 'the fake %s session is answered without the kernel' % svc)
         handles[svc] = r32(sim.uc, sim.cmd() + 12)
@@ -1414,7 +1541,7 @@ def scenario_hle_front(elf, level):
         sim.clear_capture()
     sim.kernel = lambda s, n: (_ for _ in ()).throw(AssertionError('the real kernel was called'))
     sim.set_request([0x00140040, 0x0F])    # ndm command 0x14 with one word (as the tests of the ndm front-end do)
-    r0, depth, ok = sim.enter('azl_svc32_entry', handles['ndm:u'], 'ndm command', roomy=True)
+    r0, depth, ok = sim.enter('gate32', handles['ndm:u'], 'ndm command', roomy=True)
     record('HLE: a command of the fake ndm:u (RunTraced, NdmHle, NoteCommand)', level, depth, HLE_CEILING[level], 'hle')
     if level > 0:
         check(sim.capture_lines() == ['ndm cmd 0x14 req 0000000f -> rep 00000000'],
@@ -1426,7 +1553,7 @@ def scenario_hle_front(elf, level):
     sim.log_lines.clear()
     if level > 0:
         sim.clear_capture()
-    r0, depth, ok = sim.enter('azl_svc32_entry', handles['nwm::UDS'], 'uds command 0x23', roomy=True)
+    r0, depth, ok = sim.enter('gate32', handles['nwm::UDS'], 'uds command 0x23', roomy=True)
     check(r32(sim.uc, sim.cmd() + 8) == 0x07FF, 'the fake nwm::UDS answers command 0x23 with the channel mask')
     if level > 0:
         check(sim.capture_lines() == ['uds cmd 0x23 req 00000000 -> rep 00000000 000007ff'],
@@ -1441,13 +1568,13 @@ def scenario_hle_front(elf, level):
         check(sim.log_lines[0] == 'uds: command 0x23 is first called by thread %d at priority 0x%02x' % (SIM_THREAD_ID, SIM_THREAD_PRIORITY),
               'HLE: the first-caller line carries the thread id and the priority the kernel answered (%r)' % (sim.log_lines[:1],))
     record('HLE: UdsHle::Dispatch of a command that needs no engine', level, depth, HLE_CEILING[level], 'hle')
-    # closing them (azl_svc23_entry -> azl_hook_CloseHandle -> NoteHandleClosed)
+    # closing them (the gate's svc 0x23 entry -> azl_pre23 -> NoteHandleClosed)
     sim.log_lines.clear()
     if level > 0:
         sim.clear_capture()
     worst = 0
     for svc in ('ndm:u', 'nwm::UDS'):
-        r0, depth, ok = sim.enter('azl_svc23_entry', handles[svc], 'close ' + svc)
+        r0, depth, ok = sim.enter('gate23', handles[svc], 'close ' + svc)
         worst = max(worst, depth)
     record('closing a fake session (UdsHle::NoteHandleClosed)', level, worst, BUDGET_LOG, 'log')
     if level > 0:
@@ -1468,7 +1595,7 @@ def scenario_throttle(elf, level):
     sim.kernel = lambda s, n: (_ for _ in ()).throw(AssertionError('the real kernel was called'))
     words = struct.unpack('<2I', name12('nwm::UDS'))
     sim.set_request([0x00050100, words[0], words[1], 8, 0])
-    sim.enter('azl_svc32_entry', 0x14801F, 'open nwm::UDS', roomy=True)
+    sim.enter('gate32', 0x14801F, 'open nwm::UDS', roomy=True)
     uds = r32(sim.uc, sim.cmd() + 12)
     sim.log_lines.clear()
     if level > 0:
@@ -1477,7 +1604,7 @@ def scenario_throttle(elf, level):
     worst = 0
     for i in range(60):
         sim.set_request([0x00FF0040, 0])
-        r0, depth, ok = sim.enter('azl_svc32_entry', uds, 'failing poll %d' % i, roomy=True)
+        r0, depth, ok = sim.enter('gate32', uds, 'failing poll %d' % i, roomy=True)
         worst = max(worst, depth)
         check(r32(sim.uc, sim.cmd() + 4) == 0xD900182F and r32(sim.uc, sim.cmd()) == 0x00000040,
               'throttle: the reply of call %d is the unchanged unknown-command answer' % i)
@@ -1495,7 +1622,7 @@ def scenario_throttle(elf, level):
     before = sim.svc_log.count(0x0A)
     for i in range(80):
         sim.set_request([0x00230040, 0])
-        sim.enter('azl_svc32_entry', uds, 'successful call %d' % i, roomy=True)
+        sim.enter('gate32', uds, 'successful call %d' % i, roomy=True)
         check(r32(sim.uc, sim.cmd() + 4) == 0, 'throttle: command 0x23 succeeds')
     check(sim.svc_log.count(0x0A) == before, 'throttle: successful replies never wait')
     # the window: 150 ms later the failing replies are free again
@@ -1503,7 +1630,7 @@ def scenario_throttle(elf, level):
     before = sim.svc_log.count(0x0A)
     for i in range(40):
         sim.set_request([0x00FF0040, 0])
-        sim.enter('azl_svc32_entry', uds, 'failing poll, new window %d' % i, roomy=True)
+        sim.enter('gate32', uds, 'failing poll, new window %d' % i, roomy=True)
     check(sim.svc_log.count(0x0A) == before, 'throttle: a new window of 100 ms starts free (40 failing replies, no wait)')
 
 
@@ -1702,7 +1829,7 @@ def open_session(sim, name):
     words = struct.unpack('<2I', name12(name))
     sim.kernel = lambda s, n: (_ for _ in ()).throw(AssertionError('the real kernel was called'))
     sim.set_request([0x00050100, words[0], words[1], len(name), 0])
-    sim.enter('azl_svc32_entry', 0x14801F, 'open ' + name, roomy=True)
+    sim.enter('gate32', 0x14801F, 'open ' + name, roomy=True)
     return r32(sim.uc, sim.cmd() + 12)
 
 
@@ -1724,7 +1851,7 @@ def mac_words(mac):
 
 def dlp_call(sim, handle, header, words, name, roomy=False):
     sim.set_request([header] + list(words))
-    return sim.enter('azl_svc32_entry', handle, name, roomy=roomy)
+    return sim.enter('gate32', handle, name, roomy=roomy)
 
 
 def hub_words(rig):
@@ -2198,6 +2325,69 @@ def scenario_hub_join_cap(elf, level):
     return sim
 
 
+def scenario_hub_join_gate_closing(elf, level):
+    """The swap of the plugin's block (Old 3DS: HOME, power, an applet) closes the svc hook's gate while a game thread waits for the join of
+    StartFakeSession - a wait of up to 8 s, against the 1.5 s the swap waits for the threads in the plugin. The wait ends at once, within two
+    of its 10 ms slices (less than 20 ms of the clock), with the answer of its 8 s cap, "server not found", and the end of the client role is
+    left for the network thread's next Tick, as at the cap. The flag is the word ctr/gate_flag.hpp reads (g_gate_flag: until the gate's page
+    exists, a word of the plugin's own; here the gate's page is there and it is the header's flag). The thread counted in the gate leaves the
+    plugin at once; its post, if it had one, would be skipped."""
+    sim = Sim(elf, level, hle=False)
+    uc = sim.uc
+    rig = HubRig(sim, elf)
+    hle_for_hub(sim, elf, rig)
+    ceiling = HLE_CEILING[level]
+    h = open_session(sim, 'dlp:FKCL')
+    name_words = list(struct.unpack('<5I', 'Kirby'.encode('utf-16-le').ljust(20, b'\0')))
+    sim.spy_group = struct.pack('<6sBBI20sBB2x', HOST_MAC, 1, 3, (TD_TID & 0xFFFFFF00) | 0, 'Host'.encode('utf-16-le').ljust(20, b'\0'), 4, 1)
+    rig.tick()
+    dlp_call(sim, h, FK_INIT_NAME, [0x1000, 1] + name_words + [0, 0x04000000, 0, 0], 'fkcl InitializeWithName')
+    dlp_call(sim, h, FK_START_SCAN, [0x0421, 0, 0, 0, 0, 0], 'fkcl StartScan')
+    rig.tick()
+    dlp_call(sim, h, FK_STOP_SCAN, [], 'fkcl StopScan')
+    mlo, mhi = mac_words(HOST_MAC)
+    flag = r32(uc, elf.find('g_gate_flag'))
+    check(r32(uc, flag) == 1, 'gate: the flag is open before the join (%08x at %08x)' % (r32(uc, flag), flag))
+    orig_net_thread = rig.net_thread
+    state = {'round': 0, 'closed_at': None, 'slices_after': 0}
+
+    def close_during_join(s):
+        state['round'] += 1
+        if state['round'] == 1:          # the network thread serves StartFakeSession: the join begins, and nobody polls it from then on
+            orig_net_thread(s)
+            return
+        s.ticks += 10 * 268112           # (a slice of the wait)
+        if state['closed_at'] is None:   # SWAP_ENTER: the gate closes while the game thread sleeps in its slice
+            p32(s.uc, flag, 0)
+            state['closed_at'] = s.ticks
+        else:
+            state['slices_after'] += 1
+    sim.on_yield = close_during_join
+    sim.gate_closed_in_call = True
+    sim.log_lines.clear()
+    sim.spy_calls.clear()
+    r0, depth, ok = dlp_call(sim, h, FK_START_FAKE, [mlo, mhi, 0, 0], 'fkcl StartFakeSession, the gate closes during the join')
+    closed_at = state['closed_at']
+    sim.gate_closed_in_call = False
+    check(flag == GATE_PAGE, 'gate: g_gate_flag points at the header of the gate (%08x)' % flag)
+    p32(uc, flag, 1)                     # the swap is over: the gate opens again
+    check(closed_at is not None, 'gate: the join wait slept (the gate was closed during it)')
+    waited_ms = (sim.ticks - closed_at) // 268112 if closed_at is not None else -1
+    check(reply(sim, 2) == [(0x0B << 16) | 0x40, NOT_FOUND], 'gate: the answer of the cap, "server not found": %r' % ([hex(x) for x in reply(sim, 2)],))
+    check(state['slices_after'] <= 2 and 0 <= waited_ms < 20,
+          'gate: the wait ended within two slices of the close (%d slices, %d ms)' % (state['slices_after'], waited_ms))
+    if level > 0:
+        check(any('swapped out during the join' in l for l in sim.log_lines), 'gate: the early end is logged (%r)' % (sim.log_lines[-1:],))
+        check(not any('the join did not end in 8 s' in l for l in sim.log_lines), 'gate: the early end is not logged as the cap')
+    check(sim.spy_calls == [], 'gate: the waiting thread called no method of the adapter (%r)' % (sim.spy_calls,))
+    sim.net_calls.clear()
+    rig.tick()                           # the network thread: the end of the client role is its Tick's
+    check('Disconnect' in sim.net_calls or 'HostClose' in sim.net_calls, 'gate: the next Tick of the network thread ended the join (the adapter saw %r)' % (sim.net_calls,))
+    record('hub: StartFakeSession, the gate closes during the join wait (answered at once, the end of the role left for the next Tick)', level, depth, ceiling, 'hub')
+    print('  join wait with the gate closing at debug %d: %d slices, %d ms after the close' % (level, state['slices_after'], waited_ms))
+    return sim
+
+
 def scenario_hub_close(elf, level):
     """The game closes its dlp:SRVR session without Finalize: the role ends (a posted request when the network thread is alive; on the
     calling thread when it is not), through the CloseHandle hook. Twice: over the spy network (the lobby's own part) and over the REAL
@@ -2227,7 +2417,7 @@ def scenario_hub_close(elf, level):
                 sim.ticks += 1200 * 268112     # (more than kAliveMs without a Tick)
                 rig.dead = True
             y0 = sim.yields
-            r0, depth, ok = sim.enter('azl_svc23_entry', h, 'close dlp:SRVR' + (' (network thread gone)' if dead else ''))
+            r0, depth, ok = sim.enter('gate23', h, 'close dlp:SRVR' + (' (network thread gone)' if dead else ''))
             if level > 0:
                 check(any('had called Initialize' in l for l in sim.log_lines), 'the close says the role ends with the session (%r)' % (sim.log_lines,))
             if dead:
@@ -2272,7 +2462,7 @@ def scenario_hub_found_dead(elf, level):
         sim.clear_event_fails = True
         y0 = sim.yields
         sim.set_request([0x000C0000])
-        r0, depth, ok = sim.enter('azl_svc32_entry', h, 'call on a dlp:SRVR session found dead' + (' (network thread gone)' if dead else ''))
+        r0, depth, ok = sim.enter('gate32', h, 'call on a dlp:SRVR session found dead' + (' (network thread gone)' if dead else ''))
         sim.clear_event_fails = False
         check(r0 == 0xD8E007F7, 'the call on a session found dead goes on to the real kernel (its result comes back)')
         if dead:
@@ -2298,7 +2488,7 @@ def scenario_hub_engine(elf, level):
         hle_for_hub(sim, elf, rig)
         words = struct.unpack('<2I', name12('nwm::UDS'))
         sim.set_request([0x00050100, words[0], words[1], 8, 0])
-        sim.enter('azl_svc32_entry', 0x14801F, 'open nwm::UDS', roomy=True)
+        sim.enter('gate32', 0x14801F, 'open nwm::UDS', roomy=True)
         uds = r32(sim.uc, sim.cmd() + 12)
         rig.tick()
         if hold:
@@ -2308,7 +2498,7 @@ def scenario_hub_engine(elf, level):
             check(reply(sim, 2) == [hdr(0x05, 1), 0], 'SRVR StartAccepting opened the lobby on the real engine: %r' % ([hex(x) for x in reply(sim, 2)],))
             # while the lobby holds the engine the game's own UDS commands are "wrong state" (UdsHle::Dispatch's gate)
             sim.set_request([0x00020000])
-            sim.enter('azl_svc32_entry', uds, 'uds command 0x02 while the lobby holds the engine', roomy=True)
+            sim.enter('gate32', uds, 'uds command 0x02 while the lobby holds the engine', roomy=True)
             check(reply(sim, 2)[1] == WRONG_STATE, 'while the lobby holds the engine a nwm::UDS command answers "wrong state": %r' % (reply(sim, 2),))
         if dead:
             sim.ticks += 1200 * 268112
@@ -2318,7 +2508,7 @@ def scenario_hub_engine(elf, level):
         sim.window_begin(elf.sym('_ZN3azl6DlpHub17OnGameUdsStartingEv'))
         # InitializeWithVersion as libctru sends it: 12 normal words (the shared memory size, the NodeInfo, the version), 2 translate
         sim.set_request([(0x1B << 16) | (12 << 6) | 2, 0x1000] + [0] * 10 + [0x0400, 0, 0])
-        r0, depth, ok = sim.enter('azl_svc32_entry', uds, 'nwm::UDS Initialize, %s' % flavour, roomy=True)
+        r0, depth, ok = sim.enter('gate32', uds, 'nwm::UDS Initialize, %s' % flavour, roomy=True)
         w = sim.window_depth(ROOMY_ENTRY_SP)
         if not hold:
             base = depth
@@ -2359,6 +2549,7 @@ def main():
             scenario_hub_no_network_thread(elf, level)
             scenario_hub_always_succeeds(elf, level)
             scenario_hub_join_cap(elf, level)
+            scenario_hub_join_gate_closing(elf, level)
             scenario_hub_close(elf, level)
             scenario_hub_found_dead(elf, level)
             scenario_hub_engine(elf, level)
@@ -2370,11 +2561,11 @@ def main():
         scenario_getservice(elf, level)
         scenario_traced(elf, level)
         scenario_apt(elf, level)
-        scenario_handback(elf, level)
-        scenario_power_handback(elf, level)
         scenario_game_failure(elf, level)
+        scenario_pre_without_post(elf, level)
+        scenario_swap_during_svc(elf, level)
+        scenario_close_open_gate(elf, level)
         scenario_swap_gate(elf, level)
-        scenario_resume_keeps_receive(elf, level)
         scenario_worker_off_core1(elf, level)
         scenario_hle_front(elf, level)
         scenario_throttle(elf, level)
@@ -2385,17 +2576,18 @@ def main():
             scenario_hub_no_network_thread(elf, level)
             scenario_hub_always_succeeds(elf, level)
             scenario_hub_join_cap(elf, level)
+            scenario_hub_join_gate_closing(elf, level)
             scenario_hub_close(elf, level)
             scenario_hub_found_dead(elf, level)
             scenario_hub_engine(elf, level)
     print()
-    print('%-72s %5s %7s %7s' % ('path (bytes below the SP at azl_svc32_entry)', 'debug', 'used', 'budget'))
+    print('%-72s %5s %7s %7s' % ('path (bytes below the SP at azl_gate_32)', 'debug', 'used', 'budget'))
     for scenario, level, depth, budget, kind in results:
         print('%-72s %5d %7d %7d  %s' % (scenario, level, depth, budget, kind))
     print()
-    print('(the game wrapper frame and the trampoline add %d bytes to every number: the srv thread of Tri Force Heroes'
-          ' has %d bytes below its call,' % (WRAPPER_FRAME + TRAMPOLINE_PUSH, FREE_BELOW_DISPATCHER))
-    print(' so a path that uses N here uses N + %d of them)' % (WRAPPER_FRAME + TRAMPOLINE_PUSH))
+    print('(the game wrapper frame and the stub\'s lr add %d bytes to every number: the srv thread of Tri Force Heroes'
+          ' has %d bytes below its call,' % (WRAPPER_FRAME + STUB_PUSH, FREE_BELOW_DISPATCHER))
+    print(' so a path that uses N here uses N + %d of them)' % (WRAPPER_FRAME + STUB_PUSH))
     print('chain_sim: %d checks, %d failures' % (checks[0], len(failures)))
     return 1 if failures else 0
 

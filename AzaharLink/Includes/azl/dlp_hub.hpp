@@ -93,6 +93,13 @@ public:
     /// The network thread will not tick again: a request in the queue is answered with the failure, later ones fail at once.
     void Stop();
 
+    // ---- the swap of the plugin's block (Old 3DS: HOME, power, an applet) -------------------------------------------------------
+    /// Called by the swap right after it closed the svc hook's gate (kernel->GateClosing() is true from then on): a game thread waiting
+    /// with a request still in the queue wakes now and takes it back (the same answer as at kQueuedMs), instead of at the end of its
+    /// slice. While the gate is closing no request is queued and nobody waits for the slot; a request the network thread is running is
+    /// waited for (it is not blocked on anything). Any thread, no lock.
+    void WakeForSwap();
+
     // ---- counters (diagnostics; the HLE logs them) ------------------------------------------------------------------------
     u32 served_inline() const {
         return inline_.load(std::memory_order_relaxed);

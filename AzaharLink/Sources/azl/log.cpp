@@ -46,6 +46,7 @@ constexpr u32 kDietSlotBits = 5;
 constexpr u32 kDietProbe = 4;
 constexpr u32 kDietWindowMs = 1000;  // one count line per second and kind ...
 constexpr u32 kDietFullCalls = 3;    // ... after the first three calls of that second
+constexpr u32 kDietSvcReal = 1u << 31; // (the diet's key of a traced service's command, DebugSvcReal: the command with this bit, never an IPC header)
 
 // The layout DebugIpc writes by hand (little-endian words: stored, kind, dir | ms | src, dest | size, channel, pad)
 static_assert(offsetof(DebugRecord, stored) == 0 && offsetof(DebugRecord, kind) == 2 && offsetof(DebugRecord, dir) == 3 &&
@@ -88,6 +89,7 @@ struct DietSlot {
     u32 done_first_ms; // the first and the last of those
     u32 done_last_ms;
     u32 done_arg;
+    u32 name[3];       // a traced service's name (DebugSvcReal: its count line says it), all 0 for a line of DebugIpc
 };
 DietSlot g_dbg_diet[kDietSlots];
 
@@ -263,10 +265,10 @@ __attribute__((always_inline)) inline bool AdmitLocked(u32 lane, u32 need, u32 n
 
 // g_dbg_mutex held. The payload is `first` followed by `second` (`rec.stored` bytes in all); for the records of a few words
 // that the hook stores (PushSmallLocked) there is a version that calls nothing.
-void PushLocked(const DebugRecord& rec, const void* first, u32 first_size, const void* second = nullptr,
+bool PushLocked(const DebugRecord& rec, const void* first, u32 first_size, const void* second = nullptr,
                 u32 second_size = 0) {
     if (!AdmitLocked(rec.pad == kLaneHeavy ? kLaneHeavy : kLaneControl, sizeof(DebugRecord) + rec.stored, rec.ms)) {
-        return;
+        return false;
     }
     RingWrite(&rec, sizeof(rec));
     if (first_size) {
@@ -279,6 +281,7 @@ void PushLocked(const DebugRecord& rec, const void* first, u32 first_size, const
     if (g_dbg_used > g_dbg_totals.ring_peak) {
         g_dbg_totals.ring_peak = g_dbg_used;
     }
+    return true;
 }
 
 // The hook's IPC lines are a record of a few words stored by whatever thread of the game made the call, on a stack that
@@ -311,7 +314,15 @@ __attribute__((noinline)) void PushAggregateLocked(DietSlot& slot, u32 now, bool
     const u32 last = with_pending ? slot.last_ms : slot.done_last_ms;
     const u32 arg = with_pending ? slot.last_arg : slot.done_arg;
     const u32 words[7] = {slot.handle, slot.header, arg, 0, count, first, last};
-    if (PushSmallLocked(rec, words, sizeof(words))) {
+    bool pushed;
+    if (slot.name[0] != 0) {
+        // (a traced service's command, DebugSvcReal: its name follows the words, the line reads as the service's own)
+        rec.stored = static_cast<u16>(sizeof(words) + sizeof(slot.name));
+        pushed = PushLocked(rec, words, sizeof(words), slot.name, sizeof(slot.name));
+    } else {
+        pushed = PushSmallLocked(rec, words, sizeof(words));
+    }
+    if (pushed) {
         ++g_dbg_totals.agg_lines;
         g_dbg_totals.agg_calls += count;
     } else {
@@ -335,8 +346,8 @@ inline bool SecondOver(u32 now, u32 since) {
 
 // The diet: true when the call (result 0) is only counted. g_dbg_mutex held. A kind (session handle and command) written
 // whole the first three times of every second, then one line for the rest of that second; a table with no free slot writes
-// everything whole.
-__attribute__((always_inline)) inline bool DietLocked(u32 handle, u32 header, u32 arg, u32 now) {
+// everything whole. `name`: the 12 bytes of a traced service's name (DebugSvcReal), nullptr for DebugIpc.
+__attribute__((always_inline)) inline bool DietLocked(u32 handle, u32 header, u32 arg, u32 now, const void* name = nullptr) {
     if (handle == 0) {
         return false;
     }
@@ -364,6 +375,11 @@ __attribute__((always_inline)) inline bool DietLocked(u32 handle, u32 header, u3
         slot->calls = 0;
         slot->pending = 0;
         slot->done = 0;
+        if (name) {
+            std::memcpy(slot->name, name, sizeof(slot->name)); // (12 bytes: three word copies, no call)
+        } else {
+            slot->name[0] = slot->name[1] = slot->name[2] = 0;
+        }
     }
     if (SecondOver(now, slot->window_ms)) {
         if (slot->pending) {
@@ -530,7 +546,7 @@ struct SvcRealPayload {
 };
 } // namespace
 
-void DebugSvcReal(const char* service, u32 command, u32 arg, u32 result) {
+void DebugSvcReal(const char* service, u32 command, u32 arg, u32 result, u32 handle) {
     if (g_debug_level <= 0 || !g_dbg_ring) {
         return;
     }
@@ -550,7 +566,12 @@ void DebugSvcReal(const char* service, u32 command, u32 arg, u32 result) {
         NoteMiss(kLaneHeavy, rec.ms);
         return;
     }
-    PushSmallLocked(rec, &payload, sizeof(payload));
+    // The diet of DebugIpc (Fantasy Life wrote 24 803 lines of frd:u, 90 a second, on a card already behind): a call that succeeds and
+    // that the session (`handle`, 0: none known, every call written) has made three times this second is only counted, in one line a
+    // second with the service's name. Every failure, and every call that a free slot of the table does not take, stays whole.
+    if (result != 0 || !DietLocked(handle, command | kDietSvcReal, arg, rec.ms, payload.service)) {
+        PushSmallLocked(rec, &payload, sizeof(payload));
+    }
     g_dbg_mutex.unlock();
 }
 
@@ -867,6 +888,23 @@ void DebugFormat(const DebugRecord& rec, const u8* payload, u32 start_ms, std::s
                       static_cast<unsigned long>(w[2]), static_cast<unsigned long>(w[3]));
         *out += line;
         *out += '\n';
+    } else if (rec.kind == kDbgIpcAgg && rec.stored >= 7 * sizeof(u32) + 12) {
+        // The count of a traced service's command (DebugSvcReal under the diet): the line of its last call, the service by name, then
+        // the count and the times as for an IPC call.
+        u32 w[7];
+        char name[12];
+        std::memcpy(w, payload, sizeof(w));
+        std::memcpy(name, static_cast<const u8*>(payload) + sizeof(w), sizeof(name));
+        name[sizeof(name) - 1] = 0;
+        std::snprintf(line, sizeof(line), "%6lu.%03lu svc REAL %s cmd 0x%04lx arg 0x%lx -> 0x%08lx x%lu from ",
+                      static_cast<unsigned long>(rel / 1000), static_cast<unsigned long>(rel % 1000), name,
+                      static_cast<unsigned long>(w[1] & 0xFFFFu), static_cast<unsigned long>(w[2]),
+                      static_cast<unsigned long>(w[3]), static_cast<unsigned long>(w[4]));
+        *out += line;
+        AppendRelative(out, w[5], start_ms);
+        *out += " to ";
+        AppendRelative(out, w[6], start_ms);
+        *out += '\n';
     } else if (rec.kind == kDbgIpcAgg && rec.stored >= 7 * sizeof(u32)) {
         // The count of a kind of IPC call (the diet): the line of the last call of the second, then how many calls there were
         // in all after the first three and when the first and the last of them came.
@@ -1014,6 +1052,7 @@ Stats TakeStats() {
     out.t_net_events = take(g_stats.t_net_events);
     out.t_net_send = take(g_stats.t_net_send);
     out.t_cb = take(g_stats.t_cb);
+    out.t_chat_osd = take(g_stats.t_chat_osd);
     out.t_writer = take(g_stats.t_writer);
     out.ipc_sum_ticks = take(g_stats.ipc_sum_ticks);
     out.t_net_wall = take(g_stats.t_net_wall);
@@ -1063,6 +1102,31 @@ u32 StatsServiceCall(u32 ticks) {
     return datagrams;
 }
 
+void StatsNoteChatOsd(u32 ticks) {
+    StatsAdd64(g_stats.t_chat_osd, ticks);
+    ++g_stats.chat_osd_draws;
+    if (ticks > g_stats.chat_osd_max_ticks) {
+        g_stats.chat_osd_max_ticks = ticks;
+    }
+}
+
+// The count of CTRPF OSD::Notify calls the chat made. One writer (the plugin's thread), read by the res and cost lines:
+// an atomic add keeps it honest without a lock.
+static volatile u32 g_chat_osd_notifies = 0;
+void StatsNoteChatOsdNotify() {
+    __atomic_add_fetch(&g_chat_osd_notifies, 1u, __ATOMIC_RELAXED);
+}
+unsigned long StatsChatOsdNotifies() {
+    return __atomic_load_n(&g_chat_osd_notifies, __ATOMIC_RELAXED);
+}
+static volatile u32 g_plugin_osd_notifies = 0;
+void StatsNotePluginOsdNotify() {
+    __atomic_add_fetch(&g_plugin_osd_notifies, 1u, __ATOMIC_RELAXED);
+}
+unsigned long StatsPluginOsdNotifies() {
+    return __atomic_load_n(&g_plugin_osd_notifies, __ATOMIC_RELAXED);
+}
+
 unsigned long PerSecond10(u64 ticks, u64 window_ms) {
     return static_cast<unsigned long>(ticks * 10000 / AZL_TICKS_PER_MS / (window_ms ? window_ms : 1));
 }
@@ -1080,9 +1144,10 @@ CpuNumbers MakeCpuNumbers(const Stats& s, u64 window_ms) {
     const u64 game_lock = s.lock_wait_ticks > s.lock_wait_net_ticks ? s.lock_wait_ticks - s.lock_wait_net_ticks : 0;
     c.uds10 = static_cast<u32>(PerSecond10(s.ipc_sum_ticks > game_lock ? s.ipc_sum_ticks - game_lock : 0, window_ms));
     c.frame10 = static_cast<u32>(PerSecond10(s.t_cb, window_ms));
+    c.chat10 = static_cast<u32>(PerSecond10(s.t_chat_osd, window_ms)); // (the chat's drawing at the present: not in the frame callback)
     c.writer10 = static_cast<u32>(PerSecond10(s.t_writer, window_ms));
     // (the writer's figure is wall time of a thread that mostly waits for the core: shown apart, not added)
-    c.plugin10 = c.net10 + c.uds10 + c.frame10;
+    c.plugin10 = c.net10 + c.uds10 + c.frame10 + c.chat10;
 
     c.soc10 = static_cast<u32>(PerSecond10(s.soc_ticks[kSocRecvData] + s.soc_ticks[kSocRecvEmpty] + s.soc_ticks[kSocSend], window_ms));
     c.poll10 = static_cast<u32>(PerSecond10(s.soc_ticks[kSocPoll], window_ms));
@@ -1113,7 +1178,7 @@ StatusNumbers MakeStatusNumbers(const Stats& s, u64 dt_ms, u32 rtt_ms, u32 loss_
     const CpuNumbers cpu = MakeCpuNumbers(s, dt_ms);
     n.net10 = cpu.net10;
     n.uds10 = cpu.uds10;
-    n.frame10 = cpu.frame10;
+    n.frame10 = cpu.frame10 + cpu.chat10; // (the status page's "frame": the chat's drawing with it, so the parts add up)
     n.writer10 = cpu.writer10;
     n.plugin10 = cpu.plugin10;
     n.loop_pause_ms = s.loop_gap_max;

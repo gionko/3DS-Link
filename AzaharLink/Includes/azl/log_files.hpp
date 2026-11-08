@@ -107,8 +107,11 @@ public:
 
     /// One line of the trail of a sleep (azl/sleep_crumbs.hpp) into AzaharLink.sleep.log, written and flushed at once, on the
     /// calling thread (the breadcrumb thread: nothing else). The file has its own handle and lock - nothing here waits for
-    /// the writer's SD writes - and is started afresh by a launch that finds it over 128 KB. Does nothing at level 0.
+    /// the writer's SD writes. A launch that finds it over 128 KB moves it aside as AzaharLink.sleep.1.log (the one before it
+    /// goes) and starts a new one: the trail of the launch before is kept. Does nothing at level 0.
     void WriteCrumb(const std::string& line);
+    /// The `count` lines of a turn of the breadcrumb thread, as WriteCrumb does one, in ONE write and ONE flush.
+    void WriteCrumbs(const std::string* lines, std::size_t count);
 
     /// Switches the log on (1) or off (0) at run time. On: the capture ring is allocated when `capture` (the main log
     /// does not depend on it), the level is set, the files are opened. Off: the level is set first (nothing is opened
@@ -139,6 +142,11 @@ public:
     /// (WriteCrumb) is its own thread's and is not in it.
     u64 card_wait_ticks() const {
         return __atomic_load_n(&card_wait_ticks_, __ATOMIC_RELAXED);
+    }
+    /// The lines of the main log dropped since the start because its queue was full (max_pending), as far as the writer has
+    /// counted them (ReportBusyDrops, at every Flush, whose line says each count as it comes): for the stats line.
+    u32 queue_full_total() const {
+        return __atomic_load_n(&queue_full_total_, __ATOMIC_RELAXED);
     }
 
 private:
@@ -178,8 +186,11 @@ private:
     void RotateLogLocked();
     void WriteMainLocked(const std::string& text); ///< file_mutex_ held
     void WriteDebug(const std::string& text);
-    /// The lines other threads gave up on because a lock of the log was busy, said once in the log (the writer's Flush).
+    /// The lines other threads gave up on because a lock of the log was busy, and those dropped because the queue was full, said
+    /// once in the log (the writer's Flush).
     void ReportBusyDrops();
+    /// Append's work; `report` lets a line of ReportBusyDrops past a full queue.
+    void AppendLine(const char* line, bool report);
 
     FileLayer* files_;
     std::string dir_;
@@ -191,6 +202,8 @@ private:
     platform::Mutex drain_mutex_; ///< one pass of DrainDebug at a time (guards drain_out_; taken before file_mutex_)
     std::string pending_;
     u32 append_busy_ = 0; ///< lines Append() gave up on because log_mutex_ was busy (atomic adds; ReportBusyDrops clears)
+    u32 queue_full_ = 0;  ///< lines Append() dropped because the queue held max_pending (atomic adds; ReportBusyDrops clears)
+    u32 queue_full_total_ = 0; ///< ... all of them since the start (atomic adds, by ReportBusyDrops)
     void* log_file_ = nullptr;
     u64 log_size_ = 0;
     void* debug_file_ = nullptr;

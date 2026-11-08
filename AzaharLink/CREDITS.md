@@ -127,6 +127,13 @@ Le voci sono in inglese perché sono le righe che l'app mostra; le licenze sono 
 - License: HPND - HPND (the Pillow license)
 - Link: https://github.com/python-pillow/Pillow
 
+### Spleen
+
+- What for: The font of the in-game chat (6x12 for the lines on the top screen, 8x16 for the keyboard): release 2.1.0, its printable ASCII only, turned into C arrays by Tests/make_font_spleen.py.
+- By: Frederic Cambus
+- License: BSD-2-Clause - BSD 2-Clause (the whole text is in CREDITS.md)
+- Link: https://github.com/fcambus/spleen
+
 ## Also
 
 - **Titles Delivery** (the module under it, `ConfigApp/titleshare/`) comes from TitleShare, an earlier experiment of the same author; `ConfigApp/titleshare/PATCHES.md` lists every change made to it.
@@ -134,3 +141,34 @@ Le voci sono in inglese perché sono le righe che l'app mostra; le licenze sono 
 - **MD5, AES and SHA-256** (`Sources/azl/crypto.cpp`, `ConfigApp/titleshare/common/aes.c` and `sha256.c`) are implementations of the public standards (RFC 1321, FIPS 197, FIPS 180-4); the files carry no third-party notice.
 - **The icon** and **the guide's pictures** are drawn for this project (`ConfigApp/tools/make_icon.py`, `DlpLink/tools/make_guide.py`); the guide's pictures are crops of GodMode9 v2.1.1 screenshots, with arrows drawn on them.
 - **Nintendo 3DS** and the games that run on it belong to Nintendo and to their makers. 3DS Link is not made, endorsed or supported by Nintendo, by Azahar or by any project in this list.
+
+## Spleen license
+
+The font of the in-game chat is Spleen by Frederic Cambus; the plugin carries its printable ASCII glyphs (`Includes/azl/font_spleen.inc`, made by `Tests/make_font_spleen.py`). Its license, as the release says it:
+
+```text
+Copyright (c) 2018-2024, Frederic Cambus
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS
+BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+```

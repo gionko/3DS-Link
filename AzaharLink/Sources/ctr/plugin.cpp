@@ -10,7 +10,10 @@
 #include <malloc.h>
 #include <new>
 
+#include "azl/chat_core.hpp"
+#include "azl/exit_guard.hpp"
 #include "azl/log.hpp"
+#include "azl/plg_guard.hpp"
 #include "azl/plugin_compare.hpp"
 #include "azl/rcvbuf.h"
 #include "azl/soc_plan.hpp"
@@ -20,10 +23,13 @@
 #include "azl/ticks.h"
 #include "azl/wallclock.hpp"
 #include "ctr/boot_diag.hpp"
+#include "ctr/gate_page.hpp"
+#include "ctr/input_mirror.hpp"
 #include "ctr/soc.hpp"
 #include "ctr/swap_gate.hpp"
 #include "ctr/teardown.hpp"
 #include "ctr/thread_core.hpp"
+#include "ctr/zombie_probe.hpp"
 
 // (libctru's weak hid function; Sources/main.cpp overrides it. No header of libctru declares it.)
 extern "C" bool hidShouldUseIrrst(void);
@@ -36,6 +42,17 @@ namespace ctr {
 
 namespace {
 
+// The framework's connection to Luma3DS's plugin loader (azl/plg_guard.hpp): made by __wrap_plgLdrInit (at the end of this file) on the keep-alive
+// thread before PatchProcess, read by __wrap_PLGLDR__FetchEvent and by EarlyInit; and the line about it (EarlyInit: the synchronous file, then the log).
+plgguard::State g_plg_guard;
+char g_plg_line[320];
+int g_plg_line_body = -1; ///< where the line's text begins in g_plg_line, after the clock (-1: no line)
+
+// SWAP_ENTER: the Download Play hub's requester that waits in its queue in slices sleeps no longer once the svc hook's gate is down (CloseGate).
+void WakeHubForSwap(void* hub) {
+    static_cast<DlpHub*>(hub)->WakeForSwap();
+}
+
 using CTRPluginFramework::File;
 
 // The plugin's own files - the settings and the logs - live with the app's, in /3ds/3DSLink/ (the plugin binaries stay where
@@ -47,6 +64,14 @@ constexpr const char* kOldConfigPath = "/luma/plugins/AzaharLink.ini";
 // The memory figure of the last launch (title id, KB used, KB free of the application region at the start): written with the
 // log on only, read at the next start (CompareMemoryWithLastLaunch).
 constexpr const char* kMemPath = "/3ds/3DSLink/AzaharLink.mem";
+// Where the startup-occupancy warning and the line of the framework's link to Luma3DS's plugin loader are written synchronously, even at
+// debug=0 (the only lines the plugin ever writes with the log off): the main log's own file, so a tester who turns the log on later finds
+// them in sequence.
+constexpr const char* kLogSyncPath = "/3ds/3DSLink/AzaharLink.log";
+// The exit guard's line and the watch of Luma3DS's plugin word (REGISTRO, phase Q): a file of their own, written synchronously at any debug
+// level when they have something to say (and every exit with debug=1), never while the log's writer appends to its own file.
+constexpr const char* kLumaLogPath = "/3ds/3DSLink/AzaharLink.luma.log";
+constexpr u32 kLumaWatchLines = 64;
 
 /// Makes /3ds/3DSLink (and /3ds) when they are missing: the files of the plugin have nowhere to go otherwise.
 void MakeDataDir() {
@@ -77,18 +102,29 @@ constexpr u32 kNetStopTimeoutMs = 400;
 constexpr int kEventExit = 0;
 constexpr int kEventSleepEnter = 1;
 constexpr int kEventSleepExit = 2;
+constexpr int kEventHomeEnter = 3;
+constexpr int kEventHomeExit = 4;
 constexpr int kEventSwapEnter = 5;
 constexpr int kEventSwapExit = 6;
 constexpr u32 kLogStopTimeoutMs = 400;
 // SWAP_ENTER (Old 3DS, HOME), with the log on: how long the trail gets to put the event on the card before the threads stop.
 constexpr u32 kSwapTrailWaitMs = 40;
-// SWAP_ENTER (Old 3DS, HOME): how long the plugin waits for the game's threads that are inside the hook to leave it before it lets Luma3DS free the plugin's block.
-// Luma3DS itself waits 10 s for the answer (waitForReplyTimeout); the threads that matter leave in microseconds, the budget is for a call that waits in a real service.
+// The close command (12) of APT:ReceiveParameter, with the log on, a New 3DS only: how long the game's thread gives the trail to put the close and Luma3DS's
+// word on the card before the game can be killed (Plugin::WaitForCloseTrail; the thread writes in milliseconds when the card is not busy).
+constexpr u32 kCloseTrailWaitMs = 200;
+// SWAP_ENTER (Old 3DS, HOME): how long the plugin waits for the game's threads counted in the svc hook's gate to leave the plugin's code before it lets Luma3DS free
+// the plugin's block. Luma3DS itself waits 10 s for the answer (waitForReplyTimeout); the threads leave in microseconds: a real service's call is made by the gate
+// outside the count, and every wait of the plugin's own on a game thread ends when the gate closes (ctr/gate_flag.hpp). The budget is for what is left.
 constexpr u32 kSwapDrainTimeoutMs = 1500;
 // ... and for the plugin's own threads to leave their service calls (azl/swap_gate.hpp): a poll() lasts 96 ms at most in the logs, a write of the log's writer can take a second and more on a slow card,
-// and a getaddrinfo with no DNS takes seconds. Luma3DS waits for the answer for 10 s in all, and the hooks may have used 1.7 s of them. (A call that lasts longer: the swap then goes on as it did before the gate;
-// the debug log says who was left, if the console survives it.)
-constexpr u32 kSwapGateTimeoutMs = 7000;
+// and a getaddrinfo with no DNS takes seconds. Before this wait the chat's mirror may take 1 s (kEventLockTicks), the trail 40 ms (kSwapTrailWaitMs) and the hooks 1.5 s
+// (kSwapDrainTimeoutMs): 8.64 s in all with this one. Every one of them also stops at SWAP_ENTER's one deadline (ctr/swap_gate.hpp), counted from Luma3DS's event:
+// 8 s when Luma3DS waits its 10 s, 12.5 s once the wait is raised to 15 s (RaiseRosalinaReplyWait), so the budgets above are whole then. (A call that lasts longer: the swap
+// then goes on as it did before the gate; the debug log says who was left, if the console survives it.)
+constexpr u32 kSwapGateTimeoutMs = 6100;
+constexpr u32 kRosalinaReplyWaitOffset = 0x28;               // PluginHeader.waitForReplyTimeout (Luma3DS plgldr.h): RaiseRosalinaReplyWait
+constexpr u64 kRosalinaReplyWaitNs = 10000000000ull;        // what Luma3DS writes there (file_loader.c)
+constexpr u64 kRosalinaReplyWaitRaisedNs = 15000000000ull;  // Old 3DS: 15 s
 
 // The WiFi MAC address of the console, as exposed by the kernel in the shared page, and the two bytes
 // after the 6 of the MAC (the link strength 0..3 and the network state; their meaning on this system is
@@ -336,6 +372,15 @@ constexpr DlpGame kDlpGames[] = {
     {0x000400000007C700ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, USA (catalogues and the Azahar list; not seen)
     {0x0004000000064D00ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Japan (one source; not seen)
     {0x00040000000B9100ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Taiwan (one source; not seen)
+    // Luigi's Mansion (the 2018 remake): seen on a New 3DS XL with 1.1.2 (2026-11-08): its local multiplayer opens the Download Play at once -
+    // dlp:SRVR InitializeWithName (0x0F) as the host and dlp:FKCL InitializeWithName (0x11) as the client - and the real modules answered
+    // 0xC940AC04 (wireless off); with the lobby it played (two New 3DS, 2026-11-09). The other regions' ids are 3DS Link's catalogue
+    // (ConfigApp titles.txt: the family BGN), not seen. (Mario Party: Island Tour opens dlp:SRVR the same way but did not play with the lobby:
+    // it waits for 1.1.3.)
+    {0x00040000001D1A00ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), Europe (seen)
+    {0x00040000001D1900ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), USA (catalogue)
+    {0x00040000001D1800ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), Japan (catalogue)
+    {0x00040000001D4F00ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), Korea (catalogue)
 };
 
 DlpGameMode DlpModeOf(u64 title_id) {
@@ -635,6 +680,42 @@ bool Plugin::SetDebugLevel(int level) {
     return ring_ok;
 }
 
+void Plugin::SetChatOn(bool on) {
+    config_.chat = on;
+    chat_on_.store(on, std::memory_order_relaxed);
+    WireChat(on);
+    SaveConfig();
+    Log("chat: %s (from the in-game menu)", on ? "ON" : "OFF");
+}
+
+void Plugin::WireChat(bool on) {
+    if (!active_ || !room_) {
+        return; // (the plugin off: nothing of the chat exists, whatever the switch says)
+    }
+    ChatSink* sink = chat_sink_.load(std::memory_order_relaxed);
+    if (on && !sink) {
+        // ONE block for the whole life of the plugin, made the first time the chat is on and never deleted - like Plugin::Get:
+        // a network thread that RoomClient::Stop gave up on may still hold it, and the drawing reads it from the game's thread.
+        // From the plugin's heap, never the game's memory.
+        sink = new (std::nothrow) ChatSink();
+        if (!sink) {
+            Log("chat: no memory for its %lu bytes: the chat stays off for this launch", static_cast<unsigned long>(sizeof(ChatSink)));
+            return;
+        }
+        chat_sink_.store(sink, std::memory_order_release);
+        Log("chat: %lu bytes for the lines and the box, kept until the game ends", static_cast<unsigned long>(sizeof(ChatSink)));
+    }
+    room_->SetChatSink(on ? sink : nullptr);
+}
+
+void Plugin::SetChatPos(int pos) {
+    pos = ini::ValidChatPos(pos);
+    config_.chat_pos = pos;
+    chat_pos_.store(pos, std::memory_order_relaxed);
+    SaveConfig();
+    Log("chat: position %s (from the in-game menu)", ini::ChatPosWord(pos));
+}
+
 void Plugin::ServiceLog() {
     const u64 now = platform::NowMs();
     if (now - last_log_service_ms_ < kLogServiceIntervalMs) {
@@ -793,27 +874,32 @@ void Plugin::StartCrumbs() {
             // The file is created here, with a line of its own, and not by the first event of a sleep: creating a file on the
             // card is the slowest thing the trail does, and a freeze right after the sleep query must find it written.
             const SwapGateScope gate(kGateTrail);
-            char stamp[24];
+            char stamp[24], started[24], ids[48];
             FormatConsoleClock(osGetTime(), stamp);
-            log_files_->WriteCrumb(std::string("sleep: the trail of this launch begins | tick ") +
-                                   std::to_string(static_cast<u32>(platform::NowMs())) + " ms | written at console clock " + stamp + " | AzaharLink " + kVersion);
-            for (const std::string& line : lines) { // (what happened before this turn)
-                log_files_->WriteCrumb(line);
-            }
+            FormatConsoleClock(start_os_ms_, started);
+            // (which launch this is - the file holds the trail of many - and when its plugin started: a launch that ended in a crash is
+            // told from the next one by these, not by the order of the lines alone)
+            LineBuf id_line(ids, sizeof(ids) - 1);
+            id_line.Str("title ").Hex(static_cast<u32>(game_id_ >> 32), 8).Hex(static_cast<u32>(game_id_), 8).Str(" pid 0x").Hex(process_id_);
+            ids[id_line.size()] = 0;
+            lines.insert(lines.begin(), std::string("sleep: the trail of this launch begins | ") + ids + " | plugin started at console clock " + started +
+                                            " | tick " + std::to_string(static_cast<u32>(platform::NowMs())) + " ms | written at console clock " +
+                                            stamp + " | AzaharLink " + kVersion);
+            log_files_->WriteCrumbs(lines.data(), lines.size()); // (with what happened before this turn: one write and one flush)
             crumb_written_.store(crumbs_.taken());
         }
-        while (!crumb_stop_.load()) {
-            const s64 wait_ns = crumbs_.watching() ? static_cast<s64>(SleepCrumbs::kPollMs) * 1000000LL : -1;
-            svcWaitSynchronization(crumb_wake_, wait_ns);
-            const SwapGateScope gate(kGateTrail); // (its lines go to the card: azl/swap_gate.hpp)
-            if (crumb_stop_.load()) {
-                break;
+        // The stop (RequestStop at the framework's EXIT, then Shutdown) gets one more turn: what was noted up to it - the EXIT of the process above all,
+        // pushed just before RequestStop - is written before the thread leaves.
+        for (bool last = false; !last;) {
+            if (!crumb_stop_.load()) {
+                const s64 wait_ns = crumbs_.watching() ? static_cast<s64>(SleepCrumbs::kPollMs) * 1000000LL : -1;
+                svcWaitSynchronization(crumb_wake_, wait_ns);
             }
+            last = crumb_stop_.load();
+            const SwapGateScope gate(kGateTrail); // (its lines go to the card: azl/swap_gate.hpp)
             lines.clear();
             crumbs_.Poll(static_cast<u32>(platform::NowMs()), osGetTime(), &lines);
-            for (const std::string& line : lines) {
-                log_files_->WriteCrumb(line);
-            }
+            log_files_->WriteCrumbs(lines.data(), lines.size()); // (the lines of the turn in one write and one flush, none when there are none)
             crumb_written_.store(crumbs_.taken());
         }
     };
@@ -845,7 +931,96 @@ void Plugin::StartCrumbs() {
 // KB-free"), because a launch of the same title right after the last one is rare: the first version kept one record and never
 // compared anything in a session of several games. Read and written with the log on only (debug=0 leaves the card alone), on
 // the start-up thread, ahead of the game's first instruction.
+// Debug-independent: even with the log off, one synchronous line and an OSD notice when a closed game is still in memory. A
+// closed game that was never finalized (Monster Hunter XX after a chat session, console 63) keeps its commit in the APPLICATION
+// limit's books AND its pages in the region, so this game's own figure must come from the process (svcGetProcessInfo type 2,
+// as 3DS Link's heap_plan), never from the shared limit: the limit's current already carries the zombie, and a comparison
+// against it cancels the zombie on both sides. The decision is zombie::StartupForeign (PC-tested): the books more than own +
+// 4 MB, or the region more than own + the plugin's block + 4 MB. Monster Hunter XX panics in crt0 at 0x2E5E94 before a frame,
+// so the synchronous log line is the deliverable; the OSD notice may never show. Skipped on an emulator (its books and its
+// process figures are its own model; a closed game left in memory is the console's kernel). Five official svcs, at most one
+// synchronous write.
+void Plugin::CheckStartupOccupancy() {
+    if (CTRPluginFramework::System::IsCitra()) {
+        return;
+    }
+    s64 used = 0;
+    svcGetSystemInfo(&used, 0, 1); // APPLICATION region in use
+    // The limit's current COMMIT (the books: every APPLICATION process's commit, a zombie's included)...
+    s64 books = 0;
+    {
+        ResourceLimitType name = RESLIMIT_COMMIT;
+        Handle limit = 0;
+        if (R_SUCCEEDED(svcGetResourceLimit(&limit, CUR_PROCESS_HANDLE))) {
+            svcGetResourceLimitCurrentValues(&books, limit, &name, 1);
+            svcCloseHandle(limit);
+        }
+    }
+    // ...and this game's own, read from its process before its crt0.
+    s64 own = 0;
+    if (R_FAILED(svcGetProcessInfo(&own, CUR_PROCESS_HANDLE, 2))) {
+        own = 0;
+    }
+    s64 plugin_block = 0;
+    const CTRPluginFramework::PluginHeader* header = CTRPluginFramework::FwkSettings::Header;
+    if (header) {
+        plugin_block = static_cast<s64>(header->exeSize) + static_cast<s64>(header->heapSize);
+    }
+    const u32 foreign = zombie::StartupForeign(books, used, own, plugin_block);
+    if (foreign == 0) {
+        return; // a fresh launch: the books and the region hold no more than this game (plus the plugin) and a margin
+    }
+    const unsigned long used_kb = static_cast<unsigned long>(used / 1024);
+    const unsigned long books_kb = static_cast<unsigned long>(books / 1024);
+    const unsigned long own_kb = static_cast<unsigned long>(own / 1024);
+    const unsigned long plugin_kb = static_cast<unsigned long>(plugin_block / 1024);
+    char line[320];
+    char wall[24];
+    FormatConsoleClock(osGetTime(), wall);
+    const int n = std::snprintf(line, sizeof(line),
+        "[%s] startup: a closed game is still in memory (foreign %lu: books %lu KB, region used %lu KB, own %lu KB, plugin %lu KB, "
+        "margin 4096 KB), restart the console\n",
+        wall, static_cast<unsigned long>(foreign), books_kb, used_kb, own_kb, plugin_kb);
+    if (n > 0 && n < static_cast<int>(sizeof(line))) {
+        MakeDataDir();
+        File out;
+        if (File::Open(out, kLogSyncPath, File::RWC | File::APPEND | File::SYNC) == File::SUCCESS) {
+            out.Write(line, static_cast<u32>(n));
+        }
+    }
+    PostNotification("A closed game is still in memory: restart the console before starting another game");
+}
+
+// The synchronous line goes to the main log's file (kLogSyncPath), never to AzaharLink.mem (a table that is read with sscanf and written over at every launch).
+// What the user sees and what decides the next step (REGISTRO, phase N): "try 1" is the normal case and has no line here (the log has it, with debug=1);
+// a later try = the port was busy for a moment (0xD0401834) or the kernel had no session left (0xC8601809); NOT connected = the plugin stayed off.
+bool Plugin::CheckPluginLoaderLink() {
+    const plgguard::State& s = g_plg_guard;
+    char wall[24];
+    FormatConsoleClock(osGetTime(), wall);
+    const int head = std::snprintf(g_plg_line, sizeof(g_plg_line), "[%s] ", wall);
+    const int body = head > 0 && head < static_cast<int>(sizeof(g_plg_line)) - 2
+                         ? plgguard::FormatLine(s, g_plg_line + head, sizeof(g_plg_line) - static_cast<std::size_t>(head) - 1)
+                         : 0;
+    if (body <= 0) {
+        return s.connected;
+    }
+    g_plg_line_body = head;
+    if (plgguard::WorthALine(s)) {
+        const int n = head + body;
+        g_plg_line[n] = '\n';
+        MakeDataDir();
+        File out;
+        if (File::Open(out, kLogSyncPath, File::RWC | File::APPEND | File::SYNC) == File::SUCCESS) {
+            out.Write(g_plg_line, static_cast<u32>(n + 1));
+        }
+        g_plg_line[n] = '\0';
+    }
+    return s.connected;
+}
+
 void Plugin::CompareMemoryWithLastLaunch() {
+    CheckStartupOccupancy(); // debug-independent: one synchronous line + an OSD notice if a closed game is still in memory
     if (g_debug_level <= 0) {
         return;
     }
@@ -1053,7 +1228,7 @@ void Plugin::LogAddressMap() {
 // The plugin switched itself off at start-up: say so again once a minute (a single message at launch
 // is easily missed behind the game's own loading screens).
 void Plugin::RepeatStartupIssue() {
-    if (active_ || startup_issue_.empty()) {
+    if (active_ || startup_issue_.empty() || startup_issue_once_) {
         return;
     }
     const u64 now = platform::NowMs();
@@ -1252,15 +1427,17 @@ void Plugin::LogStatsTiming(const Stats& s, u64 dt_ms) {
            static_cast<unsigned long>(c.enet10) / 10, static_cast<unsigned long>(c.enet10) % 10,
            static_cast<unsigned long>(c.frames10) / 10, static_cast<unsigned long>(c.frames10) % 10,
            static_cast<unsigned long>(c.queue10) / 10, static_cast<unsigned long>(c.queue10) % 10);
-    Append(text, sizeof(text), &n, " | game threads: uds %lu.%lu (%lu calls), %lu other ipc calls, frame callback %lu.%lu",
+    Append(text, sizeof(text), &n, " | game threads: uds %lu.%lu (%lu calls), %lu other ipc calls, frame callback %lu.%lu, chat osd %lu.%lu (%lu, max %lu us)",
            static_cast<unsigned long>(c.uds10) / 10, static_cast<unsigned long>(c.uds10) % 10,
            static_cast<unsigned long>(s.ipc_requests), static_cast<unsigned long>(s.pass_calls),
-           static_cast<unsigned long>(c.frame10) / 10, static_cast<unsigned long>(c.frame10) % 10);
-    Append(text, sizeof(text), &n, " | log writer %lu.%lu wall, not CPU, not in the total (%lu wake-ups, late avg %lu max %lu ms)",
+           static_cast<unsigned long>(c.frame10) / 10, static_cast<unsigned long>(c.frame10) % 10,
+           static_cast<unsigned long>(c.chat10) / 10, static_cast<unsigned long>(c.chat10) % 10,
+           static_cast<unsigned long>(s.chat_osd_draws), static_cast<unsigned long>(s.chat_osd_max_ticks / 268));
+    Append(text, sizeof(text), &n, " | log writer %lu.%lu wall, not CPU, not in the total (%lu wake-ups, late avg %lu max %lu ms, %lu lines dropped since the start: the queue was full)",
            static_cast<unsigned long>(c.writer10) / 10, static_cast<unsigned long>(c.writer10) % 10,
            static_cast<unsigned long>(s.writer_wakes),
            static_cast<unsigned long>(s.writer_wakes ? s.writer_late_sum / s.writer_wakes : 0),
-           static_cast<unsigned long>(s.writer_late_max));
+           static_cast<unsigned long>(s.writer_late_max), static_cast<unsigned long>(log_files_->queue_full_total()));
     Append(text, sizeof(text), &n,
            " | waiting, not CPU: soc recv+send %lu.%lu, poll %lu.%lu (waiting), SD card %lu.%lu, pauses after socket errors %lu.%lu",
            static_cast<unsigned long>(c.soc10) / 10, static_cast<unsigned long>(c.soc10) % 10,
@@ -1550,6 +1727,33 @@ void Plugin::NoteProcessEvent(int event) {
     // (the framework's keep-alive thread, 4 KB of stack: flag stores and the swap below, nothing that formats or takes a lock of the log)
     if (event >= 0 && event < kProcessEvents) {
         event_ms_[event] = static_cast<u32>(platform::NowMs());
+        if (event == kEventExit) {
+            // The game is in svcExitProcess and Luma3DS waits for the framework's answer: the gate's page owes the limit its bytes back if
+            // LateInit has not settled them yet (a game closed in its first seconds, no heap seen). Once (LateInit, SWAP_ENTER); one svc, no wait.
+            SettleGateBooksAtExit();
+            // The trail, before the probes (the log on only): the EXIT of the process with Luma3DS's plugin word (0x00000003 expected), written by the
+            // trail's thread while the rest of the exit runs (REGISTRO, phase N: which close of a game left Luma3DS's block behind).
+            if (g_debug_level > 0) {
+                NoteSleepEvent(SleepCrumbs::kFwProcExit, LumaPluginWord());
+            }
+            // The zombie probe (debug only), on the keep-alive thread, BEFORE RequestStop and Shutdown join the writer: the lines go into the
+            // log queue and Shutdown's FlushWithin carries them. Rosalina gives the process 2.5 s to terminate, which covers a few hundred svcs.
+            // No blocking wait on the writer is added here. These never run on the Old-3DS SWAP path (that end comes through SWAP_ENTER, below).
+            zombie::ForcedResLine("EXIT");
+            zombie::GameRefcount("EXIT");
+            zombie::ThreadSchedDump("EXIT");
+            zombie::GameHandleCounts();
+            zombie::MemMapWalk();
+        }
+        if (event == kEventHomeEnter || event == kEventHomeExit) {
+            // The trail (the log on only): HOME_ENTER / HOME_EXIT with Luma3DS's plugin word (0x00010001 / 0x00010002 expected).
+            if (g_debug_level > 0) {
+                NoteSleepEvent(event == kEventHomeEnter ? SleepCrumbs::kFwProcHomeEnter : SleepCrumbs::kFwProcHomeExit, LumaPluginWord());
+            }
+            // The forced res line at HOME (New 3DS only: an Old 3DS gets SWAP_ENTER/EXIT instead, where no probe runs): a clean close then has
+            // a per-class reference AT the event to compare the stuck one against.
+            zombie::ForcedResLine(event == kEventHomeEnter ? "HOME_ENTER" : "HOME_EXIT");
+        }
         if (event == kEventSleepEnter || event == kEventSleepExit) {
             // (the trail of the sleep: a few stores and one event signal)
             NoteSleepEvent(event == kEventSleepEnter ? SleepCrumbs::kFwEnter : SleepCrumbs::kFwExit, 0);
@@ -1558,18 +1762,29 @@ void Plugin::NoteProcessEvent(int event) {
             // The trail first, on the card: a crash from here to SWAP_EXIT leaves it, and the memory of the regions at each swap shows what the HOME menu has to work with.
             NoteSwapToTrail(SleepCrumbs::kFwSwapEnter, event_count_[event] + 1);
             WaitForTrail(kSwapTrailWaitMs);
+            // A net for an end with no EXIT event (a process killed, a block that does not come back): a game closed from the HOME menu gets
+            // its EXIT all the same (Luma3DS maps the plugin's block back first, then sends it), and the Settle is made there. Here the gate's
+            // page owes the limit its bytes back if LateInit has not settled them yet, and the game has its heap. Once (with LateInit and the
+            // EXIT); a load at every HOME after that; never a wait for the lock of the books, no line (the writer says it with this event's).
+            SettleGateBooksAtSwap();
             // Old 3DS, HOME: Luma3DS is waiting for the framework's answer, which this callback precedes, and frees the plugin's block as soon as it has it.
-            // Every call site goes back to the game's own words and the threads still inside the hook are waited for (the thread that raised the swap
-            // is not one of them: it went back to the game's code, azl_handback_site). The line about it comes with the event's, from the writer.
-            SuspendSvcHooks(kSwapDrainTimeoutMs);
+            // The svc hook's gate closes (only its flag changes: no word of code, Sources/ctr/gate.s) and the game's threads counted in it are waited for, outside
+            // every lock: a thread asleep in a real service is not counted (the gate makes that svc itself), and the waits of the plugin's own on a game thread end
+            // when the gate closes (the hub's queue is woken for it). The line about it comes with the event's, from the writer.
+            const u32 gate_left = CloseGate(kSwapDrainTimeoutMs, dlp_hub_ ? &WakeHubForSwap : nullptr, dlp_hub_.get());
             // Then the plugin's own threads: a service answering a call of theirs with the block gone stops the console (kernel panic, process `socket`). After the hooks: a game's thread in the
             // hook may wait for what a thread stopped at the gate holds.
             CloseSwapGate(kSwapGateTimeoutMs);
-        } else if (event == kEventSwapExit) {
-            if (!swap_back_done_.exchange(false)) { // (done by OnSwapBack, before the game's thread woke up: a second pass would start the 2 s of the hand-back again)
-                ResumeSvcHooks(); // (the block is back, byte for byte: the sites take their old trampolines again)
-                OpenSwapGate();
+            // A game's thread still counted in the hook is a certain crash once the block goes (risk O-B): what is left of the one deadline
+            // (ctr/swap_gate.hpp, from Luma3DS's event) is spent waiting for it, reading the count only, instead of answering early.
+            if (gate_left != 0) {
+                WaitGateDrained();
             }
+            NoteSwapAnswered();
+            EndSwapDeadline();
+        } else if (event == kEventSwapExit) {
+            OpenGate(); // (idempotent: OnSwapBack opened it already, as soon as the block was mapped)
+            OpenSwapGate();
             NoteSwapToTrail(SleepCrumbs::kFwSwapExit, event_count_[event] + 1);
         }
         // Last: the writer reports an event once, when it sees the count change, and the HOME button has just woken it. Counted before the gate closes, it could print the numbers of the swap before this one.
@@ -1577,16 +1792,135 @@ void Plugin::NoteProcessEvent(int event) {
     }
 }
 
-// Old 3DS, the block is back: Luma3DS has mapped it, unlocked the plugin's threads and told the framework (PLG_OK), and only then lets the game's thread that raised the swap go on.
-// Here the framework's thread runs at the priority Luma's answer gave it (__wrap_PLGLDR__Reply, below), above the game's threads: the call sites go back in the hook before any
-// of them runs. At SWAP_EXIT, later, the game's thread could already be inside its own svc at a call site while that site was rewritten: on waking up it ran the trampoline's
-// address in place of the instruction after its svc, lost that instruction, and a session it had just opened stayed 0 (0xD8E007F7 on handle 0: Pokemon, My Hero Academia).
+// Old 3DS, the block is back: Luma3DS has mapped it, unlocked the plugin's threads and told the framework (PLG_OK) (__wrap_PLGLDR__Reply, below, after the real reply).
+// The gate opens: the game's threads call the plugin again. Nothing of the game's code is written (it was written once, before the game ran), so the order in which Luma3DS
+// wakes the threads does not matter and the framework's thread keeps its own priority: a game's thread that wakes first in the gate's svc finds the same instructions it went
+// to sleep on (the defect of 1.1.2: the two-word sites rewritten under a thread asleep in their svc, LEGO Batman 2's dumps; 0xD8E007F7 on handle 0).
+// Old 3DS: how long Rosalina waits for the framework's answer to an event (SWAP_ENTER above all) is NOT a setting of Luma3DS: it is the u64
+// waitForReplyTimeout of the plugin's own header (offset 0x28, Luma3DS plgldr.h), which Rosalina writes when it loads the plugin (10 s,
+// file_loader.c) and reads again at every wait (plgloader.c, PLG__WaitForReply). Raising it here changes only this launch's copy, in the
+// plugin's memory: nothing on the card, nothing of Luma3DS, and the next game starts again from 10 s. Why: when the answer comes after
+// Rosalina's wait, Rosalina locks the threads and frees the block anyway and, at the return, the framework's thread stays stuck in its reply
+// (no swap back for the plugin, the gate closed, the room lost, the EXIT never answered: risk O-B, analysis/piano-2026-11-08). Our part ends
+// by SWAP_ENTER's one deadline (8 s from Luma3DS's event, ctr/swap_gate.hpp); 15 s leaves the framework's own work after our callback room.
+// The price: a plugin really stuck makes the HOME menu (and a close) wait 15 s instead of 10. Written only when the field holds exactly the
+// 10 s Luma3DS writes (another Luma3DS, another layout: nothing is touched), then cleaned from the data cache for Rosalina's view of it.
+// ---------------------------------------------------------------------------------------------
+// The exit guard (azl/exit_guard.hpp; Sources/ctr/exit_tramp.s; ctr/hook.cpp, InstallExitGuard). It runs on the game's thread that called
+// svcExitProcess, but on the stack below (the trampoline switches to it): not the game's, whose size nobody knows at that point. One thread
+// only (the trampoline's state word), once per launch. New 3DS only: the plugin's block is mapped for good there.
+// ---------------------------------------------------------------------------------------------
+namespace {
+
+alignas(8) u8 g_exit_guard_stack[8192];
+ExitGuardStats g_exit_stats;
+char g_luma_line[320]; // (the lines of the plugin's own thread: the install line, the watch of the word; the guard writes none)
+constexpr u32 kPluginHeaderEventPtr = 0x18; // PluginHeader.plgldrEvent (Luma3DS plgldr.h): Rosalina's event word, through its alias
+constexpr u32 kPluginHeaderReplyPtr = 0x1C; // PluginHeader.plgldrReply: Rosalina's reply word (PLG_WAIT while it waits for the plugin)
+
+volatile s32* RosalinaWord(u32 offset) {
+    const CTRPluginFramework::PluginHeader* header = CTRPluginFramework::FwkSettings::Header;
+    if (header == nullptr) {
+        return nullptr;
+    }
+    const u32 ptr = *reinterpret_cast<const volatile u32*>(reinterpret_cast<uintptr_t>(header) + offset);
+    return ptr >= 0x80000000u && ptr < 0xB0000000u ? reinterpret_cast<volatile s32*>(ptr) : nullptr; // (an alias, PA | 0x80000000: else unknown)
+}
+
+void AppendLumaLine(const char* line, int n) {
+    if (n <= 0 || n >= static_cast<int>(sizeof(g_luma_line))) {
+        return;
+    }
+    MakeDataDir();
+    File out;
+    if (File::Open(out, kLumaLogPath, File::RWC | File::APPEND | File::SYNC) == File::SUCCESS) {
+        out.Write(line, static_cast<u32>(n));
+    }
+}
+
+
+} // namespace
+
+extern "C" void __real_PLGLDR__Reply(s32 event); // (the framework's own reply: the guard answers a stuck HOME event with it)
+// The exit guard itself (azl/exit_guard.hpp, Guard): on the exiting game's thread, on g_exit_guard_stack. No file, no heap, no lock of ours: the
+// trail's ring (lock-free) and its thread put the lines on the card, waited for kTrailWaitMs at most; with the log off nothing is written and the
+// guard still acts.
+void Plugin::RunExitGuard() {
+    using namespace exitguard;
+    volatile u32* const word = LumaWordAliasForWrite();
+    if (word == nullptr) {
+        return;
+    }
+    volatile s32* const reply = RosalinaWord(kPluginHeaderReplyPtr);
+    volatile s32* const event = RosalinaWord(kPluginHeaderEventPtr);
+    NoteSleepEvent(SleepCrumbs::kExitGuardEnter, *word); // (first, before any wait: a guard that never ends is seen too)
+    Guard([word]() { return *word; }, [reply]() { return reply != nullptr ? *reply : 0; }, [event]() { return event != nullptr ? *event : 0; },
+          []() { svcSleepThread(static_cast<s64>(kWaitStepMs) * 1000000LL); },
+          [](s32 ev) { __real_PLGLDR__Reply(ev); },
+          [](const Seen& s) {
+              NoteSleepEvent(SleepCrumbs::kExitGuardRosalina,
+                             (static_cast<u32>(static_cast<u16>(s.reply_first)) << 16) | static_cast<u16>(s.event_first));
+              NoteSleepEvent(SleepCrumbs::kExitGuardWaited, s.waited_ms | (s.replied_for_plugin ? 0x80000000u : 0u));
+              NoteSleepEvent(SleepCrumbs::kExitGuardWordLast, s.word_last);
+              NoteSleepEvent(SleepCrumbs::kExitGuardAction, static_cast<u32>(s.action));
+              Get().WaitForTrail(kTrailWaitMs); // (the trail on the card, kTrailWaitMs at most; no log: at once)
+          },
+          [word]() {
+              *word = kStatusRunning; // (the svc right after this raises EXIT on it; Rosalina frees the block)
+              __sync_synchronize();
+          });
+}
+
+void Plugin::WatchLumaWord(u64 now_ms) {
+    if (!luma_alias_) {
+        return;
+    }
+    const u32 w = LumaPluginWord();
+    if (w == luma_watch_last_) {
+        return;
+    }
+    const u32 before = luma_watch_last_;
+    luma_watch_last_ = w;
+    const unsigned long since = static_cast<unsigned long>(now_ms - start_ms_);
+    if (g_debug_level > 0 && luma_watch_lines_ < kLumaWatchLines) {
+        ++luma_watch_lines_;
+        Log("luma: plugin word 0x%08lx -> 0x%08lx at %lu.%03lu s (the uncached alias)", static_cast<unsigned long>(before),
+            static_cast<unsigned long>(w), since / 1000, since % 1000);
+    }
+    if ((w & exitguard::kStatusMask) == exitguard::kStatusNone && !luma_lost_noted_) {
+        luma_lost_noted_ = true;
+        char wall[24];
+        FormatConsoleClock(osGetTime(), wall);
+        const int n = std::snprintf(g_luma_line, sizeof(g_luma_line),
+            "[%s] luma: title %016llx pid 0x%lx: the plugin word is 0x%08lx (state 0: Rosalina has no plugin for this game) %lu.%03lu s after the "
+            "start, word before 0x%08lx: no HOME or EXIT event will come; the exit guard sets it to running at the exit\n",
+            wall, static_cast<unsigned long long>(CTRPluginFramework::Process::GetTitleID()), static_cast<unsigned long>(process_id_), static_cast<unsigned long>(w), since / 1000,
+            since % 1000, static_cast<unsigned long>(before));
+        AppendLumaLine(g_luma_line, n);
+        Log("luma: the plugin word is 0 with the plugin running (%lu.%03lu s): Rosalina lost this game", since / 1000, since % 1000);
+    }
+}
+
+void Plugin::RaiseRosalinaReplyWait() {
+    const CTRPluginFramework::PluginHeader* header = CTRPluginFramework::FwkSettings::Header;
+    if (header == nullptr) {
+        return;
+    }
+    volatile u64* wait_ns = reinterpret_cast<volatile u64*>(reinterpret_cast<uintptr_t>(header) + kRosalinaReplyWaitOffset);
+    if (*wait_ns != kRosalinaReplyWaitNs) {
+        return;
+    }
+    *wait_ns = kRosalinaReplyWaitRaisedNs;
+    svcFlushProcessDataCache(CUR_PROCESS_HANDLE, reinterpret_cast<u32>(wait_ns), sizeof(u64));
+    rosalina_wait_raised_ = *wait_ns == kRosalinaReplyWaitRaisedNs;
+    SetSwapDeadlineRaised(rosalina_wait_raised_); // (SWAP_ENTER's deadline follows Luma3DS's wait)
+}
+
 void Plugin::OnSwapBack() {
     const u64 start = platform::NowUs();
-    ResumeSvcHooks();
+    OpenGate();
     const u32 took_us = static_cast<u32>(platform::NowUs() - start);
     OpenSwapGate();
-    swap_back_done_.store(true);
     NoteSleepEvent(SleepCrumbs::kFwSwapBack, took_us);
 }
 
@@ -1603,9 +1937,15 @@ void Plugin::WaitForTrail(u32 timeout_ms) {
     if (g_debug_level <= 0 || crumb_wake_ == 0) {
         return;
     }
+    const u32 budget_ms = SwapClampMs(timeout_ms); // (SWAP_ENTER's one deadline, ctr/swap_gate.hpp; no deadline: the budget as given)
+    const u32 asked_ms = timeout_ms;
+    timeout_ms = budget_ms;
     const u32 target = crumbs_.pushed();
     for (u32 waited = 0; waited < timeout_ms && static_cast<s32>(crumb_written_.load() - target) < 0; waited += 2) {
         svcSleepThread(2000000LL);
+    }
+    if (budget_ms < asked_ms && static_cast<s32>(crumb_written_.load() - target) < 0) {
+        NoteSwapWaitCut(2); // (the deadline ended it with the trail not written)
     }
 }
 
@@ -1638,24 +1978,45 @@ void Plugin::LogProcessEvents() {
             i == kEventExit ? "is closing" : i <= 2 ? "sleeps (lid) or wakes" : "goes to / returns from the HOME menu",
             wall);
         if (i == kEventSwapEnter || i == kEventSwapExit) {
-            const SwapStats swap = GetSwapStats();
+            const GateStats swap = GetGateStats();
             if (i == kEventSwapEnter) {
+                LogGateBooksAtEvents(); // (what SWAP_ENTER did with the books, if anything)
+                const SwapDeadlineStats& deadline = LastSwapDeadline();
+                Log("swap: our part answered %lu ms after %s (anchor %lu ms old; deadline %lu ms; Luma3DS waits %s) | waits cut by the deadline: %s%s%s%s%s%s",
+                    static_cast<unsigned long>(deadline.answered_ms),
+                    deadline.anchored == 1 ? "Luma3DS's event" : deadline.anchored == 2 ? "an older anchor (the earlier deadline)" : "the callback (no fresh anchor)",
+                    static_cast<unsigned long>(deadline.anchor_age_ms), static_cast<unsigned long>(deadline.deadline_ms),
+                    rosalina_wait_raised_ ? "15 s, raised" : "10 s", deadline.cut == 0 ? "none" : "",
+                    (deadline.cut & 1) ? "mirror " : "", (deadline.cut & 2) ? "trail " : "", (deadline.cut & 4) ? "hooks " : "",
+                    (deadline.cut & 8) ? "plugin's threads " : "", (deadline.cut & 16) ? "second drain (a game's thread was still in the hook)" : "");
                 const SwapGateStats& gate = g_swap_gate.stats;
-                Log("swap gate: in a service call at the start: network %lu, log writer %lu, trail %lu | left: network %lu, log writer %lu, trail %lu | waited %lu us | %lu stop(s) at the gate so far",
+                // (chat: the game's thread in the chat's OSD callback, which never stops at the gate: it skips its frame once the gate is closed)
+                Log("swap gate: in a service call at the start: network %lu, log writer %lu, trail %lu, chat %lu | left: network %lu, log writer %lu, trail %lu, chat %lu | waited %lu us | %lu stop(s) at the gate so far",
                     static_cast<unsigned long>(gate.inside_start / kGateNet & 0xFF), static_cast<unsigned long>(gate.inside_start / kGateWriter & 0xFF),
-                    static_cast<unsigned long>(gate.inside_start / kGateTrail & 0xFF), static_cast<unsigned long>(gate.inside_left / kGateNet & 0xFF),
+                    static_cast<unsigned long>(gate.inside_start / kGateTrail & 0xFF), static_cast<unsigned long>(gate.inside_start / kGateOsd & 0xFF),
+                    static_cast<unsigned long>(gate.inside_left / kGateNet & 0xFF),
                     static_cast<unsigned long>(gate.inside_left / kGateWriter & 0xFF), static_cast<unsigned long>(gate.inside_left / kGateTrail & 0xFF),
+                    static_cast<unsigned long>(gate.inside_left / kGateOsd & 0xFF),
                     static_cast<unsigned long>(gate.waited_us), static_cast<unsigned long>(g_swap_gate.stops));
-                Log("hook swap: %lu call sites given back to the game (%lu not ours), %lu thread(s) in the hook at the start and %lu left after %lu us | "
-                    "%lu call(s) handed back to their call site so far (%lu refused), %lu APT:ReceiveParameter asked about (%lu with no HOME or power button seen)",
-                    static_cast<unsigned long>(swap.restored), static_cast<unsigned long>(swap.not_ours),
-                    static_cast<unsigned long>(swap.in_flight), static_cast<unsigned long>(swap.in_flight_left),
-                    static_cast<unsigned long>(swap.waited_us), static_cast<unsigned long>(swap.handbacks),
-                    static_cast<unsigned long>(swap.handback_refused), static_cast<unsigned long>(swap.asked),
-                    static_cast<unsigned long>(swap.no_home));
+                Log("swap: gate closed, %lu in flight at the start, %lu left after %lu us | post skipped %lu so far | "
+                    "followed sessions closed unseen %lu, APT slots reused %lu, sessions not followed %lu",
+                    static_cast<unsigned long>(swap.gate.in_flight_start), static_cast<unsigned long>(swap.gate.in_flight_left),
+                    static_cast<unsigned long>(swap.gate.waited_us), static_cast<unsigned long>(swap.gate.post_skipped),
+                    static_cast<unsigned long>(swap.traced_stale), static_cast<unsigned long>(swap.traced_evicted),
+                    static_cast<unsigned long>(swap.traced_dropped));
+                if (swap.gate.in_flight_left != 0) {
+                    // (the block went with a game's thread still counted in the plugin's code: what the gate knows of the last one that came in)
+                    Log("swap: gate drain timeout: %lu thread(s) still in the plugin; the last one in came from the stub at 0x%08lx (call site 0x%08lx), handle 0x%08lx",
+                        static_cast<unsigned long>(swap.gate.in_flight_left), static_cast<unsigned long>(swap.gate.last_site),
+                        static_cast<unsigned long>(swap.last_site_address), static_cast<unsigned long>(swap.gate.last_handle));
+                }
             } else {
-                Log("hook swap: %lu call sites back in the hook, %lu of APT:ReceiveParameter left to the game for 2 s (%lu re-armed so far)", static_cast<unsigned long>(swap.hooked_again),
-                    static_cast<unsigned long>(swap.kept_out), static_cast<unsigned long>(swap.rearmed));
+                Log("swap: gate open (%lu close(s), %lu open(s) so far, post skipped %lu) | fake sessions: %lu in the gate's table, "
+                    "%lu call(s) answered by the gate while shut, %lu closed while shut and forgotten, %lu not in the table (full)",
+                    static_cast<unsigned long>(swap.gate.closes), static_cast<unsigned long>(swap.gate.opens),
+                    static_cast<unsigned long>(swap.gate.post_skipped), static_cast<unsigned long>(swap.fake_in_table),
+                    static_cast<unsigned long>(swap.fake_hits), static_cast<unsigned long>(swap.fake_settled),
+                    static_cast<unsigned long>(swap.fake_full));
             }
         }
     }
@@ -1704,6 +2065,10 @@ void Plugin::EarlyInit() {
     }
     initialized_ = true;
     start_ms_ = platform::NowMs();
+    start_os_ms_ = osGetTime(); // (the trail's first line: when this launch's plugin started, by the console's clock)
+    if (R_FAILED(svcGetProcessId(&process_id_, CUR_PROCESS_HANDLE))) {
+        process_id_ = 0;
+    }
     file_layer_.reset(new CtrFiles());
     MakeDataDir(); // (the framework opens the SD card before PatchProcess: the folder can be made here)
     bootdiag::Begin(); // (the diagnostic build only: the state of the process before we touch anything, on the card at once)
@@ -1718,7 +2083,26 @@ void Plugin::EarlyInit() {
     // (debug=0: Log() returns at once, no file is created and no ring is allocated). The framework opens the SD card
     // before calling PatchProcess. If the settings cannot be read, the plugin stays ON and the log stays off.
     const bool config_read_early = LoadConfig();
-    active_ = config_.enabled && config_.tunnel_enabled;
+    // The framework's connection to Luma3DS's plugin loader (azl/plg_guard.hpp), made before this: without it no event of the process (HOME, sleep, swap,
+    // exit) reaches the plugin, and an Old 3DS would swap the block out under hooks and threads nobody stopped. The plugin then stays out of this launch
+    // as when it is switched off (Sources/main.cpp, !active()): no hooks, no network, no chat, no mirror, and the reason on screen once.
+    const bool loader_linked = CheckPluginLoaderLink();
+    active_ = config_.enabled && config_.tunnel_enabled && loader_linked;
+    if (!loader_linked) {
+        startup_issue_ = "3DS Link: the plugin could not talk to Luma's plugin loader: restart the game";
+        startup_issue_once_ = true;
+        PostNotification(startup_issue_);
+    }
+    {
+        s64 is_new = 0;
+        swap_console_ = svcGetSystemInfo(&is_new, 0x10001, 0) != 0; // (Luma3DS swaps the plugin's block out on an Old 3DS: the very test of thread_core)
+    }
+    if (swap_console_ && loader_linked) {
+        RaiseRosalinaReplyWait();
+    }
+    if (!swap_console_ && loader_linked) {
+        luma_alias_ = SetupLumaWordAlias(); // (a New 3DS with Luma3DS: the probes and the exit guard read the word as Luma writes it)
+    }
     bool capture_ready = true;
     if (config_.debug > 0) {
         g_debug_level = 1;
@@ -1732,6 +2116,9 @@ void Plugin::EarlyInit() {
         char stamp[24];
         FormatConsoleClock(osGetTime(), stamp);
         Log("==== AzaharLink %s (built %s), console clock %s ====", kVersion, kBuildStamp, stamp);
+        if (g_plg_line_body >= 0) {
+            Log("%s", g_plg_line + g_plg_line_body);
+        }
     }
     if (!capture_ready) {
         Log("debug: not enough memory for the capture ring: only AzaharLink.log is written");
@@ -1796,7 +2183,7 @@ void Plugin::EarlyInit() {
     CompareMemoryWithLastLaunch();
 
     Log("config: read at startup: %s, plugin %s", config_read_early ? "yes" : "no (defaults)",
-        active_ ? "ON" : "OFF (enabled=0 or tunnel=0): no hooks, no network");
+        active_ ? "ON" : !loader_linked ? "OFF (no connection to Luma3DS's plugin loader): no hooks, no network" : "OFF (enabled=0 or tunnel=0): no hooks, no network");
     if (config_from_old_place_) {
         Log("config: read from the old place %s (there is no %s yet: the 3DS Link app moves the file when it runs)", kOldConfigPath,
             kConfigPath);
@@ -1819,7 +2206,11 @@ void Plugin::EarlyInit() {
         // The hooks give the game a wireless that leads into the room through sockets: without
         // memory for them the plugin stays out of the game (the real wireless keeps working). A game that cannot spare the block
         // while it sizes its heap gets it at the first connection (socplan::kLateBlockTitles); an empty file /3ds/3DSLink/soc-from-system
-        // sends such a game down the road of an Old 3DS on a New one, the only place where that road can be tried.
+        // sends such a game down the road of an Old 3DS on a New one: the block from the SYSTEM region and on the kernel's books. Since 1.1.2
+        // it no longer tries the whole road: on a New 3DS the game holds about 80 MiB of a 124 MiB APPLICATION region, so pages are left and the Charge's
+        // reservation finds them and goes the kernel's way ("made through the kernel's reservation"); the fallback written in kernel mode
+        // (books::ChargeOrWrite, kNoPages) and the Uncharge over the three regions run only where the game holds the whole region, an Old
+        // 3DS with Monster Hunter XX: only there are they tried.
         const bool late = socplan::TakesBlockLate(game_id_);
         if (late) {
             const bool from_system = File::Exists("/3ds/3DSLink/soc-from-system") == 1;
@@ -1887,6 +2278,11 @@ void Plugin::EarlyInit() {
         }
     });
     room_->SetRoomInfoCallback([this](const room::RoomInfo& info) { OnRoomInfo(info); });
+    // (chat=0: no block, no sink - the room's chat packets go where they always went, unread. A file the card could not give yet
+    // makes nothing either: the chat's default is on, but the file may say chat=0 - LateInit reads it again and wires the chat then)
+    if (config_read_early && config_.chat) {
+        WireChat(true);
+    }
     room_->SetStateCallback([this](RoomClient::State state, RoomClient::Error error) {
         Log("room: %s%s%s", RoomClient::StateName(state),
             error != RoomClient::Error::None ? " - " : "",
@@ -1990,8 +2386,28 @@ void Plugin::EarlyInit() {
         });
         SetHomeObserver([]() { Plugin::Get().OnHomeButton(); });
         SetAptObserver(&Plugin::NoteSleepEvent); // (the trail of a sleep: with the log on)
+        SetTrailWaiter(&Plugin::WaitForCloseTrail); // (the close command 12: the log on, a New 3DS only)
         if (!bootdiag::Skip("hooks")) {
-            hook_stats_ = InstallSvcHooks(hle_.get());
+            hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);
+            if (!swap_console_ && luma_alias_ && hook_stats_.gate_ready) {
+                // The exit guard (REGISTRO, phase Q): a New 3DS only (an Old 3DS swaps the block out, and the guard is in it).
+                g_exit_stats = InstallExitGuard([]() { RunExitGuard(); },
+                                                reinterpret_cast<u32>(g_exit_guard_stack) + sizeof(g_exit_guard_stack));
+                char wall[24];
+                FormatConsoleClock(osGetTime(), wall);
+                const int n = std::snprintf(g_luma_line, sizeof(g_luma_line),
+                    "[%s] exit guard: title %016llx pid 0x%lx: %lu of %lu ARM svc 0x03 site(s) hooked, trampoline at 0x%08lx, %lu Thumb candidates "
+                    "(not hooked), Luma's word 0x%08lx at the start (through its alias)%s%s\n",
+                    wall, static_cast<unsigned long long>(CTRPluginFramework::Process::GetTitleID()), static_cast<unsigned long>(process_id_),
+                    static_cast<unsigned long>(g_exit_stats.hooked), static_cast<unsigned long>(g_exit_stats.sites),
+                    static_cast<unsigned long>(g_exit_stats.tramp), static_cast<unsigned long>(g_exit_stats.thumb),
+                    static_cast<unsigned long>(LumaPluginWord()), g_exit_stats.why_not != nullptr ? ": no guard, " : "",
+                    g_exit_stats.why_not != nullptr ? g_exit_stats.why_not : "");
+                AppendLumaLine(g_luma_line, n);
+                if (g_debug_level > 0 && n > 0) {
+                    Log("%s", g_luma_line + 2 + std::strlen(wall));
+                }
+            }
         }
     }
 #ifdef AZL_BOOT_DIAG
@@ -2157,6 +2573,16 @@ void Plugin::NoteRoomMembers(const room::RoomInfo& info) {
     for (const room::MemberInfo& member : info.members) {
         now.push_back({member.mac, member.nickname, SanitizeTitle(member.game_name), RoomMemberPlays(member.game_name, member.game_id)});
     }
+    // Who came and who left, in the chat (the chat on, at every debug level): this runs on the network thread, the ring's one writer.
+    // The first list of a join is the baseline (no line for who was already there: the "has N/M players" notice says it).
+    if (room_members_known_) {
+        if (ChatSink* sink = room_->chat_sink()) {
+            const u32 now_ms = static_cast<u32>(platform::NowMs());
+            for (const RoomMemberChange& c : RoomMemberChanges(room_members_, now, room_->mac())) {
+                sink->OnPresence(c.nickname.data(), c.nickname.size(), c.joined, now_ms);
+            }
+        }
+    }
     if (room_members_known_ && g_debug_level > 0) {
         // (azl/room_members.hpp: "room: 'Friend-A' [FINAL FANTASY EXPLORERS] joined the room ..."; a player the room has not
         // yet told the game of has no brackets)
@@ -2262,6 +2688,17 @@ void Plugin::NoteSleepEvent(u32 kind, u32 value) {
     svcSignalEvent(self.crumb_wake_);
 }
 
+void Plugin::WaitForCloseTrail() {
+    Plugin& self = Get();
+    if (g_debug_level <= 0 || self.swap_console_ || self.crumb_wake_ == 0) {
+        return; // (no log, no trail, or an Old 3DS: its HOME goes through the swap of the block, which has its own budget)
+    }
+    const u32 target = self.crumbs_.pushed();
+    for (u32 waited = 0; waited < kCloseTrailWaitMs && !GateClosing() && static_cast<s32>(self.crumb_written_.load() - target) < 0; waited += 2) {
+        svcSleepThread(2000000LL);
+    }
+}
+
 void Plugin::OnSleepEnter() {
     // The game's thread, inside the APT call that told it: the sleep is certain from here (a refused one never gets
     // this far), so the session ends now, before the game acknowledges and the console goes under. With
@@ -2359,6 +2796,10 @@ void Plugin::LateInit() {
     platform::SetPreferredCore(config_.net_core);
     azl_enet_socket_buffers = config_.socket_buffers ? 1 : 0;
     room_->SetFastData(config_.radio_like);
+    // (the file as read now: one the card could not give at start-up may switch the chat either way; off allocates nothing)
+    if (config_.chat || chat_sink_.load(std::memory_order_relaxed)) {
+        WireChat(config_.chat);
+    }
     Log("config: %s enabled=%d host='%s' port=%u nickname='%s' tunnel=%d autoconnect=%d radio_like=%d"
         " socket_buffers=%d rcvbuf_kb=%d sleep_stop=%d net_thread_core=%d menu_key=%s",
         loaded ? "loaded" : "no file,", config_.enabled, config_.host.c_str(), config_.port,
@@ -2381,6 +2822,8 @@ void Plugin::LateInit() {
     // The framework installed its own hooks in the first seconds: check that none of them landed on
     // one of our patched sites.
     ReportForeignPatches();
+    // The gate's page went on the kernel's books before the game sized its heap (ctr/gate_page.cpp): the limit comes back down now.
+    SettleGatePage();
 
     ResolveIdentity();
     ResolveGameName();
@@ -2391,7 +2834,12 @@ void Plugin::LateInit() {
         config_.nickname.empty() ? "from the console" : "from the settings",
         MacToString(console_mac_).c_str(), GameName().c_str());
 
-    if (hook_stats_.send_sync_sites == 0) {
+    if (hook_stats_.no_gate != nullptr) {
+        // (a console where the gate's page could not be taken: no hooks at all for this launch, never the alias where the SYSTEM page failed, never the old two-word ones; ctr/gate_page.cpp)
+        Log("WARNING: the svc hook is off for this launch: %s", hook_stats_.no_gate);
+        PostNotification(std::string("AzaharLink: the hook found no place for its gate (") + hook_stats_.no_gate +
+                         "): multiplayer will not work in this launch");
+    } else if (hook_stats_.send_sync_sites == 0) {
         Log("WARNING: no svc 0x32 stub found in the game's code: UDS cannot be intercepted");
         PostNotification("AzaharLink: cannot hook this game (no system call found in its code): multiplayer will not work");
     }
@@ -2423,6 +2871,7 @@ void Plugin::Shutdown() {
     // whichever of the two comes first logs it once - come before 'shutdown: begin', so that the end of a log reads in
     // the order it happened.
     LogProcessEvents();
+    LogGateBooksAtEvents(); // (what the EXIT event, or the last SWAP_ENTER, did with the books, if anything)
     Log("shutdown: begin (%lu hook sites, network %s)",
         static_cast<unsigned long>(hook_stats_.send_sync_sites),
         room_ && room_->state() != RoomClient::State::Idle ? "up" : "idle");
@@ -2431,8 +2880,8 @@ void Plugin::Shutdown() {
     // card of the Zelda session: log_files.hpp, LogFileLimits::exit_capture_ms).
     log_files_->BeginShutdown();
     // The hooks stay in the game's code on purpose: the game's own threads may still be running
-    // through them while it closes, rewriting live code without invalidating the instruction cache
-    // can crash them, and the trampolines stay mapped until the process dies anyway. The HLE keeps
+    // through them while it closes, and the gate's page and the plugin stay mapped until the process
+    // dies anyway (nothing of the game's code is ever written after the installation). The HLE keeps
     // answering the fake sessions the game still holds.
 
     // The Download Play hub (a game in Lobby mode) before the network thread: the thread that serves its requests is about to go.
@@ -2473,7 +2922,7 @@ void Plugin::Shutdown() {
             static_cast<unsigned long>(t.agg_calls), static_cast<unsigned long>(t.agg_lines),
             static_cast<unsigned long>(t.ring_peak / 1024));
     }
-    Log("shutdown: done");
+    Log("shutdown: done (the chat's input mirror at the game's last event: %s)", MirrorLastText(MirrorLastState()));
 
     log_stop_.store(true);
     WakeLogWriter();
@@ -2502,6 +2951,29 @@ void Plugin::Shutdown() {
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
+
+bool Plugin::ReadDataFile(const char* path, std::size_t max_bytes, std::string& out) {
+    File file;
+    if (File::Open(file, path, File::READ) != File::SUCCESS) {
+        return false;
+    }
+    const u64 size = file.GetSize();
+    if (size == 0) {
+        return false;
+    }
+    // (a bigger file is read up to its last whole line within `max_bytes`: the memory the menu takes stays what it is)
+    const std::size_t take = size > max_bytes ? max_bytes : static_cast<std::size_t>(size);
+    out.assign(take, '\0');
+    if (file.Read(&out[0], static_cast<u32>(take)) < 0) {
+        out.clear();
+        return false;
+    }
+    if (take < size) {
+        const std::size_t last = out.rfind('\n');
+        out.resize(last == std::string::npos ? 0 : last + 1);
+    }
+    return !out.empty();
+}
 
 bool Plugin::LoadConfig() {
     // The old place (an app older than this build) is read while the new file is missing, never written (SaveConfig writes the new
@@ -2563,7 +3035,7 @@ bool Plugin::LoadConfig() {
             }
         } else if (key == "menu_key") {
             if (!value.empty()) {
-                config_.menu_key = value; // (a chord, or "off"/"none": see menu_off())
+                config_.menu_key = ini::MenuKeyFromFile(value); // (a chord, or "off"/"none": see menu_off(); the old default is the new one)
             }
         } else if (key == "game_name") {
             config_.game_name = value;
@@ -2573,13 +3045,23 @@ bool Plugin::LoadConfig() {
             config_.rcvbuf_kb = ini::RcvbufKb(value); // (checked where it is used)
         } else if (key == "sleep_stop") {
             config_.sleep_stop = ini::SleepStop(value); // (0, 1, 2: see azl/ini_values.hpp)
+        } else if (key == "chat") {
+            config_.chat = ini::ParseBool(value, true); // (a slip is the default, on)
+        } else if (key == "chat_key") {
+            if (!value.empty()) {
+                config_.chat_key = value;
+            }
+        } else if (key == "chat_pos") {
+            config_.chat_pos = ini::ParseChatPos(value); // (one of the four words; anything else is the default, bottom-left)
         }
     }
+    chat_on_.store(config_.chat, std::memory_order_relaxed);
+    chat_pos_.store(config_.chat_pos, std::memory_order_relaxed);
     return true;
 }
 
 bool Plugin::SaveConfig() {
-    // All 15 keys, always, in the order the Setup app writes them (ini::Render is the one writer of both): a file made by the
+    // All 18 keys, always, in the order the Setup app writes them (ini::Render is the one writer of both): a file made by the
     // plugin can be edited by hand without knowing which keys exist. The advanced ones, rcvbuf_kb and sleep_stop, used to be
     // written only when they differed from the default, so a file never showed them.
     ini::Fields fields;
@@ -2598,6 +3080,9 @@ bool Plugin::SaveConfig() {
     fields.debug = config_.debug;
     fields.rcvbuf_kb = config_.rcvbuf_kb;
     fields.sleep_stop = config_.sleep_stop;
+    fields.chat = config_.chat;
+    fields.chat_key = config_.chat_key;
+    fields.chat_pos = config_.chat_pos;
     const std::string text = ini::Render(fields);
 
     File file;
@@ -2683,6 +3168,8 @@ bool Plugin::Tick(bool want_connected) {
     if (shutting_down_.load()) {
         return true;
     }
+    SettleGateFakeClosed(); // (the fake sessions the game closed while the gate was shut: one load when there is none)
+    WatchLumaWord(platform::NowMs()); // (Luma3DS's plugin word through its alias: a load when it has not changed)
     const u64 now = platform::NowMs();
     SampleLinkState(now); // (the room thread is not always there when the link goes)
     if (!log_thread_.running()) {
@@ -2886,23 +3373,48 @@ std::vector<std::string> Plugin::TakeNotifications() {
 } // namespace azl
 
 // The framework's answer to Luma3DS. With 3 (the plugin is ready for the swap of its block, an Old 3DS only: Luma sends that event nowhere else) the call returns
-// once the block is back, and Luma has unlocked this thread before it lets the game's thread go on. The thread goes up to the priority the framework created it with,
-// so that putting the call sites back in the hook finishes before a game's thread runs on this core (Plugin::OnSwapBack); then its own priority again.
+// once the block is back and mapped: the svc hook's gate opens then (Plugin::OnSwapBack), never before (a game's thread would call into a block that is not there).
+// No priority games: nothing of the game's code changes, so who runs first does not matter.
 constexpr s32 kReplySwap = 3;
-constexpr s32 kSwapBackPriority = 0x1A;
 
 extern "C" void __real_PLGLDR__Reply(s32 event);
 extern "C" void __wrap_PLGLDR__Reply(s32 event) {
-    if (event != kReplySwap) {
-        __real_PLGLDR__Reply(event);
-        return;
-    }
-    s32 priority = 0;
-    const bool raised = R_SUCCEEDED(svcGetThreadPriority(&priority, CUR_THREAD_HANDLE)) &&
-                        R_SUCCEEDED(svcSetThreadPriority(CUR_THREAD_HANDLE, kSwapBackPriority));
     __real_PLGLDR__Reply(event);
-    azl::ctr::Plugin::Get().OnSwapBack();
-    if (raised) {
-        svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
+    if (event == kReplySwap) {
+        azl::ctr::Plugin::Get().OnSwapBack();
     }
+}
+
+// The framework's connection to Luma3DS's plugin loader, guarded (azl/plg_guard.hpp; -Wl,--wrap=plgLdrInit -Wl,--wrap=PLGLDR__FetchEvent in the Makefile:
+// KeepThreadMain's one call of each). Both run on the framework's keep-alive thread - plgLdrInit once, before PatchProcess, FetchEvent every 250 ms -
+// and are plain C: no Log, no string, no heap (4 KB of stack, Tests/stack_usage.sh). The arbiter: plgLdrInit takes it from word 3 of the answer of the IPC
+// 0x90000 (in the ELF: ldr [tls, #0x8c], then a store to its static plgLdrArbiter) and returns the connection's result only; that word is cleared before
+// each try, so a try whose IPC did not answer shows 0. A session without its arbiter is closed (plgLdrExit: the count back to 0, the handle closed)
+// and tried again. FetchEvent without a connection answers 0, "no event" (KeepThreadMain takes values outside 1..6 back to its wait): never a
+// connection tried there (Rosalina serves plg:ldr and the events in one loop: a try while it waits for our reply blocks 10 s, and the event word
+// it then reads is the old one). PLGLDR__Reply needs no guard: the framework replies only to an event it fetched.
+extern "C" Result __real_plgLdrInit(void);
+extern "C" void plgLdrExit(void);
+extern "C" Result __wrap_plgLdrInit(void) {
+    azl::plgguard::State& s = azl::ctr::g_plg_guard;
+    s64 citra = 0;
+    s.emulator = svcGetSystemInfo(&citra, 0x20000, 0) == 0; // (Citra's and Azahar's information type: Luma3DS has none such)
+    const u64 start = svcGetSystemTick();
+    const Result rc = azl::plgguard::Connect(
+        &s,
+        []() {
+            u32* cmd = getThreadCommandBuffer();
+            cmd[3] = 0;
+            const s32 r = __real_plgLdrInit();
+            return azl::plgguard::Try{r, r >= 0 ? cmd[3] : 0u};
+        },
+        []() { plgLdrExit(); },
+        []() { svcSleepThread(static_cast<s64>(azl::plgguard::kRetryMs) * 1000000LL); });
+    s.ms = static_cast<u32>((svcGetSystemTick() - start) / (SYSCLOCK_ARM11 / 1000));
+    return rc;
+}
+
+extern "C" s32 __real_PLGLDR__FetchEvent(void);
+extern "C" s32 __wrap_PLGLDR__FetchEvent(void) {
+    return azl::plgguard::FetchOrNone(azl::ctr::g_plg_guard, []() { return __real_PLGLDR__FetchEvent(); });
 }

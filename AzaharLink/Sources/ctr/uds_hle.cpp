@@ -7,6 +7,8 @@
 #include "azl/dlp_hub.hpp"
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
+#include "ctr/gate_flag.hpp"
+#include "ctr/hook.hpp"
 
 namespace azl {
 namespace ctr {
@@ -259,6 +261,7 @@ void UdsHle::MarkInitialized(Handle handle) {
 bool UdsHle::ForgetFakeHandle(Handle handle) {
     bool initialized = false;
     platform::LockGuard lock(mutex_);
+    GateFakeRemove(handle); // (the gate's table of the fake sessions: written under this lock only)
     for (int i = 0; i < kMaxFakeHandles; ++i) {
         if (fake_[i] == handle) {
             initialized |= fake_initialized_[i] != 0;
@@ -412,6 +415,14 @@ bool UdsHle::InterceptGetServiceHandle(Result* svc_result) {
         fake_initialized_[slot] = 0;
         fake_ndm_[slot] = static_cast<s8>(ndm_session);
         fake_[slot] = fake;
+        // With the gate shut (an Old 3DS's swap) the gate answers this session itself, with the error the real service gives a call it cannot
+        // take now: never the kernel's 0xD8E007F7 (not a session), on which the game's SDK stops with an error screen.
+        const u32 shut_result = kind == kKindUds ? res::kWrongState : kind == kKindNdm ? NdmHle::kResBadState : DlpHub::kResultWirelessOff;
+        if (GateFakeAdd(fake, shut_result) < 0) {
+            LogLine line;
+            line.Str("uds: WARNING the gate's table of the fake sessions is full: during the HOME menu of an Old 3DS the calls on 0x").Hex(fake)
+                .Str(" reach the kernel");
+        }
     }
     if (kind == kKindUds) {
         ++sessions_;
@@ -528,7 +539,9 @@ __attribute__((noinline)) void UdsHle::ThrottleFailing(u64 now_ticks) {
     if (++fail_window_count_ <= kFailFreeCalls) {
         return;
     }
-    svcSleepThread(kFailPauseNs);
+    if (!GateClosing()) { // (not while the swap of the plugin's block waits for this thread to leave the plugin)
+        svcSleepThread(kFailPauseNs);
+    }
     StatsAdd(g_stats.hle_throttled);
     if (++throttled_ == 1) {
         s32 priority = 0;
@@ -708,17 +721,24 @@ __attribute__((noinline)) void DlpTraceReply(bool srvr, u32 id, const u32* cmd) 
 // (it gives up by itself after 3 s). The wait is on this thread, in slices, with no lock (PollPending takes the hub's lock for the
 // length of a read). If the network thread is gone the join never ends: after kDlpJoinCapMs the reply is "server not found" and
 // the end of the client role is asked of the hub (OnSessionClosed cancels the join; with no network thread alive the hub leaves it
-// for the next Tick, which is all there is to wait for).
+// for the next Tick, which is all there is to wait for). The same answer at once when the swap of the plugin's block closes the svc
+// hook's gate (ctr/gate_flag.hpp): the swap waits for this thread to leave the plugin's code, for 1.5 s at the most, and this wait is 8 s.
 __attribute__((noinline)) void WaitForJoin(DlpHub& hub, u32* cmd) {
     const u64 deadline = platform::NowMs() + kDlpJoinCapMs;
     while (!hub.PollPending(cmd)) {
-        if (platform::NowMs() >= deadline) {
+        const bool closing = GateClosing();
+        if (closing || platform::NowMs() >= deadline) {
             hub.OnSessionClosed(DlpKind::Fkcl);
             cmd[0] = (DlpService::kFkStartFakeSession << 16) | 0x40;
             cmd[1] = kNotFound;
             LogLine line;
-            line.Str("dlp: dlp:FKCL StartFakeSession: the join did not end in ").Dec(kDlpJoinCapMs / 1000)
-                .Str(" s (the network thread is not running it): answered \"server not found\", the end of the client role is left to the network thread");
+            if (closing) {
+                line.Str("dlp: dlp:FKCL StartFakeSession: the plugin's memory is being swapped out during the join (HOME, power, an applet): "
+                         "answered \"server not found\" at once, the end of the client role is left to the network thread");
+            } else {
+                line.Str("dlp: dlp:FKCL StartFakeSession: the join did not end in ").Dec(kDlpJoinCapMs / 1000)
+                    .Str(" s (the network thread is not running it): answered \"server not found\", the end of the client role is left to the network thread");
+            }
             return;
         }
         svcSleepThread(kDlpJoinSleepNs);

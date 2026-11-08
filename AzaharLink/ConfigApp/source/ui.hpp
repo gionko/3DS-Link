@@ -145,6 +145,10 @@ struct App {
     void ReleaseHome();
     void ApplyHome();
 
+    // The room in use when it is a public one (pages_lobbies.cpp keeps it): its name for the screens that say which room this is.
+    std::string public_room_key; // "host:port", lower case ("" = the room in use is not a public one)
+    std::string public_room_name;
+
     std::string toast;
     u32 toast_color = 0;
     u64 toast_until = 0;
@@ -161,7 +165,7 @@ struct App {
     // Writes AzaharLink.ini ("Saved." on success, a lasting error when it fails).
     void Save();
     // Writes the list of saved rooms (a toast only when it cannot).
-    void SaveServers();
+    bool SaveServers(); // (true when the file was written)
     // Writes 3DSLink.cfg. Until the first start is over (first_start_done) nothing is written: the file's presence is what says it is over.
     void SaveAppConfig();
 
@@ -298,7 +302,29 @@ struct Row {
     std::string note_title;
     u32 note_color = 0; // the colour of the note's title (0 = the accent colour)
     std::string note;
+    // A room of the public lobbies (pages_lobbies.cpp): two columns at the right, the ping (coloured) and the players over a bar of how full the
+    // room is (`fill` 0..1, below 0 = no bar), and before them a padlock (`lock` 0 = none, 1 = a password we do not have, 2 = one we have) and
+    // small coloured squares (`lobby_marks`, kLobbyFull ...; their legend is on the top screen).
+    bool lobby = false;
+    std::string ping;
+    u32 ping_color = 0;
+    std::string players;
+    float fill = -1.0f;
+    int lock = 0;
+    unsigned lobby_marks = 0;
 };
+
+// Where the two columns of a public room are: their right edges, for the labels of the bar too. The players' column is as wide as "100/100".
+constexpr float kLobbyPlayersRight = 304.0f;
+constexpr float kLobbyPlayersW = 36.0f;
+constexpr float kLobbyPingRight = kLobbyPlayersRight - kLobbyPlayersW - 10.0f;
+// What a public room is besides its name, as small coloured squares with no word (the name needs the width of the row): full, the user's game
+// of another region, among the favourites (the Server list), no longer in the list, another version of Azahar.
+constexpr unsigned kLobbyFull = 1, kLobbyRegion = 2, kLobbyFavourite = 4, kLobbyGone = 8, kLobbyVersion = 16;
+// The squares of `marks`, ending at `right_edge`; returns where they begin.
+float DrawLobbyMarks(float right_edge, float yc, unsigned marks);
+// Their legend on one line from `x` ("Full", "Other region" ...), each with its square, at most `max_w` wide.
+void DrawLobbyLegend(float x, float yc, float max_w);
 
 struct ListView {
     int sel = 0;
@@ -327,7 +353,9 @@ void DrawRows(const ListView& v, const std::vector<Row>& rows);
 // Pieces of the screens
 // ---------------------------------------------------------------------------------------------
 
-void DrawTitleBar(float width, const char* title, const std::string& right);
+// While HOME is off (g.home_blocked) the bar of the touch screen says so with a badge before `right`; `badge_right` > 0 is where the badge ends
+// instead, for a page that has words of its own at the right of its bar (the columns of Public lobbies).
+void DrawTitleBar(float width, const char* title, const std::string& right, float badge_right = 0.0f);
 // The bar of a top screen that shows the console's state at its right: the battery and the free space of the SD card. The title is at the left
 // with the app's version after it in a smaller type.
 // `wifi_channel` (1, 6 or 11; 0 = not known: nothing is drawn): the channel of the room, "Wi-Fi CH 6", to the left of the battery.
@@ -347,7 +375,7 @@ void DrawSignalBars(float x, float yc, int level);
 // A touch button with a key chip, e.g. [B] Back. `compact` is the smaller type of the START button of the footer.
 void DrawButton(const Rect& r, const char* key, const char* label, bool enabled, bool pressed, bool compact = false);
 // The bar, the footer and the border are drawn after the rows so they cover the rows that scroll past the edges.
-void DrawListChrome(const char* title, const std::string& right);
+void DrawListChrome(const char* title, const std::string& right, float badge_right = 0.0f);
 // The footer of a page: [B Back] (not on the first page), [A action] (when the page has one), the key hints, [START Save & exit].
 // A button after A that does what a key of the pad does (X, Y, L, R): [X Parts].
 struct FooterKey {
@@ -429,6 +457,10 @@ protected:
     }
     virtual std::string BarRight() const {
         return std::string();
+    }
+    // Where the "HOME off" badge of the bar ends (0 = before BarRight, at the right of the bar).
+    virtual float BarBadgeRight() const {
+        return 0.0f;
     }
     // The key hints between the footer buttons.
     virtual const char* Hint() const {

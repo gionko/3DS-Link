@@ -248,6 +248,10 @@ inline constexpr Credit kCredits[] = {
     {"Pillow", "HPND", "the Pillow contributors",
      "Draws the icon and the guide's pictures: a build script, not part of the app.",
      "HPND (the Pillow license)", "github.com/python-pillow/Pillow"},
+    {"Spleen", "BSD-2-Clause", "Frederic Cambus",
+     "The font of the in-game chat (6x12 for the lines on the top screen, 8x16 for the keyboard): release 2.1.0, its printable ASCII only, turned into C "
+     "arrays by Tests/make_font_spleen.py.",
+     "BSD 2-Clause (the whole text is in CREDITS.md)", "github.com/fcambus/spleen"},
 };
 constexpr int kCreditCount = static_cast<int>(sizeof(kCredits) / sizeof(kCredits[0]));
 

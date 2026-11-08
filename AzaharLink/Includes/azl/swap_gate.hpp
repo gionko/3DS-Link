@@ -19,6 +19,7 @@ namespace azl {
 constexpr u32 kGateNet = 1u << 0;     ///< the room's network thread, around each socket call
 constexpr u32 kGateWriter = 1u << 8;  ///< the log's writer, around a pass of the SD card
 constexpr u32 kGateTrail = 1u << 16;  ///< the thread of the sleep's trail, around its lines
+constexpr u32 kGateOsd = 1u << 24;    ///< the game's thread that presents, in the chat's OSD callback (GateTryPass: it never stops at the gate)
 
 struct SwapGateStats {
     u32 closes = 0;       ///< SWAP_ENTER handled
@@ -61,6 +62,14 @@ inline void GateLeave(SwapGate& g, u32 who) {
     if (g.on != 0) {
         __atomic_fetch_sub(&g.inside, who, __ATOMIC_SEQ_CST);
     }
+}
+
+/// For a thread that is not the plugin's and must never stop here (the game's, in the chat's OSD callback, Sources/ctr/chat_overlay.cpp): true
+/// when it may go on - counted while the gate is on, not at all while it is off (a New 3DS: GateLeave then counts nothing either) - and false
+/// when the gate is closed: it skips its work and does not call GateLeave. Never GateEnter on such a thread: it would be parked in the plugin's
+/// code, which Luma3DS does not stop, and wake up in memory that is gone.
+inline bool GateTryPass(SwapGate& g, u32 who) {
+    return g.on == 0 || GateTryEnter(g, who);
 }
 
 /// SWAP_ENTER: closes the gate and waits for who is inside, at most `timeout_us`. Returns who is left (weighed). The gate stays closed either way: who comes later must stop.

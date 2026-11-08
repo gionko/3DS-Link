@@ -16,7 +16,7 @@ done
 gcc $CFLAGS -c Sources/enet/enet_3ds.c -o "$OUT/enet_3ds.o"
 CORE="Sources/azl/crypto.cpp Sources/azl/log.cpp Sources/azl/platform.cpp Sources/azl/room_proto.cpp
       Sources/azl/uds_frames.cpp Sources/azl/uds_engine.cpp Sources/azl/room_client.cpp
-      Sources/azl/ndm_hle.cpp Sources/azl/arm_reloc.cpp Sources/azl/svc_patch.cpp"
+      Sources/azl/ndm_hle.cpp"
 g++ -std=c++17 -O1 -g -w -DAZL_E3DS=1 -IIncludes -pthread Tests/room_integration.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_integration_3ds"
 # the data path of the ENet client (what a service call reads, when the acknowledgements go, the counters) against the same layer; the link wraps
 # the three socket calls and the clock the way Tests/run.sh does for the PC's layer

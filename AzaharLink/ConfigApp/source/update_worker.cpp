@@ -6,6 +6,8 @@
 
 #include "cacert_pem.h" // certs/cacert.pem, linked in by bin2o: Mozilla's roots, as curl.se publishes them
 #include "dlp_prepare_logic.hpp" // (dlp::kAppTid: the title id of the installed app)
+#include "fileio.hpp"
+#include "public_lobbies.hpp"
 #include "settings.hpp"
 #include "update_http.hpp"
 
@@ -17,6 +19,7 @@ constexpr size_t kThreadStack = 128 * 1024; // (a TLS handshake: mbedTLS's numbe
 constexpr u32 kBlock = 256 * 1024;
 constexpr long kCheckSeconds = 60;
 constexpr long kChangelogSeconds = 30;
+constexpr long kListsSeconds = 30;
 constexpr Result kNotVerified = static_cast<Result>(0xC8A04FFF); // (no code of AM's: AM finished, and does not show the title at this version)
 
 } // namespace
@@ -29,7 +32,11 @@ struct Worker::Impl {
     Thread thread = nullptr;
     bool http_ready = false;
     // The job
+    enum class Job { Check, Install, Lists };
+    Job job = Job::Check;
     bool install = false;
+    std::string list_path, titles_path;
+    ListsStatus lists;
     Target target = Target::None;
     std::string version, path;
 };
@@ -174,12 +181,77 @@ void RunInstall(Worker::Impl* impl) {
     Finish(impl, status);
 }
 
+void SetLists(Worker::Impl* impl, const ListsStatus& lists) {
+    LightLock_Lock(&impl->lock);
+    impl->lists = lists;
+    LightLock_Unlock(&impl->lock);
+}
+
+void FailLists(Worker::Impl* impl, NetResult result) {
+    ListsStatus failed;
+    failed.stage = ListsStatus::Stage::Failed;
+    failed.net = result;
+    SetLists(impl, failed);
+}
+
+// A whole list that is not the one the page uses waits in <path>.new for the page.
+bool WriteIfNew(const std::string& path, const std::string& text, std::size_t max_bytes) {
+    std::string old;
+    if (setup::ReadTextFile(path, max_bytes + 1, old) == setup::LoadResult::Loaded && old == text) {
+        return false; // (a list that waits stays: it is newer than one GitHub's cache may still hand out for a few minutes)
+    }
+    return setup::WriteTextFile(path + ".new", text);
+}
+
+void RunLists(Worker::Impl* impl) {
+    HttpControl control;
+    control.cancel = &impl->cancel;
+    control.total_seconds = kListsSeconds;
+    ByteBuffer body;
+    const NetResult got = Download(lobbies::kListUrl, control, lobbies::kMaxListBytes, body);
+    if (got != NetResult::Ok) {
+        FailLists(impl, got);
+        return;
+    }
+    const std::string text(reinterpret_cast<const char*>(body.data()), body.size());
+    lobbies::List list;
+    if (!lobbies::ParseList(text, list)) {
+        FailLists(impl, NetResult::Server);
+        return;
+    }
+    ListsStatus status;
+    status.list_changed = WriteIfNew(impl->list_path, text, lobbies::kMaxListBytes);
+    std::string titles_text, waiting;
+    setup::ReadTextFile(impl->titles_path, lobbies::kMaxTitlesBytes + 1, titles_text);
+    if (setup::ReadTextFile(impl->titles_path + ".new", lobbies::kMaxTitlesBytes + 1, waiting) == setup::LoadResult::Loaded && !waiting.empty()) {
+        titles_text = waiting; // (titles that came before and wait for the page are as new)
+    }
+    if (!list.titles_stamp.empty() && lobbies::HeaderValue(titles_text, "titles") != list.titles_stamp && !impl->cancel.load()) {
+        ByteBuffer titles_body;
+        if (Download(lobbies::kTitlesUrl, control, lobbies::kMaxTitlesBytes, titles_body) == NetResult::Ok) {
+            const std::string fresh(reinterpret_cast<const char*>(titles_body.data()), titles_body.size());
+            lobbies::Titles titles;
+            // (the file must be the one the list names: GitHub's cache can still hand out the last one for a few minutes)
+            if (titles.Parse(fresh) && titles.stamp() == list.titles_stamp) {
+                status.titles_changed = setup::WriteTextFile(impl->titles_path + ".new", fresh);
+            }
+        }
+    }
+    status.stage = ListsStatus::Stage::Done;
+    SetLists(impl, status);
+}
+
 void ThreadMain(void* arg) {
     Worker::Impl* impl = static_cast<Worker::Impl*>(arg);
     // mbedTLS seeds itself with sslcGenerateRandomData and does not look at its result: without the service open its keys would be predictable. So no service, no request. (This
     // is the only thing the console's own SSL module is asked for: TLS itself is mbedTLS, whatever the firmware.)
+    const bool lists = impl->job == Worker::Impl::Job::Lists;
     if (R_FAILED(sslcInit(0))) {
-        FailNet(impl, NetResult::Failed);
+        if (lists) {
+            FailLists(impl, NetResult::Failed);
+        } else {
+            FailNet(impl, NetResult::Failed);
+        }
         return;
     }
     if (!impl->http_ready) {
@@ -187,7 +259,13 @@ void ThreadMain(void* arg) {
         impl->http_ready = HttpInit();
     }
     if (!impl->http_ready) {
-        FailNet(impl, NetResult::Failed);
+        if (lists) {
+            FailLists(impl, NetResult::Failed);
+        } else {
+            FailNet(impl, NetResult::Failed);
+        }
+    } else if (lists) {
+        RunLists(impl);
     } else if (impl->install) {
         RunInstall(impl);
     } else {
@@ -248,13 +326,17 @@ bool Worker::Begin(Stage first) {
     status.latest = impl_->status.latest;
     impl_->status = status;
     LightLock_Unlock(&impl_->lock);
-    s32 priority = 0x30;
-    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
-    impl_->thread = threadCreate(ThreadMain, impl_, kThreadStack, priority < 0x3F ? priority + 1 : priority, -2, false);
-    if (!impl_->thread) {
+    if (!Spawn()) {
         FailNet(impl_, NetResult::NoMemory);
     }
     return true;
+}
+
+bool Worker::Spawn() {
+    s32 priority = 0x30;
+    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+    impl_->thread = threadCreate(ThreadMain, impl_, kThreadStack, priority < 0x3F ? priority + 1 : priority, -2, false);
+    return impl_->thread != nullptr;
 }
 
 bool Worker::StartCheck() {
@@ -262,6 +344,7 @@ bool Worker::StartCheck() {
         return false; // (the fields below belong to the job that runs)
     }
     impl_->install = false;
+    impl_->job = Impl::Job::Check;
     return Begin(Stage::Checking);
 }
 
@@ -270,10 +353,44 @@ bool Worker::StartInstall(Target target, const std::string& version, const std::
         return false; // (the fields below belong to the job that runs)
     }
     impl_->install = true;
+    impl_->job = Impl::Job::Install;
     impl_->target = target;
     impl_->version = version;
     impl_->path = path;
     return Begin(Stage::Downloading);
+}
+
+bool Worker::StartLists(const std::string& list_path, const std::string& titles_path) {
+    if (impl_->thread) {
+        if (threadJoin(impl_->thread, 0) != 0) {
+            return false; // (the fields below belong to the job that runs)
+        }
+        threadFree(impl_->thread);
+        impl_->thread = nullptr;
+    }
+    impl_->cancel.store(false);
+    impl_->job = Impl::Job::Lists;
+    impl_->install = false;
+    impl_->list_path = list_path;
+    impl_->titles_path = titles_path;
+    ListsStatus running;
+    running.stage = ListsStatus::Stage::Running;
+    SetLists(impl_, running);
+    if (!Spawn()) {
+        FailLists(impl_, NetResult::NoMemory);
+    }
+    return true;
+}
+
+bool Worker::ListsRunning() const {
+    return impl_->thread && impl_->job == Impl::Job::Lists && threadJoin(impl_->thread, 0) != 0;
+}
+
+ListsStatus Worker::ReadLists() const {
+    LightLock_Lock(&impl_->lock);
+    const ListsStatus lists = impl_->lists;
+    LightLock_Unlock(&impl_->lock);
+    return lists;
 }
 
 Status Worker::Read() const {

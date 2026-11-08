@@ -1,7 +1,12 @@
 # RSF di 3DS Link (app su SD). Derivato da DlpTest/host.rsf (= template FBI/buildtools, provato su hardware: DlpTestHost.cia
 # installata con FBI e lanciata). Variabili passate da make_3dslink_cia.sh con -D.
-# SystemCallAccess: i 48 SVC del template (la lista qui sotto). 3DSLink.elf ne usa 29 (objdump, tools/verify_cia.py --elf), tutti dentro questa lista.
-# Se un giorno 3DS Link usasse un SVC fuori lista il kernel ucciderebbe il processo: verify_cia.py --elf lo segnala PRIMA.
+# SystemCallAccess: i 48 SVC del template piu' GetProcessInfo (43), aggiunto il 2026-11-06 per l'allocatore della memoria dell'app
+# (ConfigApp/source/heap_alloc.cpp: tipo 2 e 19).
+# OpenProcess (51), GetProcessList (101), QueryProcessMemory (125): aggiunti il 2026-11-07 per lo sguardo a un gioco chiuso rimasto in memoria
+# (ConfigApp/source/zombie_census.cpp), solo in lettura. MAI GetThreadList (102): il kernel prende un riferimento al processo e non lo restituisce.
+# 3DSLink.elf usa solo SVC di questa lista (objdump, tools/verify_cia.py --elf).
+# Luma3DS non controlla questa maschera (k11_extension/source/svcHandler.s passa ogni svc dalla sua tabella), ma la lista resta quella vera:
+# verify_cia.py --elf ferma la build se il codice usa un SVC che qui non c'e'.
 # dlp:SRVR tolto: l'host DLP di 3DS Link parla nwm::UDS grezzo e non apre dlp:SRVR.
 BasicInfo:
   Title                   : $(APP_TITLE)
@@ -105,6 +110,8 @@ AccessControlInfo:
     ExitThread: 9
     GetCurrentProcessorNumber: 17
     GetHandleInfo: 41
+    GetProcessInfo: 43
+    OpenProcess: 51
     GetProcessId: 53
     GetProcessIdOfThread: 54
     GetResourceLimit: 56
@@ -116,9 +123,11 @@ AccessControlInfo:
     GetThreadId: 55
     GetThreadIdealProcessor: 15
     GetThreadPriority: 11
+    GetProcessList: 101
     MapMemoryBlock: 31
     OutputDebugString: 61
     QueryMemory: 2
+    QueryProcessMemory: 125
     ReleaseMutex: 20
     ReleaseSemaphore: 22
     SendSyncRequest1: 46

@@ -27,7 +27,8 @@ constexpr u64 kLateDeauthMs = 3000;
 
 // A scan listens to each channel of its mask for the dwell time (libctru: 3 x 110 ms) and reports the
 // beacons heard since one beacon interval before it started; the nwm chip has no scan timeout, ours
-// stops a nonsensical request at 10 s. It waits in slices so that the game's cancel event is seen.
+// stops a nonsensical request at 10 s. It waits in slices so that the game's cancel event is seen, and the closing of the svc hook's
+// gate (KernelOps::GateClosing: the swap of the plugin's block) within a slice.
 constexpr u16 kScanChannelBits = 0x7FFF; // channels 1..15
 constexpr u64 kScanSliceMs = 20;
 constexpr u64 kMaxScanWindowMs = 10000;
@@ -2014,8 +2015,10 @@ u32 UdsEngine::ConnectToNetwork(const u8* network_info, std::size_t size, u8 con
     }
 
     // Block like the real service does (outside the lock: the room thread needs it). Whoever ends
-    // the attempt (the host's answer, a Disconnect, a Shutdown) leaves the result behind.
-    kernel_->WaitEvent(connect_event_, kConnectTimeoutNs);
+    // the attempt (the host's answer, a Disconnect, a Shutdown) leaves the result behind. In slices: the swap of the plugin's block
+    // waits for this thread to leave the plugin's code for 1.5 s at the most, and this wait is 5 s (KernelOps::WaitEventGuarded).
+    const bool answered = kernel_->WaitEventGuarded(connect_event_, kConnectTimeoutNs);
+    const bool swapped = !answered && kernel_->GateClosing();
     Guard lock(this);
     RoleTrace trace(this);
     if (connect_gen_ != gen) {
@@ -2031,7 +2034,11 @@ u32 UdsEngine::ConnectToNetwork(const u8* network_info, std::size_t size, u8 con
         if (connection_status_.status == static_cast<u32>(NetworkStatus::Connecting)) {
             Teardown(NetworkStatusChangeReason::BeforeCommunication, true);
         }
-        Log("uds: timed out while connecting to the host");
+        if (swapped) {
+            Log("uds: the plugin's memory is being swapped out (HOME, power, an applet) while connecting to the host: the attempt ends as a timeout");
+        } else {
+            Log("uds: timed out while connecting to the host");
+        }
         ++g_stats.connect_result[1];
         return res::kConnectTimeout;
     }
@@ -2173,6 +2180,11 @@ void UdsEngine::WaitForScan(const ScanParams& scan, u64 window_ms) {
         // The cancel event is the game's own (nwm only holds a copy): it is looked at, never closed. A
         // handle that is 0, invalid or not signalled just lets the scan go on.
         if (scan.cancel != 0 && kernel_->WaitEvent(scan.cancel, 0)) {
+            return;
+        }
+        // The swap of the plugin's block waits for this thread to leave the plugin's code (1.5 s at the most; this window can be 10 s):
+        // the scan ends now and reports what was heard so far, like a scan the game cancelled.
+        if (kernel_->GateClosing()) {
             return;
         }
         const u64 slice = std::min<u64>(kScanSliceMs, window_ms - waited);

@@ -59,10 +59,12 @@ public:
     /// What the 5 s wait of ConnectToNetwork does: really wait (kNormal), stay in it until the mode
     /// changes and then time out (kHold: lets a test look at the "connecting" state), or time out at
     /// once (kFail).
+    /// (The engine makes that wait through WaitEventGuarded, in slices: the long wait is told apart by
+    /// the call, not by its length.)
     enum ConnectMode { kNormal, kHold, kFail };
-    bool WaitEvent(u32 h, s64 ns) override {
+    bool WaitEventGuarded(u32 h, s64 ns) override {
         if (ns < 1000000000LL || connect_mode.load() == kNormal) { // only ConnectToNetwork waits that long
-            return FakeKernel::WaitEvent(h, ns);
+            return FakeKernel::WaitEventGuarded(h, ns);
         }
         held.fetch_add(1);
         bool signalled = false;

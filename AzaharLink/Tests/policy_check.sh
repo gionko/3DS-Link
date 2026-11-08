@@ -31,6 +31,10 @@ need_order() {
   b=$(tr -d '\r' < "$1" | grep -F -n -m1 -- "$3" | cut -d: -f1)
   { [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fail "$1: '$2' does not come before '$3' ($4)"
 }
+# $1 = file, $2 = a statement that must open a line after its indentation (a commented-out copy, '// x;', does not count), $3 = why
+need_stmt() {
+  tr -d '\r' < "$1" | awk -v s="$2" '{ sub(/^[ \t]+/, ""); if (index($0, s) == 1) found = 1 } END { exit !found }' || fail "$1 no longer has the statement '$2' ($3)"
+}
 
 # The ini defaults: the sleep action is off until the lid test, the receive ring is the 64 KB the soc service grants, and
 # these two live in ONE place (Includes/azl/ini_values.hpp) that the plugin's Config and the Setup app's Settings both take
@@ -47,17 +51,19 @@ need Includes/ctr/plugin.hpp "bool enabled = true;" "the plugin is on by default
 SLEEP_DEFAULT=$(grep -o 'kSleepStopDefault = [0-9]*;' Includes/azl/ini_values.hpp | sed 's/.*= //; s/;//')
 tr -d '\r' < README.md | grep -q "^| \`sleep_stop\` | $SLEEP_DEFAULT |" || fail "README.md does not give $SLEEP_DEFAULT as the default of sleep_stop"
 
-# No knob beyond these (a new ini key is a decision, not a side effect). They are 15: the 13 of 0.1.14 plus
-# rcvbuf_kb and sleep_stop. menu_key and debug are old keys: 0.1.15 only gave them values (menu_key=off, debug 0 or 1).
+# No knob beyond these (a new ini key is a decision, not a side effect). They are 18: the 13 of 0.1.14 plus
+# rcvbuf_kb and sleep_stop, chat and chat_key (1.1.1: the switch and the chord of the chat), and chat_pos (the corner of the chat's
+# lines on the top screen, which came with the chat itself).
+# menu_key and debug are old keys: 0.1.15 only gave them values (menu_key=off, debug 0 or 1).
 KEYS=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -o 'key == "[a-z_]*"' | sed 's/key == "//; s/"//' | sort | tr '\n' ' ')
-WANTED="autoconnect debug enabled game_name host menu_key net_thread_core nickname password port radio_like rcvbuf_kb sleep_stop socket_buffers tunnel "
+WANTED="autoconnect chat chat_key chat_pos debug enabled game_name host menu_key net_thread_core nickname password port radio_like rcvbuf_kb sleep_stop socket_buffers tunnel "
 [ "$KEYS" = "$WANTED" ] || fail "the ini keys read by the plugin are '$KEYS', expected '$WANTED'"
 
-# Both programs write all 15 keys, in one place: they fill every field of ini::Fields and call ini::Render, which writes the 15
+# Both programs write all 18 keys, in one place: they fill every field of ini::Fields and call ini::Render, which writes the 18
 # lines (a writer that forgets a key, or a third writer with its own list, fails here). Before 0.1.16 the plugin left out
 # rcvbuf_kb and sleep_stop unless they were set and the app did not know them: a file made by either had no line for them and a
 # hand edit needed the key names.
-FIELDS="autoconnect debug enabled game_name host menu_key net_thread_core nickname password port radio_like rcvbuf_kb sleep_stop socket_buffers tunnel "
+FIELDS="autoconnect chat chat_key chat_pos debug enabled game_name host menu_key net_thread_core nickname password port radio_like rcvbuf_kb sleep_stop socket_buffers tunnel "
 for f in Sources/ctr/plugin.cpp ConfigApp/source/settings.cpp; do
   GOT=$(tr -d '\r' < "$f" | grep -o 'fields\.[a-z_]* = ' | sed 's/fields\.//; s/ = //' | sort -u | tr '\n' ' ')
   [ "$GOT" = "$FIELDS" ] || fail "$f fills the ini fields '$GOT', expected '$FIELDS'"
@@ -66,24 +72,26 @@ done
 RENDERED=$(tr -d '\r' < Includes/azl/ini_values.hpp | sed -n '/^inline std::string Render/,/^}/p' | grep -o '"[a-z_]*=' | tr -d '="' | sort | tr '\n' ' ')
 [ "$RENDERED" = "$WANTED" ] || fail "ini::Render writes '$RENDERED', expected '$WANTED'"
 ! tr -d '\r' < Sources/ctr/plugin.cpp | grep -q 'WriteLine' || fail "plugin.cpp writes a line of the ini by itself (it must go through ini::Render)"
-# The switches (enabled, tunnel, autoconnect, socket_buffers) are read by the shared ParseBool in both programs: 1/on/true/yes
+# The switches (enabled, tunnel, autoconnect, socket_buffers, chat) are read by the shared ParseBool in both programs: 1/on/true/yes
 # and 0/off/false/no, and a slip is the key's default, never "on". radio_like has three values (0, 1, 2: ini::ParseRadioLike,
 # which takes the words of a switch for 0 and 1) since the performance round of 2026-10-19.
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'ini::ParseBool(value, true)')" = "4" ] || fail "the plugin reads a switch of the ini without ini::ParseBool"
-[ "$(tr -d '\r' < ConfigApp/source/settings.cpp | grep -c 'azl::ini::ParseBool(value, true)')" = "4" ] || fail "the Setup app reads a switch of the ini without ini::ParseBool"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'ini::ParseBool(value, true)')" = "5" ] || fail "the plugin reads a switch of the ini without ini::ParseBool"
+[ "$(tr -d '\r' < ConfigApp/source/settings.cpp | grep -c 'azl::ini::ParseBool(value, true)')" = "5" ] || fail "the Setup app reads a switch of the ini without ini::ParseBool"
 need Sources/ctr/plugin.cpp "config_.radio_like = ini::ParseRadioLike(value);" "the plugin reads radio_like's three values with the shared parser"
 need ConfigApp/source/settings.cpp "cfg.radio_like = azl::ini::ParseRadioLike(value);" "the Setup app reads radio_like's three values with the shared parser"
 need Includes/azl/ini_values.hpp 'if (Word(value) == "2") {' "radio_like=2 is the third value"
 need Includes/azl/ini_values.hpp "return known ? (on ? 1 : 0) : 1;" "the words of a switch mean 0 and 1 for radio_like, a slip is 1"
-need ConfigApp/source/pages_config.cpp "g.cfg.radio_like = step < 0 ? setup::PrevRadioLike(g.cfg.radio_like) : setup::NextRadioLike(g.cfg.radio_like);" "the row 'Radio-like data' goes through its three values"
+# (radio_like and sleep_stop are no rows of Settings since 1.1.1, the user's choice: the app carries their values, a new file has the defaults)
+need ConfigApp/source/settings.cpp "    fields.radio_like = cfg.radio_like;" "the app writes radio_like back as it read it (no row, never lost)"
 if tr -d '\r' < Sources/ctr/plugin.cpp | grep -n 'value != "0"'; then
   fail "the plugin reads a switch of the ini as 'anything but 0 is on' again (ini::ParseBool)"
 fi
 if tr -d '\r' < ConfigApp/source/settings.cpp | grep -n 'value != "0"'; then
   fail "the Setup app reads a switch of the ini as 'anything but 0 is on' again (ini::ParseBool)"
 fi
-# The 3DS Link app (the Setup app) has a row for every key that is not an advanced one (socket_buffers, net_thread_core, game_name
-# and rcvbuf_kb are in the file, never lost, but are not rows; the menu chord is carried by the In-game menu row). The main page
+# The 3DS Link app (the Setup app) has a row for every key that is not an advanced one (socket_buffers, net_thread_core, game_name,
+# rcvbuf_kb, and since 1.1.1 radio_like and sleep_stop, are in the file, never lost, but are not rows; the menu chord has its row Menu keys,
+# the chat its three rows: In-game chat, Chat keys, Chat position). The main page
 # has the 3DS Link switch (enabled + tunnel); the room (host, port, and its own password) is chosen on the Azahar Emulator Room page; the nickname
 # and the other switches are on the Settings page.
 for field in enabled tunnel; do
@@ -92,12 +100,665 @@ done
 for field in host port password; do
   grep -E -q "g\.cfg\.$field = " ConfigApp/source/pages_servers.cpp || fail "the Setup app has no page that sets $field (a room brings its own)"
 done
-for field in nickname autoconnect radio_like sleep_stop debug; do
+for field in nickname autoconnect debug menu_chord chat chat_key chat_pos; do
   grep -E -q "g\.cfg\.$field([^a-z_]|$)" ConfigApp/source/pages_config.cpp || fail "the Settings page of the Setup app has no row for $field"
 done
 need ConfigApp/source/pages_servers.cpp 'pass.label = "Password";' "the form of a room has its password row (each room keeps its own)"
 need ConfigApp/source/settings.hpp "std::string password;" "a saved room has a password"
-need ConfigApp/source/pages_config.cpp "g.cfg.sleep_stop = step < 0 ? setup::PrevSleepStop(g.cfg.sleep_stop) : setup::NextSleepStop(g.cfg.sleep_stop);" "the row 'End session on sleep' goes through its three values (A and right go forward, left goes back)"
+need ConfigApp/source/settings.cpp "    fields.sleep_stop = cfg.sleep_stop;" "the app writes sleep_stop back as it read it (no row, never lost)"
+need Includes/azl/ini_values.hpp 'constexpr const char* kDefaultChatKey = "L+Left+Select";' "the chat's chord is L + Left + Select, the mirror of the menu's"
+need ConfigApp/source/pages_config.cpp "if (ChordsClash(chord, g.cfg.chat_key)) {" "the menu's keys cannot be the chat's"
+# ... nor hold them or be held by them (review of the chat, defect 47: the app refused only the same chord, so a menu on L+Select took the
+# chat's L+Left+Select, the menu looked at first; and the plugin left Select out of chat_key, so chat_key=L+R took the game's own keys)
+need ConfigApp/source/pages_config.cpp "if (ChordsClash(chord, setup::MenuOn(g.cfg) ? g.cfg.menu_key : g.cfg.menu_chord)) {" "the chat's keys cannot be the menu's"
+need_after ConfigApp/source/pages_config.cpp "bool ChordsClash(const std::string& a, const std::string& b) {" "    return azl::ini::ChordsNested(a, b);" "the app refuses a chord that holds the other or is held by it"
+need_after Includes/azl/ini_values.hpp "inline bool ChordsNested(const std::string& a, const std::string& b) {" "    return (x & y) == x || (x & y) == y;" "two chords clash when one holds every key of the other"
+need_after Includes/azl/ini_values.hpp "inline unsigned ChordBits(const std::string& chord) {" "    unsigned bits = 1u; // (Select)" "the app counts Select in every chord, as the plugin adds it"
+need_line Sources/main.cpp "    g_chat_keys = ParseKeys(cfg.chat_key) | Key::Select;" "Select is always in the chat's chord, as in the menu's"
+need_line Sources/main.cpp "    const auto clash = [](u32 a, u32 b) { return !g_menu_off && ((a & b) == a || (a & b) == b); };" "the plugin finds the chords that hold one another (only with the menu on)"
+need_after Sources/main.cpp "    if (g_chat_keys == Key::Select || clash(g_chat_keys, g_menu_keys)) {" "        g_chat_keys = ParseKeys(azl::ini::kDefaultChatKey) | Key::Select;" "a chat chord of Select alone or that clashes takes the default"
+need_after Sources/main.cpp "    if (clash(g_chat_keys, g_menu_keys)) {" "        g_menu_keys = ParseKeys(azl::ini::kDefaultMenuKey) | Key::Select;" "a menu chord that still clashes takes its default"
+need_order Sources/main.cpp "    g_menu_keys = ParseKeys(cfg.menu_key) | Key::Select;" "    if (g_chat_keys == Key::Select || clash(g_chat_keys, g_menu_keys)) {" "the clash is looked for with the menu's chord read"
+need_line Tests/log_files_test.cpp '    CHECK(ini::ChordsNested("L+Left+Select", "l+left") && ini::ChordsNested("L+Select", ini::kDefaultChatKey));' "the ini test checks the nested chords"
+# The chat is ON by default (the user's decision, 2026-11-04: it can be switched off in the app and in the in-game menu), and its lines are
+# at the bottom left of the top screen until the user moves them. The word in the file is one of four; anything else is the default, read
+# by the one shared parser in both programs, and the plugin's Config and the app's Settings take the default from the shared header.
+need Includes/azl/ini_values.hpp "bool chat = true;" "the chat is on in a new file"
+need Includes/ctr/plugin.hpp "bool chat = true;" "the plugin's chat is on when the file does not say otherwise"
+need ConfigApp/source/settings.hpp "bool chat = true;" "the app's row In-game chat is on when the file does not say otherwise"
+need Includes/azl/ini_values.hpp "enum ChatPos : int { kChatPosTopLeft = 0, kChatPosTopRight = 1, kChatPosBottomLeft = 2, kChatPosBottomRight = 3, kChatPosCount = 4 };" "the four corners of chat_pos, in the order the rows cycle"
+need Includes/azl/ini_values.hpp 'constexpr const char* kChatPosWords[kChatPosCount] = {"top-left", "top-right", "bottom-left", "bottom-right"};' "the words of chat_pos in the file, in the order of the corners"
+need Includes/azl/ini_values.hpp "constexpr int kChatPosDefault = kChatPosBottomLeft;" "the chat's lines are at the bottom left by default"
+need_line Includes/azl/ini_values.hpp "    return kChatPosDefault;" "a word of chat_pos that is none of the four is the default"
+need Includes/azl/ini_values.hpp 'out += std::string("chat_pos=") + ChatPosWord(f.chat_pos) + "\n";' "the file holds the word of the corner, never past the table"
+need Includes/ctr/plugin.hpp "int chat_pos = ini::kChatPosDefault;" "the plugin takes the chat's corner from the shared header"
+need ConfigApp/source/settings.hpp "int chat_pos = azl::ini::kChatPosDefault;" "the app takes the chat's corner from the shared header"
+need Sources/ctr/plugin.cpp "config_.chat_pos = ini::ParseChatPos(value);" "the plugin reads chat_pos with the shared parser"
+need ConfigApp/source/settings.cpp "cfg.chat_pos = azl::ini::ParseChatPos(value);" "the app reads chat_pos with the shared parser"
+need ConfigApp/source/pages_config.cpp "chat_pos.dim = !g.cfg.chat;" "the row Chat position is dim while the chat is off"
+tr -d '\r' < README.md | grep -q '^| `chat` | 1 |' || fail "README.md does not give 1 as the default of chat"
+tr -d '\r' < README.md | grep -q '^| `chat_pos` | `bottom-left` |' || fail "README.md does not give bottom-left as the default of chat_pos"
+# ... and the in-game menu switches the chat and moves it with the game paused: saved to the ini and taken at once through the atomics the
+# chat reads on the other threads.
+need Sources/game_menu.cpp 'DrawRow(scr, y, sel, "In-game chat", "", kDim, false);' "the in-game menu has the chat's switch"
+need Sources/game_menu.cpp "plugin.SetChatPos(ini::NextChatPos(plugin.chat_pos(), right ? 1 : -1));" "left and right move the chat's corner in the in-game menu"
+need_order Sources/game_menu.cpp "    rows.push_back(kChat);" "    rows.push_back(kDebug);" "the chat's rows come before the debug log"
+need Sources/ctr/plugin.cpp "chat_on_.store(on, std::memory_order_relaxed);" "the chat's switch of the in-game menu is taken at once"
+need Sources/ctr/plugin.cpp "chat_pos_.store(pos, std::memory_order_relaxed);" "the chat's corner of the in-game menu is taken at once"
+# What the file says reaches the same atomics: without these two a chat=0 in the ini would leave the chat ON for the network thread and
+# the game's (its memory and its work with the chat off, against the decision), and the corner of the file would never be used.
+need_order Sources/ctr/plugin.cpp "config_.chat_pos = ini::ParseChatPos(value);" "    chat_on_.store(config_.chat, std::memory_order_relaxed);" "LoadConfig hands the chat's switch it read to the other threads"
+need_order Sources/ctr/plugin.cpp "config_.chat_pos = ini::ParseChatPos(value);" "    chat_pos_.store(config_.chat_pos, std::memory_order_relaxed);" "LoadConfig hands the chat's corner it read to the other threads"
+# The chat of the room (Includes/azl/chat_core.hpp, through RoomClient::SetChatSink). Its numbers are the user's decisions (2026-11-04): 5
+# messages kept in all, 128 characters each (125 and "..." past that), a nick of 20, more than 4 a second dropped before the decoding, one of
+# ours a second. The header allocates nothing and does not use the reader of room_proto.hpp (PacketReader::String mallocs a std::string per
+# field): the packet's lengths are read by hand.
+need Includes/azl/chat_core.hpp "constexpr u32 kLines = 5; " "the chat keeps 5 messages in all"
+need Includes/azl/chat_core.hpp "constexpr u32 kTextMax = 128; " "a message is kept to 128 characters"
+need Includes/azl/chat_core.hpp "constexpr u32 kNickMax = 20; " "a nick is kept to 20 characters (the room's own rule)"
+need Includes/azl/chat_core.hpp "constexpr u32 kRateMax = 4; " "more than 4 messages a second are dropped"
+need Includes/azl/chat_core.hpp "constexpr u32 kRateWindowMs = 1000; " "... in a sliding second"
+# ... and at most 2 of them from one member, read before the decoding (review of the chat, defect 41: one ring for everybody, and a member
+# flooding at 20 a second took nearly every place: a friend's messages at 1 a second were decoded 17% of the time)
+need Includes/azl/chat_core.hpp "constexpr u32 kRatePerMember = 2; " "at most 2 of the 4 a second from one member: a flood leaves the others theirs"
+need_after Includes/azl/chat_core.hpp "    bool Admit(u32 now_ms, u32 tag) {" "            same += (tags_[i] == tag && now_ms - ts_[i] < kRateWindowMs) ? 1 : 0;" "the rate limit counts the member's messages of the last second"
+need_line Includes/azl/chat_core.hpp "        if (same >= kRatePerMember) {" "a member's message past its share of the second is dropped"
+need_line Includes/azl/chat_core.hpp "        tags_[slot] = tag;" "the rate limit keeps who sent each message it took"
+need Tests/chat_core_test.cpp "CHECK(friends == 120 && flood <= 120" "the chat's test runs a flood with two friends: every one of the friends' passes"
+need Tests/chat_room_probe.cpp 'CHECK(std::strcmp(v.lines[3].text, "amid the flood") == 0' "a message amid a flood is kept, against the real room"
+need Includes/azl/chat_core.hpp "constexpr u32 kSendGapMs = 1000; " "at most one message of ours a second"
+need Includes/azl/chat_core.hpp "constexpr u32 kScanPerChar = 4;" "the cleaning stops early: 5000 characters cost what 128 do"
+hit=$(tr -d '\r' < Includes/azl/chat_core.hpp | sed 's://.*$::' | grep -n -E 'std::(string|vector|function)|\bnew\b|\b(malloc|calloc|realloc)[[:space:]]*\(|PacketReader|#include <(string|vector|functional)>' | head -3)
+[ -z "$hit" ] || fail "Includes/azl/chat_core.hpp allocates or reads with PacketReader (the chat is decoded by hand, with no heap): $hit"
+# The room client: the chat packet is decoded only with a block (the chat off = nullptr = dropped unread, as before the chat), after the rate
+# limit; the block is copied in the loop like the callbacks (no lock per packet); the room's status messages stay in the default; ours goes
+# from the network thread only, built on the stack, reliable on channel 0, never through tx_, and only while joined.
+need Sources/azl/room_client.cpp "                    case room::IdChatMessage:" "the room client hands the chat's packets to the chat's block"
+need_after Sources/azl/room_client.cpp "                        if (chat) {" "if (chat->Admit(chat_ms, chat::SenderTag(data, size))) {" "a chat packet is decoded only after the rate limit took it, its sender read first"
+if tr -d '\r' < Sources/azl/room_client.cpp | grep -n 'case room::IdStatusMessage'; then
+  fail "Sources/azl/room_client.cpp handles the room's status messages: the plugin already says who comes and goes (they stay in the default)"
+fi
+need_after Sources/azl/room_client.cpp "            tick = tick_cb_;" "chat = chat_sink_.load(std::memory_order_acquire);" "the network loop takes the chat's block with the callbacks, when their generation changes"
+need_after Sources/azl/room_client.cpp "void RoomClient::SetChatSink(ChatSink* sink) {" "cb_generation_.fetch_add(1);" "a new chat block (or none) is taken by the loop at its next round"
+need Sources/azl/room_client.cpp "const u32 chat_size = chat->TakeOutgoing(static_cast<u32>(now_ms), state() == State::Joined, chat_packet);" "ours goes only while joined"
+need Sources/azl/room_client.cpp "ENetPacket* packet = enet_packet_create(chat_packet, chat_size, EnetPacketFlags(true));" "ours goes reliable, like the room's own chat"
+need_order Sources/azl/room_client.cpp "const u32 chat_size = chat->TakeOutgoing(" "        if (tx_pending_.load(std::memory_order_acquire) != 0) {" "ours is sent before the game's queue is taken, from the network thread"
+# The plugin: with the chat on ONE block, made once and never deleted (a network thread that Stop() gave up on may still hold it); with the
+# chat off none at all, and no sink.
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'new (std::nothrow) ChatSink()')" = "1" ] || fail "Sources/ctr/plugin.cpp makes the chat's block in more than one place, or with another gap between our messages"
+if tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -E 'delete[[:space:]]+(sink|chat_sink_)'; then
+  fail "Sources/ctr/plugin.cpp deletes the chat's block: the network thread and the drawing may still hold it"
+fi
+need_after Sources/ctr/plugin.cpp "    if (config_read_early && config_.chat) {" "        WireChat(true);" "the chat's block is made at start only when the file was read and says the chat is on (a file not read yet may say chat=0: LateInit wires it)"
+need_after Sources/ctr/plugin.cpp "    if (config_.chat || chat_sink_.load(std::memory_order_relaxed)) {" "        WireChat(config_.chat);" "LateInit wires the chat as the file read now says: chat=0 unhooks a block made at start, so the room no longer decodes the chat (review of the chat, defect 49)"
+# A chat packet ENet refuses is freed here (enet_peer_send leaves it to the caller) and is not kept as our line.
+need_after Sources/azl/room_client.cpp "                    if (enet_peer_send(server, 0, packet) == 0) {" "chat_sent = true;" "our chat line is kept only when ENet took the packet"
+need_after Sources/azl/room_client.cpp "                    } else {" "enet_packet_destroy(packet);" "a chat packet ENet refuses is freed"
+need Sources/azl/room_client.cpp "chat->SentOutgoing(config.nickname.c_str(), config.nickname.size(), static_cast<u32>(now_ms), chat_sent);" "our chat line is kept only when ENet took the packet"
+# Our line is the room's too: a client that leaves within kChatGoodbyeMs of its last chat message waits (kGoodbyeWaitMs at most) for the room's
+# acknowledgement before the disconnect, which throws away what ENet holds (and the room what it has not handled), on both ways out.
+need_after Sources/azl/room_client.cpp "                        chat_sent = true;" "chat_sent_ms = now_ms;" "the goodbye knows when our last chat message went"
+need Sources/azl/room_client.cpp "constexpr u32 kChatGoodbyeMs = 2000;" "a goodbye up to two seconds after our chat message waits for it"
+need_line Sources/azl/room_client.cpp "        if (!to_send.empty() || (chat_sent_ms != 0 && platform::NowMs() - chat_sent_ms < kChatGoodbyeMs)) {" "the goodbye waits for the game's last frames and for our last chat message, on the quick stop (EXIT, sleep) and on Stop()"
+need_order Sources/azl/room_client.cpp "        const bool quick = quick_stop_.load();" "        if (!to_send.empty() || (chat_sent_ms != 0" "... after the quick stop's frames went"
+need_order Sources/azl/room_client.cpp "        if (!to_send.empty() || (chat_sent_ms != 0" "            enet_peer_disconnect_now(server, 0);" "... before the quick stop's disconnect"
+need_order Sources/azl/room_client.cpp "        if (!to_send.empty() || (chat_sent_ms != 0" "            enet_peer_disconnect(server, 0);" "... and before the graceful one"
+need_after Sources/azl/room_client.cpp "            for (const u64 until = platform::NowMs() + kGoodbyeWaitMs;" "platform::NowMs() < until && ReliableBacklog(server) > 0;) {" "the goodbye's wait is bounded by a deadline and ends at the acknowledgement"
+need_after Sources/azl/room_client.cpp "            enet_peer_disconnect(server, 0);" "bool done = server->state == ENET_PEER_STATE_DISCONNECTED;" "a room that let us go during the wait is not waited for again"
+need Tests/chat_room_probe.cpp 'std::printf("6. A sends and leaves at once' "the goodbye that waits for our last chat message is tested against the real room"
+need_after Sources/ctr/plugin.cpp "    ChatSink* sink = chat_sink_.load(std::memory_order_relaxed);" "    if (on && !sink) {" "the block is made only when the chat goes on"
+need Sources/ctr/plugin.cpp "    room_->SetChatSink(on ? sink : nullptr);" "the chat off hands the room client no block"
+need Tests/run.sh 'Tests/chat_core_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_core_test"' "the chat's test counts the allocations through the link"
+need Tests/integration.sh "/tmp/azl_tests/chat_room_probe \$R1 24872" "the chat is tested against the real room"
+# The chat's lines on the top screen (Includes/azl/chat_draw.hpp) and the drawing under them (Includes/azl/gfx_surface.hpp): they run on the
+# game's thread inside the framework's OSD callback, so the two headers are held to the rule of the game-thread code everywhere (no heap,
+# no container, no printf, no big buffer: their regions are counted with the others below), and they draw with their own stores, never with
+# the framework's (DrawSysfont reads the framebuffer, blends and allocates; DrawRect writes a byte at a time; neither draws the right eye).
+# The framebuffer is reached only through the word and halfword stores of gfx_surface.hpp (and its byte store): a read of that uncached
+# memory costs more than a write, and a store that is not theirs is not counted by Tests/chat_draw_test.cpp.
+# The user's decisions (2026-11-04): Spleen 6x12, opaque strips in the background of the app, the bottom-right corner above the framework's
+# notifications; 2026-11-08: smaller and tighter, the whole width of the top screen (the 6x12 glyphs in a cell of 10 rows, lines of 62
+# cells, at most 3 lines a message, so that the longest nick and 128 characters always show whole).
+for h in Includes/azl/chat_draw.hpp Includes/azl/gfx_surface.hpp; do
+  hit=$(tr -d '\r' < "$h" | sed 's://.*$::' | grep -n -E 'std::(string|vector|function|mutex)|\bnew\b|\b(malloc|calloc|realloc)[[:space:]]*\(|#include <(string|vector|functional|mutex|cstdio)>|DrawSysfont|DrawRect|GetTextWidth|OSD::|\bprintf\b' | head -3)
+  [ -z "$hit" ] || fail "$h allocates, formats or draws with the framework (the chat draws on the game's thread with its own stores): $hit"
+done
+hit=$(tr -d '\r' < Includes/azl/gfx_surface.hpp | sed 's://.*$::' | grep -o -E 'reinterpret_cast<[^>]*>' | grep -v -x -E 'reinterpret_cast<(std::uintptr_t|Word\*|Half\*)>' | head -2)
+[ -z "$hit" ] || fail "Includes/azl/gfx_surface.hpp reaches the framebuffer other than through Put32 / Put16 / Put8 (a read of it, or a store that is not counted): $hit"
+[ "$(tr -d '\r' < Includes/azl/gfx_surface.hpp | sed 's://.*$::' | grep -c -E 'reinterpret_cast<(Word|Half)\*>')" = "2" ] || fail "Includes/azl/gfx_surface.hpp has a word or halfword access of the framebuffer other than the stores of Put32 and Put16"
+need Includes/azl/gfx_surface.hpp "#define AZL_GFX_COUNT_STORE(bytes) ((void)0)" "the plugin's stores are counted by nothing (the test counts them)"
+need Includes/azl/gfx_surface.hpp '#include "azl/font_spleen.inc"' "the chat's font is Spleen"
+need Includes/azl/chat_draw.hpp "constexpr u32 kBlockLines = 3; " "a message takes at most 3 lines on the top screen"
+need Includes/azl/chat_draw.hpp "constexpr u32 kCols = 62; " "a line of the chat is the whole width of the top screen (2026-11-08)"
+need Includes/azl/chat_draw.hpp "constexpr int kGlyphW = 6, kLineH = 10; " "the chat's text is the 6x12 font in a cell of 10 rows: smaller, tighter lines"
+need Includes/azl/gfx_surface.hpp "constexpr Font kFont6x10 = {&kSpleen6x10[0][0], 6, 10};" "the chat's font of 10 rows is the generated table"
+need Includes/azl/chat_draw.hpp "                if (total - (at + i + 1) <= room) {" "a line breaks at a space only when the rest still fits the lines left: a message the block holds shows whole"
+need_line Tests/chat_draw_test.cpp "    CHECK(whole == 2000);" "the chat's test wraps 2000 messages of 128 characters with the longest nick: every one whole"
+# The geometry is held where it is made (CHAT-2, 2026-11-08): no block past the top screen's 400 columns in any corner (DrawBlock writes
+# where it is told, on the game's framebuffer), every height a multiple of 4 rows (the strips go out as words), a column at most 32 rows
+# (one run of RunColumnBoth: its masks are a u32, and a shift by 32 is undefined), and a guard at run time behind the asserts.
+need Includes/azl/chat_draw.hpp "static_assert(kLeftX + BlockWidth(kCols) <= 400, " "a block in a left corner ends inside the top screen"
+need Includes/azl/chat_draw.hpp "static_assert(kRightEdge <= 400 && kRightEdge - BlockWidth(kCols) >= kLeftX, " "a block in a right corner starts inside the top screen"
+need Includes/azl/chat_draw.hpp "static_assert(BlockHeight(kBlockLines) <= 32, " "a column of a block is one run of 32 rows at most"
+need Includes/azl/chat_draw.hpp "static_assert(BlockHeight(1) % 4 == 0 && BlockHeight(2) % 4 == 0 && BlockHeight(3) % 4 == 0, " "every block is a whole number of 4 rows"
+need Includes/azl/chat_draw.hpp "static_assert(kNickMax + 2 + kTextMax <= kCols * kBlockLines, " "the longest nick and 128 characters fit a block"
+need_after Includes/azl/chat_draw.hpp "            const int x0 = right ? kRightEdge - width : kLeftX;" "            if (x0 < 0 || x0 + width > s.w) {" "a block that would pass the screen's edge is not drawn"
+need Includes/azl/chat_draw.hpp "    const u32 all = h >= 32 ? 0xFFFFFFFFu : (1u << h) - 1;" "the bar of a block of 32 rows is all 32 bits, never a shift by 32"
+need Includes/azl/chat_draw.hpp "constexpr u32 kShowMs = 10000; " "the lines stay 10 s after the last message came (the user's decision)"
+need Tests/chat_draw_test.cpp "    CHECK(chat::ShownLines(v, 0xFFFFFF00u + 10000u, false) == 0);" "the test holds the 10 s in numbers, not through kShowMs"
+need Includes/azl/chat_draw.hpp "constexpr gfx::Rgb kBg = {13, 14, 17};" "the chat's strips are opaque, in the background of 3DS Link"
+need Includes/azl/chat_draw.hpp "constexpr int kRightEdge = 390; " "the right corners end where the framework's notifications do"
+need Includes/azl/chat_draw.hpp "return notices == 0 ? kBottomY : ((230 - 15 * static_cast<int>(notices) - 3) & ~3);" "the bottom-right corner climbs above the plugin's notifications"
+need Includes/azl/chat_draw.hpp "            const gfx::Rgb bar = l.nick_len == 0 ? kNoticeBar : kNick[NickColour(l.nick, l.nick_len)];" "every block is drawn with its nick's colour, a notification of the plugin with its own"
+need Includes/azl/chat_draw.hpp "            DrawBlock(s, x0, y0, l, w, gfx::Raw(bar, s.format), text_raw, bg_raw);" "every block is drawn with the colour of its bar"
+# Their cost: the lines are drawn on the presenting game thread every frame for 10 s after a message, and the worst frame (5 blocks of two
+# full lines, the 3D on) was 1.7-1.9 million instructions, 6-15 ms of an Old 3DS's frame, when every pixel called the colour's picker and
+# every column divided stride by bpp (the ARM11 has no division: a call to the library's). The pixel's colour is worked out in line, the
+# address with no division, a group of four background pixels is not worked out at all, and Tests/chat_draw_cost.sh (run by
+# Tests/stack_usage.sh) counts the instructions of the plugin's own build of the two headers in an ARM emulator against budgets.
+need Includes/azl/gfx_surface.hpp "__attribute__((always_inline)) inline u32 PickBit(u32 ma, u32 mb, u32 bit, u32 a, u32 b, u32 bg) {" "the colour of a pixel of the chat is worked out in line, never a call a pixel"
+need Includes/azl/gfx_surface.hpp "    return x * s.stride + (s.h - 1u - y) * s.bpp;" "the address of a pixel is worked out with no division (the ARM11 has none)"
+# The framework hands the game's format byte unmasked (0x40 the top screen in 2D, 0x20 the 3D) and works its Screen::BytesPerPixel out of it
+# unmasked (3 for any value it does not know): the chat's lines and keyboard were never drawn in RGBA8 and the 16-bit formats with a high bit.
+# The screen is taken through gfx::ScreenSurface (Tests/chat_host_test.cpp, TestScreenFormats): the format masked, the bytes a pixel from it.
+need Includes/azl/gfx_surface.hpp "    s.format = static_cast<u8>(raw_format & 7);" "the format of a screen is its low 3 bits"
+need Includes/azl/gfx_surface.hpp "    s.bpp = static_cast<u8>(BytesPerPixel(s.format));" "the bytes of a pixel of a screen come from its masked format"
+need Sources/ctr/chat_overlay.cpp "    return gfx::ScreenSurface(reinterpret_cast<u8*>(scr.LeftFramebuffer)," "the chat takes the framework's screen through gfx::ScreenSurface"
+need Sources/game_menu.cpp "    return gfx::ScreenSurface(reinterpret_cast<u8*>(scr.LeftFramebuffer)," "the paused menu takes the framework's screen through gfx::ScreenSurface"
+hit=$(grep -rn -F 'BytesPerPixel' Sources | grep -v -F 'gfx::BytesPerPixel(' | head -2)
+[ -z "$hit" ] || fail "the framework's Screen::BytesPerPixel is read (worked out of the game's format byte unmasked: 3 for 0x40 | RGBA8): $hit"
+need_line Tests/chat_host_test.cpp "    TestScreenFormats();" "the chat host's test runs the screens with the high bits of the format"
+[ "$(tr -d '\r' < Includes/azl/gfx_surface.hpp | grep -c -F 'if (((ma | mb) & 15) == 0) {')" = "2" ] || fail "Includes/azl/gfx_surface.hpp: a group of four background pixels is not worked out (RGBA8 and 16-bit)"
+need Includes/azl/gfx_surface.hpp "            if (((ma | mb) & 15) != 0) {" "a group of four background pixels is not worked out (BGR8)"
+need Includes/azl/chat_draw.hpp "            glyph[line] = &gfx::kFont6x10.cols[gfx::GlyphIndex(ch) * kGlyphW];" "a cell's glyph is looked up once for its 6 columns"
+need_line Tests/stack_usage.sh "bash Tests/chat_draw_cost.sh || FAILED=1" "the instructions of the chat's lines are counted by the stack check"
+need_line Tests/chat_draw_cost.py "        ok = drawn == lines and n <= budget and probe.bus <= bus_budget and same" "every frame of the chat's lines is held to its budgets of instructions and bus writes, and to the reference build byte by byte"
+need Tests/chat_draw_cost.py "    ('5 long messages, 3D', 0, 1, 5, 20, 128, 721000, 30560)," "the worst frame of the chat's lines (RGBA8, the 3D on, 5 blocks of 382 x 32) stays within 721 000 instructions and 30 560 bus writes"
+need Tests/chat_draw_cost.py "    ('5 long messages, 3D', 1, 1, 5, 20, 128, 792000, 30560)," "the worst frame of the chat's lines (BGR8, the 3D on) stays within 792 000 instructions and 30 560 bus writes"
+need Tests/chat_draw_cost.py "    ('5 long messages, 3D', 2, 1, 5, 20, 128, 718000, 30560)," "the worst frame of the chat's lines (RGB565, the 3D on) stays within 718 000 instructions and 30 560 bus writes"
+# The framebuffer is strongly ordered and uncached: every store is a bus transaction the core waits for, and one store a word was 83 440 of
+# them in the worst frame of the lines (RGBA8, the 3D on). On the console a whole group of four pixels goes out in one stm an image (4, 3 or
+# 2 words in r4-r7, from a word: RunColumnBoth reaches a word before its groups, gfx::Usable asks both images on words), 20 860 in that
+# frame; the PC and the cost check's reference build (AZL_GFX_NO_BURST, never in the plugin's build) keep a store a word, and the check
+# holds the plugin's build to the reference byte by byte.
+need Includes/azl/gfx_surface.hpp "#if defined(__arm__) && !defined(__thumb__) && !defined(AZL_GFX_NO_BURST)" "a group of the chat's pixels is one block store on the console"
+need Includes/azl/gfx_surface.hpp '    __asm__ volatile("stm %0, {r4-r7}" : : "r"(l + off), "r"(x0), "r"(x1), "r"(x2), "r"(x3) : "memory");' "a group of RGBA8 is one block store of four words"
+need Includes/azl/gfx_surface.hpp '    __asm__ volatile("stm %0, {r4-r6}" : : "r"(l + off), "r"(x0), "r"(x1), "r"(x2) : "memory");' "a group of BGR8 is one block store of three words"
+need Includes/azl/gfx_surface.hpp '    __asm__ volatile("stm %0, {r4-r5}" : : "r"(l + off), "r"(x0), "r"(x1) : "memory");' "a group of 16 bits is one block store of two words"
+need Includes/azl/gfx_surface.hpp "            Put3Both(l, r, off, c0 | c1 << 24, c1 >> 8 | c2 << 16, c2 >> 16 | c3 << 8);" "a group of BGR8 goes out as one block"
+[ "$(tr -d '\r' < Includes/azl/gfx_surface.hpp | grep -c -F '            Put32Both(l, r, off')" = "0" ] || fail "Includes/azl/gfx_surface.hpp: a group of pixels goes out one store a word"
+! grep -r -q -F 'AZL_GFX_NO_BURST' Makefile Sources || fail "AZL_GFX_NO_BURST (the cost check's reference, a store a word) is set in the plugin's build"
+need Tests/chat_draw_cost.sh "for v in probe:-UAZL_GFX_NO_BURST probe_ref:-DAZL_GFX_NO_BURST; do" "the cost check builds the plugin's probe and the reference with a store a word"
+[ "$(tr -d '\r' < Tests/chat_draw_cost.py | grep -c -F -x '        same = probe.framebuffers() == ref.framebuffers()')" = "2" ] || fail "Tests/chat_draw_cost.py: the block stores of the lines and of the keyboard are not both checked byte by byte against the reference build"
+need Tests/chat_draw_cost.sh "-w /src pablomk7/libctrpf:0.8.0" "the chat's lines are counted as the plugin's own compiler builds them"
+# The keyboard's copy onto the bottom screen (azl/chat_host.hpp, CopyImage) runs on the same thread every frame the keyboard is open, the
+# whole 320 x 240 screen: one store a word was 234 K instructions a frame in RGBA8 (several ms of an Old 3DS's frame). On the console it goes
+# out in blocks of eight words (ldm/stm), only from and to words (a block access off a word is a data abort), and the same count holds it.
+need_after Includes/azl/chat_host.hpp "inline void CopyImage(const Image& im, const gfx::Surface& fb) {" "#if defined(__arm__) && !defined(__thumb__)" "the keyboard's copy is the burst on the console"
+need Includes/azl/chat_host.hpp '"    stm   %[dst]!, {r3-r9, r12}' "the keyboard's copy writes eight words a store"
+need Includes/azl/chat_host.hpp "im.col_bytes == kImageH * im.bpp && (reinterpret_cast<std::uintptr_t>(im.pixels) & 3) == 0;" "the keyboard's picture is copied only from a word's address"
+# ... and only onto a screen of its own format: RGB565, RGB5A1 and RGBA4 have the same bytes a pixel, so the bpp alone would copy a picture
+# of one onto another (review of the chat, H15: one or two frames of the keyboard in the wrong colours); Tests/chat_host_test.cpp tries them
+need Includes/azl/chat_host.hpp "    return gfx::Usable(fb) && fb.format == im.format && fb.bpp == im.bpp && fb.w == kImageW" "the keyboard's picture is copied only onto a screen of its own format"
+need Tests/chat_host_test.cpp "            CHECK(chat::ImageFits(im16.im, fb16.s) == (fi == ff));" "the chat host's test copies no picture across the 16-bit formats"
+need Tests/chat_draw_cost.py "        ok = copied == 1 and wrong == 0 and n <= budget" "the keyboard's copy is checked byte by byte and held to its budget of instructions"
+need Tests/chat_draw_cost.py "    (0, 240, 44800),  # RGBA8" "the keyboard's copy (RGBA8) stays within 44 800 instructions a frame"
+# The keyboard's picture is drawn on the plugin's thread, at the game's own priority on the Old 3DS's core 0 (a game's thread woken meanwhile
+# waits): the whole screen is 1.5-2 million instructions, 5.6-7.4 ms at 268 MHz, and every change of the view (the blink twice a second, every
+# key) drew it all. Only what changed is drawn again (osk::DrawOskOver), byte for byte the whole drawing (osk_test, and the count's check).
+need Sources/ctr/chat_overlay.cpp "        osk::DrawOskOver(chat::ImageSurface(*g_image), v, g_drawn);" "the chat's keyboard is drawn again only where its view changed"
+need Includes/azl/osk_draw.hpp "            if (!SameLook(look, LookOf(was, key)) || (recase && kKeys[i].kind == kChar && kKeys[i].ch >= 'a' && kKeys[i].ch <= 'z')) {" "a key is drawn again only when its look or its label changed"
+need_line Tests/osk_test.cpp "    TestDrawOver();" "the keyboard drawn over its picture is checked against the whole drawing, byte by byte"
+# The picture is drawn again only when the view changed (review of the chat, defect 26: osk::Same guards the redraw of chat_overlay.cpp and of
+# the game menu, built by no test on the PC; a guard dropped or a Same never true drew the 333 KB picture 30 times a second, 10 MB/s, with more
+# frames of mixed pixels): the guard and Same's compare are pinned, osk_test checks two views of an idle keyboard equal and every field
+need_after Sources/ctr/chat_overlay.cpp "    g_osk->Snapshot(&v);" "    if (!force && g_drawn_valid && osk::Same(v, g_drawn)) {" "the chat's keyboard is drawn again only when its view changed"
+need_after Sources/ctr/chat_overlay.cpp "    if (!force && g_drawn_valid && osk::Same(v, g_drawn)) {" "        return;" "the chat's keyboard with the same view leaves the redraw"
+need Sources/game_menu.cpp "    if (!osk::Same(v, m.osk_drawn)) {" "the menu's keyboard is drawn again only when its view changed"
+need_after Includes/azl/osk.hpp "inline bool Same(const View& a, const View& b) {" "    return std::memcmp(&a, &b, sizeof(View)) == 0;" "two views are the same when they are equal byte for byte"
+need Includes/azl/osk.hpp "        std::memset(v, 0, sizeof(View));" "every byte of a view is written, its padding too (Same compares bytes)"
+need_line Tests/osk_test.cpp "    TestSame();" "the keyboard's test checks the redraw's guard: idle views the same, every field changed seen"
+need Tests/chat_draw_cost.py "        ok = wrong == 0 and n <= budget" "every redraw of the keyboard is checked byte by byte and held to its budget of instructions"
+need Tests/chat_draw_cost.py "    (1, 0, 70700), (1, 1, 116000), (1, 2, 70000)," "the cursor's blink redraws one line of the keyboard (at most 116 K instructions)"
+need Tests/chat_draw_cost.py "    (3, 0, 196900), (3, 1, 279300), (3, 2, 212100)," "a character typed redraws a line, the bar and a key (at most 280 K instructions)"
+need Tests/chat_draw_cost.py "    uc.hook_add(UC_HOOK_BLOCK, on_block)" "the count's hook is there from the start (a hook added later misses the blocks already translated)"
+# The font is made by its script from the BDF files of a Spleen release, with the license in it (the BSD 2-Clause asks a copy of the source to
+# keep it) and in the credits (CREDITS.md, which the binary's copies go with, and the app's list: about_test holds the two the same).
+head -1 Includes/azl/font_spleen.inc | grep -q "^// Generated by Tests/make_font_spleen.py from the BDF files of Spleen" || fail "Includes/azl/font_spleen.inc is not marked as generated by Tests/make_font_spleen.py (run the script on the release's files instead of editing it)"
+[ -f Tests/make_font_spleen.py ] || fail "Tests/make_font_spleen.py, the script that makes the chat's font, is gone"
+need Includes/azl/font_spleen.inc "// Copyright (c) 2018-2024, Frederic Cambus" "the font keeps Spleen's copyright"
+need Includes/azl/font_spleen.inc "//   * Redistributions in binary form must reproduce the above copyright" "the font keeps Spleen's license"
+# The fonts and the keyboard's table are inline: one copy in the plugin (a constexpr of a namespace has internal linkage, so game_menu.o and
+# chat_overlay.o had a copy each of all three, 3,812 bytes of .rodata twice in the plugin's block, on the Old 3DS's 5 MiB too).
+need Includes/azl/font_spleen.inc "inline constexpr u16 kSpleen6x12[95][6] = {" "the 6x12 font is in the plugin once"
+need Includes/azl/font_spleen.inc "inline constexpr u16 kSpleen8x16[95][8] = {" "the 8x16 font is in the plugin once"
+need Includes/azl/font_spleen.inc "inline constexpr u16 kSpleen6x10[95][6] = {" "the 6x10 font (the chat's lines) is in the plugin once"
+need Tests/make_font_spleen.py "    _, t10 = table('kSpleen6x10', bdf6, crop10, 10)" "the 6x10 font is made by the script from the 6x12 BDF, not by hand"
+need Tests/make_font_spleen.py "'inline constexpr u16 %s[%d][%d] = {'" "the font's script makes the tables inline"
+need Includes/azl/osk.hpp "inline constexpr KeyDef kKeys[] = {" "the keyboard's table is in the plugin once"
+need CREDITS.md "Copyright (c) 2018-2024, Frederic Cambus" "the credits carry Spleen's copyright (the copy of the license that goes with the binaries)"
+need CREDITS.md "Redistributions in binary form must reproduce the above copyright" "the credits carry Spleen's license"
+need ConfigApp/source/about_text.hpp '{"Spleen", "BSD-2-Clause", "Frederic Cambus",' "the app's credits thank Spleen"
+need Tests/run.sh 'Tests/chat_draw_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_draw_test"' "the chat's drawing test counts the allocations through the link"
+# The plugin's one on-screen keyboard (Includes/azl/osk.hpp: the table and the state; Includes/azl/osk_draw.hpp: the drawing), the chat's in
+# the game and the password's in the paused menu. No heap (the host makes it with new (std::nothrow) when it opens and deletes it when it
+# closes), no framework, no printf, and the framebuffer only through gfx_surface.hpp's stores. Its edges are its own, from the keys held:
+# in the game the framework's loop updates the controller every frame, so its "pressed" is nearly always 0 there (STUDIO-CHAT section 11),
+# and a key held when it opens (the chord) is no press. The paused menu asks a room's password on it, never on the framework's Keyboard
+# (whose look settings went from main.cpp with it).
+for h in Includes/azl/osk.hpp Includes/azl/osk_draw.hpp; do
+  hit=$(tr -d '\r' < "$h" | sed 's://.*$::' | grep -n -E 'std::(string|vector|function|mutex)|\bnew\b|\b(malloc|calloc|realloc)[[:space:]]*\(|#include <(string|vector|functional|mutex|cstdio)>|DrawSysfont|DrawRect|GetTextWidth|OSD::|Controller::|GetKeysPressed|hidKeysDown|\bprintf\b|reinterpret_cast' | head -3)
+  [ -z "$hit" ] || fail "$h allocates, formats, reads the pad through the framework or reaches the framebuffer other than through gfx_surface.hpp: $hit"
+done
+need Includes/azl/osk.hpp "const u32 pressed = held & ~prev_held_;" "the keyboard makes its own edges from the keys held"
+need Includes/azl/osk.hpp "u32 prev_held_ = 0xFFFFFFFFu;" "a key held when the keyboard opens is no press"
+need Includes/azl/osk.hpp "bool touch_prev_ = true; " "a finger on the screen when the keyboard opens is no key"
+need Includes/azl/osk.hpp "constexpr u32 kRepeatDelayMs = 400; " "a held key repeats after 400 ms"
+need Includes/azl/osk.hpp "constexpr u32 kRepeatMs = 90; " "... and then every 90 ms"
+need Includes/azl/osk.hpp "constexpr u32 kRevealMs = 1000; " "a password's last character stays visible 1 s"
+need Sources/game_menu.cpp "m.osk = new (std::nothrow) osk::Osk(o, Plugin::Get().config().password.c_str());" "the password's keyboard is made when the room refuses (and deleted when it closes)"
+need Sources/game_menu.cpp "    o.max_len = 64;" "a room's password has at most 64 characters"
+need Sources/game_menu.cpp "    o.mask = true;" "the password is masked"
+hit=$(tr -d '\r' < Sources/game_menu.cpp | sed 's://.*$::' | grep -n -E '\bKeyboard\b' | head -2)
+[ -z "$hit" ] || fail "Sources/game_menu.cpp uses the framework's Keyboard (a room's password is typed on the plugin's own keyboard, azl/osk.hpp): $hit"
+if tr -d '\r' < Sources/main.cpp | grep -n -E 'look\.Keyboard\.'; then
+  fail "Sources/main.cpp sets the look of the framework's Keyboard, which the plugin no longer opens"
+fi
+need Tests/run.sh 'Tests/osk_test.cpp -Wl,--wrap=malloc -o "$OUT/osk_test"' "the keyboard's test counts the allocations through the link"
+# The chat over the running game (Sources/ctr/chat_overlay.cpp, the console's side; Includes/azl/chat_host.hpp, the pure parts that
+# Tests/chat_host_test.cpp holds). The framework's OSD callback is registered ONCE, the first time the chat is on, and never with the chat
+# off; on the game's thread it passes the swap's gate with GateTryPass (never GateEnter or SwapGateScope: a game's thread parked in the
+# plugin's code wakes up in memory that is gone) and only copies. The keyboard is fed from the keys held (never the framework's "pressed",
+# never its sysfont, and Controller::InjectKey/InjectTouch write a page that is read-only: a data abort), and the picture it is drawn into
+# is made only while it is open. It closes, its draft kept, on the notifications counted by the hook (any level of the log, the low byte)
+# and on the framework's events, which main.cpp counts before Plugin::NoteProcessEvent.
+for h in Includes/azl/chat_host.hpp Sources/ctr/chat_overlay.cpp; do
+  hit=$(tr -d '\r' < "$h" | sed 's://.*$::' | grep -n -E 'GetKeysPressed|hidKeysDown|DrawSysfont|DrawRect|Inject(Key|Touch)|GateEnter|SwapGateScope|\bprintf\b' | head -3)
+  [ -z "$hit" ] || fail "$h reads the pad's 'pressed', draws with the framework, injects input or parks a game's thread at the gate: $hit"
+done
+hit=$(tr -d '\r' < Includes/azl/chat_host.hpp | sed 's://.*$::' | grep -n -E 'std::(string|vector|function|mutex)|\bnew\b|\b(malloc|calloc|realloc)[[:space:]]*\(|#include <(string|vector|functional|mutex|cstdio)>|OSD::|Controller::' | head -3)
+[ -z "$hit" ] || fail "Includes/azl/chat_host.hpp allocates or reaches the framework (it is pure: the console's side is chat_overlay.cpp): $hit"
+hit=$(grep -rn -E 'Inject(Key|Touch)' Sources Includes | head -2)
+[ -z "$hit" ] || fail "the plugin injects input through the framework (Controller::InjectKey/InjectTouch write a read-only page: a data abort): $hit"
+[ "$(grep -rh -E 'OSD::Run\(' Sources | grep -v -E '^[[:space:]]*//' | wc -l)" = "1" ] || fail "OSD::Run is called in more than one place, or nowhere (one callback, the chat's, registered once)"
+need_after Sources/ctr/chat_overlay.cpp "    if (on && !g_osd_running) {" "OSD::Run(OnChatOsd);" "the chat's OSD callback is registered only with the chat on, and once"
+need_after Sources/ctr/chat_overlay.cpp "bool OnChatOsd(const Screen& scr) {" "if (!GateTryPass(g_swap_gate, kGateOsd)) {" "the chat's OSD callback passes the swap's gate before anything else, and never stops at it"
+need_after Sources/ctr/chat_overlay.cpp "    if (!GateTryPass(g_swap_gate, kGateOsd)) {" "        return false;" "the gate closed, the chat's OSD callback goes out at once: nothing of the plugin's block is read while it goes to the SD"
+need_after Sources/ctr/chat_overlay.cpp "    u32 drew = chat::kDrewNothing;" "    if (g_overlay.on.load(std::memory_order_relaxed) != 0) {" "past the gate, the chat's OSD callback looks at the switch first: off after an on (the callback stays registered), it reads no clock and makes no svc"
+need_after Sources/ctr/chat_overlay.cpp "    if (g_overlay.on.load(std::memory_order_relaxed) != 0) {" "chat::DrawOverlay(g_overlay, SurfaceOf(scr)" "the chat's OSD callback draws, and reads the clock for it, only with the chat on"
+need_order Sources/ctr/chat_overlay.cpp "    if (!GateTryPass(g_swap_gate, kGateOsd)) {" "g_overlay.on.load(std::memory_order_relaxed)" "the chat's OSD callback reads its switch only past the gate (g_overlay is in the plugin's block)"
+need_line Sources/ctr/chat_overlay.cpp "    GateLeave(g_swap_gate, kGateOsd);" "the chat's OSD callback leaves the swap's gate it passed (else every drain of SWAP_ENTER waits its whole budget)"
+need_after Sources/ctr/chat_overlay.cpp "    GateLeave(g_swap_gate, kGateOsd);" "    return drew != chat::kDrewNothing;" "the chat's OSD callback leaves the gate right before its only return after the pass"
+need_order Sources/ctr/chat_overlay.cpp "chat::DrawOverlay(g_overlay, SurfaceOf(scr)" "GateLeave(g_swap_gate, kGateOsd);" "the chat's OSD callback leaves the gate only after drawing"
+need Includes/azl/swap_gate.hpp "constexpr u32 kGateOsd = 1u << 24;" "the game's thread in the chat's OSD callback has a weight of its own in the swap's gate"
+need Includes/azl/swap_gate.hpp "    return g.on == 0 || GateTryEnter(g, who);" "GateTryPass counts nothing on a New 3DS (GateLeave counts nothing there)"
+need Includes/azl/chat_host.hpp "    return raw & 0xFFu;" "the chat reads the notification's low byte (0x608 is the power button of an Old 3DS)"
+need Includes/azl/chat_host.hpp "    return (signal >= 1 && signal <= 3) || signal == 5 || (signal >= 7 && signal <= 11);" "the keyboard closes on the notifications 1, 2, 3, 5, 7, 8, 9, 10, 11"
+need Includes/azl/chat_host.hpp "    return signal == 1 || signal == 2 || signal == 8 || signal == 9;" "no opening for a while after HOME and power"
+need Includes/azl/chat_host.hpp "constexpr u32 kReopenHoldMs = 2000; " "no opening for 2 s after HOME, power or a swap"
+need Includes/azl/chat_host.hpp "    if (rc < 0 || static_cast<s32>(result_word) < 0) {" "only a notification the game was given closes the keyboard"
+need Includes/azl/chat_host.hpp "constexpr u32 kWorkPerSecond = 30; " "the keyboard's work at most 30 times a second"
+need Sources/ctr/chat_overlay.cpp "constexpr u64 kWorkGapTicks = chat::WorkGap(SYSCLOCK_ARM11);" "the keyboard's pace on the console is 1/30 s"
+need Includes/azl/chat_host.hpp "    return (per_second + WorkEarly(per_second) + kWorkPerSecond - 1) / kWorkPerSecond;" "the pace's gap is rounded up and holds the early allowance: no second holds a 31st job"
+# The pace takes the jitter of the frame callback (review of the chat, defect 37: a job refused for coming 0.1 ms before 1/30 s after the last
+# went to the third frame, 22-26 jobs a second at 60 fps, 18-23 at 30 fps): each job has a place at most 2 ms before it, the next a gap later
+need_line Includes/azl/chat_host.hpp "constexpr u32 kWorkEarlyDiv = 500;  ///< a job's place in the pace may be this part of a second (2 ms) before it: the frames' own jitter" "the pace's early allowance is 2 ms: a gap of 33.4 ms, less than two frames"
+need_after Includes/azl/chat_host.hpp "    bool Due(u64 now) {" "        if (started_ && now < next_) {" "the pace never takes a job before the next place"
+need_line Includes/azl/chat_host.hpp "        next_ = now + gap_ - (behind < early_ ? behind : early_); // (this job's place, and a gap; early_ < gap_)" "a job's place is at most the early allowance before it"
+need Sources/ctr/chat_overlay.cpp "constexpr u64 kWorkEarlyTicks = chat::WorkEarly(SYSCLOCK_ARM11);" "the keyboard's pace on the console takes 2 ms of jitter"
+need_line Sources/ctr/chat_overlay.cpp "chat::WorkPacer g_pacer(kWorkGapTicks, kWorkEarlyTicks);" "the keyboard's pace on the console is given its early allowance"
+need_line Tests/chat_host_test.cpp "    TestPaceJitter();" "the chat host's test runs the pace with the frames' jitter"
+# The latch between two jobs keeps the edges (review of the chat, defect 23: the touch OR-ed over a job's frames merged a lift of 17-33 ms,
+# and "q, one frame up, w" typed nothing): a second edge waits for the next job, the press after a short release is never folded into it
+need_after Includes/azl/chat_host.hpp "    void Sample(u32 v) {" "        two ^= t & one;" "the keyboard's latch counts a second edge of a key or of the touch between two jobs"
+need_after Includes/azl/chat_host.hpp "        seen ^= one;" "        one = two;" "the keyboard's latch gives the waiting edge at the next job"
+need_after Includes/azl/chat_host.hpp "    osk::Input Take(u32 now_ms) {" "        in.held = keys_.Take();" "the keyboard is given the keys' edges one a job"
+need_line Includes/azl/chat_host.hpp "        in.touch = touch_.Take() != 0;" "the keyboard is given the touch's edges one a job, not the touch of any frame since the last"
+need_line Tests/chat_host_test.cpp "    TestLatchLifts();" "the chat host's test runs the short lifts of the stylus and of the keys"
+need Sources/ctr/hook.cpp "static __attribute__((noinline)) void NoteAptForChat(Result rc, u32 result_word, u32 raw) {" "the chat's observer of the notifications is out of line"
+need_order Sources/ctr/hook.cpp "        NoteAptForChat(rc, cmd[1], raw);" "        if (g_apt_observer && g_debug_level > 0 && answered) {" "the chat counts the notifications at every level of the log, before the debug log's observer"
+need_order Sources/main.cpp "    azl::ctr::ChatProcessEvent(static_cast<int>(event));" "    Plugin::Get().NoteProcessEvent(static_cast<int>(event));" "the chat counts the framework's events before the plugin's swap work"
+need Sources/main.cpp "azl::ctr::ChatFrame(g_chat_keys, !g_menu_off);" "the chat's work runs every frame of the running game"
+need Sources/ctr/chat_overlay.cpp "    g_osk = new (std::nothrow) osk::Osk(o, g_draft);" "the chat's keyboard is made when it opens, from the draft"
+need Sources/ctr/chat_overlay.cpp "    u8* pixels = im ? new (std::nothrow) u8[chat::ImageBytes(format)] : nullptr;" "the keyboard's picture is made only while it is open"
+need Sources/ctr/chat_overlay.cpp "    FreeImage(g_keeper.Freeable(g_overlay.image));" "the keyboard's picture is freed only when no copy can read it"
+# Nothing of the keyboard outlives it (chat_overlay.cpp is built by no test on the PC: up to 333,440 bytes a keyboard on the Old 3DS's 5 MiB
+# block): the picture's pixels and the picture freed, the keyboard deleted at its close after its picture is withdrawn, a picture the close
+# could not withdraw withdrawn by the next frame, and no new picture while an old one waits (the keeper holds one: a second Retire fails)
+need_after Sources/ctr/chat_overlay.cpp "void FreeImage(chat::Image* im) {" "        delete[] im->pixels;" "the keyboard's picture frees its pixels"
+need_after Sources/ctr/chat_overlay.cpp "        delete[] im->pixels;" "        delete im;" "the keyboard's picture is freed with its pixels"
+need_after Sources/ctr/chat_overlay.cpp "    if (g_image && g_keeper.Retire(g_overlay.image)) {" "    delete g_osk;" "the keyboard's close withdraws its picture, then deletes the keyboard"
+need_after Sources/ctr/chat_overlay.cpp "    FreeImage(g_keeper.Freeable(g_overlay.image));" "    if (!g_osk && g_image && g_keeper.Retire(g_overlay.image)) {" "a picture left with the keyboard closed is withdrawn on the next frame"
+need_after Sources/ctr/chat_overlay.cpp "    if (!g_keeper.Empty()) {" "        return nullptr;" "no new picture while an old one waits to be freed"
+# The game's input goes to the mirror only once the keyboard's picture is published (one MirrorWant, right after the first Publish of an
+# opening): a picture that cannot be made (no memory on the Old 3DS's 5 MiB block, a format it does not draw in) or a bottom screen the game
+# never presents within kShowWaitMs closes the keyboard with a notification, once; before that the keys are the game's, nothing typed blind
+# (review of the chat, defect 15: an invisible keyboard held the game's input, the picture's new of 150-300 KB tried again every frame)
+need_after Sources/ctr/chat_overlay.cpp "    g_overlay.image.Publish(im);" "    if (!g_shown) {" "the game's input is wanted only after the keyboard's picture is published"
+need_after Sources/ctr/chat_overlay.cpp "    if (!g_shown) {" "        MirrorWant();" "the first picture of an opening hands the game's input to the mirror"
+n=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -c 'MirrorWant()')
+[ "$n" = 1 ] || fail "Sources/ctr/chat_overlay.cpp asks the mirror $n times (once, after the keyboard's picture is published: never at the opening)"
+need_line Sources/ctr/chat_overlay.cpp "    g_shown = false; // (the game's input stays its own until the Image is published: EnsureImage)" "every opening waits for its own picture"
+need Sources/ctr/chat_overlay.cpp "constexpr u32 kShowWaitMs = 1000;" "an opened keyboard that is not on the screen after a second is closed"
+need Sources/ctr/chat_overlay.cpp "    if (!cannot && !g_shown && now_ms - g_opened_ms >= kShowWaitMs) {" "the keyboard waits for the bottom screen at most kShowWaitMs"
+need_after Sources/ctr/chat_overlay.cpp "    if (cannot) {" '        Close(true, "not shown");' "a keyboard that cannot be shown is closed, its draft kept"
+need_after Sources/ctr/chat_overlay.cpp '        Close(true, "not shown");' "        Notify(cannot);" "a keyboard that cannot be shown says so"
+need Sources/ctr/chat_overlay.cpp "    if (!g_shown || !g_pacer.Due(svcGetSystemTick())) {" "nothing is typed before the keyboard is seen"
+# The keyboard's work at most 30 times a second (review of the chat, defect 25: WorkPacer is tested in chat_host_test, but chat_overlay.cpp is
+# built by no test on the PC and only the gap's constant was pinned): the pace's check leaves the frame, and the keyboard's only Feed and
+# only redraw of the frame's work come after it
+need_after Sources/ctr/chat_overlay.cpp "    if (!g_shown || !g_pacer.Due(svcGetSystemTick())) {" "        return; // (nothing typed before the keyboard is seen" "a frame between two of the keyboard's jobs goes out at once"
+n=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -c -E '(->|\.)Feed\(|Redraw\(false\)')
+[ "$n" = 2 ] || fail "Sources/ctr/chat_overlay.cpp feeds or redraws the keyboard $n times (one Feed and one Redraw(false), both after the pace)"
+need_order Sources/ctr/chat_overlay.cpp "    if (!g_shown || !g_pacer.Due(svcGetSystemTick())) {" "    const osk::Result r = g_osk->Feed(g_latch.Take(now_ms));" "the keyboard is fed only after the pace"
+need_order Sources/ctr/chat_overlay.cpp "    if (!g_shown || !g_pacer.Due(svcGetSystemTick())) {" "    Redraw(false);" "the keyboard's picture is redrawn only after the pace"
+need_order Sources/ctr/chat_overlay.cpp "    if (!g_keeper.Empty()) {" "        g_keeper.Retire(g_overlay.image); // (the slot shows g_image" "the picture of another format is withdrawn only with the keeper empty"
+# ... and freed before the new one is made, never two on the heap (review of the chat, defect 35: the new one made at once, 230-307 KB
+# more for a frame on the Old 3DS's 5 MiB block, 541,948 bytes over the base in the stress test): at once when no copy reads it, else the
+# new one waits for a next frame
+need_after Sources/ctr/chat_overlay.cpp "        g_keeper.Retire(g_overlay.image); // (the slot shows g_image" "        chat::Image* old = g_keeper.Freeable(g_overlay.image);" "the picture of another format is freed at once when no copy reads it"
+need_after Sources/ctr/chat_overlay.cpp "        chat::Image* old = g_keeper.Freeable(g_overlay.image);" "        FreeImage(old);" "the picture of another format is freed before the new one is made"
+need_after Sources/ctr/chat_overlay.cpp "        FreeImage(old);" "        if (old == nullptr) {" "a picture of another format still read waits: no new one beside it"
+need_after Sources/ctr/chat_overlay.cpp "        if (old == nullptr) {" "            return nullptr; // (a copy still reads it" "a picture of another format still read waits: no new one beside it"
+need_order Sources/ctr/chat_overlay.cpp "        FreeImage(old);" "    chat::Image* im = new (std::nothrow) chat::Image();" "the old picture is freed before the new one is made"
+# Send asks whether the box is busy BEFORE it posts (only the network thread empties it): asked after a failed Post, a box emptied in
+# between read as "nothing to send" and the draft was thrown away (review of T5, 2026-11-04)
+need_after Includes/azl/chat_host.hpp "inline Sent SubmitDraft(ChatSink& sink, const char* text, u32 n) {" "    if (sink.OutboxBusy()) {" "the keyboard's Send asks the box first: a draft is never lost to the network thread emptying it"
+# HOME, power, sleep or exit close an open keyboard on the next frame, its draft kept and at once (the user's fall-back: the keyboard, its
+# picture on the plugin's heap and the mirror's wish never outlive HOME or the swap); CloseRules is tested in chat_host_test, but chat_overlay.cpp
+# is built by no test on the PC: that ChatFrame asks it and closes on its answer is held here
+need Sources/ctr/chat_overlay.cpp "    const bool must_close = g_rules.Update(chat::Look(chat::g_signals), now_ms);" "the chat's frame asks the close rules about HOME, power, sleep and exit"
+need_after Sources/ctr/chat_overlay.cpp "    if (g_osk && must_close) {" '        Close(true, "HOME, power, sleep or exit", true);' "an open keyboard closes on HOME, power, sleep or exit, its draft kept and at once"
+# ... and every other closing that is not a Send keeps the draft too (review of the chat, defect 51: only HOME's was held, while the Close calls
+# and Close's own copy are built by no test on the PC; a closing turned to Close(false, ...) lost what was typed, in silence)
+need_after Sources/ctr/chat_overlay.cpp "    } else if (g_osk && !on) {" '        Close(true, "chat off", true);' "an open keyboard closes when the chat is turned off, its draft kept and at once"
+need_after Sources/ctr/chat_overlay.cpp "    } else if (g_osk && plugin.room().state() != RoomClient::State::Joined) {" '        Close(true, "left the room", true);' "an open keyboard closes when the room is left, its draft kept and at once"
+need_after Sources/ctr/chat_overlay.cpp "    if (r == osk::Result::kCancel) {" '        Close(true, "cancelled");' "a keyboard cancelled keeps its draft"
+need_line Sources/ctr/chat_overlay.cpp '            Close(true, "not in a room");' "a Send out of a room closes the keyboard with its draft kept"
+need_after Sources/ctr/chat_overlay.cpp "    if (keep) {" "            g_draft[i] = g_osk->text()[i];" "Close with keep copies what was typed into the draft"
+need_after Sources/ctr/chat_overlay.cpp "            g_draft[i] = g_osk->text()[i];" "        g_draft[n] = '\0';" "the draft kept is ended"
+need Sources/ctr/chat_overlay.cpp "        const chat::Sent sent = chat::SubmitDraft(*sink, g_osk->text(), g_osk->length());" "the keyboard's Send goes through SubmitDraft"
+# Our message refused after Send (review of the chat, defect 46: the keyboard closed and the draft was forgotten at once, so the room left
+# before the network thread's round, or ENet not taking the packet, lost the text in silence): the refusals read before the Post, the message
+# watched, and a refusal gives its text back as the draft (unless a newer one is there) and tells the player
+need_order Sources/ctr/chat_overlay.cpp "        const u32 refused = sink->counters.refused.load(std::memory_order_relaxed);" "        const chat::Sent sent = chat::SubmitDraft(*sink, g_osk->text(), g_osk->length());" "the refusals are read before Send posts: the refusal of the message posted is never in the snapshot"
+need_after Sources/ctr/chat_overlay.cpp "        if (sent == chat::Sent::kPosted) {" "            if (g_watch.Posted(refused, left)) {" "a message posted is watched until the network thread sent or refused it (and a refusal of the one before, in between, is told)"
+need Sources/ctr/chat_overlay.cpp "    if (!g_watch.Refused(*sink)) {" "the chat asks whether our last message was refused"
+need_after Sources/ctr/chat_overlay.cpp "    } else if (g_draft[0] == '\0') {" "        std::memcpy(g_draft, sink->Outbox(), sizeof g_draft);" "a message refused after Send goes back to the draft (the keyboard closed)"
+need_after Sources/ctr/chat_overlay.cpp "    if (g_osk) {" "            g_osk->SetText(sink->Outbox());" "a message refused after Send goes back into the open keyboard when nothing is typed in it"
+need Sources/ctr/chat_overlay.cpp 'Notify(left ? "Message not sent: not in the room" : "Message not sent: the room did not take it");' "the player is told of a message refused after Send, and why (CHAT-5)"
+need Sources/ctr/chat_overlay.cpp "        TellRefused(sink); // (our last message refused by the network thread after Send forgot the draft)" "the chat's frame asks whether our last message was refused"
+need_order Sources/ctr/chat_overlay.cpp "        TellRefused(sink);" "        const chat::Sent sent = chat::SubmitDraft(*sink, g_osk->text(), g_osk->length());" "a refusal that came since the frame's look is told before Send (not taken into the new message's baseline)"
+need_order Sources/ctr/chat_overlay.cpp "        const u32 left = sink->counters.refused_left.load(std::memory_order_relaxed);" "        const chat::Sent sent = chat::SubmitDraft(*sink, g_osk->text(), g_osk->length());" "the reasons are read before Send posts too"
+need Includes/azl/chat_host.hpp "        not_in_room_ = sink.counters.refused_left.load(std::memory_order_relaxed) != left_;" "the watch tells why the message was refused"
+need_after Includes/azl/chat_core.hpp "        if (!joined) {" "            counters.refused_left.fetch_add(1, std::memory_order_relaxed);" "a message refused because we were not in the room is counted apart"
+# The keyboard stays open after Send (the user's request, 2026-11-08): the text is emptied for the next message, the draft forgotten, and a
+# Close key (the chat's label of the Cancel key; the room's password keeps Cancel), SELECT or B with nothing typed close it. A Send within the
+# second of the last one keeps the text and says so.
+need_order Sources/ctr/chat_overlay.cpp "            if (g_watch.Posted(refused, left)) {" "            g_osk->Clear();" "Send empties the keyboard and leaves it open"
+[ "$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -c 'Close(false')" = "0" ] || fail "Sources/ctr/chat_overlay.cpp closes the keyboard and forgets its text somewhere (Send's close: the keyboard stays open after Send)"
+need Sources/ctr/chat_overlay.cpp '    o.cancel = "Close"; ' "the chat's keyboard has a Close key"
+need Includes/azl/osk.hpp '    const char* cancel = "Cancel"; ' "the keyboard's cancel key says Cancel unless the host says otherwise (the room's password)"
+need Includes/azl/osk_draw.hpp "        AddText(l, v.cancel);" "the cancel key says the host's label"
+need Includes/azl/osk_draw.hpp "std::memcmp(now.cancel, was.cancel, sizeof(now.cancel)) != 0) {" "another cancel label is the whole screen drawn again"
+need Sources/ctr/chat_overlay.cpp 'Notify("One message a second: Send again");' "a Send within the second keeps the text and says so"
+need_line Tests/osk_test.cpp "    TestClearAndClose();" "the keyboard's test empties it after Send, puts a refused text back and holds the labels of the cancel key"
+need_after Includes/azl/chat_host.hpp "    bool Refused(const ChatSink& sink) {" "        if (!armed_ || sink.OutboxBusy()) {" "a message still in the box is not refused yet"
+need_after Includes/azl/chat_host.hpp "        armed_ = false;" "        return sink.counters.refused.load(std::memory_order_relaxed) != refused_;" "a refusal is told once, by the counter that moved"
+need_line Tests/chat_host_test.cpp "    TestPostWatch();" "the chat host's test runs the message refused after Send"
+# The plugin's notifications never cover the chat (the user's request, 2026-11-08): the chat's OSD callback draws them in the corner OPPOSITE
+# the chat (bottom-left -> top-right, top-left -> bottom-right and back: the one chat_pos of 3DS Link and of the in-game menu sets both), the
+# chat's stack stops where theirs begins; when the callback cannot draw them (the chat off or never on, no top screen drawn on in the last
+# 500 ms: a format the layer refuses, a game that does not present, an Old 3DS swap) they go to the framework's OSD::Notify as before, whole.
+need Includes/azl/chat_draw.hpp "    return 3 - corner; // (top-left <-> bottom-right, top-right <-> bottom-left)" "the plugin's notifications go to the corner opposite the chat"
+need Includes/azl/chat_host.hpp "    const int across = Opposite(corner);" "the callback draws the notifications in the corner opposite the chat"
+need Includes/azl/chat_host.hpp "    if (notes != 0 && DrawChatLines(fb, board, notes, across, across == kBottomRight ? young : 0, kNoLimit, &limit) != 0) {" "the notifications are drawn first, and say where their stack ends"
+need Includes/azl/chat_host.hpp "    if (shown != 0 && DrawChatLines(fb, v, shown, corner, corner == kBottomRight ? young : 0, limit) != 0) {" "the chat's stack stops where the notifications' begins"
+need_after Includes/azl/chat_host.hpp "    if (!TopUsable(fb)) {" "        o.top_seen.store(0, std::memory_order_relaxed);" "a top screen the layer refuses is told to the plugin's thread: its notifications go to the framework"
+need Includes/azl/chat_host.hpp "constexpr u32 kTopSeenMs = 500; " "a notification goes to the chat's callback only if it drew the top screen in the last half second"
+need Sources/ctr/chat_overlay.cpp "    if (!g_osd_running || g_overlay.on.load(std::memory_order_relaxed) == 0) {" "with the chat off or never on the notifications are the framework's"
+need Sources/ctr/chat_overlay.cpp "    if (seen == 0 || !chat::Recent(now_ms, seen, chat::kTopSeenMs)) {" "with no top screen drawn on lately the notifications are the framework's"
+need_after Sources/ctr/chat_overlay.cpp "void Notify(const char* text) {" "    if (ChatNotice(text)) {" "the chat's own notifications go to the opposite corner too"
+need_after Sources/main.cpp "        if (!azl::ctr::ChatNotice(message.c_str())) {" "            OSD::Notify(message);" "a notification the chat's callback cannot show is the framework's, whole"
+need_line Tests/chat_host_test.cpp "    TestNotices();" "the chat host's test draws the notifications in the opposite corner of every corner, and a refused screen told"
+hit=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -n -E '(->|\.)(Post|OutboxBusy)\(' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/chat_overlay.cpp posts to the chat's box by itself (chat::SubmitDraft asks the box first: a draft is never lost): $hit"
+# On the game's thread only the copy (review of the chat, O11): the OSD callback's region never sends, feeds or redraws the keyboard nor cleans
+# a text (SubmitDraft and Sanitize read up to 528 bytes at every present, and a second producer of the outgoing box breaks its one-writer pact)
+hit=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | awk '/^[[:space:]]*\/\/ >>> game-thread code/{f=1} f{print} /^[[:space:]]*\/\/ <<< game-thread code/{f=0}' | sed 's://.*$::' | grep -n -E 'SubmitDraft|Sanitize|TakeOutgoing|Feed\(|Redraw\(|Type\(|g_osk|g_latch' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/chat_overlay.cpp: the game-thread code (the OSD callback) does the keyboard's or the box's work, only the copy belongs there: $hit"
+need Tests/run.sh 'Tests/chat_host_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_host_test"' "the chat host's test counts the allocations through the link"
+need_line Tests/stack_usage.sh 'budget chat_overlay "azl::ctr::{anonymous}::OnChatOsd" 64' "the chat's OSD callback takes at most 64 bytes of the game's stack"
+# The callback is reached by no hook entry (the framework calls it through a pointer): the call graph check follows it as a root of its own
+# (no formatter below it) and adds up its deepest chain of frames against a ceiling (a helper with a buffer of its own: every frame small)
+need_line Tests/callgraph_check.py "    r'^azl::ctr::\(anonymous namespace\)::OnChatOsd\(CTRPluginFramework::Screen const&\)\$'," "the call graph check follows the chat's OSD callback for formatters"
+need_line Tests/callgraph_check.py "    (r'^azl::ctr::\(anonymous namespace\)::OnChatOsd\(CTRPluginFramework::Screen const&\)\$', OSD_CHAIN_CEILING)," "the chat's OSD callback's whole chain is held to a ceiling"
+need_line Tests/callgraph_check.py "OSD_CHAIN_CEILING = 480" "the chain under the chat's OSD callback is at most 480 bytes of the game's stack (392 measured)"
+need_line Tests/callgraph_check.py "    for p in check_frame_roots(funcs, dem, quiet):" "the report of the call graph check runs the chain ceilings"
+need Tests/callgraph_mutants.py "('O15 Log with a format in a helper of the chat" "the call graph's mutants hold a formatter below the OSD callback"
+need Tests/callgraph_mutants.py "('O16 a 1.5 KB buffer in a helper of the chat" "the call graph's mutants hold a big frame below the OSD callback"
+# Every call graph mutant's text is found once in the tree (it is run by hand, with Docker: a stale text stopped it at the fifth mutant in 1.1.0,
+# the ones after it never ran); a text not found is a mutant not caught, and the others still run
+"$(command -v python >/dev/null 2>&1 && echo python || echo python3)" Tests/callgraph_mutants.py --patterns >/dev/null || fail "a mutant of Tests/callgraph_mutants.py no longer finds its text in the tree (python Tests/callgraph_mutants.py --patterns says which)"
+need_after Tests/callgraph_mutants.py "            if s.count(old) != 1:" "                failed += 1" "a call graph mutant whose text is not found is counted as not caught and the others still run (no assert)"
+# The input mirror page (Sources/ctr/input_mirror.cpp, the console's side; Includes/azl/hid_mirror.hpp, the pure parts that
+# Tests/hid_mirror_test.cpp holds; STUDIO-CHAT sections 2, 11 and 12). While the keyboard is open the game's HID page is a neutral copy at the
+# game's own address. The framework's own mapping is never switched (the plugin reads the real input there) and must be among the pages
+# found, or nothing is switched. A writable shared neighbour refuses the switch (the kernel would fold the mirror into it), the mirror must
+# come out as exactly one page, the address must be free after an unmap. The game's threads are held across every change by Luma3DS's
+# PROCESSOP_SCHEDULE_THREADS with a predicate that reads ONE word of the kernel's thread, the TLS address Luma3DS's own swap reads (Old 3DS
+# and New), and leaves out the caller and the plugin's threads; the hold is asked twice and checked against the threads of the process.
+# The page goes back synchronously at the framework's events FIRST (before Plugin::NoteProcessEvent takes the hooks out at SWAP_ENTER) and
+# never falls back on the mirror at SWAP_ENTER and EXIT (the mirror's page goes with the plugin's block); on a game's thread, in the hook,
+# for a notification that closes the keyboard, through a try of the lock only. svc 0xA0 is called in its first, five-argument form
+# (libctrpf's stub is the later form, which a Luma3DS from before it refuses). No thread, no hook, no Scheduler task of the framework.
+need_line Includes/azl/hid_mirror.hpp "constexpr u32 kPadEntries = 0x28;      ///< 8 entries of 0x10: held, pressed, released, Circle Pad (s16 x, s16 y)" "the pad's entries start at 0x28"
+need_line Includes/azl/hid_mirror.hpp "constexpr u32 kTouchEntries = 0xC8;    ///< 8 entries of 8: u16 x, u16 y, u32 flag at +4" "the touch's entries start at 0xC8"
+need Includes/azl/hid_mirror.hpp "    std::memset(m + kTouchRaw, 0, kTouchEnd - kTouchRaw);" "the mirror's touch entries are zero, the flag too (a zero entry with the flag set is a finger at 0,0)"
+need Includes/azl/hid_mirror.hpp "constexpr u32 kQuietMs = 50; " "the game gets its page back after 50 ms with nothing held"
+need Includes/azl/hid_mirror.hpp "constexpr u32 kMaxWaitMs = 1000; " "... or after 1 s"
+need Includes/azl/hid_mirror.hpp "constexpr u32 kReleasedSamples = 2; " "the keys the game saw held are released for 2 samples"
+need Includes/azl/hid_mirror.hpp "    return r.state == kStateShared && (r.perm & kPermW) != 0;" "a writable shared neighbour refuses the switch"
+# (two of the game's mappings side by side are read-only now, but their two mirrors would be one folded block: the way back would unmap
+# one page of it, the kernel panic of the neighbour check)
+need Includes/azl/hid_mirror.hpp "NeighbourMerges(below) || NeighbourMerges(above) || NextToAnother(f, i)) {" "two of the game's mappings side by side refuse the switch"
+need Sources/ctr/input_mirror.cpp "        RestoreLocked(true, true, kWhereNotification, &ticks);" "the way back on a game's thread spins its pauses: it never sleeps in the plugin's code"
+need Sources/ctr/input_mirror.cpp "    if (g_m.closing.load(std::memory_order_seq_cst) != g_want_closing || g_m.dead.load(std::memory_order_relaxed) != 0) {" "a closing counted before the switch cancels it (under the lock), and after EXIT nothing is switched"
+need Includes/azl/hid_mirror.hpp "    return r.base == va && r.size == kPageBytes && r.state == kStateShared" "the mirror is exactly one page at the address"
+# (the kernel's unmap of one page of a block folded with a writable shared one the game mapped beside the mirror frees from the address over
+# the whole folded size: folded below, past the block and kernelpanic(); folded above, nothing done. Only an exact page is unmapped, an
+# address found free gets its real page; the test's kernel unmaps as the kernel does)
+need_after Includes/azl/hid_mirror.hpp "            if (!IsFreeAt(r, va)) {" "                if (!MappedExactly(r, va) || ops.UnmapMirror(va) != 0) {" "the way back unmaps only a mirror that is exactly one page, and maps the real page at a free address"
+need_line Tests/hid_mirror_test.cpp "        if (!k.Query(va, &r) || r.base + r.size > va + kPageBytes) {" "the test's unmap does nothing on a block folded above, as the kernel"
+need_line Tests/hid_mirror_test.cpp "            for (u32 a = va; a < va + r.size; a += kPageBytes) {" "the test's unmap frees from the address over the folded size, as the kernel"
+need_line Tests/hid_mirror_test.cpp "        CHECK(o.panics == 0 && o.foreign_unmapped == 0 && o.folded_unmaps == 0);" "a block folded below or above the mirror: no kernel panic, nothing of it freed"
+need_after Includes/azl/hid_mirror.hpp "            if (!ops.Query(va, &r) || !IsFreeAt(r, va)) {" "out = Outcome::kNotFree;" "the address is free after the real page is unmapped"
+need_after Includes/azl/hid_mirror.hpp "                if (p == own_va) {" "f.own_seen = true;" "the framework's own mapping is never switched"
+need Sources/ctr/input_mirror.cpp "    if (!f.own_seen) {" "nothing is switched when the framework's own mapping is not among the pages found"
+# (the predicate reads two words of Luma3DS's own KThread, one layout for the Old and the New 3DS: +0x98, the kernel's alias of the TLS page,
+# for the mark - the word Luma3DS's swap reads - and +0x94, the TLS's user address, for the caller: what getThreadLocalStorage() gives
+# (TPIDRURO) is the user address, never the alias, and Luma3DS's lock holds the current thread too, so a game's thread giving the page back
+# from the hook would hold itself with the whole game. Tests/hid_mirror_test.cpp runs it inside Luma3DS's loop)
+need Includes/azl/hid_mirror.hpp "constexpr u32 kKThreadTlsWord = 0x26;" "the mark is read through the word of the kernel's thread that Luma3DS's swap reads"
+need Includes/azl/hid_mirror.hpp "constexpr u32 kKThreadUserTlsWord = 0x25;" "the caller is told by the TLS's user address, the value getThreadLocalStorage() gives"
+hit=$(tr -d '\r' < Includes/azl/hid_mirror.hpp | sed 's://.*$::' | grep -n -E 'kthread\[' | grep -v -F -e 'kthread[kKThreadTlsWord]' -e 'kthread[kKThreadUserTlsWord]' | head -2)
+[ -z "$hit" ] || fail "Includes/azl/hid_mirror.hpp reads another word of the kernel's thread (only the TLS's two are known to be Luma3DS's own on both models): $hit"
+hit=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | sed 's://.*$::' | grep -n -E 'kthread\[' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/input_mirror.cpp reads the kernel's thread itself (the predicate is azl/hid_mirror.hpp's HoldThread, the tested one): $hit"
+need_after Sources/ctr/input_mirror.cpp "__attribute__((noinline, used)) bool azl_mirror_thread_predicate(const u32* kthread) {" "    return azl::hidmirror::HoldThread(kthread, azl_mirror_pred_caller_tls, azl_mirror_pred_off);" "the kernel's predicate is the tested one"
+need Includes/azl/hid_mirror.hpp "__attribute__((always_inline)) inline bool HoldThread(const u32* kthread, u32 caller_tls, u32 off) {" "the predicate makes no call: it runs in the kernel"
+need_after Includes/azl/hid_mirror.hpp "inline bool HoldThread(const u32* kthread, u32 caller_tls, u32 off) {" "    if (tls == 0 || kthread[kKThreadUserTlsWord] == caller_tls) {" "the hold leaves out the caller by its user TLS"
+need Includes/azl/hid_mirror.hpp "    return *reinterpret_cast<const volatile u32*>(static_cast<uintptr_t>(tls)) != kThreadVarsMagic;" "the hold leaves out the plugin's threads"
+need_line Tests/hid_mirror_test.cpp "    TestPredicate();" "the predicate is run inside Luma3DS's loop"
+need Includes/azl/hid_mirror.hpp "        if (!FreezeSeenAll(calls, ops.Threads(), ops.Cap())) {" "the hold is checked against the threads of the process"
+need Sources/ctr/input_mirror.cpp '    asm volatile("svc 0xA0"' "the mirror is mapped with svc 0xA0's first form, which every Luma3DS takes"
+hit=$(grep -rn -E '\bsvcMapProcessMemoryEx[[:space:]]*\(' Sources | head -2)
+[ -z "$hit" ] || fail "the plugin calls libctrpf's svcMapProcessMemoryEx (its later form: a Luma3DS from before it takes the magic number for a handle): $hit"
+need Sources/ctr/input_mirror.cpp "            state = LastState(RestoreOffGameThread(!last, static_cast<u32>(event), &ticks), kMirrorLastGivenBack);" "at SWAP_ENTER and EXIT the mirror never stays"
+need_line Sources/ctr/input_mirror.cpp "    const bool last = event == chat::kEventExit || event == chat::kEventSwapEnter;" "the game's last events are EXIT and SWAP_ENTER (on an Old 3DS the net for an end with no EXIT event: a process killed, a block that does not come back)"
+# (the events that reach the way back are chat::IsClosingEvent's, the list the chat's counters use and Tests/chat_host_test.cpp holds:
+# without SWAP_ENTER an Old 3DS's mirror page could stay mapped at the game's HID address while the plugin's block goes to the SD)
+need_line Includes/azl/chat_host.hpp "    return event == kEventHomeEnter || event == kEventSwapEnter || event == kEventSleepEnter || event == kEventExit;" "the page goes back at HOME_ENTER, SWAP_ENTER, SLEEP_ENTER and EXIT"
+need_after Sources/ctr/input_mirror.cpp "void MirrorProcessEvent(int event) {" "    if (!chat::IsClosingEvent(event)) {" "the mirror's way back takes the closing events from the one tested list"
+# (the keep-alive thread waits for the lock at most 1 s, looking every 1 ms, while the plugin's thread stands aside - every TryLock of the
+# plugin's thread looks at event_waiting first: the longest work under the lock took 620-1007 us in 56 samples on console, so a lock not
+# had in 1 s is held by a thread that no longer runs. At SWAP_ENTER Luma3DS waits for its answer (10 s): an unbounded wait for a lock whose
+# holder is gone would stall the console. Nothing is changed without the lock - the holder may be between the unmap and the map of the
+# game's HID page - so a lock not had leaves the way back to the plugin's thread; after the game's last event (EXIT, SWAP_ENTER) the mirror
+# then stays mapped, and an alias of the plugin's memory outlives the game (console 63, 2026-11-06): the shutdown's line says so. A way
+# back without the lock - every other thread held, each address put right from what the kernel says - was built and dropped on 2026-11-06:
+# a holder stopped between its check and its svc ran the svc afterwards, and its state was never cleared, for a case not seen on console)
+need Sources/ctr/input_mirror.cpp "constexpr u64 kEventLockTicks = SYSCLOCK_ARM11;" "the keep-alive thread waits for the lock at most 1 s"
+need Sources/ctr/input_mirror.cpp "constexpr s64 kEventLockStepNs = 1000000;" "the keep-alive thread looks at the lock every 1 ms"
+need_after Sources/ctr/input_mirror.cpp "    const u64 deadline = svcGetSystemTick() + (left < kEventLockTicks ? left : kEventLockTicks);" "    while (!locked && svcGetSystemTick() < deadline) {" "the keep-alive thread's wait for the lock is bounded"
+need_order Sources/ctr/input_mirror.cpp "    g_m.event_waiting.fetch_add(1, std::memory_order_seq_cst);" "    const u64 deadline = svcGetSystemTick() + (left < kEventLockTicks ? left : kEventLockTicks);" "the plugin's thread stands aside before the keep-alive thread starts waiting"
+need_stmt Sources/ctr/input_mirror.cpp "g_m.event_waiting.fetch_sub(1, std::memory_order_seq_cst);" "the plugin's thread takes the lock again once the event is done"
+hit=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | sed 's://.*$::' | awk '/^[A-Za-z].*\) \{$/{fn=$0} /g_m\.lock\.TryLock\(\)/{ if (index($0, "event_waiting.load(") == 0 && index(prev, "event_waiting.load(") == 0 && fn !~ /^void Mirror(RestoreFromGame|ProcessEvent)\(/) print FNR": "$0 } {prev=$0}' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/input_mirror.cpp: the plugin's thread takes the mirror's lock without looking at event_waiting (the keep-alive's wait at the game's last event would meet it): $hit"
+need_after Sources/ctr/input_mirror.cpp "        // with no EXIT event, a process killed: no line)." "        g_m.want_restore.store(1, std::memory_order_release);" "a lock not had in time leaves the way back to the plugin's thread and touches nothing"
+need_after Sources/ctr/input_mirror.cpp "        g_m.want_restore.store(1, std::memory_order_release);" "        state = kMirrorLastNoLock;" "a lock not had at the game's last event is said in the shutdown's line"
+need_after Sources/ctr/input_mirror.cpp "    if (last) {" "        g_last.store(state, std::memory_order_release);" "what became of the mirror at the game's last event is kept for the shutdown's line"
+hit=$(cat Sources/ctr/input_mirror.cpp Includes/azl/hid_mirror.hpp | tr -d '\r' | sed 's://.*$::' | grep -n -E 'Reconcile|Seize|stolen|Gone\(|pred_all' | head -2)
+[ -z "$hit" ] || fail "the input mirror changes the game's pages without the lock again (the way back without the lock was dropped on 2026-11-06): $hit"
+# (the shutdown's line says what became of the mirror at the game's last event)
+need Sources/ctr/plugin.cpp 'MirrorLastText(MirrorLastState())' "the shutdown's line says what became of the input mirror at the game's last event"
+need_line Tests/chat_host_test.cpp "    CHECK(chat::IsClosingEvent(3) && chat::IsClosingEvent(5) && chat::IsClosingEvent(1) && chat::IsClosingEvent(0));" "the chat host's test holds the closing events"
+# (the framework's pause - its menu over the game, Process::Pause - holds the game's threads with the same bit of the kernel's thread as
+# the mirror's hold: libctrpf's LockGameThreads is PROCESSOP_SCHEDULE_THREADS too. A way back during it, at an event of the keep-alive
+# thread (the lid closed with the menu open), turns the predicate off: our let-go would wake the game under the menu. Every way back
+# that is not on a game's thread goes through RestoreOffGameThread, and the flag is 0 again after it)
+need_after Sources/ctr/input_mirror.cpp "Outcome RestoreOffGameThread(bool may_fall_back, u32 where, u32* ticks) {" "    azl_mirror_pred_off = CTRPluginFramework::Process::IsPaused() ? 1u : 0u;" "a way back off the game's thread under the framework's pause holds and lets go of no thread"
+need_after Sources/ctr/input_mirror.cpp "    const Outcome out = RestoreLocked(false, may_fall_back, where, ticks);" "    azl_mirror_pred_off = 0;" "the predicate is on again for the switch and the game's thread"
+# (the pause's count goes up before its hold and down before its let-go, and the flag is read once: a way back of the keep-alive amid the
+# start of the menu's pause read it wrong - review of the chat, defect 44. The plugin's own menu gives the page back on its thread before its
+# Process::Pause, with a bounded wait for the lock, and is not opened while the mirror stays; no switch is made while it is open)
+need Sources/game_menu.cpp "    if (opens && may_open && MirrorBeforePause()) {" "the in-game menu opens only with the input mirror's page given back"
+need_after Sources/ctr/input_mirror.cpp "bool MirrorBeforePause() {" "    const u64 deadline = svcGetSystemTick() + kPauseLockTicks;" "the page back before the menu's pause waits for the lock ..."
+need Sources/ctr/input_mirror.cpp "constexpr u64 kPauseLockTicks = SYSCLOCK_ARM11 / 10;" "... at most 100 ms"
+need_after Sources/ctr/input_mirror.cpp "bool MirrorBeforePause() {" '    while (!RestoreHere("the in-game menu") && svcGetSystemTick() < deadline) {' "the page goes back before the menu's pause, on the plugin's thread, until its deadline"
+need_after Sources/ctr/input_mirror.cpp "        svcSleepThread(kPauseLockStepNs);" "    return g_m.active.load(std::memory_order_acquire) == 0;" "the menu is not opened while the mirror stays"
+need_after Includes/azl/hid_mirror.hpp "    if (tls == 0 || kthread[kKThreadUserTlsWord] == caller_tls) {" "    if (off != 0) {" "the predicate holds no thread under the framework's pause"
+hit=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | sed 's://.*$::' | grep -n -E 'RestoreLocked\(false' | grep -v -F 'RestoreLocked(false, may_fall_back, where, ticks)' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/input_mirror.cpp gives the page back off the game's thread without RestoreOffGameThread (the framework's pause): $hit"
+need_after Sources/ctr/chat_overlay.cpp "void ChatProcessEvent(int event) {" "    MirrorProcessEvent(event);" "the page goes back first, before the plugin's swap work"
+# (a switch is cancelled by a closing its frame's look did not see: the count is taken BEFORE the look and the switch compares with it under
+# the lock; every event and notification counts its signal before its closing. A count taken at the wish (MirrorWant, after the look) took
+# a SWAP_ENTER that came between the look and the wish as seen: on an Old 3DS the mirror engaged after SWAP_ENTER's way back and stayed
+# mapped at the game's HID address while Luma3DS freed the plugin's block)
+need_order Sources/ctr/chat_overlay.cpp "    MirrorBeforeLook();" "    const bool must_close = g_rules.Update(chat::Look(chat::g_signals), now_ms);" "the closings are counted before the frame's look at the signals"
+n=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -c 'MirrorBeforeLook()')
+[ "$n" = 1 ] || fail "Sources/ctr/chat_overlay.cpp counts the closings for the look $n times (once, right before the look)"
+need_after Sources/ctr/input_mirror.cpp "void MirrorBeforeLook() {" "    g_look_closing = g_m.closing.load(std::memory_order_seq_cst);" "the count before the look is the closings'"
+need_after Sources/ctr/input_mirror.cpp "void MirrorWant() {" "    g_want_closing = g_look_closing;" "the switch compares with the count taken before the look"
+need_after Sources/ctr/chat_overlay.cpp "void ChatProcessEvent(int event) {" "    chat::NoteProcessEvent(chat::g_signals, event);" "the keep-alive counts the signal..."
+need_order Sources/ctr/chat_overlay.cpp "    chat::NoteProcessEvent(chat::g_signals, event);" "    MirrorProcessEvent(event);" "... before the closing"
+need_after Sources/ctr/hook.cpp "static __attribute__((noinline)) void NoteAptForChat(Result rc, u32 result_word, u32 raw) {" "    if (chat::NoteAptNotification(chat::g_signals, rc, result_word, raw)) {" "a notification counts its signal before its closing"
+need_after Sources/ctr/hook.cpp "static __attribute__((noinline)) void NoteAptForChat(Result rc, u32 result_word, u32 raw) {" "        MirrorRestoreFromGame();" "a notification that closes the keyboard gives the game its page back before the game acts on it"
+need_after Sources/ctr/input_mirror.cpp "void MirrorRestoreFromGame() {" "    g_m.closing.fetch_add(1, std::memory_order_seq_cst);" "a closing notification cancels a switch that is not made yet"
+need_after Sources/ctr/input_mirror.cpp "    if (!g_m.lock.TryLock()) {" "        g_m.want_restore.store(1, std::memory_order_release);" "a game's thread never waits for the lock: the plugin's thread finishes"
+need Sources/ctr/chat_overlay.cpp "    MirrorFrame(now_ms);" "the mirror's work runs every frame, the chat on or off"
+# ... and, once nothing maps the page any more, MirrorFrame gives it back to the heap and forgets it (review of the chat, defect 56: the
+# two lines dropped, 4 KB of the plugin's heap stayed taken after the first keyboard, against "only while it is needed")
+need_after Sources/ctr/input_mirror.cpp "    } else if (!g_want && g_page && g_m.event_waiting.load(std::memory_order_seq_cst) == 0 && g_m.lock.TryLock()) {" "            g_m.page.store(0, std::memory_order_seq_cst);" "the mirror's page is given back when nothing maps it"
+need_after Sources/ctr/input_mirror.cpp "            g_m.page.store(0, std::memory_order_seq_cst);" "            std::free(g_page);" "the mirror's page goes back to the plugin's heap when nothing maps it"
+need_after Sources/ctr/input_mirror.cpp "            std::free(g_page);" "            g_page = nullptr;" "the freed page is forgotten (Engage takes a new one)"
+need Sources/ctr/input_mirror.cpp "        if (CTRPluginFramework::System::IsCitra()) {" "an emulator gets the keyboard without the mirror"
+hit=$(cat Sources/ctr/input_mirror.cpp Includes/azl/hid_mirror.hpp | tr -d '\r' | sed 's://.*$::' | grep -n -E 'threadCreate|svcCreateThread|Scheduler::|InstallSvcHooks|GateEnter|SwapGateScope|svcWaitSynchronization' | head -2)
+[ -z "$hit" ] || fail "the input mirror makes a thread, a hook or a task, or waits on a game's thread: $hit"
+need Tests/run.sh 'Tests/hid_mirror_test.cpp -o "$OUT/hid_mirror_test"' "the input mirror's test is built"
+need_line Tests/stack_usage.sh 'budget input_mirror "azl_mirror_thread_predicate" 0' "the predicate of the hold runs in the kernel, on its stack: no frame"
+need_line Tests/stack_usage.sh 'budget input_mirror "azl::ctr::MirrorRestoreFromGame" 24' "the input mirror's way back on a game's thread stays small"
+need ConfigApp/source/pages_config.cpp "} else if (keys == KEY_X) {" "X alone gives the default chord back"
+# ... and, while the mirror is the game's page, its live parts are copied again at every frame (review of the chat, I12: the call dropped, the
+# indices and ticks of the pad and the touch, the accelerometer and the gyroscope stayed frozen and the "released" were never written again)
+body=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | awk '/^void MirrorFrame\(u32 now_ms\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::')
+printf '%s\n' "$body" | grep -F -A3 -- "    if (g_m.active.load(std::memory_order_acquire) != 0) {" | grep -F -q -- "        hidmirror::RefreshMirror(g_page, real, g_released.Next());" || fail "Sources/ctr/input_mirror.cpp: MirrorFrame no longer refreshes the mirror's live parts (RefreshMirror with the next 'released') at every frame the mirror is mapped"
+
+# ---- the zombie probe (ctr/zombie_probe.hpp/.cpp): the MHXX-after-chat leak of a TERMINATED-but-not-finalized process -------------
+# Every console-reading entry point of the probe early-returns unless the capture is on (g_debug_level>0) AND Luma3DS's custom svcs are
+# there (BackdoorOk): the four are GameRefcount, ThreadSchedDump, GameHandleCounts, MemMapWalk, with the one uniform guard. The fifth,
+# ForcedResLine, uses official svcs only (svcGetResourceLimit*) and is gated on the log alone, so Azahar has a reference line too.
+ZGUARD="if (g_debug_level <= 0 || !BackdoorOk()"
+[ "$(tr -d '\r' < Sources/ctr/zombie_probe.cpp | grep -c -F -- "$ZGUARD")" = 4 ] || fail "Sources/ctr/zombie_probe.cpp: the four backdoor probe entry points no longer all guard on 'g_debug_level<=0 || !BackdoorOk()' (a probe that runs with the log off, or on Azahar, can brick the console)"
+need_after Sources/ctr/zombie_probe.cpp "void ForcedResLine(const char* when) {" "    if (g_debug_level <= 0) {" "the forced res line runs with the log on only"
+# BackdoorOk is the Azahar gate: an emulator (no Luma custom svcs) or a svc that does not answer turns every backdoor read off. IsCitra()
+# is tested FIRST and short-circuits: the Luma svc 0x90 is never issued on an emulator (the same order as input_mirror's Supported()).
+need_after Sources/ctr/zombie_probe.cpp "    if (g_backdoor < 0) {" "        if (CTRPluginFramework::System::IsCitra()) {" "the probe's Azahar gate tests IsCitra before anything else"
+need_after Sources/ctr/zombie_probe.cpp "        if (CTRPluginFramework::System::IsCitra()) {" "            g_backdoor = 0; // an emulator: the Luma svc below is never issued there" "on an emulator the backdoor is off without a Luma svc"
+need Sources/ctr/zombie_probe.cpp "            g_backdoor = svcConvertVAToPA(reinterpret_cast<const void*>(0x1FF80000), false) != 0 ? 1 : 0;" "the probe's gate checks svcConvertVAToPA on a console"
+need_order Sources/ctr/zombie_probe.cpp "        if (CTRPluginFramework::System::IsCitra()) {" "svcConvertVAToPA(" "IsCitra short-circuits the Luma svc"
+[ "$(tr -d '\r' < Sources/ctr/zombie_probe.cpp | grep -c -F -- 'svcConvertVAToPA(')" = 1 ] || fail "Sources/ctr/zombie_probe.cpp: svcConvertVAToPA is called outside BackdoorOk's console branch"
+# GameHandleCounts: GET_ALL_HANDLES with NO class token (with one, Luma calls GetClassToken on every entry without the table's lock or a
+# reference: a handle closed on the other core meanwhile is a freed object), the count in use checked against the buffer first (the
+# kernel does not bound the copy), each handle classified by svcGetHandleInfo 0x10001 (the lock and a reference); KServerSession 0x95,
+# not KSession 0x70 (never in a handle table).
+need Sources/ctr/zombie_probe.cpp "svcControlProcess(CUR_PROCESS_HANDLE, PROCESSOP_GET_ALL_HANDLES, reinterpret_cast<u32>(g_handle_buf), 0);" "GET_ALL_HANDLES is called without a class token"
+[ "$(tr -d '\r' < Sources/ctr/zombie_probe.cpp | grep -c -F -- 'PROCESSOP_GET_ALL_HANDLES')" = 1 ] || fail "Sources/ctr/zombie_probe.cpp: a second GET_ALL_HANDLES call (one with a class token walks the table unlocked)"
+need Sources/ctr/zombie_probe.cpp "if (R_FAILED(svcGetProcessInfo(&in_use, CUR_PROCESS_HANDLE, 4)) || in_use < 0 ||" "the handles in use are checked against the buffer before GET_ALL_HANDLES writes"
+need_after Sources/ctr/zombie_probe.cpp "if (R_FAILED(svcGetProcessInfo(&in_use, CUR_PROCESS_HANDLE, 4)) || in_use < 0 ||" "        in_use > static_cast<s64>(kHandleBufWords - kHandleBufSpare)) {" "the handles in use leave the buffer room to spare"
+need_order Sources/ctr/zombie_probe.cpp "svcGetProcessInfo(&in_use, CUR_PROCESS_HANDLE, 4)" "PROCESSOP_GET_ALL_HANDLES" "the count check comes before the copy"
+need Sources/ctr/zombie_probe.cpp "if (R_FAILED(svcGetHandleInfo(&token, static_cast<Handle>(g_handle_buf[i]), 0x10001))) {" "each handle is classified by GetHandleInfo 0x10001"
+need Includes/ctr/zombie_probe.hpp "constexpr u32 kHandleTokens[] = {0x1F, 0xB0, 0x8D, 0x39, 0x2F, 0x35, 0x98, 0x95, 0xA5};" "the classes counted (KServerSession 0x95, not KSession 0x70)"
+# No newlib formatter in the probe (the keep-alive thread's 4 KB stack): one Log() format per line (printf_lite).
+! tr -d '\r' < Sources/ctr/zombie_probe.cpp | grep -q -E 'snprintf|sprintf|vsnprintf' || fail "Sources/ctr/zombie_probe.cpp formats with the printf family (newlib's 1.4 KB chain on the keep-alive thread): use one Log() format"
+# The mirror's counters are read as passes and let-gos (a hold is two passes), never as a 1:1 pairing.
+need Sources/ctr/zombie_probe.cpp "passes == 2 * letgos ? \"yes\" : \"NO\"" "the threads line says balanced when the hold passes are twice the let-gos"
+# The refcount is read with the owned objects next to it (each owns a reference to its owner): the residual is what is compared.
+need Sources/ctr/zombie_probe.cpp "const s64 owned = OwnedObjects(cur, 1, kLimitCount);" "the ref line gives the owned objects and the residual"
+# The memory-map walk: the header's WalkMap (PC-tested: never loops, the cap marked).
+need Sources/ctr/zombie_probe.cpp "const WalkEnd end = WalkMap(0x00100000, 0x14000000, kMapLineCap, query, emit);" "the memory-map walk goes through the PC-tested WalkMap"
+need Sources/ctr/zombie_probe.cpp 'Log("vm: walk truncated at 0x%08lx' "a walk cut by the cap says so"
+# The handle-transfer line in the hook reads the token with a Luma ext svc only when the backdoor is there (a blind custom svc on Azahar kills the process).
+need_after Sources/ctr/hook.cpp "    if (zombie::BackdoorOk()) {" "        if (R_SUCCEEDED(svcGetHandleInfo(&flags, x.handle, 0x10001))) { // 0x10001: the object's class token flags (Luma ext)" "the ipc-xfer type read is gated by the Azahar backdoor check"
+# Every handle the probe opens is closed on every path (closes >= opens in the file): svcDuplicateHandle, svcOpenThread and the resource-limit handle.
+ZOPENS=$(tr -d '\r' < Sources/ctr/zombie_probe.cpp | grep -c -E 'svcDuplicateHandle\(|svcOpenThread\(|svcGetResourceLimit\(')
+ZCLOSES=$(tr -d '\r' < Sources/ctr/zombie_probe.cpp | grep -c 'svcCloseHandle(')
+{ [ "$ZCLOSES" -ge "$ZOPENS" ] && [ "$ZOPENS" -ge 2 ]; } || fail "Sources/ctr/zombie_probe.cpp: a handle the probe opens is not closed ($ZCLOSES close(s) for $ZOPENS open(s)): a leaked reference could resurrect the object"
+# The KThread layout the backdoor reads is pinned and verified against svcGetProcessorID before any mask is trusted.
+# svcGetThreadList is never called (REGISTRO phase K, 2026-11-07): the kernel's GetThreadList takes a reference on the process and never gives
+# it back (kernel 11.14: "they forget to decref the process!"). The chat's input mirror called it at every switch, so a game in which the
+# keyboard was used stayed TERMINATED but never finalized after HOME -> Close, with all its memory, until the console restarted. The count of
+# threads comes from svcGetProcessInfo type 7 (balanced). Only the diagnostic build's boot_diag.cpp (AZL_BOOT_DIAG, never delivered) keeps it.
+GTL=$(grep -rln 'svcGetThreadList(' Sources Includes ConfigApp/source | grep -v '^Sources/ctr/boot_diag.cpp$' | tr '\n' ' ')
+[ -z "$GTL" ] || fail "svcGetThreadList is called in: $GTL (it leaks a reference on the process: a closed game would stay in memory)"
+need Sources/ctr/input_mirror.cpp "        if (svcGetProcessInfo(&n, CUR_PROCESS_HANDLE, 7) != 0) {" "the mirror counts the threads with GetProcessInfo 7"
+need Sources/ctr/zombie_probe.cpp "    if (svcGetProcessInfo(&count, CUR_PROCESS_HANDLE, 7) != 0) {" "the probe counts the threads with GetProcessInfo 7"
+need ConfigApp/source/zombie_census.cpp "    const int threads = R_SUCCEEDED(svcGetProcessInfo(&v, h, 7)) ? static_cast<int>(v) : -1;" "3DS Link counts the closed game's threads with GetProcessInfo 7"
+need Sources/ctr/boot_diag.cpp "#ifdef AZL_BOOT_DIAG" "boot_diag.cpp (the one svcGetThreadList left) is only in the diagnostic build"
+! grep -q '    GetThreadList:' ../DlpLink/rsf/3dslink.rsf || fail "DlpLink/rsf/3dslink.rsf lists GetThreadList: 3DS Link must never call it"
+need ConfigApp/source/zombie_plan.hpp "    return result == 0 ? 1 : (result == 0x09401BFEu ? 0 : -1);" "the closed game's wait: the kernel's timeout is positive, not success"
+# The probe runs ONLY at the events named - never on the Old-3DS SWAP path (its waits sum 8.64 s against Rosalina's 10 s and must not grow).
+if tr -d '\r' < Sources/ctr/plugin.cpp | awk '/if \(event == kEventSwapEnter\) \{/{on=1} /} else if \(event == kEventSwapExit\)/{on=0} on && /zombie::/{print}' | grep -q .; then
+  fail "Sources/ctr/plugin.cpp: a zombie probe runs on the SWAP_ENTER path (Old 3DS): it must run only at EXIT, HOME and keyboard/mirror events, never on the swap"
+fi
+need_line Sources/ctr/plugin.cpp '            zombie::ForcedResLine("EXIT");' "the forced res line is logged at EXIT"
+need_line Sources/ctr/plugin.cpp '            zombie::GameRefcount("EXIT");' "the game's refcount is read at EXIT"
+need_line Sources/ctr/plugin.cpp '            zombie::ThreadSchedDump("EXIT");' "the thread scheduling dump runs at EXIT"
+need_line Sources/ctr/plugin.cpp '            zombie::GameHandleCounts();' "the game's held-handle counts are read at EXIT"
+need_line Sources/ctr/plugin.cpp '            zombie::MemMapWalk();' "the memory-map walk runs at EXIT"
+need Sources/ctr/plugin.cpp 'zombie::ForcedResLine(event == kEventHomeEnter ? "HOME_ENTER" : "HOME_EXIT");' "the forced res line is logged at HOME_ENTER and HOME_EXIT (New 3DS)"
+need_order Sources/ctr/plugin.cpp 'zombie::ForcedResLine("EXIT");' 'void Plugin::OnSwapBack()' "the EXIT probes are in NoteProcessEvent, before the writer is joined in Shutdown"
+# The startup-occupancy line is the ONE probe allowed with the log off: debug-independent, one comparison and one synchronous write, called from CompareMemoryWithLastLaunch before its debug-gated return.
+need_after Sources/ctr/plugin.cpp "void Plugin::CompareMemoryWithLastLaunch() {" "    CheckStartupOccupancy(); // debug-independent" "the occupancy check runs even at debug=0, before the compare's debug return"
+need Sources/ctr/plugin.cpp "if (File::Open(out, kLogSyncPath, File::RWC | File::APPEND | File::SYNC) == File::SUCCESS) {" "the startup occupancy warning is written synchronously, even at debug=0"
+# The game's own figure comes from the PROCESS (svcGetProcessInfo type 2), never from the shared limit (which carries the zombie too: the
+# comparison would cancel it), and the decision is the header's PC-tested StartupForeign (books or region); skipped on an emulator.
+need Sources/ctr/plugin.cpp "    if (R_FAILED(svcGetProcessInfo(&own, CUR_PROCESS_HANDLE, 2))) {" "the startup check reads this game's own figure from its process"
+need Sources/ctr/plugin.cpp "    const u32 foreign = zombie::StartupForeign(books, used, own, plugin_block);" "the startup check decides with the PC-tested StartupForeign"
+need_after Sources/ctr/plugin.cpp "void Plugin::CheckStartupOccupancy() {" "    if (CTRPluginFramework::System::IsCitra()) {" "the startup check is skipped on an emulator"
+need Includes/ctr/zombie_probe.hpp "    if (books > own + kStartupMargin) {" "a zombie in the books is foreign (heap_plan's ForeignInBooks)"
+need Includes/ctr/zombie_probe.hpp "    if (used > own + plugin_block + kStartupMargin) {" "a zombie in the region is foreign"
+if tr -d '\r' < Sources/ctr/plugin.cpp | awk '/void Plugin::CheckStartupOccupancy\(\) \{/{on=1} on&&/^}/{c++} on&&c==1{on=0} on&&/g_debug_level/{print}' | grep -q .; then
+  fail "Sources/ctr/plugin.cpp: CheckStartupOccupancy looks at g_debug_level: it must run the same with the log off (it is the only debug-0 probe)"
+fi
+# The forced res line and the ipc-xfer line are built the game-thread-safe way (the res line is the keep-alive thread's Log, off the game threads; the ipc-xfer line is a control-lane DebugLine).
+need Sources/ctr/hook.cpp "DebugLine line;" "the ipc-xfer handle-transfer line is a control-lane DebugLine (no printf on a game thread)"
+need_line Tests/stack_usage.sh 'budget input_mirror "azl_mirror_thread_predicate" 0' "the predicate stays frameless (the cross-core count is read per thread at events instead)"
+# Line endings: plugin.cpp keeps its CRLF, the new files are LF.
+grep -q -U $'\r' Sources/ctr/plugin.cpp || fail "Sources/ctr/plugin.cpp lost its CRLF line endings"
+! grep -q -U $'\r' Sources/ctr/zombie_probe.cpp || fail "Sources/ctr/zombie_probe.cpp must keep LF line endings"
+! grep -q -U $'\r' Includes/ctr/zombie_probe.hpp || fail "Includes/ctr/zombie_probe.hpp must keep LF line endings"
+need Tests/run.sh 'Tests/zombie_probe_test.cpp -o "$OUT/zombie_probe_test"' "the zombie probe's pure-logic test is built"
 need ConfigApp/source/ui.cpp "setup::HasAllKeys(cfg)" "the app completes a file that lacks keys"
 # The app is called 3DS Link (3DSLink.3dsx) but it edits the plugin's own file: the plugin and its ini keep their names
 tr -d '\r' < ConfigApp/Makefile | grep -E -q '^TARGET[[:space:]]*:=[[:space:]]*3DSLink[[:space:]]*$' || fail "ConfigApp/Makefile no longer builds 3DSLink.3dsx"
@@ -115,7 +776,7 @@ need Sources/azl/log_files.cpp "const int next = block_hi_[kind] + 1;" "a rotate
 # The list of saved rooms: servers.txt in the app's data folder (a name and an address for each: "host[:port]|name"), 10 rooms at most
 need ConfigApp/source/paths.hpp 'kServersFileName = "servers.txt";' "the saved rooms live in servers.txt in the data folder"
 need ConfigApp/source/settings.hpp "static constexpr std::size_t kMax = 10;" "the list of saved rooms holds 10"
-need ConfigApp/source/settings.hpp "constexpr std::size_t kMaxServerNameChars = 12;" "a room's name is 12 characters at most"
+need ConfigApp/source/settings.hpp "constexpr std::size_t kMaxServerNameChars = 64;" "a room's name is 64 characters at most (the name of a public room kept as a saved one: it runs by on its row when it does not fit)"
 need ConfigApp/source/settings.cpp 'out += "|" + s.name;' "the file keeps a room's name after its address, after a '|'"
 need ConfigApp/source/settings.cpp "const std::size_t bar = line.find('|');" "a line of the servers file is 'host[:port]' (as in the earlier builds) with an optional '|name'"
 need ConfigApp/source/pages_servers.cpp "NewProbePage(room," "a room that is added or changed is tested at once"
@@ -273,7 +934,7 @@ need ConfigApp/titleshare/source/log.c "if(logrot_due(gBytes)) {" "the log rotat
 # defaults, obfuscated in builtin_keys_blob.h and read by builtin_keys.c; no source writes either of them inline, and the library gets the IV from its caller
 need ConfigApp/titleshare_host/builtin_keys.c 'uint8_t key[16] = {0}, ctr[16] = {0};' "the built-in blob is opened with a key of zeros and a counter of zeros, like Azahar's"
 need ConfigApp/titleshare_host/builtin_keys.c 'aes_ctr_crypt(rk, ctr, 0, text, sizeof(bk_blob));' "the built-in blob is opened with the AES the app already has"
-[ "$(tr -d '' < ConfigApp/titleshare/common/sdcrypt.c | grep -c -F 'if(bk_get(BK_GENERATOR_CONSTANT, cbytes) != 0) {')" = 2 ] || fail "ConfigApp/titleshare/common/sdcrypt.c: the SD key and the NCCH key must both take the key generator's constant from the built-in values"
+[ "$(tr -d '\r' < ConfigApp/titleshare/common/sdcrypt.c | grep -c -F 'if(bk_get(BK_GENERATOR_CONSTANT, cbytes) != 0) {')" = 2 ] || fail "ConfigApp/titleshare/common/sdcrypt.c: the SD key and the NCCH key must both take the key generator's constant from the built-in values"
 if grep -rn -E 'static const u128 C |DLP_IV\[' ConfigApp --include=*.c --include=*.h --include=*.cpp --include=*.hpp; then
   fail "a source carries the key generator's constant or the Download Play IV inline: they are only in builtin_keys_blob.h, obfuscated"
 fi
@@ -627,7 +1288,7 @@ need Sources/azl/log_files.cpp "if (debug_file_ || g_debug_level <= 0 || !DebugR
 need Sources/azl/log_files.cpp "if (crumb_file_ || g_debug_level <= 0) {" "the trail of a sleep (AzaharLink.sleep.log) is never opened with the log off"
 # (the capture, the main log, and the trail's file: opened and, for the trail, reopened after the old one is removed)
 [ "$(grep -c 'OpenAppend(' Sources/azl/log_files.cpp)" = "4" ] || fail "Sources/azl/log_files.cpp opens a file in a place that is not behind the level check"
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -o 'File::Open(' | wc -l)" = "8" ] || fail "Sources/ctr/plugin.cpp opens a file besides the log layer, the ini read, the ini write, the memory record (read and write) and the three read-only openings of the comparison of this game's plugin with 3DS Link's (ReadPluginHead, PluginFilesAreEqual)"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -o 'File::Open(' | wc -l)" = "12" ] || fail "Sources/ctr/plugin.cpp opens a file besides the log layer, the exit guard's own file (AppendLumaLine, on the plugin's thread), the ini read, the ini write, the memory record (read and write), the startup-occupancy warning (CheckStartupOccupancy, the one debug-0 write), the line of the link to Luma3DS's plugin loader (CheckPluginLoaderLink, debug-independent too), the three read-only openings of the comparison of this game's plugin with 3DS Link's (ReadPluginHead, PluginFilesAreEqual), and the read-only one of the in-game menu's lists (ReadDataFile)"
 need_after Sources/ctr/plugin.cpp "void Plugin::CompareMemoryWithLastLaunch() {" "if (g_debug_level <= 0) {" "the memory record is read and written with the log on only (debug=0 leaves the card alone)"
 need Sources/ctr/plugin.cpp "mem against the last launch of this title:" "two launches of a title are compared (2026-10-20: the proof that an exit leaves nothing)"
 need Sources/ctr/plugin.cpp "    CompareMemoryWithLastLaunch();" "... at the start, after the memory line"
@@ -642,7 +1303,7 @@ need Sources/ctr/plugin.cpp ': DebugRingReady() ? "AzaharLink.log and AzaharLink
 # ... and nothing else in the product touches a file: not one call that creates, writes, removes or renames outside the
 # log layer (Sources/azl/log_files.cpp, which only calls its FileLayer) and plugin.cpp (counted above; its FSUSER_*
 # calls only read the game's icon)
-if grep -rn -E 'File::(Open|Remove|Rename)|fopen|freopen|std::(o|i)?fstream|FSUSER_(OpenFile|DeleteFile|RenameFile|CreateFile)|FS_OPEN_(WRITE|CREATE)|mkdir|\bopen\(' Sources Includes --include=*.cpp --include=*.hpp --include=*.c --include=*.h | grep -v "^Sources/ctr/plugin.cpp:\|^Sources/azl/log_files.cpp:\|^Sources/ctr/boot_diag.cpp:"; then
+if grep -rn -E 'File::(Open|Remove|Rename)|fopen|freopen|std::(o|i)?fstream|FSUSER_(OpenFile|DeleteFile|RenameFile|CreateFile)|FS_OPEN_(WRITE|CREATE)|mkdir|\bopen\(' Sources Includes --include=*.cpp --include=*.hpp --include=*.c --include=*.h | grep -v "^Sources/ctr/plugin.cpp:\|^Sources/azl/log_files.cpp:\|^Sources/ctr/boot_diag.cpp:\|^Sources/game_menu_tour.cpp:"; then
   fail "a source file besides the log layer and plugin.cpp touches a file (debug=0 must leave the card alone)"
 fi
 grep -q 'FS_OPEN_WRITE\|FS_OPEN_CREATE' Sources/ctr/plugin.cpp && fail "plugin.cpp opens a file of the card for writing through FSUSER (only the icon is read that way)"
@@ -652,11 +1313,31 @@ grep -q 'FS_OPEN_WRITE\|FS_OPEN_CREATE' Sources/ctr/plugin.cpp && fail "plugin.c
 tr -d '\r' < Sources/ctr/boot_diag.cpp | tail -1 | grep -q -F -- '#endif // AZL_BOOT_DIAG' || fail "Sources/ctr/boot_diag.cpp does not end with the #endif of AZL_BOOT_DIAG"
 ! grep -q 'AZL_BOOT_DIAG' Makefile ../DlpLink/tools/build_all.sh || fail "the delivered plugin's Makefile or build_all.sh names AZL_BOOT_DIAG (the diagnostic build is made only by diag/build_diag.sh)"
 need diag/build_diag.sh "sed -i 's/-DAZL_USE_CTRPF/-DAZL_USE_CTRPF -DAZL_BOOT_DIAG/' \"\$WORK/Makefile\"" "the diagnostic flag goes into a COPY of the Makefile"
+# ... and the screenshots of the in-game menu (Sources/game_menu_tour.cpp): written to the card by a test build only, the whole file under
+# -DAZL_MENU_TOUR, which only `make EXTRA_CFLAGS=-DAZL_MENU_TOUR` gives (by hand, in a copy of the folders); build_all.sh never passes EXTRA_CFLAGS.
+[ "$(tr -d '\r' < Sources/game_menu_tour.cpp | grep -c '^#ifdef AZL_MENU_TOUR$')" = "1" ] || fail "Sources/game_menu_tour.cpp is not compiled only under AZL_MENU_TOUR (it writes to the card)"
+tr -d '\r' < Sources/game_menu_tour.cpp | head -1 | grep -q -x '#ifdef AZL_MENU_TOUR' || fail "Sources/game_menu_tour.cpp does not begin with the #ifdef of AZL_MENU_TOUR"
+tr -d '\r' < Sources/game_menu_tour.cpp | tail -1 | grep -q -F -- '#endif // AZL_MENU_TOUR' || fail "Sources/game_menu_tour.cpp does not end with the #endif of AZL_MENU_TOUR"
+! grep -q 'AZL_MENU_TOUR\|EXTRA_CFLAGS' ../DlpLink/tools/build_all.sh || fail "build_all.sh names AZL_MENU_TOUR or EXTRA_CFLAGS (the menu's test build is made by hand only)"
 
 # The in-game menu switch: menu_key=off (or none) vetoes every opening, and nothing waits for the menu to join the room
 need Sources/main.cpp "g_menu_off = plugin.menu_off();" "main reads the switch"
-tr -d '\r' < Sources/main.cpp | grep -A2 "static bool OnMenuOpening" | grep -q "if (g_menu_off) {" || fail "OnMenuOpening does not veto first when the menu is off"
-need Sources/main.cpp "if ((cfg.autoconnect || g_menu_off) && !cfg.host.empty()) {" "with the menu off the room is joined at start whatever autoconnect says"
+tr -d '\r' < Sources/main.cpp | grep -A1 "static bool OnMenuOpening" | grep -q "return false;" || fail "OnMenuOpening lets the framework's menu open (the plugin's own menu is the only one)"
+need Sources/main.cpp "    if (!g_menu_off) {" "the plugin's menu is looked for only when the switch is on"
+need Sources/main.cpp "g_want_connected = (cfg.autoconnect || g_menu_off) && !cfg.host.empty();" "with the menu off the room is joined at start whatever autoconnect says"
+# The plugin's own in-game menu (Sources/game_menu.cpp): no cheat tools, B closes it, the room changes with the game running.
+need Sources/main.cpp "settings.AllowActionReplay = false;" "the framework's cheat codes are off"
+need Sources/main.cpp "settings.AllowSearchEngine = false;" "... and its memory search"
+need Sources/game_menu.cpp "    } else if (down & Key::B) {" "B goes back, and closes the menu on its first page"
+need Sources/game_menu.cpp "        if (!(Controller::GetKeysDown() & Key::B)) {" "a B still held when the menu closes does not reach the game"
+need Sources/game_menu.cpp "    m.file.Clear();" "the list shown is given back when the menu closes (the plugin keeps nothing of it in the game's memory)"
+# The game's APT notifications are passed on as they come: an SDK title's thread of the notifications panics on an empty one (svcBreak:
+# Super Street Fighter IV 3D on two consoles, 2026-11-04, when the in-game menu took the HOME notification away; analysis/ssf4-crash-menu-2026-11-04).
+! tr -d '\r' < Sources/ctr/hook.cpp | grep -q -E 'cmd\[2\] *= *0;' || fail "the svc hook changes the game's APT notification (an empty one makes an SDK title panic)"
+need Includes/azl/room_choices.hpp "        std::string().swap(text_);" "... really given back (clear() keeps the capacity)"
+need Includes/azl/ini_values.hpp 'constexpr const char* kDefaultMenuKey = "L+Right+Select";' "the menu's chord is L + Right + Select (beside Rosalina's L + Down + Select)"
+need Sources/ctr/plugin.cpp "config_.menu_key = ini::MenuKeyFromFile(value);" "a file that still holds the old default L+R+Select takes the new one (the plugin)"
+need ConfigApp/source/settings.cpp "cfg.menu_key = azl::ini::MenuKeyFromFile(value);" "... and the app"
 need Includes/azl/ini_values.hpp 'return word == "off" || word == "none";' "off and none switch the menu off"
 
 # The scan filter only counts (spec C7): nothing in the plugin turns it on
@@ -790,6 +1471,27 @@ need Sources/ctr/plugin.cpp "if (writer_stopped) {" "the logs are closed when th
 need Sources/azl/log_files.cpp "if (crumb_mutex_.try_lock()) {" "closing the logs does not wait for the trail's lock"
 need Sources/azl/log_files.cpp "if (DebugOldestMs(&oldest)) {" "the first line of a capture file is not later than the first record that follows it"
 need Sources/ctr/plugin.cpp "the trail of this launch begins" "the trail's file is created when its thread starts, not by the first event of a sleep"
+# - the trail of the launch before a crash is the one file that reached the card (2026-11-07): a launch that finds it over 128 KB moves it aside
+#   as AzaharLink.sleep.1.log (the one before it goes) instead of erasing it; its first line says which launch it is (the title, the process
+#   id, the console's clock at the plugin's start); the lines of a turn of the breadcrumb thread go in one write and one flush
+need Sources/azl/log_files.cpp 'constexpr const char* kCrumbOldName = "AzaharLink.sleep.1.log";' "the trail of the launches before is kept as AzaharLink.sleep.1.log"
+need_after Sources/azl/log_files.cpp "        files_->Remove(dir_ + kCrumbOldName);" "        files_->Rename(dir_ + kCrumbName, dir_ + kCrumbOldName);" "a full trail is moved aside, not erased"
+if grep -n -F 'files_->Remove(dir_ + kCrumbName)' Sources/azl/log_files.cpp; then
+  fail "Sources/azl/log_files.cpp erases the trail of the launches before (it is moved aside as AzaharLink.sleep.1.log)"
+fi
+need Sources/ctr/plugin.cpp "    start_os_ms_ = osGetTime();" "the console's clock at the plugin's start is kept for the trail"
+need Sources/ctr/plugin.cpp 'id_line.Str("title ").Hex(static_cast<u32>(game_id_ >> 32), 8).Hex(static_cast<u32>(game_id_), 8).Str(" pid 0x").Hex(process_id_);' "the trail's first line names the title and the process"
+need Sources/ctr/plugin.cpp " | plugin started at console clock " "the trail's first line says when the plugin started"
+[ "$(grep -c 'log_files_->WriteCrumb(' Sources/ctr/plugin.cpp)" = "0" ] || fail "Sources/ctr/plugin.cpp writes the trail a line at a time (a write and a flush each: WriteCrumbs takes a turn's lines in one)"
+[ "$(grep -c 'log_files_->WriteCrumbs(lines.data(), lines.size());' Sources/ctr/plugin.cpp)" = "2" ] || fail "Sources/ctr/plugin.cpp: the breadcrumb thread's two turns (the first and the loop) do not write their lines in one"
+[ "$(grep -c 'files_->Flush(crumb_file_);' Sources/azl/log_files.cpp)" = "1" ] || fail "Sources/azl/log_files.cpp flushes the trail in more or fewer than one place (once a turn, WriteCrumbs)"
+# - the main log's queue full (the card behind): the lines dropped are counted, said by the writer's next flush (the line goes in past the full
+#   queue) and kept in a total that the stats line shows
+need_after Sources/azl/log_files.cpp "    } else {" "        __atomic_fetch_add(&queue_full_, 1u, __ATOMIC_RELAXED);" "a line dropped because the queue is full is counted"
+need Sources/azl/log_files.cpp "log: %lu lines were dropped: the queue of the main log was full" "the writer says how many lines a full queue dropped"
+need Sources/azl/log_files.cpp "    if (report || pending_.size() < limits_.max_pending) {" "the report of the drops goes in past a full queue"
+need Sources/ctr/plugin.cpp "lines dropped since the start: the queue was full)" "the stats line shows the lines a full queue dropped"
+need_line Tests/log_files_test.cpp "    TestQueueFullIsCounted();" "the log's test fills the queue and reads the count"
 # - the capture does not keep the game from leaving (0.1.17): once Shutdown begins the capture has half a second, then every pass stops after the
 #   write in hand; the main log is flushed first and the lines are never dropped for the capture; a writer stuck in a write to the card gets a
 #   short wait, not Close()'s drain. (On the full 128 GB card of the Zelda session, 2026-10-14, the exit took very long and the log's last lines
@@ -810,7 +1512,7 @@ need Sources/ctr/uds_hle.cpp "u32 request[request_words != 0 ? request_words : 1
 need Tests/chain_sim/chain_sim.py "HLE_CEILING = {0: 320, 1: 520}" "the HLE proper at debug 1 is held to 520 bytes (1896 with newlib's printf under Log())"
 need Tests/chain_sim/chain_sim.py "the printf family ran in the HLE proper" "the chain test fails a printf in the HLE proper"
 need Sources/ctr/uds_hle.cpp "const u32 started = static_cast<u32>(platform::NowTicks());" "the hot frame passes no 64-bit argument on the stack (the canary of Tri Force Heroes' thread saw 12 bytes more with one)"
-need Tests/chain_sim/chain_sim.py "PURE_WRITTEN = {0: 88, 1: 156}" "the pure path is held to what the hotfix wrote below the entry SP (the emulator's canary: 108 / 176)"
+need Tests/chain_sim/chain_sim.py "PURE_WRITTEN = {0: 104, 1: 132}" "the pure path is held to what it writes below the gate's entry SP (the emulator's canary: the hotfix's 88 / 156, the gate's context +16 at debug 0)"
 
 # The screen (0.1.16): the numbers that decide what the plugin shows the player
 # - the CPU figure is CPU. Every soc call is timed (sampling one in four put the ENet share at 0 in 98% of the windows of PROVA 2),
@@ -839,11 +1541,33 @@ need Sources/ctr/plugin.cpp "poll %lu.%lu (waiting)," "... and gives the idle po
 [ "$(grep -c 'CardTimer card(&card_wait_ticks_);' Sources/azl/log_files.cpp)" = "3" ] || fail "Sources/azl/log_files.cpp: the main log's flush, the capture's write and the capture's flush must both time their time in the file layer"
 need Sources/ctr/uds_hle.cpp "StatsAdd64(g_stats.ipc_sum_ticks, ticks);" "the game threads' time in the commands is a 64-bit sum"
 need Sources/main.cpp "azl::StatsAdd64(azl::g_stats.t_cb, svcGetSystemTick() - start);" "the frame callback's time is a 64-bit sum"
+need Sources/main.cpp "            start += svcGetSystemTick() - menu_from;" "the time the in-game menu was open is not the frame callback's"
 need Sources/ctr/plugin.cpp "const Stats s = TakeStats();" "the window is taken whole, the 64-bit sums read and cleared atomically"
+# The chat's OSD callback draws at the game's present, outside the frame callback: its time goes into the stats window and the total (review
+# of the chat, defect 34: 'plugin total 1.0 = 0.1% of a core' with about 40 ms a second of chat lines drawn on the game's thread)
+need_after Sources/ctr/chat_overlay.cpp "        const u32 ticks = static_cast<u32>(svcGetSystemTick() - start);" "        StatsNoteChatOsd(ticks);" "the chat's OSD callback's time goes into the stats window"
+# The keyboard's Redraw takes its time as the callback does, only with the log on (review of the chat, defect 39: svcGetSystemTick at every
+# redraw at debug=0, for an Add that was skipped): at debug=0 the measure costs no svc
+body=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | awk '/^void Redraw\(bool force\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::')
+printf '%s\n' "$body" | grep -F -x -q -- "    const u64 start = timed ? svcGetSystemTick() : 0;" || fail "Sources/ctr/chat_overlay.cpp: Redraw no longer reads the clock only with the log on"
+printf '%s\n' "$body" | grep -F -A1 -- "    g_drawn_valid = true;" | grep -F -x -q -- "    if (timed) {" || fail "Sources/ctr/chat_overlay.cpp: Redraw's cost is no longer noted only with the log on"
+# The chat's counters go into the debug log's line of the costs, also when nothing was drawn (review of the chat, defect 42: counted and never
+# read, a message dropped by the rate limit, malformed or refused looked the same in the log as one never sent)
+need Sources/ctr/chat_overlay.cpp "| messages: taken %lu, over the rate %lu, malformed %lu, empty %lu | ours: sent %lu, refused %lu (not in the room %lu, by the \"" "the chat's line of the costs gives its counters, the refusals by reason ..."
+need Sources/ctr/chat_overlay.cpp "\"room's connection %lu) | OSD notifies: chat %lu, plugin %lu\"," "... and the OSD-notify count"
+need_line Sources/ctr/chat_overlay.cpp "    const unsigned long taken = get(k.taken), drops = get(k.rate_drops), malformed = get(k.malformed), empty = get(k.empty);" "the chat's line reads the counters of the room's messages"
+need_line Sources/ctr/chat_overlay.cpp "    const unsigned long sent = get(k.sent), refused = get(k.refused), refused_left = get(k.refused_left);" "the chat's line reads the counters of our messages"
+need_line Sources/ctr/chat_overlay.cpp "        malformed, empty, sent, refused, refused_left, refused - refused_left, StatsChatOsdNotifies(), StatsPluginOsdNotifies());" "the chat's line is given its counters and the OSD-notify counts (the chat's and the plugin's, apart)"
+need_line Sources/ctr/chat_overlay.cpp "    if (g_cost_top.n.load() == 0 && g_cost_bottom.n.load() == 0 && g_cost_redraw.n.load() == 0 && counted == g_counted_logged) {" "the chat's line is written when a counter moved, nothing drawn"
+need_line Sources/ctr/chat_overlay.cpp "        LogCosts(now_ms, *sink); // (on: the sink is there)" "the chat's line is given the sink's counters"
+need_line Sources/azl/log.cpp "    c.plugin10 = c.net10 + c.uds10 + c.frame10 + c.chat10;" "the plugin's total holds the chat's OSD callback"
+need Sources/azl/log.cpp "    out.t_chat_osd = take(g_stats.t_chat_osd);" "TakeStats takes the chat's OSD sum"
+need_after Sources/azl/log.cpp "    if (ticks > g_stats.chat_osd_max_ticks) {" "        g_stats.chat_osd_max_ticks = ticks;" "the stats window keeps the longest draw of the chat's OSD callback"
+need Sources/ctr/plugin.cpp "frame callback %lu.%lu, chat osd %lu.%lu (%lu, max %lu us)" "the stats line shows the chat's OSD callback beside the frame callback"
 if grep -n 'const Stats s = g_stats' Sources/ctr/plugin.cpp; then
   fail "the statistics window is copied from g_stats again (a 64-bit sum can be read in two halves): TakeStats()"
 fi
-for sum in t_net_service t_net_events t_net_send t_cb t_writer ipc_sum_ticks t_net_wall t_net_pause t_writer_wait lock_wait_ticks lock_wait_net_ticks frame_gap_sum; do
+for sum in t_net_service t_net_events t_net_send t_cb t_chat_osd t_writer ipc_sum_ticks t_net_wall t_net_pause t_writer_wait lock_wait_ticks lock_wait_net_ticks frame_gap_sum; do
   grep -q "Ticks64 $sum;" Includes/azl/stats.hpp || fail "Includes/azl/stats.hpp: $sum is not a 64-bit sum (Ticks64) any more"
 done
 need Includes/azl/stats.hpp "Ticks64 soc_ticks[kSocKinds];" "the soc time is a 64-bit sum"
@@ -875,7 +1599,17 @@ need Sources/ctr/plugin.cpp "socplan::StartupIssue(SocketBufferSize(), g_debug_l
 # - The list of the games that cannot spare the socket buffer while they size their heap (Monster Hunter XX): not there before their first instruction; one outside the budget goes on the kernel's books as it is taken, or a game closed from HOME on an Old 3DS leaves the next one without a budget
 need Sources/ctr/plugin.cpp '(late || ReserveSocketMemory())' "a title of the list does not take the socket buffer before the game's first instruction"
 need Sources/ctr/soc.cpp 'if (g_reserve_late && FindBooks()) {' "a block outside the budget only for a title of the list, and only with the kernel's books found on the live object"
-need_after Sources/ctr/soc.cpp 'if (AllocateBlock(socplan::kSocBlockSize, true, &p)) {' 'ChargeBooks(socplan::kSocBlockSize);' "the block outside the budget goes on the kernel's books as soon as it is taken"
+#   ... on the books BEFORE it is taken (a process that dies in between keeps the block's bytes too many on current, never a sum of the private blocks above
+#   current, which gives the whole budget back to nobody), and off them again when it is not had (refused, or at another address: freed with svc 0xA3's FREE,
+#   which does not touch the books, where svcControlMemory's FREE would release a commit the kernel never charged)
+need_order Sources/ctr/soc.cpp '    if (outside_budget && !ChargeBooks(size)) {' '    const Result rc = outside_budget' "the block outside the budget goes on the kernel's books before svc 0xA3 takes it"
+need_after Sources/ctr/soc.cpp '    if (outside_budget && !ChargeBooks(size)) {' '        return Try::Stop;' "a charge that could not be made does not go on to take the block outside the books"
+need_after Sources/ctr/soc.cpp '        return Try::Allocated;' '        UnchargeBack(size);' "a block outside the budget that was refused comes off the books"
+need_after Sources/ctr/soc.cpp '            if (outside_budget) {' '                svcControlMemoryUnsafe(&ignored, out, size, MEMOP_FREE, static_cast<MemPerm>(0));' "a block outside the budget at another address is freed with svc 0xA3, which does not touch the books"
+need_after Sources/ctr/soc.cpp '                svcControlMemoryUnsafe(&ignored, out, size, MEMOP_FREE, static_cast<MemPerm>(0));' '                UnchargeBack(size);' "... and comes off the books"
+[ "$(tr -d '\r' < Sources/ctr/soc.cpp | sed 's://.*$::' | grep -c 'UnchargeBack(size);')" = "2" ] || fail "Sources/ctr/soc.cpp: the charge of a block outside the budget is taken back in another number of places than the two where the block is not had"
+[ "$(grep -rn --include='*.cpp' 'UnchargeBooks(' Sources | sed 's://.*$::' | grep -c 'UnchargeBooks(')" = "2" ] || fail "UnchargeBooks is called elsewhere than soc.cpp's UnchargeBack (its definition and that one call)"
+need_after Sources/ctr/soc.cpp '    if (g_reserve_late && FindBooks()) {' '        if (AllocateBlock(socplan::kSocBlockSize, true, &p)) {' "the late block outside the budget is the one AllocateBlock takes through TryAt's charge"
 # - frames lost: the text depends on the game's UDS calls (no call in the window, or none in its last second: not reading)
 need Includes/azl/screen_text.hpp "constexpr u32 kNotReadingMs = 1000;" "a game that has made no UDS call for a second is not reading"
 need Includes/azl/screen_text.hpp "constexpr unsigned long kWarnAbove = 50;" "more than 50 frames in a window is worth a toast"
@@ -885,7 +1619,7 @@ if grep -n 'reads too slowly' Sources/ctr/plugin.cpp; then
   fail "plugin.cpp says \"reads too slowly\" by itself: the text is frameslost::Text's, chosen from the game's UDS calls"
 fi
 need Sources/ctr/soc.cpp 'g_debug_level > 0 ? "Could not start the network layer (0x%08lx)"' "no pointer to the log when the log is on"
-need Sources/main.cpp 'azl::g_debug_level > 0 ? "" : " Set debug=1 for the details in the log."' "no pointer to the log when the log is on"
+need Sources/game_menu.cpp "plugin.startup_issue().empty()" "the menu of a plugin that stayed out of the game says why"
 
 # No management frame is ever sent into the room (Azahar asserts on one): the only builder of a data frame
 # writes a zero management byte (the rule checker of the unit tests watches every frame the engines send)
@@ -912,8 +1646,8 @@ fi
 # from the machine code, is Tests/callgraph_check.py, which Tests/stack_usage.sh runs on the built ELF - it follows direct
 # calls, tail calls and function addresses from the entries of the hook and from the callbacks the hook reaches through a
 # pointer, and fails if the printf family, Log() or DebugEvent() is among them):
-#   Sources/ctr/hook.cpp         the whole hook: PassThrough and its three branches, PassThroughApt, FindTraced,
-#                                WorthLogging, the name tests, azl_hook_SendSyncRequest, azl_hook_CloseHandle
+#   Sources/ctr/hook.cpp         the whole hook: PassThroughPre/Post and their branches, PassThroughAptPre/Post, FindTraced,
+#                                WorthLogging, the name tests, azl_pre32/azl_post32/azl_pre23/azl_post23 (what the gate calls)
 #   Sources/ctr/uds_hle.cpp      the front of the IPC front-end: FakeKind, MarkInitialized, ForgetFakeHandle,
 #                                NoteHandleClosed, InterceptGetServiceHandle, HandleSendSyncRequest; and RunTraced
 #   Sources/ctr/plugin.cpp       the observers of the game's APT session: OnSleepEnter (and SleepActs), OnWake, OnHomeButton,
@@ -967,10 +1701,25 @@ game_thread_file Includes/azl/line.hpp 1
 game_thread_file Sources/azl/uds_engine.cpp 2
 game_thread_file Sources/azl/room_client.cpp 1
 game_thread_file Includes/azl/printf_lite.hpp 1
-game_thread_file Includes/azl/apt_sleep.hpp 1
+game_thread_file Includes/azl/apt_sleep.hpp 2
+game_thread_file Includes/azl/traced_sessions.hpp 1
 game_thread_file Includes/azl/link_policy.hpp 1
 game_thread_file Includes/azl/sleep_crumbs.hpp 1
 game_thread_file Sources/azl/ndm_hle.cpp 1
+game_thread_file Includes/azl/chat_core.hpp 2
+# ... and the chat's drawing (the OSD callback runs on the game's thread that presents a frame): the stores and the text, and the lines
+game_thread_file Includes/azl/gfx_surface.hpp 1
+game_thread_file Includes/azl/chat_draw.hpp 1
+# ... and the chat over the running game: the hook's count of the notifications, the handshake of the keyboard's picture and the callback's
+# drawing (Includes/azl/chat_host.hpp), and the callback itself (Sources/ctr/chat_overlay.cpp)
+game_thread_file Includes/azl/chat_host.hpp 4
+game_thread_file Sources/ctr/chat_overlay.cpp 1
+# ... and the input mirror's way back, which the hook runs on the game's thread that got a notification (Sources/ctr/input_mirror.cpp,
+# MirrorRestoreFromGame and the kernel's calls under it; Includes/azl/hid_mirror.hpp, the Switcher)
+game_thread_file Includes/azl/hid_mirror.hpp 1
+game_thread_file Sources/ctr/input_mirror.cpp 1
+# ... and the zombie probe's one game-thread function (ctr/zombie_probe.cpp, BackdoorOk, reached from the hook's ipc-xfer line): no Log, no heap
+game_thread_file Sources/ctr/zombie_probe.cpp 1
 game_thread_file Sources/azl/platform.cpp 1
 # ... and the three headers of the fake Download Play lobby (pure, header only: one region each, which is all of the code in them)
 game_thread_file Includes/azl/dlp_types.hpp 1
@@ -979,7 +1728,8 @@ game_thread_file Includes/azl/dlp_ipc.hpp 1
 # ... and the code on the game's threads does call the printf-free lines (the scan above would also pass if the lines were
 # simply dropped): the two pass-through lines are stored raw, the others are built piece by piece
 need Sources/ctr/hook.cpp "DebugIpc(handle, header, arg," "the pass-through line of every IPC call is stored as raw words"
-need Sources/ctr/hook.cpp "DebugSvcReal(traced->name, command, arg0, result);" "the line of a traced service is stored as raw words"
+need Sources/ctr/hook.cpp "DebugSvcReal(traced->name, command, arg0, result, ctx[0]);" "the line of a traced service is stored as raw words, its session's handle given to the diet"
+need Sources/azl/log.cpp "    if (result != 0 || !DietLocked(handle, command | kDietSvcReal, arg, rec.ms, payload.service)) {" "the lines of a traced service are under the diet of the IPC lines (Fantasy Life: 90 a second of frd:u)"
 [ "$(grep -c 'g_home_observer();' Sources/ctr/hook.cpp)" = "2" ] || fail "Sources/ctr/hook.cpp: the HOME button must wake the log writer in both places of PassThroughApt (after the notification's lines, and when the lines are over)"
 need Sources/ctr/uds_hle.cpp "DebugServiceCommand(uds, id, request," "the capture of a command is built without printf"
 need Sources/ctr/uds_hle.cpp "DebugPullPacket(request[0]," "the capture of a PullPacket is built without printf"
@@ -998,12 +1748,12 @@ need Tests/stack_usage.sh 'callgraph_check.py "$WORK/cg"' "the stack check asks 
 need Tests/stack_usage.sh 'callgraph_check.py --selftest' "the call graph checker is tried against a made-up listing first"
 need Tests/chain_sim/chain_sim.py "BUDGET_PURE = 300 " "the pure pass-through path is held to 300 bytes below the entry SP, at debug 0 and 1"
 need Tests/chain_sim/chain_sim.py "for level in (0, 1):" "the chain test runs at both log levels"
-need_line Tests/stack_usage.sh 'budget hook "azl::ctr::PassThrough" 32' "the hot frame of every IPC call stays small"
+need_line Tests/stack_usage.sh 'budget hook "azl::ctr::PassThroughPre" 32' "the hot frame of every IPC call stays small (the half before the svc: PassThrough was split in pre and post for the gate)"
 
 # Test hygiene. A test that no script runs is a gate that is not there: every test source is built AND run by the script
 # that owns it (the host tests by Tests/run.sh, the 32-bit ones, which drive UdsHle, by Tests/ipc_test/build.sh and then
 # Tests/hle_tests.sh and Tests/integration.sh), and a new *_test.cpp that is in none of them fails here
-for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test update_test logrot_test log_module_test ncch_icon_test reloc_test hook_swap_test hook_swap_test_tsan gsp_wrapper_test; do
+for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test chat_core_test chat_core_test_tsan chat_draw_test osk_test chat_host_test chat_host_test_tsan hid_mirror_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test update_test logrot_test log_module_test ncch_icon_test hook_swap_test hook_swap_test_tsan gate_plan_test kernel_books_test gsp_wrapper_test traced_sessions_test traced_sessions_test_tsan heap_plan_test; do
   tr -d '\r' < Tests/run.sh | grep -q -E "^  (timeout 1200 )?\"\\\$OUT/$t\"( |\$)" || fail "Tests/run.sh does not run the unit test $t (a line of its own that calls \"\$OUT/$t\")"
   need Tests/run.sh "-o \"\$OUT/$t\"" "the unit test $t is built by Tests/run.sh"
 done
@@ -1146,7 +1896,7 @@ need Includes/azl/room_client.hpp "constexpr u32 kQuickPollMs = 1;" "1 ms after 
 need Includes/azl/room_client.hpp "constexpr u32 kQuickPollWindowMs = 10;" "... for 10 ms"
 need Sources/azl/room_client.cpp "        if (tx_pending_.load(std::memory_order_acquire) != 0) { // (the game's thread sets it under the lock: nothing pushed, no lock)" "the queue is looked at through an atomic, not the lock, every round"
 need Sources/ctr/uds_hle.cpp "            svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);" "the first call of a command says the thread and its priority"
-need Sources/azl/log.cpp "    c.plugin10 = c.net10 + c.uds10 + c.frame10;" "the writer's wall time is not in the CPU total"
+need Sources/azl/log.cpp "    c.plugin10 = c.net10 + c.uds10 + c.frame10 + c.chat10;" "the writer's wall time is not in the CPU total"
 need Includes/enet/enet.h "   enet_uint32          azlDeliverOutOfOrder;" "ENet can hand a reliable packet over ahead of a hole"
 need Sources/enet/peer.c "          placeholder -> azlDispatched = 1;" "... leaving a placeholder for the sequence accounting"
 need_after Sources/enet/peer.c "          if (incomingCommand -> azlDispatched)" "enet_free (incomingCommand);" "... that is freed, never delivered, when its turn comes"
@@ -1183,7 +1933,7 @@ need Sources/azl/room_client.cpp 'static_assert(kRepeatMax * 2 <= CopyDedupe::kS
 need Sources/azl/log.cpp "    out.lock_hold_ticks = take(g_stats.lock_hold_ticks);" "TakeStats takes the lock's hold sum"
 need ConfigApp/source/settings.cpp "if (c >= -1 && c <= 3) {" "the app accepts net_thread_core 2 and 3 (the A/B key must survive a save)"
 need Sources/ctr/uds_hle.cpp "        static bool said[kStatsCommands]; // (never cleared: the line below is said once per command in the life of the plugin)" "the first-caller line is said once, not once a window"
-need Sources/main.cpp "        const int level = radio ? g_radio_level : 0;" "the in-game switch keeps the configured level (radio_like=2 is not turned into 1)"
+need Sources/ctr/plugin.cpp "    room_->SetFastData(config_.radio_like);" "the radio level is the settings' (the in-game menu has no switch for it)"
 need Sources/azl/uds_engine.cpp "    if (twin_unmatched) {" "a forwarded copy with no twin is counted once the copy rule let it through"
 [ "$(tr -d '\r' < Sources/azl/uds_engine.cpp | grep -c '        ForgetChangedNodesLocked(before);')" = "2" ] || fail "a client does not forget the numbers of a slot that changed console (both Logoff refreshes)"
 need Tests/azahar_rules.hpp "            Add(\"secure-shape\", \"SecureData with aggregate count \" + std::to_string(LoadBE16(raw + 2)) + \" (Azahar emits 0)\");" "the Azahar rule leaves the sequence number free"
@@ -1363,7 +2113,8 @@ need ConfigApp/source/appcfg.cpp 'cfg.dlp_delivery = azl::ini::ParseBool(value, 
 need ConfigApp/source/appcfg.cpp $'out += std::string("dlp_delivery=") + (cfg.dlp_delivery ? "1" : "0") + "\\n";' "the switch is written every time, so that a hand edit only flips a digit"
 need ConfigApp/source/pages_config.cpp 'dlp_switch.on = g.app_cfg.dlp_delivery;' "the row of Settings shows the switch"
 need ConfigApp/source/pages_config.cpp 'g.app_cfg.dlp_delivery = on;' "the row of Settings flips the switch"
-need ConfigApp/source/pages_config.cpp 'g.SaveAppConfig();' "the switch is saved when it is flipped"
+need_after ConfigApp/source/pages_config.cpp 'g.app_cfg.dlp_delivery = on;' 'g.SaveAppConfig();' "the delivery switch is saved when it is flipped"
+need_after ConfigApp/source/pages_config.cpp 'g.app_cfg.update_check = on;' 'g.SaveAppConfig();' "the update-check switch is saved when it is flipped"
 need ConfigApp/source/pages_config.cpp 'dlp_switch.label = dlp::kSwitchLabel;' "the row is called as the text says"
 need ConfigApp/source/dlp_text.hpp 'constexpr const char* kSwitchLabel = "Download Play delivery";' "the row of the switch is called Download Play delivery (as the notes and the documents call it)"
 need ConfigApp/source/dlp_text.hpp '"OFF: the whole feature is shut. Its entry is faint and nothing of it runs or is read or written.' "the note of the switch says what off means"
@@ -1740,9 +2491,9 @@ need Sources/ctr/hook.cpp 'u32 RewriteStubbedGspWrappers() {' "the rewrite is a 
 need Sources/ctr/hook.cpp 'stats.gsp_stub_wrappers = g_gsp_stub_wrappers;' "InstallSvcHooks reports what the rewrite did"
 # ... called from EarlyInit, outside `if (active_)` (LEGO Batman 2 aborted at start with the main switch off, the plugin still loaded by Luma3DS), BEFORE the hooks look for the framework's sites
 [ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c '^    RewriteStubbedGspWrappers();$')" = "1" ] || fail "Sources/ctr/plugin.cpp: RewriteStubbedGspWrappers() is called once, at the level of EarlyInit itself and not inside 'if (active_)': the framework aborts at start with the switch off otherwise"
-need_order Sources/ctr/plugin.cpp '    RewriteStubbedGspWrappers();' 'hook_stats_ = InstallSvcHooks(hle_.get());' "the GSP wrapper is rewritten BEFORE the hooks look for the framework's sites"
+need_order Sources/ctr/plugin.cpp '    RewriteStubbedGspWrappers();' 'hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' "the GSP wrapper is rewritten BEFORE the hooks look for the framework's sites"
 need_order Sources/ctr/plugin.cpp '    RewriteStubbedGspWrappers();' "// The game's APT session tells when the console goes to sleep; we only look" "... and before the block that only runs when the plugin is on"
-need_order Sources/ctr/hook.cpp 'u32 RewriteStubbedGspWrappers() {' 'HookStats InstallSvcHooks(UdsHle* hle) {' "the rewrite is defined before the install, which reports it"
+need_order Sources/ctr/hook.cpp 'u32 RewriteStubbedGspWrappers() {' 'HookStats InstallSvcHooks(UdsHle* hle, bool reserve_exit_tramp) {' "the rewrite is defined before the install, which reports it"
 need Includes/azl/gsp_wrapper.hpp 'stub > end - 8' "the end of the stub is tested without adding to the target (a bl whose target wraps round the top of the address space passed 'stub + 8 > end')"
 ! grep -q 'stub + 8 > end' Includes/azl/gsp_wrapper.hpp || fail "Includes/azl/gsp_wrapper.hpp tests 'stub + 8 > end' again: it wraps for a target of 0xFFFFFFFC"
 need Tests/gsp_wrapper_test.cpp 'for (const u32 target : {0xFFFFFFFCu, 0xFFFFFFF8u, 0xFFFFFFF4u, 0xFFFFFFFFu, 0x00000000u, 0x00000004u}) {' "the test tries a bl whose target wraps round the top of the address space"
@@ -1767,6 +2518,7 @@ need Sources/ctr/plugin.cpp '{0x000400000007C800ull, DlpGameMode::Lobby, true}' 
 need Sources/ctr/plugin.cpp '{0x000400000007C700ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, USA is a Lobby game: the room carries its Download Play lobby"
 need Sources/ctr/plugin.cpp '{0x0004000000064D00ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Japan is a Lobby game: the room carries its Download Play lobby"
 need Sources/ctr/plugin.cpp '{0x00040000000B9100ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Taiwan is a Lobby game: the room carries its Download Play lobby"
+need Sources/ctr/plugin.cpp '{0x00040000001D1A00ull, DlpGameMode::Lobby}' "Luigi's Mansion 2018 (Europe, seen: dlp:SRVR / dlp:FKCL InitializeWithName) is a Lobby game"
 need Sources/ctr/plugin.cpp '{0x00040000001C2100ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale answers the wireless check only (the probe)"
 need Sources/ctr/plugin.cpp '{0x00040000001C2000ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale, the other region's id, answers the wireless check only"
 hit=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -i -E '0x000400000010C000|0x000400000010BF00|0x0004000000183600|0x00040000001C2100|0x00040000001C2000|0x000400000007C800|0x000400000007C700|0x0004000000064D00|0x00040000000B9100' | grep -v 'DlpGameMode::' | head -3)
@@ -1776,7 +2528,7 @@ need Sources/ctr/plugin.cpp 'return DlpModeOf(title_id) == DlpGameMode::ProbeOnl
 need Sources/ctr/plugin.cpp 'if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {' "the hub exists only for a Lobby game, and only when the plugin is active"
 need Sources/ctr/plugin.cpp 'new (std::nothrow) DlpHub(engine, kernel, config, resolver)' "the hub is the one allocation of the lobby and a refusal leaves the real services"
 need Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' "the HLE is given the hub"
-need_order Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' 'hook_stats_ = InstallSvcHooks(hle_.get());' "the hub is set before the hooks are installed (a game's first call finds it)"
+need_order Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' 'hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' "the hub is set before the hooks are installed (a game's first call finds it)"
 need_after Sources/ctr/plugin.cpp 'engine_->Tick(now_ms);' 'dlp_hub_->Tick();' "the hub serves after the engine's own Tick, on the network thread"
 need_order Sources/ctr/plugin.cpp 'dlp_hub_->Stop();' 'room_->StopWithin(kNetStopTimeoutMs)' "the hub is stopped before the room: no request waits for a network thread that is going away"
 need Sources/ctr/plugin.cpp 'dlp_hub_->SetPlayerName(name);' "the console's profile name is the name the lobby shows (the games send Initialize with no name)"
@@ -1835,6 +2587,22 @@ need_after Sources/azl/dlp_hub.cpp 'Refresh();  // (BEFORE the answer is publish
 need Sources/azl/dlp_hub.cpp 'state_.store(kQueued, std::memory_order_seq_cst);' "a request is queued with a sequentially consistent store, paired with Stop()'s (a request posted just after Stop() fails at once)"
 need Sources/azl/dlp_hub.cpp 'stopped_.store(true, std::memory_order_seq_cst);' "Stop() sets its flag with the matching sequentially consistent store"
 need Sources/azl/dlp_hub.cpp 'if (post_mutex_.try_lock()) {' "OnGameUdsStarting does not return early while a request is in flight (post_mutex_ is its requester's)"
+# The waits a game thread makes inside the engine and the hub end when the swap of the plugin's block closes the svc hook's gate (KernelOps::GateClosing,
+# ctr/gate_flag.hpp): the swap waits 1.5 s for the threads counted in the gate, and after it the code they sleep in is gone (the class of dumps 03/05/06).
+# ConnectToNetwork waits 5 s, a scan up to 10 s, a posted dlp request 2 s in the queue and the slot without a limit.
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kGateSliceMs = 10;' "a game thread in the engine looks at the gate at least every 10 ms (under the 20 ms a wait without the guard may take)"
+need Includes/azl/uds_engine.hpp 'virtual bool GateClosing() {' "the engine and the hub ask the gate through the kernel they are given (the PC builds them without the plugin)"
+need_after Includes/azl/uds_engine.hpp 'asked += slice;' 'if (GateClosing()) {' "the guarded wait ends when the gate closes"
+need Includes/ctr/kernel_ops.hpp 'return ctr::GateClosing();' "on the console the gate is the flag of the svc hook's gate"
+need Sources/azl/uds_engine.cpp 'const bool answered = kernel_->WaitEventGuarded(connect_event_, kConnectTimeoutNs);' "ConnectToNetwork's 5 s wait is the guarded one"
+need Sources/azl/uds_engine.cpp 'constexpr u64 kScanSliceMs = 20;' "the scan looks at the gate every 20 ms at the most"
+need_after Sources/azl/uds_engine.cpp 'if (scan.cancel != 0 && kernel_->WaitEvent(scan.cancel, 0)) {' 'return;' "the game's cancel event ends the scan ..."
+need Sources/azl/uds_engine.cpp '        if (kernel_->GateClosing()) {' "... and so does the closing of the gate"
+need Sources/azl/dlp_hub.cpp 'if (event_ == 0 || !NetAlive() || kernel_->GateClosing()) {' "no dlp request is posted while the gate closes (a close of a session is then left to the next Tick)"
+need_after Sources/azl/dlp_hub.cpp 'while (!post_mutex_.try_lock()) {' 'if (kernel_->GateClosing()) {' "a requester behind another one does not wait for the slot while the gate closes"
+need Sources/azl/dlp_hub.cpp 'if (state == kQueued && (platform::NowMs() >= deadline || kernel_->GateClosing())) {' "a queued request is taken back when the gate closes, as at kQueuedMs"
+need_after Sources/azl/dlp_hub.cpp 'void DlpHub::WakeForSwap() {' 'if (event_ != 0 && state_.load(std::memory_order_acquire) == kQueued) {' "the swap can wake a queued requester at once (WakeForSwap) ..."
+need_after Sources/azl/dlp_hub.cpp 'if (event_ != 0 && state_.load(std::memory_order_acquire) == kQueued) {' 'kernel_->SignalEvent(event_);' "... with the event it waits on"
 need Sources/azl/dlp_hub.cpp 'return id == DlpService::kFkFinalize || id == DlpService::kFkStopScan || id == DlpService::kFkStopSession;' "the commands that succeed in every state (FKCL): Triple Deluxe and Planet Robobot throw a fatal error at a negative Finalize"
 need Sources/azl/dlp_hub.cpp 'return id == DlpService::kSvFinalize || id == DlpService::kSvEndAccepting;' "... (SRVR)"
 need Sources/azl/dlp_hub.cpp 'return id == DlpService::kFkFinalize || id == DlpService::kFkStopSession;' "the ones that end the FKCL role"
@@ -2019,7 +2787,8 @@ hit=$(grep -r -n -E 'dlp_hub|DlpHub|EngineLobbyNet' ConfigApp --include=*.cpp --
 # function and the sum of the frames down to the network, and Tests/run.sh runs it. What must not change by accident: that it runs, the flags it compiles with, its budgets,
 # the sizes the probe asserts on ARM32, a wrapper for every public function, and the noinline that keeps the big frames out of their callers.
 need_line Tests/run.sh '  bash Tests/dlp_stack_check.sh' "the suite runs the stack and size check of the fake lobby on the plugin's target (a frame of an ARM function is not seen by the x86-64 tests)"
-need Tests/dlp_stack_check.sh '-c Tests/dlp_stack_probe.cpp -o' "the check compiles the probe"
+need Tests/dlp_stack_check.sh '-c Tests/dlp_stack_probe.cpp -o "$W/probe_$pass.o"' "the check compiles the probe (passes A and B)"
+need Tests/dlp_stack_check.sh '-c Tests/dlp_stack_probe.cpp -o "$W/probe_H.o"' "the check compiles the probe with the hub (pass H)"
 need_line Tests/dlp_stack_check.sh 'for pass in A B; do' "two passes: as the plugin would build it (the sums of the frames are held) and with every function kept (every frame and every circle is seen)"
 need_line Tests/dlp_stack_check.sh '  [ "$pass" = B ] && extra="-fkeep-inline-functions"' "pass B keeps every inline function: a public function that has no wrapper yet, or a helper that pass A inlines everywhere, is still measured"
 need_line Tests/dlp_stack_check.sh '"$PY" "$W/check.py" --selftest' "the check tries itself on made-up listings first: a gate that cannot say no is not a gate"
@@ -2030,11 +2799,13 @@ need Tests/dlp_stack_check.sh 'CHAIN_MAX=160 ' "from a function of the lobby dow
 need_line Tests/dlp_stack_check.sh 'ARM_FLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Os -mword-relocations -fomit-frame-pointer -ffunction-sections -fno-strict-aliasing -Wall -Wno-psabi -fno-rtti -fno-exceptions -std=gnu++17"' "the probe is compiled with the flags of the Makefile (ARM11 MPCore, -Os, no RTTI, no exceptions, gnu++17): the frames of another compilation are not the plugin's"
 need_line Tests/dlp_stack_check.sh 'STRICT_FLAGS="-Wextra -Wpedantic -Wshadow -Werror -fstack-usage -fcallgraph-info=su"' "the headers must be clean for the plugin's compiler, and the compiler is asked for the frames and the call graph"
 need Tests/dlp_stack_check.sh '"${DEVKITARM:+$DEVKITARM/bin/arm-none-eabi-g++}" /opt/devkitpro/devkitARM/bin/arm-none-eabi-g++; do' "the compiler is looked for where the devkitARM container keeps it (not in its PATH)"
-need Tests/dlp_stack_check.sh 'if [ -n "$DLP_STACK_REQUIRED" ]; then' "without the compiler the check is skipped aloud, and DLP_STACK_REQUIRED makes that a failure"
+need_after Tests/dlp_stack_check.sh 'if [ -z "$ARM_GXX" ]; then' 'if [ -n "$DLP_STACK_REQUIRED" ]; then' "without the compiler the check is skipped aloud, and DLP_STACK_REQUIRED makes that a failure"
+need_after Tests/dlp_stack_check.sh 'if [ -z "$CTRU" ]; then' 'if [ -n "$DLP_STACK_REQUIRED" ]; then' "without the libctru headers the pass H is skipped aloud, and DLP_STACK_REQUIRED makes that a failure"
 # Nothing may be kept in memory: a `static u8 scratch[4096]` is not in sizeof(DlpLobby) and not in a frame. The object file of the probe shows it (data and bss stay at 0),
 # and the array scan of the game-thread code looks at every line that is not a constant.
 need Tests/dlp_stack_check.sh 'read -r _text data bss _rest < <("$ARM_SIZE" "$W/probe_$pass.o" | awk '"'"'NR == 2'"'"')' "the check reads the size of the object file of the probe (text data bss)"
-need Tests/dlp_stack_check.sh 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the fake lobby keeps no static storage: data and bss of the probe are 0 (a static buffer would hide from sizeof and from the frames)"
+need_after Tests/dlp_stack_check.sh '"$W/probe_$pass.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the fake lobby keeps no static storage: data and bss of the probe are 0 (a static buffer would hide from sizeof and from the frames)"
+need_after Tests/dlp_stack_check.sh '"$W/probe_H.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the hub's header keeps no static storage: data and bss of the probe with the hub are 0"
 # A test of the lobby that hangs (a loop that waits for something a regression no longer does) must fail the suite after 20 minutes, not stop it for good.
 for t in dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test; do
   need_line Tests/run.sh "  timeout 1200 \"\$OUT/$t\"" "the suite runs $t under a timeout: a hang is a failure, not a stop"
@@ -2053,6 +2824,7 @@ need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpLobby::Tables) == 168,' 
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(Group) == 40,' "a lobby heard is 40 bytes on ARM32"
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(NodeEntry) == 32,' "a player as the network reports it is 32 bytes on ARM32"
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(HeardGroup) <= 40,' "a lobby heard on the stack of a game thread is at most 40 bytes on ARM32"
+need Tests/dlp_stack_probe.cpp 'PROBE_NOINLINE void p_OnSessionClosed(DlpService* s, DlpKind kind) { s->OnSessionClosed(kind); }' "the close of a game's session (a game thread) is measured too: without its wrapper the stack check would not see it, and only the ARM compiler would notice"
 dlp_wrappers() { # $1 = header, $2 = class: every public function of the class is called by the probe
   local names n
   names=$(tr -d '\r' < "$1" | awk -v cls="$2" '
@@ -2216,7 +2988,8 @@ need Tests/dlp_net_stack_check.sh 'FRAME_ADAPTER=80 ' "no method of the adapter 
 need Tests/dlp_net_stack_check.sh 'FRAME_ENGINE=64 ' "no function of the engine's lobby pieces that a game thread reaches has a frame over 64 bytes"
 need Tests/dlp_net_stack_check.sh '"$ARM_GXX" $ARM_FLAGS -Wextra -Wpedantic -Wshadow -Werror -fstack-usage -c Sources/azl/dlp_lobby_net.cpp -o "$W/adapter.o"' "the adapter is compiled for the plugin's target with the flags of the Makefile, strictly"
 need Tests/dlp_net_stack_check.sh '"$ARM_GXX" $ARM_FLAGS -fstack-usage -c Sources/azl/uds_engine.cpp -o "$W/engine.o"' "the engine is compiled for the plugin's target with the flags of the Makefile"
-need Tests/dlp_net_stack_check.sh 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the adapter keeps no static storage: data and bss of its object are 0"
+need_after Tests/dlp_net_stack_check.sh '"$W/adapter.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the adapter keeps no static storage: data and bss of its object are 0"
+need_after Tests/dlp_net_stack_check.sh '"$W/hub.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the hub keeps no static storage: data and bss of its object are 0"
 need Tests/dlp_net_stack_check.sh 'if check_su "$W/bad_frame.su" ' "the gate tries itself first: a frame over its budget must be refused"
 need Tests/dlp_net_stack_check.sh 'if check_su "$W/bad_dynamic.su" ' "... and a dynamic frame"
 need Tests/dlp_net_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "this test stops at the first undefined behaviour (UBSan options: halt_on_error=1)"
@@ -2230,14 +3003,423 @@ done
 [ "$(grep -c 'CHECK_EQ(counted.count(), 0u);' Tests/dlp_net_test.cpp)" = "2" ] || fail "Tests/dlp_net_test.cpp: the reading calls of the adapter are proven to allocate nothing in two places (the console that holds the engine, the one that only looks)"
 [ "$(grep -c 'CHECK_EQ(res, R_TIMEOUT);' Tests/dlp_net_test.cpp)" = "2" ] || fail "Tests/dlp_net_test.cpp: a join to a host that does not answer (full, or closed) is proven to give up with the games' own timeout, twice"
 
-# ---- The swap of the plugin's memory on an Old 3DS: the HOME button must not take the game down (1.0.12) ---------------------------------------------------
-# Luma3DS saves the plugin's block to a file and frees it when an Old 3DS game goes to the HOME menu. The kernel raises that on the game's OWN thread, at the end of its
-# APT:ReceiveParameter, and puts the thread to sleep until the block is gone: if the hook made that svc, the thread wakes up in freed memory (the prefetch abort of the 1.0.4 report, PC in
-# svcSendSyncRequest, LR in azl_hook_SendSyncRequest). So the entry hands that call back to its call site (azl_handback_site: an Old 3DS, a HOME button just seen), the sites go back to the
-# game at SWAP_ENTER and into the hook at SWAP_EXIT, and the threads still in the hook are counted and waited for. On a New 3DS the framework sends no swap event and nothing of this runs
-# but the counter. The logic is held by Tests/hook_swap_test.cpp (and Tests/hook_swap_mutants.py), the assembly by Tests/hook_sim/entry_sim.py (Tests/hook_sim/entry_mutants.py), the whole chain
-# by Tests/chain_sim/chain_sim.py; these pins hold the text of each piece.
-need Sources/ctr/svc_entry.s "SVC_ENTRY azl_svc32_entry, azl_hook_SendSyncRequest, 1" "the SendSyncRequest entry asks whether the call is the one that raises the swap"
+# ---- The swap of the plugin's memory on an Old 3DS: the HOME button must not take the game down (1.0.12; the gate, 1.1.2+) ----------------------------------
+# Luma3DS saves the plugin's block to a file and frees it when an Old 3DS game goes to the HOME menu, and the game's threads are never stopped for it. Until 1.1.2 the
+# sites were two words rewritten at every swap, and a thread asleep in the svc of a site woke up on the literal (LEGO Batman 2's dumps). Since the gate
+# (analysis/fix-gancio-swap-old-2026-11-05): every site is ONE word `b stub`, written once before the game runs, the stubs and the gate (Sources/ctr/gate.s) are in a page
+# the swap does not take away (ctr/gate_page.cpp), every real svc of the game is made by the gate, and the swap only flips the gate's flag: CloseGate at SWAP_ENTER (it
+# waits for the threads counted in the plugin's code), OpenGate once the block is mapped again. The logic is held by Tests/gate_plan_test.cpp and Tests/hook_swap_test.cpp
+# (and Tests/hook_swap_mutants.py), the assembly by Tests/hook_sim/gate_sim.py (Tests/hook_sim/gate_mutants.py), the whole chain by Tests/chain_sim/chain_sim.py; these pins
+# hold the text of each piece, and the rules that make the gate the fix for good (analysis/fix-gancio-swap-old-2026-11-05/PROGETTO-CORREZIONE.md, 7.3).
+need Sources/ctr/hook.cpp 'written = WriteGate(memory, g_gate_page.address, g_gate_page.bytes, blob, pointers, g_sites, g_site_count);' "the sites are hooked by the tested WriteGate: the gate, the stubs, then ONE word per site, once"
+need Sources/ctr/hook.cpp 'g_gate_flag = &g_gate->flag;' "once the gate is there, the waits on a game thread look at the flag the swap closes"
+need Sources/ctr/hook.cpp 'g_gate_page = TakeGatePage(g_sites[0].address, g_sites[g_site_count - 1].address, bytes, &stats.no_gate);' "the gate's page is taken for the span of the sites found"
+# (the lines of a file from the first that has $2 to the first after it that is exactly $3, no CR; and code without its // comments)
+region() {
+  tr -d '\r' < "$1" | awk -v a="$2" -v b="$3" '!on && index($0, a) { on = 1 } on { print } on && $0 == b { exit }'
+}
+code_of() {
+  sed 's://.*$::'
+}
+# 1. No word of the game's text is written but by the installation, once, before the game runs (InstallSvcHooks > WriteGate through GateTextMemory: the sites)
+#    and by RewriteStubbedGspWrappers (the bl of a GSP wrapper, before the framework's search). A write anywhere else is a word that can change under a thread
+#    asleep in a svc: the defect of 1.1.2 (LEGO Batman 2's dumps).
+PATCHERS=$(grep -rn --include='*.cpp' --include='*.hpp' --include='*.h' --include='*.c' 'Process::Patch(' Sources Includes | awk '{ f = $0; sub(/:.*$/, "", f); l = $0; sub(/^[^:]*:[0-9]*:/, "", l); sub(/\/\/.*$/, "", l); if (index(l, "Process::Patch(")) n[f]++ } END { for (f in n) print n[f], f }' | sort | tr '\n' ' ')
+[ "$PATCHERS" = "3 Sources/ctr/hook.cpp " ] || fail "Process::Patch is called in '$PATCHERS', expected three times in Sources/ctr/hook.cpp (the gate's installation, the GSP wrapper's bl and the exit guard's svc 0x03 words): the game's text is written only before the game runs"
+region Sources/ctr/hook.cpp 'ExitGuardStats InstallExitGuard(void (*guard)(), u32 stack_top) {' '}' | code_of | grep -q 'Process::Patch(addr, jump)' || fail "the exit guard's words are written somewhere else than in InstallExitGuard"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | code_of | grep -c 'InstallExitGuard(')" = "1" ] || fail "InstallExitGuard is called more than once (it is the installation, before the game runs)"
+need_order Sources/ctr/plugin.cpp '            hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' '                g_exit_stats = InstallExitGuard([]() { RunExitGuard(); },' "the exit guard is installed right after the hooks, in EarlyInit, before the game runs"
+[ "$(region Sources/ctr/hook.cpp 'struct GateTextMemory {' '};' | code_of | grep -c 'Process::Patch(')" = "1" ] || fail "Sources/ctr/hook.cpp: GateTextMemory (what WriteGate writes the sites through) no longer has the one Process::Patch"
+[ "$(region Sources/ctr/hook.cpp 'u32 RewriteStubbedGspWrappers() {' '}' | code_of | grep -c 'Process::Patch(')" = "1" ] || fail "Sources/ctr/hook.cpp: RewriteStubbedGspWrappers no longer has the other Process::Patch"
+[ "$(cat Sources/ctr/*.cpp Includes/azl/*.hpp Includes/ctr/*.hpp | tr -d '\r' | code_of | grep -c 'GateTextMemory memory{')" = "1" ] && \
+  region Sources/ctr/hook.cpp 'HookStats InstallSvcHooks(UdsHle* hle, bool reserve_exit_tramp) {' '}' | code_of | grep -q 'GateTextMemory memory{' || fail "the memory that writes the game's text (GateTextMemory) is made somewhere else than in InstallSvcHooks"
+[ "$(cat Sources/ctr/*.cpp Sources/azl/*.cpp Includes/azl/*.hpp Includes/ctr/*.hpp | tr -d '\r' | code_of | grep -c 'PatchText(')" = "2" ] || fail "PatchText (one word of the game's text) is called somewhere else than in WriteGate (azl/gate_plan.hpp)"
+[ "$(cat Sources/ctr/*.cpp Sources/azl/*.cpp Sources/*.cpp | tr -d '\r' | code_of | grep -c 'WriteGate(')" = "1" ] || fail "WriteGate is called more than once in the plugin (the sites are written once, by InstallSvcHooks)"
+hit=$(grep -rnE --include='*.cpp' --include='*.hpp' --include='*.h' --include='*.c' 'Process::(Write(8|16|32|64|Float|Double|String)?|CopyMemory|Poke|ProtectMemory|ProtectRegion)\b|\bPoke(8|16|32)?[[:space:]]*\(' Sources Includes | grep -v '^[^:]*:[0-9]*:[[:space:]]*//' | head -2)
+[ -z "$hit" ] || fail "a write of the process's memory through the framework besides Process::Patch: $hit"
+# ... the swap's path (SWAP_ENTER, the way back, SWAP_EXIT) writes no code: it only flips the gate's flag (GateClose / GateOpen write `flag` and nothing else of the header).
+for fn in 'void Plugin::NoteProcessEvent(int event) {' 'void Plugin::OnSwapBack() {' 'extern "C" void __wrap_PLGLDR__Reply(s32 event) {'; do
+  hit=$(region Sources/ctr/plugin.cpp "$fn" '}' | code_of | grep -E 'Process::|WriteGate|PatchText|StorePage|InstallSvcHooks|RewriteStubbed|svcFlushProcessDataCache|InstructionCache' | head -1)
+  [ -z "$hit" ] || fail "Sources/ctr/plugin.cpp: the swap's path ($fn) writes code: $hit"
+done
+for fn in 'u32 CloseGate(u32 timeout_ms, void (*wake)(void*), void* arg) {' 'void OpenGate() {'; do
+  hit=$(region Sources/ctr/hook.cpp "$fn" '}' | code_of | grep -E 'Process::|WriteGate|PatchText|StorePage|g_sites\[|g_gate->[a-z_]+ *=[^=]|svcFlushProcessDataCache|InstructionCache' | head -1)
+  [ -z "$hit" ] || fail "Sources/ctr/hook.cpp: $fn writes something else than the gate's flag (through GateClose / GateOpen): $hit"
+done
+# ... nothing but GateTextMemory (the installation) syncs the caches of code, and nothing stores through the address of a site: a function of
+#    its own that gave the sites their svc back at the swap (the two-word hook of 1.1.2) would need one or the other.
+CACHES='svcFlushProcessDataCache|svcInvalidateEntireInstructionCache|svcInvalidateProcessDataCache|svcStoreProcessDataCache|InvalidateInstructionCache|FlushEntireDataCache'
+[ "$(cat Sources/ctr/*.cpp Sources/azl/*.cpp Sources/*.cpp Includes/azl/*.hpp Includes/ctr/*.hpp | tr -d '\r' | code_of | grep -cE "\b($CACHES)\b")" = "8" ] && \
+  [ "$(region Sources/ctr/hook.cpp 'ExitGuardStats InstallExitGuard(void (*guard)(), u32 stack_top) {' '}' | code_of | grep -cE "\b($CACHES)\b")" = "4" ] && \
+  [ "$(region Sources/ctr/plugin.cpp 'void Plugin::RaiseRosalinaReplyWait() {' '}' | code_of | grep -cE "\b($CACHES)\b")" = "1" ] && \
+  [ "$(region Sources/ctr/hook.cpp 'struct GateTextMemory {' '};' | code_of | grep -cE "\b($CACHES)\b")" = "3" ] || fail "a sync of the caches of code outside GateTextMemory (the installation of the gate): code written again somewhere else"
+hit=$(cat Sources/ctr/*.cpp Includes/ctr/*.hpp | tr -d '\r' | code_of | grep -E 'reinterpret_cast<[[:space:]]*(volatile[[:space:]]+)?u(8|16|32)[[:space:]]*\*[[:space:]]*>[[:space:]]*\([^)]*g_sites\[|\([[:space:]]*(volatile[[:space:]]+)?u(8|16|32)[[:space:]]*\*[[:space:]]*\)[[:space:]]*\(?[[:space:]]*g_sites\[' | head -1)
+[ -z "$hit" ] || fail "a store through the address of a site (the game's text written outside WriteGate): $hit"
+# ... CloseGate hands the gate to GateClose whole, with its time in microseconds, and touches g_gate in no other way (Tests/chain_sim/chain_sim.py,
+#    scenario_close_open_gate, runs the compiled CloseGate and OpenGate: the whole wait with a thread counted, the flag the only word written).
+need Sources/ctr/hook.cpp '        *g_gate, static_cast<u64>(budget_ms) * 1000, []() { return platform::NowUs(); },' "CloseGate waits its time (ms to us, SWAP_ENTER's one deadline at most) on the gate itself"
+for fn in 'u32 CloseGate(u32 timeout_ms, void (*wake)(void*), void* arg) {' 'void OpenGate() {'; do
+  [ "$(region Sources/ctr/hook.cpp "$fn" '}' | code_of | grep -oE '\bg_gate\b' | wc -l | tr -d ' ')" = "2" ] || fail "Sources/ctr/hook.cpp: $fn uses g_gate otherwise than to test it and hand it to GateClose / GateOpen"
+done
+need Tests/chain_sim/chain_sim.py '        scenario_close_open_gate(elf, level)' "the whole-chain test runs the compiled CloseGate and OpenGate"
+# ... the books come down only once the game's heap is SEEN (GameHeapSeen says yes only from svcQueryMemory; WaitForGameHeap only from GameHeapSeen, and only there)
+[ "$(region Sources/ctr/kernel_books.cpp 'bool GameHeapSeen() {' '}' | code_of | grep -c 'return')" = "1" ] && \
+  region Sources/ctr/kernel_books.cpp 'bool GameHeapSeen() {' '}' | code_of | grep -q -x -F '    return R_SUCCEEDED(svcQueryMemory(&info, &page, socplan::kRegionBase)) && info.state != MEMSTATE_FREE;' || \
+  fail "Sources/ctr/kernel_books.cpp: GameHeapSeen says yes otherwise than from the game's region mapped"
+region Sources/ctr/kernel_books.cpp 'bool WaitForGameHeap() {' '}' | code_of | grep -A1 -F 'if (GameHeapSeen()) {' | grep -q -F 'return true;' && \
+  [ "$(region Sources/ctr/kernel_books.cpp 'bool WaitForGameHeap() {' '}' | code_of | grep -c 'return true')" = "1" ] || fail "Sources/ctr/kernel_books.cpp: WaitForGameHeap says yes without the game's heap seen"
+for fn in 'inline u32 GateClose(' 'inline void GateOpen('; do
+  body=$(region Includes/azl/hook_swap.hpp "$fn" '}' | code_of)
+  hit=$(printf '%s\n' "$body" | grep -E '\bg\.[a-z_]+[[:space:]]*([-+*|&^]?=[^=]|\+\+|--)|Store[A-Za-z]*\(&g\.' | grep -v 'Ops::StoreFlag(&g.flag, ' | head -1)
+  [ -z "$hit" ] && [ "$(printf '%s\n' "$body" | grep -c 'Ops::StoreFlag(&g.flag, ')" = "1" ] || fail "Includes/azl/hook_swap.hpp: $fn writes the gate's header besides its flag, or not the flag once: $hit"
+done
+# ... and the svc 0x32 words CTRPluginFramework hooks by itself (GSP::Initialize, the wrappers of RegisterInterruptRelayQueue) are never sites: the framework's
+#    search wants them as its pattern has them and aborts at the game's start without them (the class of LEGO Batman 2 and Balloon Fight). The tested functions of
+#    azl/gsp_wrapper.hpp (Tests/gsp_wrapper_test.cpp, TestFrameworkSites) find them before the scan and keep them out of it.
+need Sources/ctr/hook.cpp '    g_framework_site_count = FindFrameworkSites(ReadGameWord, nullptr, first, end, g_framework_sites, kMaxFrameworkSites);' "the framework's own sites are found in the whole text"
+need_order Sources/ctr/hook.cpp '    g_framework_site_count = FindFrameworkSites(ReadGameWord, nullptr, first, end, g_framework_sites, kMaxFrameworkSites);' '        if (!IsHookSite(word, addr, g_framework_sites, g_framework_site_count, &framework_site)) {' "... before the scan of the sites, which keeps them out"
+region Sources/ctr/hook.cpp '        if (!IsHookSite(word, addr, g_framework_sites, g_framework_site_count, &framework_site)) {' '        }' | code_of | tail -2 | head -1 | grep -q -x '            continue;' || fail "Sources/ctr/hook.cpp: a word that is not a site of the hook (the framework's svc among them) is not skipped by the scan"
+[ "$(region Includes/azl/gsp_wrapper.hpp 'inline bool IsHookSite(' '}' | code_of | grep -c -x -F '    if (word == kSvcSendSyncRequestWord) {')" = "1" ] && \
+  need_after Includes/azl/gsp_wrapper.hpp '            if (framework[i] == address) {' '                return false;' "a framework's svc 0x32 is not a site of the hook" || fail "Includes/azl/gsp_wrapper.hpp: IsHookSite no longer looks for the framework's svc 0x32 among the sites"
+need_stmt Tests/gsp_wrapper_test.cpp 'TestFrameworkSites();' "the GSP test runs the framework's sites and the filter of the hook's on an image with both wrappers"
+# 2. Every real svc 0x32 / 0x23 the game makes through the hook is made by the gate (Sources/ctr/gate.s), in its page, uncounted: a thread asleep in it holds
+#    nothing of the plugin and wakes up on the gate's own instructions. None from the plugin's code on a game thread (Tests/callgraph_check.py follows the
+#    calls of the built ELF; this is the text).
+hit=$(for f in $(grep -rlE 'svc[[:space:]]+#?0x(32|23)\b' Sources Includes | grep -v '^Sources/ctr/gate\.s$'); do
+        tr -d '\r' < "$f" | sed 's://.*$::; s:@.*$::' | grep -nE '^[[:space:]]*svc[[:space:]]+#?0x(32|23)\b|("|\\[nt])[[:space:]]*svc[[:space:]]+#?0x(32|23)\b' | sed "s:^:$f\::"
+      done | head -2)
+[ -z "$hit" ] || fail "a svc 0x32 / 0x23 in the plugin's code besides the gate's (Sources/ctr/gate.s): $hit"
+hit=$(tr -d '\r' < Sources/ctr/hook.cpp | awk -v b="$GT_BEGIN" -v e="$GT_END" '$0 ~ b { on = 1; next } $0 ~ e { on = 0; next } on { l = $0; sub(/\/\/.*$/, "", l); if (l ~ /svc(SendSyncRequest|CloseHandle)[[:space:]]*\(/) print FNR ": " l }' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/hook.cpp: pre or post makes a real svc 0x32 / 0x23 itself (the gate makes the game's): $hit"
+need Sources/ctr/gate.s '    GATE azl_gate_32, 0x32, azl_gate_pre32, azl_gate_post32' "the gate's two entries make the two svc of the game"
+need Sources/ctr/gate.s '    GATE azl_gate_23, 0x23, azl_gate_pre23, azl_gate_post23' "the gate's two entries make the two svc of the game"
+# 3. SWAP_ENTER closes the gate outside every lock (a game's thread counted in the gate may wait for one: the close would wait for its whole budget), and what runs
+#    before it on the framework's thread (the trail) takes none either; CloseGate is called once, from there.
+# SWAP_ENTER's one deadline (risk O-B, analysis/piano-2026-11-08): begun at the event from the APT anchor, applied to every wait, ended after the answer
+need Sources/main.cpp '        azl::ctr::BeginSwapDeadline(azl::ctr::LastAptReceiveTick());' "SWAP_ENTER starts its one deadline from Luma3DS's event"
+need_order Sources/main.cpp '        azl::ctr::BeginSwapDeadline(azl::ctr::LastAptReceiveTick());' '    azl::ctr::ChatProcessEvent(static_cast<int>(event));' "the deadline begins before the chat's mirror waits"
+need Sources/ctr/hook.cpp '            __atomic_store_n(&g_apt_receive_tick, svcGetSystemTick(), __ATOMIC_RELAXED);' "the APT ReceiveParameter pre stores the anchor at every debug level"
+need Sources/ctr/swap_gate.cpp '    const u32 budget_ms = SwapClampMs(timeout_ms); // (the one deadline of SWAP_ENTER: SwapClampMs)' "the plugin's threads' wait takes the deadline"
+need Sources/ctr/hook.cpp '    const u32 budget_ms = SwapClampMs(timeout_ms); // (the one deadline of SWAP_ENTER, ctr/swap_gate.hpp)' "the hooks' drain takes the deadline"
+need Sources/ctr/plugin.cpp '    const u32 budget_ms = SwapClampMs(timeout_ms); // (SWAP_ENTER'"'"'s one deadline, ctr/swap_gate.hpp; no deadline: the budget as given)' "the trail's wait takes the deadline"
+need Sources/ctr/input_mirror.cpp '    const u64 left = SwapTicksLeft(); // (SWAP_ENTER'"'"'s one deadline, ctr/swap_gate.hpp; none at EXIT: the full second)' "the mirror's wait takes the deadline"
+need_order Sources/ctr/plugin.cpp '            CloseSwapGate(kSwapGateTimeoutMs);' '                WaitGateDrained();' "a game's thread still in the hook is waited for with what is left of the deadline"
+need_order Sources/ctr/plugin.cpp '                WaitGateDrained();' '            EndSwapDeadline();' "the deadline ends after the answer's last wait"
+[ "$(grep -c 'kSwapDeadlineMs = 8000;' Includes/ctr/swap_gate.hpp)" = "1" ] || fail "Includes/ctr/swap_gate.hpp: SWAP_ENTER's deadline is no longer 8 s from Luma3DS's event (Rosalina waits 10 s, or 15 s raised)"
+# The fake sessions with the gate shut (risk O-A, analysis/piano-2026-11-08): the gate answers a svc 0x32 on one itself and only marks a
+# svc 0x23; the plugin fills the table under UdsHle'"'"'s lock and settles the closes on Plugin::Tick, by asking the kernel
+need Sources/ctr/gate.s '    GATE azl_gate_32, 0x32, azl_gate_pre32, azl_gate_post32, 1' "svc 0x32's gate answers the fake sessions with the flag 0"
+need Sources/ctr/gate.s '    GATE azl_gate_23, 0x23, azl_gate_pre23, azl_gate_post23, 2' "svc 0x23's gate marks the fake sessions closed with the flag 0"
+need Sources/ctr/gate.s '    cmp   r0, #0                      @ (handle 0: never a fake one)' "handle 0 never matches a free slot"
+need Sources/ctr/gate.s '    bne   8b                          @ (the slot itself is the plugin'"'"'s alone: it stays as it is)' "the gate never writes a slot of the fake sessions"
+need Sources/ctr/gate.s '    DMB   r1                          @ the handle read before its result (the plugin writes the result, then the handle)' "the gate reads a slot's handle before its result (no emulator sees a missing barrier)"
+need Sources/ctr/gate.s '    bne   5f                          @ closed while shut: the value may name something else now, the kernel answers' "a slot closed while shut is not answered by the gate"
+need Sources/ctr/uds_hle.cpp '    GateFakeRemove(handle); // (the gate'"'"'s table of the fake sessions: written under this lock only)' "a forgotten fake session leaves the gate's table"
+need Sources/ctr/uds_hle.cpp '        if (GateFakeAdd(fake, shut_result) < 0) {' "a new fake session goes into the gate's table"
+need_order Sources/ctr/uds_hle.cpp '        fake_[slot] = fake;' '        if (GateFakeAdd(fake, shut_result) < 0) {' "the session is in the HLE's table, under its lock, before the gate's"
+need Sources/ctr/plugin.cpp '    SettleGateFakeClosed(); // (the fake sessions the game closed while the gate was shut: one load when there is none)' "Plugin::Tick settles the fake sessions closed with the gate shut"
+need Sources/ctr/hook.cpp '        if (R_FAILED(svcClearEvent(handle))) {' "a fake session closed with the gate shut is forgotten only once the kernel says it is gone"
+need Sources/ctr/hook.cpp '            __atomic_store_n(&slot.handle, handle, __ATOMIC_RELEASE); // (the result is there before the gate can match the handle)' "the slot's result is written before its handle"
+[ "$(grep -c 'kSwapDeadlineRaisedMs = 12500;' Includes/ctr/swap_gate.hpp)" = "1" ] || fail "Includes/ctr/swap_gate.hpp: SWAP_ENTER's deadline with Rosalina's wait raised to 15 s is no longer 12.5 s"
+need Sources/ctr/plugin.cpp '    SetSwapDeadlineRaised(rosalina_wait_raised_); // (SWAP_ENTER'"'"'s deadline follows Luma3DS'"'"'s wait)' "the deadline follows Rosalina's wait once it is raised"
+# The exit guard (REGISTRO phase Q): a New 3DS only, the word read and written through Luma's uncached alias, the guard on its own stack,
+# its line in a file of its own; the tests that prove it are run
+need Sources/ctr/plugin.cpp '    if (!swap_console_ && loader_linked) {' "the alias of Luma's word is looked for on a New 3DS linked to the loader only"
+need Sources/ctr/plugin.cpp '            if (!swap_console_ && luma_alias_ && hook_stats_.gate_ready) {' "the exit guard is installed on a New 3DS with the gate and the alias only (never on an Old 3DS: the guard is in the block the swap takes away)"
+need Sources/ctr/plugin.cpp 'constexpr const char* kLumaLogPath = "/3ds/3DSLink/AzaharLink.luma.log";' "the guard's line goes to a file of its own (the writer appends to the main log)"
+need Sources/ctr/plugin.cpp '                                                reinterpret_cast<u32>(g_exit_guard_stack) + sizeof(g_exit_guard_stack));' "the guard runs on the plugin's own stack, not the exiting thread's"
+need Sources/ctr/hook.cpp '    if (svcGetSystemInfo(&emulator, 0x20000, 0) == 0) {' "no alias, and so no guard, on an emulator"
+need Sources/ctr/hook.cpp '        const u32 bytes = PageCount(g_site_count + (reserve_exit_tramp ? kExitTrampStubs : 0), blob.bytes) * kGatePageBytes; // (+ the exit guard'"'"'s trampoline, InstallExitGuard: a New 3DS only)' "the gate's page keeps room for the exit guard's trampoline, on a New 3DS only"
+need Sources/ctr/plugin.cpp '            hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' "the reserve for the trampoline only where the guard goes"
+need Includes/ctr/hook.hpp '    return *g_luma_word_ptr;' "the probes read Luma's word through the alias Luma writes (phase O read the cached copy)"
+need Includes/azl/exit_guard.hpp '        return Action::Leave; // (not a state Luma3DS writes: never written over)' "a value that is not Luma's state is never written over"
+need Includes/azl/exit_guard.hpp 'constexpr u32 kWaitBudgetMs = 1000;' "the guard waits 1 s at most (the system gives a closing game about 3 s)"
+need Tests/run.sh '  "$OUT/exit_guard_test"' "the exit guard runs against the model of Luma3DS"
+need Tests/stack_usage.sh '    "$PY" Tests/hook_sim/exit_tramp_sim.py "$WORK/gate" || FAILED=1' "the exit guard's trampoline runs in the emulator"
+# The chat says who came into the room and who left it (2026-11-08, asked by the testers): from the list of members, on the network thread
+need Sources/ctr/plugin.cpp '                sink->OnPresence(c.nickname.data(), c.nickname.size(), c.joined, now_ms);' "the chat tells who comes and goes"
+need_order Sources/ctr/plugin.cpp 'void Plugin::OnRoomInfo(const room::RoomInfo& info) {' '    NoteRoomMembers(info);' "the presence lines are pushed on the network thread (the room's list of members), the chat ring's one writer"
+# Old 3DS: Rosalina's wait for the answer raised to 15 s in the plugin's own header, only from the exact 10 s Luma3DS writes
+need Sources/ctr/plugin.cpp '    if (*wait_ns != kRosalinaReplyWaitNs) {' "Rosalina's wait is raised only from the 10 s Luma3DS writes"
+need Sources/ctr/plugin.cpp 'constexpr u64 kRosalinaReplyWaitRaisedNs = 15000000000ull;  // Old 3DS: 15 s' "Rosalina's wait raised to 15 s"
+need Sources/ctr/plugin.cpp '    if (swap_console_ && loader_linked) {' "Rosalina's wait is raised only on an Old 3DS linked to the plugin loader"
+hit=$(region Sources/ctr/plugin.cpp 'void Plugin::NoteProcessEvent(int event) {' '            const u32 gate_left = CloseGate(kSwapDrainTimeoutMs, dlp_hub_ ? &WakeHubForSwap : nullptr, dlp_hub_.get());' | code_of | grep -E 'LockGuard|\.lock\(\)|LightLock_Lock|RecursiveLock_Lock|TakePatchLock|SwapGateScope|GateEnter|TryLockBriefly|CloseSwapGate' | head -1)
+[ -z "$hit" ] || fail "Sources/ctr/plugin.cpp: SWAP_ENTER takes a lock (or stops the plugin's threads) before it closes the svc hook's gate: $hit"
+for fn in 'void Plugin::WaitForTrail(u32 timeout_ms) {' 'void Plugin::NoteSwapToTrail(u32 kind, u32 number) {'; do
+  hit=$(region Sources/ctr/plugin.cpp "$fn" '}' | code_of | grep -E 'LockGuard|\.lock\(\)|LightLock_Lock|RecursiveLock_Lock|TakePatchLock|SwapGateScope|GateEnter' | head -1)
+  [ -z "$hit" ] || fail "Sources/ctr/plugin.cpp: $fn, which SWAP_ENTER runs before it closes the gate, takes a lock: $hit"
+done
+hit=$(region Sources/ctr/hook.cpp 'u32 CloseGate(u32 timeout_ms, void (*wake)(void*), void* arg) {' '}' | code_of | grep -E 'LockGuard|\.lock\(\)|LightLock_Lock|RecursiveLock_Lock|TakePatchLock' | head -1)
+[ -z "$hit" ] || fail "Sources/ctr/hook.cpp: CloseGate takes a lock: $hit"
+[ "$(cat Sources/ctr/*.cpp Sources/*.cpp | tr -d '\r' | code_of | grep -c 'CloseGate(kSwapDrainTimeoutMs,')" = "1" ] || fail "CloseGate is called from somewhere else than SWAP_ENTER"
+need_after Sources/ctr/hook.cpp '            if (!woken && wake != nullptr) { // (a thread counted in the gate that sleeps in slices: its slice ends now)' '                wake(arg);' "the close wakes the hub's queue at its first look, with the flag already 0"
+# 4. The gate opens only once the block is mapped again: the framework's reply to Luma3DS returns then (the first statement of the wrap), OnSwapBack opens it after
+#    it, and SWAP_EXIT again (idempotent). Nowhere else.
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | awk 'p { print; exit } index($0, "extern \"C\" void __wrap_PLGLDR__Reply(s32 event) {") { p = 1 }')" = '    __real_PLGLDR__Reply(event);' ] || fail "Sources/ctr/plugin.cpp: the wrap of PLGLDR__Reply does something before the framework's reply (the block is mapped only when it returns)"
+OPENERS=$(grep -rn --include='*.cpp' 'OpenGate()' Sources | awk '{ f = $0; sub(/:.*$/, "", f); l = $0; sub(/^[^:]*:[0-9]*:/, "", l); sub(/\/\/.*$/, "", l); if (index(l, "OpenGate()") && !index(l, "void OpenGate()")) n[f]++ } END { for (f in n) print n[f], f }' | sort | tr '\n' ' ')
+[ "$OPENERS" = "2 Sources/ctr/plugin.cpp " ] || fail "OpenGate is called in '$OPENERS', expected twice in Sources/ctr/plugin.cpp (OnSwapBack, after the framework's reply, and SWAP_EXIT)"
+# 5. Every wait a game thread can make in the plugin's code (in pre, in the HLE, in post) ends when the gate closes, or is shorter than 20 ms: the swap waits
+#    1.5 s for the threads counted in the gate and the block goes after it. The waits of the engine and the hub are pinned above (kGateSliceMs, the scan, Post);
+#    Tests/callgraph_check.py lists every wait reachable in the built ELF, with its reason (WAITS_ALLOWED), and fails on a new one.
+need_after Sources/ctr/uds_hle.cpp '    while (!hub.PollPending(cmd)) {' '        const bool closing = GateClosing();' "the wait for a join (8 s) looks at the gate at every slice"
+need Sources/ctr/uds_hle.cpp '        if (closing || platform::NowMs() >= deadline) {' "... and ends at once when it closes, as at its cap"
+need_line Sources/ctr/uds_hle.cpp 'constexpr s64 kDlpJoinSleepNs = 10 * 1000 * 1000;' "the join's slice is 10 ms (under the 20 ms a wait may take past the close)"
+need_after Sources/ctr/uds_hle.cpp '    if (!GateClosing()) { // (not while the swap of the plugin' '        svcSleepThread(kFailPauseNs);' "the pause of a thread that keeps failing is not made while the gate closes"
+need Sources/ctr/uds_hle.cpp '    constexpr s64 kFailPauseNs = 500000;' "... and it is half a millisecond"
+need_after Sources/ctr/hook.cpp '    if (kind == kAptNoteFatal && !GateClosing()) {' '        svcSleepThread(50000000LL);' "the 50 ms a fatal error gives the trail are not taken while the gate closes"
+need Includes/azl/dlp_hub.hpp '    static constexpr u32 kSliceMs = 100;' "the hub's queue sleeps in slices of 100 ms, which the close of the gate ends (WakeForSwap, at CloseGate's first look)"
+need Tests/callgraph_check.py "    bad += check_waits(funcs, dem, quiet)" "the call graph check holds every wait a game thread can reach to the list of the guarded or short ones"
+need Tests/callgraph_check.py "WAIT_PRIMITIVES = ('svcSleepThread', 'svcWaitSynchronization', 'svcWaitSynchronizationN', 'LightLock_Lock', 'RecursiveLock_Lock', 'LightEvent_Wait'," "the waits the call graph check looks for"
+need Tests/callgraph_check.py "GAME_SVCS = ('svcSendSyncRequest', 'svcCloseHandle')" "... and the game's two svc, which only the gate makes"
+need Tests/callgraph_mutants.py "('W1 a sleep in a helper of PassThroughPre" "the call graph's mutants hold a wait in pre"
+need Tests/callgraph_mutants.py "('W2 a 30 ms sleep in the engine" "... a wait in the HLE proper, past the cut of the formatters"
+need Tests/callgraph_mutants.py "('W3 the plugin makes the game" "... and the game's CloseHandle made by the plugin"
+# 6. Between pre and post the context is values only (a swap during the svc skips the post: a pointer into the plugin's block would outlive it), ctx[3] is the
+#    gate's, and nothing pre takes waits for post to give it back: the table of the traced sessions takes its entries in post only.
+hit=$(tr -d '\r' < Sources/ctr/hook.cpp | awk -v b="$GT_BEGIN" -v e="$GT_END" '$0 ~ b { on = 1; next } $0 ~ e { on = 0; next } on { l = $0; sub(/\/\/.*$/, "", l); if (l ~ /ctx\[3\][[:space:]]*=[^=]/ || (l ~ /ctx\[[0-2]\][[:space:]]*=[^=]/ && l ~ /reinterpret_cast|&|->|\.c_str|traced[^-]/)) print FNR ": " l }' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/hook.cpp: pre carries something else than a value to post in the context (or writes the gate's ctx[3]): $hit"
+[ "$(grep -c 'Result PassThrough[A-Za-z]*Post(Result rc, const u32\* ctx) {' Sources/ctr/hook.cpp)" = "5" ] || fail "Sources/ctr/hook.cpp: a post that may write the context, or a sixth post (the five read ctx[0..2] as pre left them)"
+for take in 'g_traced.Add(session, name, apt);' 'g_traced.Opened(session);'; do
+  [ "$(tr -d '\r' < Sources/ctr/hook.cpp | code_of | grep -c -F "${take%%(*}(")" = "1" ] && region Sources/ctr/hook.cpp '__attribute__((noinline)) Result PassThroughGetServicePost(Result rc, const u32* ctx) {' '}' | grep -q -F "$take" || \
+    fail "Sources/ctr/hook.cpp: '$take' is made somewhere else than in the post of GetServiceHandle (an entry taken in pre would stay taken when a swap skips the post)"
+done
+need_after Sources/ctr/hook.cpp '__attribute__((noinline)) Result PassThroughTracedPost(Result rc, const u32* ctx) {' '    const TracedSession* traced = FindTraced(ctx[0]);' "the traced session is looked up again after the call, by its handle"
+# 7. The gate's page is never in CTRPF's and Luma's page (0x01E80000, 0x2000 bytes): ChooseAddress starts with the page's end at 0x01E80000 and only goes down
+#    (the three ways it moves; Tests/gate_plan_test.cpp runs it on the maps of 36 launches and on the case of that page not mapped yet).
+need Includes/azl/gate_plan.hpp 'constexpr u32 kGateCeiling = 0x01E80000;' "the gate's page ends at or below CTRPF's page"
+need Includes/azl/gate_plan.hpp '    u32 top = kGateCeiling; // the highest end the page may have' "ChooseAddress starts under CTRPF's page"
+need Includes/azl/gate_plan.hpp '        const u32 base = top - size;' "the page ends at top"
+TOPS=$(region Includes/azl/gate_plan.hpp 'inline u32 ChooseAddress(Query query,' '}' | code_of | grep -E '^[[:space:]]*top[[:space:]]*[-+]?=' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '\n' '|')
+[ "$TOPS" = 'top = span.base & ~(kGatePageBytes - 1);|top = (span.base + span.size) & ~(kGatePageBytes - 1);|top = reach_top < top ? reach_top : top - kGatePageBytes;|' ] || fail "Includes/azl/gate_plan.hpp: ChooseAddress moves the page's end otherwise than down ($TOPS)"
+need Tests/gate_plan_test.cpp 'never in 0x01E80000-0x01E82000' "the test of the place with CTRPF's page not mapped yet"
+need Sources/ctr/gate_page.cpp 'const u32 address = ChooseAddress(QuerySpan, min_site, max_site, bytes, &place);' "the console takes the place the tested ChooseAddress gives"
+# 8. An Old 3DS has no alias of the plugin's memory (the swap takes it away under a thread asleep in the gate: the defect itself). Four ways out of
+#    ChooseGateWay (azl/gate_plan.hpp, Tests/gate_plan_test.cpp): Azahar the alias; from Luma3DS 13.0 svc 0xA3 on an Old AND a New 3DS (an alias is
+#    out of the kernel's books while the game's process outlives the plugin's block: an application started then that sizes its memory to the byte
+#    fails at its start, 3DS Link on a New 3DS XL, 1.1.2); before 13.0 the alias on a New 3DS (no swap there; svc 0xA3 may not be there) and nothing on
+#    an Old 3DS. A SYSTEM page that failed has NO fallback, on an Old and a New 3DS alike: no hooks for that launch (on a New 3DS the alias is never unmapped
+#    and outlives the game: "Cannot map plugin memory" at every start until a reboot, console 63, 2026-11-06; the alias only where ChooseGateWay gives it).
+#    The SYSTEM page goes on the kernel's books at once, after svc 0xA3 and before anything else (no game thread runs yet), and the limit comes back
+#    down only once the game has its heap (LateInit), except on a New 3DS in memtype 6, where pm puts it back at the end of every application.
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'return Alias(')" = "1" ] || fail "Sources/ctr/gate_page.cpp: the alias of the plugin's memory is taken in another case than the way ChooseGateWay gives (a fallback on it outlives the game)"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'MapProcessMemoryEx5(')" = "2" ] || fail "Sources/ctr/gate_page.cpp: the plugin's memory is mapped outside Alias"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'Alias(')" = "2" ] || fail "Sources/ctr/gate_page.cpp: Alias is called elsewhere than in the way ChooseGateWay gives (a fallback on it outlives the game)"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'IsNew3DS')" = "2" ] || fail "Sources/ctr/gate_page.cpp: the New 3DS is asked of the framework elsewhere than for is_new and SettleGateBooks"
+region Sources/ctr/gate_page.cpp '    const char* fail = nullptr;' '}' | code_of | grep -q -E 'Alias\(|MapProcessMemory|IsNew3DS' && fail "Sources/ctr/gate_page.cpp: a branch of the SYSTEM page's attempt takes the alias or tells a New 3DS apart"
+need_line Sources/ctr/gate_page.cpp '    const bool is_new = CTRPluginFramework::System::IsNew3DS();' "the New 3DS from the framework"
+need Sources/ctr/gate_page.cpp '    const GateWay way = ChooseGateWay(CTRPluginFramework::System::IsCitra(), is_new, luma_version, &reason);' "the way from the framework's Azahar and New 3DS and from Luma3DS's version"
+#    no fallback: is_new only for ChooseGateWay, SettleNeeded and the drift (six lines: its definition, ChooseGateWay, SettleNeeded, SettleDrift's call,
+#    SettleDrift's parameter and its DriftReference), never a test of its own; the failure's branch is the same for an Old and a New 3DS, with no alias
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'is_new')" = "6" ] || fail "Sources/ctr/gate_page.cpp: is_new is used otherwise than for ChooseGateWay, SettleNeeded and the drift's reference (a fallback of a New 3DS?)"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c -E 'if \(!?is_new')" = "0" ] || fail "Sources/ctr/gate_page.cpp: a test of is_new in TakeGatePage (the failure of the SYSTEM page is the same on an Old and a New 3DS: no hooks)"
+FAIL_BRANCH=$(region Sources/ctr/gate_page.cpp '    // No SYSTEM page, and no RaiseBooks' '}' | code_of)
+[ -n "$FAIL_BRANCH" ] || fail "Sources/ctr/gate_page.cpp: the branch of a failed SYSTEM page is no longer found"
+printf '%s\n' "$FAIL_BRANCH" | grep -q -E 'is_new|Alias|MapProcessMemory|IsNew3DS' && fail "Sources/ctr/gate_page.cpp: the branch of a failed SYSTEM page takes the alias or tells a New 3DS apart (an alias outlives the game)"
+printf '%s\n' "$FAIL_BRANCH" | grep -q -x -F '    *why = fail;' || fail "Sources/ctr/gate_page.cpp: a failed SYSTEM page does not say why on the screen"
+printf '%s\n' "$FAIL_BRANCH" | grep -q -x -F '    return GatePage{};' || fail "Sources/ctr/gate_page.cpp: a failed SYSTEM page does not end with no page"
+grep -rn -F 'kSystemFallbackReason' Sources Includes Tests/gate_plan_test.cpp >/dev/null && fail "the reason of the alias of a New 3DS whose SYSTEM page failed is back (there is no such fallback)"
+need Tests/gate_plan_test.cpp '    const char* reasons[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};' "the plan's test tells the reasons apart: Azahar, a New and an Old 3DS before and from Luma3DS 13.0"
+need Tests/gate_plan_test.cpp '            CHECK(reasons[i] != nullptr && reasons[j] != nullptr && std::strcmp(reasons[i], reasons[j]) != 0);' "... two by two"
+need Tests/gate_plan_test.cpp '        for (int j = i + 1; j < 5; ++j) {' "... every pair of the five"
+need_after Sources/ctr/gate_page.cpp '    *why = fail;' '    Log("gate: no hooks: SYSTEM page failed: %s (0x%08lx, %lu bytes at 0x%08lx): no other page is taken (never the alias)", fail,' "... and says so in the log, with the words the sheet of the test looks for"
+need_order Sources/ctr/gate_page.cpp '    if (!FindBooks()) {' '    *why = fail;' "... only once the SYSTEM page was tried"
+need_order Sources/ctr/gate_page.cpp '        } else if (!RaiseBooks(bytes, &rc)) {' '    *why = fail;' "... after the one branch that raises the books"
+region Sources/ctr/gate_page.cpp '            page.books_raised = true;' '        }' | code_of | grep -q -x '            return page;' || fail "Sources/ctr/gate_page.cpp: the branch that raised the books goes on to the failure's branch (no hooks with the books raised by a page that is not the gate's)"
+#    A Raise the kernel refuses (rc: its result, in the line of the failure) frees the page again with svc 0xA3, which leaves the books alone, and goes on to
+#    no hooks like any other failure there: never a SYSTEM page off the books (the next game's budget lost at this one's end, Tests/kernel_books_test.cpp TestRaiseRefused).
+RAISE_FAIL=$(region Sources/ctr/gate_page.cpp '        } else if (!RaiseBooks(bytes, &rc)) {' '        } else {' | code_of)
+printf '%s\n' "$RAISE_FAIL" | grep -q -x -F '            const Result freed = svcControlMemoryUnsafe(&ignored, address, bytes, MEMOP_FREE, static_cast<MemPerm>(0));' || \
+  fail "Sources/ctr/gate_page.cpp: a page whose Raise failed is not freed with svc 0xA3 (a SYSTEM page left off the books)"
+printf '%s\n' "$RAISE_FAIL" | grep -q -E 'return|books_raised|g_settle_owed|GatePageKind::System|RaiseBooks\(bytes[^)]*\)\)? *;' && fail "Sources/ctr/gate_page.cpp: the branch of a failed Raise keeps the page, owes a Settle or raises again"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'books_raised = ')" = "1" ] || fail "Sources/ctr/gate_page.cpp: books_raised is set elsewhere than in the branch whose RaiseBooks was made"
+need_after Sources/ctr/gate_page.cpp '        } else {' '            page.books_raised = true;' "the branch after a RaiseBooks that was made is the one that keeps the page"
+need Sources/ctr/gate_page.cpp '    if (R_FAILED(svcGetSystemInfo(&luma, 0x10000, 0))) {' "... Luma3DS's version from Luma3DS itself (0 without it)"
+need Sources/ctr/gate_page.cpp '    const u32 luma_version = static_cast<u32>(luma);' "... and that is the version the way is chosen with"
+need_after Sources/ctr/gate_page.cpp '    if (way == GateWay::Alias) {' '        return Alias(address, bytes, reason, why);' "the alias only where ChooseGateWay gives it"
+region Sources/ctr/gate_page.cpp '    if (way == GateWay::None) {' '    }' | code_of | grep -q '        return page;' || fail "Sources/ctr/gate_page.cpp: an Old 3DS with a Luma3DS before 13.0 goes on to svc 0xA3"
+need_order Sources/ctr/gate_page.cpp '    if (way == GateWay::None) {' '    if (!FindBooks()) {' "... and the books and svc 0xA3 come after that test"
+need_order Sources/ctr/gate_page.cpp '    if (!FindBooks()) {' '    return GatePage{};' "an Old or New 3DS where the SYSTEM page failed has no page and no hooks"
+need_line Includes/azl/gate_plan.hpp 'constexpr u32 kLumaWithControlMemoryUnsafe = 13u << 24;' "svc 0xA3 from Luma3DS 13.0 (its plugin loader takes the block of an Old 3DS with it)"
+need_after Includes/azl/gate_plan.hpp '    if (citra) {' '        return GateWay::Alias;' "Azahar takes the alias"
+need_after Includes/azl/gate_plan.hpp '    if (luma_version < kLumaWithControlMemoryUnsafe) {' '        if (is_new) {' "before Luma3DS 13.0 the New 3DS is asked first"
+need_after Includes/azl/gate_plan.hpp '        if (is_new) {' '            return GateWay::Alias;' "... and a New 3DS before Luma3DS 13.0 takes the alias"
+WAYS=$(region Includes/azl/gate_plan.hpp 'inline GateWay ChooseGateWay(' '}' | code_of | grep -o -E 'if \([^{]*\) \{|return GateWay::[A-Za-z]+;' | tr '\n' '|')
+[ "$WAYS" = 'if (citra) {|return GateWay::Alias;|if (luma_version < kLumaWithControlMemoryUnsafe) {|if (is_new) {|return GateWay::Alias;|return GateWay::None;|return GateWay::System;|' ] || \
+  fail "Includes/azl/gate_plan.hpp: ChooseGateWay has other ways out than its four (Azahar the alias; before Luma3DS 13.0 a New 3DS the alias and an Old 3DS nothing; then the SYSTEM page, Old and New): $WAYS"
+need_stmt Tests/gate_plan_test.cpp 'TestChooseGateWay();' "the plan's test runs the way of every console and Luma3DS"
+need_order Sources/ctr/gate_page.cpp '    if (!FindBooks()) {' '        rc = svcControlMemoryUnsafe(&out, address, bytes, static_cast<MemOp>(MEMOP_ALLOC | MEMOP_REGION_SYSTEM),' "no SYSTEM page without the kernel's books found"
+need_after Sources/ctr/gate_page.cpp '            fail = "the page is not where it was asked";' '        } else if (!RaiseBooks(bytes, &rc)) {' "the books are raised right after the page is taken and found where it was asked"
+need_order Sources/ctr/gate_page.cpp '        rc = svcControlMemoryUnsafe(&out, address, bytes,' '        } else if (!RaiseBooks(bytes, &rc)) {' "... after svc 0xA3"
+need_order Sources/ctr/gate_page.cpp '        } else if (!RaiseBooks(bytes, &rc)) {' '            page.kind = GatePageKind::System;' "... before the page is the gate's"
+need_after Sources/ctr/gate_page.cpp 'void SettleGateBooks(const GatePage& page) {' '    if (page.kind != GatePageKind::System || !page.books_raised) {' "only a SYSTEM page whose books were raised is settled"
+#    ... and not on a New 3DS in memtype 6 (pm resets the limit at the end of every application): out before WaitForGameHeap and SettleBooks
+need_line Includes/azl/books_math.hpp 'inline bool SettleNeeded(bool is_new, u32 app_memtype) {' "who owes the Settle, in the tested books_math.hpp"
+need_line Includes/azl/books_math.hpp '    return !(is_new && app_memtype == 6);' "... everyone but a New 3DS in memtype 6"
+need_line Sources/ctr/gate_page.cpp '    if (!books::SettleNeeded(CTRPluginFramework::System::IsNew3DS(), OS_KernelConfig->app_memtype)) {' "SettleGateBooks asks SettleNeeded with the framework's New 3DS and the kernel's app_memtype"
+region Sources/ctr/gate_page.cpp '    if (!books::SettleNeeded(' '    }' | code_of | grep -q -x '        return;' || fail "Sources/ctr/gate_page.cpp: a New 3DS in memtype 6 settles the books all the same"
+need_order Sources/ctr/gate_page.cpp '    if (page.kind != GatePageKind::System || !page.books_raised) {' '    if (!books::SettleNeeded(' "... asked in SettleGateBooks"
+need_order Sources/ctr/gate_page.cpp '    if (!books::SettleNeeded(' '    if (!WaitForGameHeap()) {' "... before the wait for the game's heap"
+need_order Sources/ctr/gate_page.cpp '    if (!books::SettleNeeded(' '    const bool settled = SettleBooks(owed);' "... and before the Settle"
+need_stmt Tests/kernel_books_test.cpp 'TestSettleNeeded();' "the books' test asks SettleNeeded of every console and memtype"
+need_stmt Tests/kernel_books_test.cpp 'TestNewMemtype6RaiseOnly();' "... and plays a New 3DS in memtype 6 with Raise only"
+need_order Sources/ctr/gate_page.cpp '    if (!WaitForGameHeap()) {' '    const u32 owed = books::TakeOwed(&g_settle_owed);' "the limit comes down only once the game has its heap"
+need_after Sources/ctr/gate_page.cpp '    const u32 owed = books::TakeOwed(&g_settle_owed);' '    if (owed == 0) {' "... and only with the bytes still owed (the EXIT event may have settled them)"
+region Sources/ctr/gate_page.cpp '    if (owed == 0) {' '    }' | code_of | grep -q -x '        return;' || fail "Sources/ctr/gate_page.cpp: SettleGateBooks settles what the EXIT event has settled already"
+need_order Sources/ctr/gate_page.cpp '    if (owed == 0) {' '    const bool settled = SettleBooks(owed);' "... and settles what it took"
+region Sources/ctr/gate_page.cpp '    if (!WaitForGameHeap()) {' '    }' | code_of | grep -q '        return;' || fail "Sources/ctr/gate_page.cpp: with no heap of the game seen the books are settled all the same"
+#    On an Old 3DS (and a New 3DS in memtype 7) the limit of the applications outlives the process (pm writes it only at boot): a launch that ended between RaiseBooks and its
+#    Settle with no EXIT event (killed while the plugin is swapped out, a crash) left it raised until a reboot. The next launch takes that drift back before it
+#    raises the books (books::Drift against books::DriftReference, the limit of boot: the region's size on a New 3DS, where Rosalina has taken the plugin's block
+#    off APPMEMALLOC, APPMEMALLOC on an Old 3DS; at most 1 MiB; Tests/kernel_books_test.cpp). Not on a New 3DS in memtype 6, where pm puts the limit back itself.
+need_order Sources/ctr/gate_page.cpp '    if (!FindBooks()) {' '        const bool settle_needed = books::SettleNeeded(is_new, OS_KernelConfig->app_memtype);' "who owes the Settle is asked once the books are found"
+need_after Sources/ctr/gate_page.cpp '        const bool settle_needed = books::SettleNeeded(is_new, OS_KernelConfig->app_memtype);' '        if (settle_needed) {' "... and the drift is taken back only where Settle is owed"
+need_after Sources/ctr/gate_page.cpp '        if (settle_needed) {' '            SettleDrift(is_new); // (before this launch raises the books: what an earlier one left there)' "an Old 3DS (a New 3DS in memtype 7) takes back the drift of the limit once the books are found"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'SettleDrift(is_new);')" = "1" ] || fail "Sources/ctr/gate_page.cpp: SettleDrift is called elsewhere than under settle_needed"
+need_order Sources/ctr/gate_page.cpp '            SettleDrift(is_new); // (before this launch raises the books: what an earlier one left there)' '        rc = svcControlMemoryUnsafe(&out, address, bytes,' "... before its own page and its own raise"
+need Sources/ctr/gate_page.cpp '    const u32 appmemalloc = static_cast<u32>(osGetMemRegionSize(MEMREGION_APPLICATION)); // (APPMEMALLOC, 0x1FF80040)' "APPMEMALLOC, the limit pm set at boot on an Old 3DS"
+need Sources/ctr/gate_page.cpp '    if (R_FAILED(svcGetSystemInfo(&region, 0x10000, 0x80)) || region <= 0 || region >= 0x40000000) {' "the region's size from Luma3DS (0 when it does not answer)"
+need Sources/ctr/gate_page.cpp '    const u32 reference = books::DriftReference(is_new, static_cast<u32>(region), appmemalloc);' "the reference of the drift by the tested books::DriftReference"
+need Sources/ctr/gate_page.cpp '    const s32 drift = books::Drift(limit, reference);' "... and the drift by the tested books::Drift"
+need_line Includes/azl/books_math.hpp '    return is_new && region_size != 0 ? region_size : appmemalloc;' "the region's size on a New 3DS (APPMEMALLOC there is short of the plugin's block), APPMEMALLOC on an Old 3DS or without an answer"
+need_stmt Tests/kernel_books_test.cpp 'TestDriftReference();' "the books' test measures the drift of a New 3DS in memtype 7 against the region, and an Old 3DS against APPMEMALLOC"
+#    The Settle is owed once (g_settle_owed, set in TakeGatePage once the books are raised and Settle is owed): LateInit, SWAP_ENTER or the EXIT event, whichever comes
+#    first, takes it with one exchange (books::TakeOwed). The EXIT event (the framework's keep-alive thread, the game in svcExitProcess and alive) settles a game closed
+#    before LateInit, and on an Old 3DS one closed from the HOME menu too (Luma3DS maps the plugin's block back, then sends EXIT: k11_extension SendSyncRequest.c,
+#    plgloader.c); SWAP_ENTER (an Old 3DS, HOME) is the net for an end with no EXIT event (a process killed, a block that does not come back), but only
+#    once the game's heap is seen (books::TakeOwedOnceHeapSeen: before it, a lower limit takes a page off the room the game sizes its heap with). The keep-alive thread
+#    answers Luma3DS: it never waits for the lock of the books (TrySettleOwedBooks: LightLock_TryLock, the bytes taken only under it; busy, they stay owed).
+need_line Includes/azl/books_math.hpp '    return __atomic_exchange_n(owed, 0u, __ATOMIC_SEQ_CST);' "what Settle owes is taken with one exchange: never twice"
+need_line Sources/ctr/gate_page.cpp '            __atomic_store_n(&g_settle_owed, settle_needed ? bytes : 0u, __ATOMIC_SEQ_CST);' "Settle is owed only where pm does not put the limit back"
+need_order Sources/ctr/gate_page.cpp '            page.books_raised = true;' '            __atomic_store_n(&g_settle_owed,' "... after the raise that was made"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'g_settle_owed')" = "6" ] || fail "Sources/ctr/gate_page.cpp: g_settle_owed is touched otherwise than by its definition, TakeGatePage's store, LateInit's TakeOwed, the EXIT's and SWAP_ENTER's TrySettleOwedBooks and SWAP_ENTER's first look"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'books::TakeOwed(&g_settle_owed);')" = "1" ] || fail "Sources/ctr/gate_page.cpp: the bytes owed are taken otherwise than by SettleGateBooks (LateInit) and TrySettleOwedBooks (the keep-alive thread)"
+[ "$(tr -d '\r' < Sources/ctr/gate_page.cpp | code_of | grep -c 'TrySettleOwedBooks(&g_settle_owed, ')" = "2" ] || fail "Sources/ctr/gate_page.cpp: the keep-alive thread settles otherwise than at the EXIT and at SWAP_ENTER"
+need_after Sources/ctr/gate_page.cpp 'void SettleGateBooksAtExit() {' '    const OwedSettle result = TrySettleOwedBooks(&g_settle_owed, true, &bytes);' "the EXIT event settles what is still owed, whatever the heap (nothing sizes one any more)"
+need_after Sources/ctr/gate_page.cpp 'void SettleGateBooksAtSwap() {' '    if (__atomic_load_n(&g_settle_owed, __ATOMIC_SEQ_CST) == 0) {' "SWAP_ENTER: one load at every HOME once the Settle is made"
+need_after Sources/ctr/gate_page.cpp '    if (__atomic_load_n(&g_settle_owed, __ATOMIC_SEQ_CST) == 0) {' '        return;' "... and nothing more then"
+need_line Sources/ctr/gate_page.cpp '    const OwedSettle result = TrySettleOwedBooks(&g_settle_owed, GameHeapSeen(), &bytes);' "SWAP_ENTER settles only once the game's heap is seen"
+for fn in 'void SettleGateBooksAtExit() {' 'void SettleGateBooksAtSwap() {'; do
+  region Sources/ctr/gate_page.cpp "$fn" '}' | code_of | grep -q -E 'Log\(|WaitForGameHeap|ReadBooks|SettleBooks\(|svcSleepThread|LightLock_Lock' && fail "Sources/ctr/gate_page.cpp: $fn writes a line or waits on the keep-alive thread"
+done
+need_line Includes/azl/books_math.hpp '    return heap_seen ? TakeOwed(owed) : 0u;' "the bytes owed are taken at SWAP_ENTER only once the game's heap is there"
+body=$(region Sources/ctr/kernel_books.cpp 'OwedSettle TrySettleOwedBooks(u32* owed, bool heap_seen, u32* bytes) {' '}' | code_of | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | sed -n '2,19p' | tr '\n' '|')
+[ "$body" = '*bytes = 0;|if (__atomic_load_n(owed, __ATOMIC_SEQ_CST) == 0) {|return OwedSettle::Nothing;|}|if (LightLock_TryLock(&g_books_lock) != 0) {|return OwedSettle::Busy;|}|const u32 take = books::TakeOwedOnceHeapSeen(owed, heap_seen);|if (take != 0) {|g_books.add = static_cast<s32>(take);|svcCustomBackdoor(reinterpret_cast<void*>(KernelSettleBooks));|}|LightLock_Unlock(&g_books_lock);|*bytes = take;|return take != 0 ? OwedSettle::Settled : heap_seen ? OwedSettle::Nothing : OwedSettle::NoHeap;|}|' ] || \
+  fail "Sources/ctr/kernel_books.cpp: TrySettleOwedBooks no longer only TRIES the lock of the books, takes the bytes owed under it (once the heap is seen) and settles them ($body)"
+need_after Sources/ctr/plugin.cpp '        if (event == kEventExit) {' '            SettleGateBooksAtExit();' "the EXIT event settles the books of the gate's page the game did not live to settle"
+need_order Sources/ctr/plugin.cpp 'void Plugin::NoteProcessEvent(int event) {' '            SettleGateBooksAtExit();' "... in the framework's event, before its answer to Luma3DS"
+[ "$(grep -rn --include='*.cpp' 'SettleGateBooksAtExit()' Sources | sed 's://.*$::' | grep -c 'SettleGateBooksAtExit()')" = "2" ] || fail "SettleGateBooksAtExit is called elsewhere than at the EXIT event (its definition and that one call)"
+need_order Sources/ctr/plugin.cpp '        if (event == kEventSwapEnter) {' '            SettleGateBooksAtSwap();' "SWAP_ENTER settles the books of a game that may be closed from the HOME menu"
+need_order Sources/ctr/plugin.cpp '            SettleGateBooksAtSwap();' '            const u32 gate_left = CloseGate(kSwapDrainTimeoutMs,' "... in the framework's event, before its answer to Luma3DS"
+need_order Sources/ctr/plugin.cpp '            SettleGateBooksAtSwap();' '        } else if (event == kEventSwapExit) {' "... at SWAP_ENTER only"
+[ "$(grep -rn --include='*.cpp' 'SettleGateBooksAtSwap()' Sources | sed 's://.*$::' | grep -c 'SettleGateBooksAtSwap()')" = "2" ] || fail "SettleGateBooksAtSwap is called elsewhere than at SWAP_ENTER (its definition and that one call)"
+need_order Sources/ctr/plugin.cpp 'void Plugin::Shutdown() {' '    LogGateBooksAtEvents(); // (what the EXIT event, or the last SWAP_ENTER, did with the books, if anything)' "the shutdown says what the EXIT event did with the books"
+need_after Sources/ctr/plugin.cpp '            if (i == kEventSwapEnter) {' '                LogGateBooksAtEvents(); // (what SWAP_ENTER did with the books, if anything)' "... and the writer what SWAP_ENTER did"
+need_stmt Tests/kernel_books_test.cpp 'TestDeathBeforeSettleWithExit();' "the books' test plays a game closed before LateInit, settled at its EXIT, and the claim taken once"
+need_stmt Tests/kernel_books_test.cpp 'TestOldClosedFromHome();' "... an Old 3DS closed from the HOME menu, settled at SWAP_ENTER after the heap, left owed before it"
+need_stmt Tests/kernel_books_test.cpp 'TestRaiseWhileTheGameBeforeEnds();' "... the Release of the application before between any two calls of the Raise"
+need_stmt Tests/kernel_books_test.cpp 'TestRaiseRefused();' "... and a page whose Raise failed, freed"
+region Sources/ctr/gate_page.cpp '    if (drift != 0) {' '    }' | code_of | grep -q 'SettleBooks(static_cast<u32>(drift));' || fail "Sources/ctr/gate_page.cpp: the drift is not taken back with SettleBooks"
+need_line Includes/azl/books_math.hpp 'constexpr s32 kMaxDrift = 1024 * 1024;' "the drift taken back is at most 1 MiB, under the 2 MiB of the smallest block MODE3 takes off APPMEMALLOC"
+need Includes/azl/books_math.hpp '    if (diff <= 0 || diff > kMaxDrift || diff % kDriftUnit != 0) {' "only a whole number of pages above APPMEMALLOC is a drift"
+need_stmt Tests/kernel_books_test.cpp 'TestDriftOfLaunchesThatDied();' "the books' test plays launches that die before the settle and the next one that takes the drift back"
+need_stmt Tests/kernel_books_test.cpp 'TestDriftBounds();' "... and what is not a drift"
+#    The KResourceLimit's mutex is never taken by the plugin (AV1, 2026-11-06: the kernel changes current[] under the object's KLightMutex, and a mutex taken
+#    from outside and let go with a plain store leaves a waiter of the other core asleep, KLightMutex::UnlockImpl's interrupt missing). current[] moves through
+#    the kernel's own calls first (books_math.hpp, Tests/kernel_books_test.cpp): current += X is svcControlMemory's ALLOC (the kernel reserves X, Kernel11
+#    ControlMemory) freed with svc 0xA3 (Luma3DS's FREE releases nothing); current -= X is svc 0xA3's ALLOC freed with svcControlMemory's FREE (the kernel
+#    releases X). Only limits[kCommit] is written in kernel mode, with the interrupts off (Luma3DS's svcHandler turns them on before the backdoor's function):
+#    the kernel writes limits[] only in SetLimitValue, which pm calls at boot and on a New 3DS in memtype 6, never while a game runs; Reserve reads it once.
+#    Raise lifts the limit, then reserves (refused: the limit back); Charge lifts it around the reservation only (written before it, back down after it).
+#    Only when the kernel answers that it has no pages (0xD86007F3, books::kNoPages: Monster Hunter XX on an Old 3DS holds the whole region, and the kernel's
+#    way alone left it with no socket block, no network) do Charge and Uncharge write current[kCommit] themselves, after the kernel's try: KernelChargeBooks,
+#    load-add-store with the interrupts off, the way of 1.0.13-1.1.1 (2026-11-06, the regression of the first AV1 fix). Never for another answer, never first.
+need Sources/ctr/kernel_books.cpp '    asm volatile("mrs %0, cpsr\n\tcpsid i" : "=r"(cpsr)::"memory");' "the interrupts go off in kernel mode"
+need Sources/ctr/kernel_books.cpp '    asm volatile("msr cpsr_c, %0" ::"r"(cpsr) : "memory");' "... and come back as they were"
+body=$(region Sources/ctr/kernel_books.cpp "__attribute__((noinline)) s32 KernelSettleBooks() {" '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | sed -n '2,6p' | tr '\n' '|')
+[ "$body" = 'const u32 cpsr = InterruptsOff();|books::Settle(g_books.limits, g_books.add);|InterruptsBack(cpsr);|return 0;|}|' ] || \
+  fail "Sources/ctr/kernel_books.cpp: KernelSettleBooks writes more than limits[] or with the interrupts on ($body)"
+body=$(region Sources/ctr/kernel_books.cpp "__attribute__((noinline)) s32 KernelLiftBooks() {" '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | sed -n '2,6p' | tr '\n' '|')
+[ "$body" = 'const u32 cpsr = InterruptsOff();|books::Lift(g_books.limits, g_books.add);|InterruptsBack(cpsr);|return 0;|}|' ] || \
+  fail "Sources/ctr/kernel_books.cpp: KernelLiftBooks writes more than limits[] or with the interrupts on ($body)"
+for fn in 'inline void Lift(volatile s32* limits, s32 bytes) {:limits[kCommit] += bytes;' 'inline void Settle(volatile s32* limits, s32 bytes) {:limits[kCommit] -= bytes;'; do
+  body=$(region Includes/azl/books_math.hpp "${fn%%:*}" '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | sed -n '2,$p' | tr '\n' '|')
+  [ "$body" = "${fn#*:}|}|" ] || fail "Includes/azl/books_math.hpp: ${fn%%(*} writes more than the commit's limit, or writes it otherwise ($body)"
+done
+if cat Includes/azl/books_math.hpp Sources/ctr/kernel_books.cpp | tr -d '\r' | code_of | grep -n -E 'ldrex|strex|clrex|kMutexOffset|kMutexWaitersOffset|0xFFFF9000|WriteUnderMutex|TryTakeMutex|g_books\.mutex'; then
+  fail "the plugin takes the KResourceLimit's mutex itself: never (AV1)"
+fi
+[ "$(cat Includes/azl/books_math.hpp Sources/ctr/kernel_books.cpp | tr -d '\r' | code_of | grep -c -E 'current\[[^]]*\] *(\+|-)?= ')" = "1" ] || \
+  fail "current[] of the KResourceLimit is written elsewhere than in books::Charge (the fallback when the kernel has no pages)"
+body=$(region Includes/azl/books_math.hpp 'inline void Charge(volatile s32* current, s32 bytes) {' '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | sed -n '2,$p' | tr '\n' '|')
+[ "$body" = 'current[kCommit] += bytes;|}|' ] || fail "Includes/azl/books_math.hpp: Charge writes more than the commit's current, or writes it otherwise ($body)"
+body=$(region Sources/ctr/kernel_books.cpp "__attribute__((noinline)) s32 KernelChargeBooks() {" '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | sed -n '2,6p' | tr '\n' '|')
+[ "$body" = 'const u32 cpsr = InterruptsOff();|books::Charge(g_books.current, g_books.add);|InterruptsBack(cpsr);|return 0;|}|' ] || \
+  fail "Sources/ctr/kernel_books.cpp: KernelChargeBooks writes more than current[kCommit] or with the interrupts on ($body)"
+[ "$(tr -d '\r' < Sources/ctr/kernel_books.cpp | code_of | grep -c 'KernelChargeBooks')" = "2" ] || fail "Sources/ctr/kernel_books.cpp: current[] is written otherwise than through ConsoleKernel::WriteCurrent"
+[ "$(grep -rn --include='*.cpp' --include='*.hpp' 'books::Charge(' Sources Includes | sed 's://.*$::' | grep -c 'books::Charge(')" = "1" ] || fail "books::Charge is called elsewhere than in KernelChargeBooks"
+[ "$(tr -d '\r' < Includes/azl/books_math.hpp | code_of | grep -c 'WriteCurrent(')" = "2" ] || fail "Includes/azl/books_math.hpp: current[] is written by other steps than ChargeOrWrite and UnchargeOrWrite"
+[ "$(grep -rn --include='*.cpp' 'WriteCurrent(' Sources | sed 's://.*$::' | grep -c 'WriteCurrent(')" = "1" ] || fail "WriteCurrent is called from the console's code itself (only books::ChargeOrWrite and UnchargeOrWrite may)"
+[ "$(tr -d '\r' < Sources/ctr/kernel_books.cpp | code_of | grep -c 'KernelLiftBooks')" = "2" ] || fail "Sources/ctr/kernel_books.cpp: the limit is lifted otherwise than through ConsoleKernel::Lift"
+#    The kernel's calls of the steps, on the console (ConsoleKernel): which svc moves the books and which does not
+body=$(region Sources/ctr/kernel_books.cpp 'struct ConsoleKernel {' '};' | code_of | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | tr '\n' '|')
+[ "$body" = 'struct ConsoleKernel {|void Read(s32* limit, s32* current) {|svcCustomBackdoor(reinterpret_cast<void*>(KernelReadBooks));|*limit = g_books.read_limits[0];|*current = g_books.read_commit;|}|static void MoveLimit(s32 (*write)(), u32 bytes) {|g_books.add = static_cast<s32>(bytes);|svcCustomBackdoor(reinterpret_cast<void*>(write));|}|void Lift(u32 bytes) {|MoveLimit(KernelLiftBooks, bytes);|}|void Lower(u32 bytes) {|MoveLimit(KernelSettleBooks, bytes);|}|s32 AllocCharged(u32 bytes, u32* address) {|return svcControlMemory(address, 0, 0, bytes, MEMOP_ALLOC_LINEAR, static_cast<MemPerm>(MEMPERM_READ | MEMPERM_WRITE));|}|s32 FreeUncharged(u32 address, u32 bytes) {|u32 ignored = 0;|return svcControlMemoryUnsafe(&ignored, address, bytes, MEMOP_FREE, static_cast<MemPerm>(0));|}|s32 AllocUncharged(u32 address, u32 bytes, books::Region region) {|const u32 from = region == books::Region::System        ? MEMOP_REGION_SYSTEM|: region == books::Region::Application ? MEMOP_REGION_APP|: MEMOP_REGION_BASE;|u32 out = 0;|return svcControlMemoryUnsafe(&out, address, bytes, static_cast<MemOp>(MEMOP_ALLOC | from),|static_cast<MemPerm>(MEMPERM_READ | MEMPERM_WRITE));|}|s32 FreeCharged(u32 address, u32 bytes) {|u32 ignored = 0;|return svcControlMemory(&ignored, address, 0, bytes, MEMOP_FREE, static_cast<MemPerm>(0));|}|u32 FreeSpan(u32 bytes) {|return FreeHeapSpan(bytes);|}|void WriteCurrent(s32 bytes) {|g_books.add = bytes;|svcCustomBackdoor(reinterpret_cast<void*>(KernelChargeBooks));|}|};|' ] || \
+  fail "Sources/ctr/kernel_books.cpp: ConsoleKernel no longer reads the books with KernelReadBooks, reserves with svcControlMemory's linear ALLOC at an address the kernel chooses, frees that with svc 0xA3 (no Release), allocates with svc 0xA3 in the region it is given (SYSTEM, APPLICATION, BASE) and releases with svcControlMemory's FREE, or writes current[] otherwise than with KernelChargeBooks ($body)"
+#    The steps themselves (Includes/azl/books_math.hpp, run by Tests/kernel_books_test.cpp)
+body=$(region Includes/azl/books_math.hpp 's32 ReserveThroughKernel(Kernel& kernel, u32 bytes) {' '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | tr '\n' '|')
+[ "$body" = 's32 ReserveThroughKernel(Kernel& kernel, u32 bytes) {|u32 address = 0;|const s32 rc = kernel.AllocCharged(bytes, &address);|if (rc < 0) {|return rc;|}|const s32 freed = kernel.FreeUncharged(address, bytes);|if (freed < 0) {|kernel.FreeCharged(address, bytes);|return freed;|}|return 0;|}|' ] || \
+  fail "Includes/azl/books_math.hpp: ReserveThroughKernel no longer reserves through the kernel's ALLOC and frees the block with svc 0xA3, svcControlMemory only when svc 0xA3 could not ($body)"
+body=$(region Includes/azl/books_math.hpp 's32 ReleaseThroughKernel(Kernel& kernel, u32 bytes, u32* released) {' '}' | code_of | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | tr '\n' '|')
+[ "$body" = 's32 ReleaseThroughKernel(Kernel& kernel, u32 bytes, u32* released) {|*released = 0;|u32 piece = bytes;|int region = 0;|while (*released < bytes) {|if (piece > bytes - *released) {|piece = bytes - *released;|}|const u32 address = kernel.FreeSpan(piece);|const s32 rc = address == 0 ? kNoFreeSpan : kernel.AllocUncharged(address, piece, kReleaseRegions[region]);|if (rc < 0) {|if (piece > kPageBytes) {|piece = kPageBytes;|continue;|}|if (rc == kNoPages && region + 1 < kReleaseRegionCount) {|++region;|continue;|}|return rc;|}|const s32 freed = kernel.FreeCharged(address, piece);|if (freed < 0) {|kernel.FreeUncharged(address, piece);|return freed;|}|*released += piece;|}|return 0;|}|' ] || \
+  fail "Includes/azl/books_math.hpp: ReleaseThroughKernel no longer takes svc 0xA3's block and frees it with svcControlMemory (whole in SYSTEM, then a page at a time, on to the next region only when one has no page) ($body)"
+need_line Includes/azl/books_math.hpp 'constexpr Region kReleaseRegions[kReleaseRegionCount] = {Region::System, Region::Application, Region::Base};' "the Release's block from SYSTEM first, then APPLICATION, then BASE (AV1-R2: a SYSTEM region with no page left)"
+need_line Includes/azl/books_math.hpp 'constexpr s32 kNoPages = static_cast<s32>(0xD86007F3);' "the one answer of the kernel that lets the books be written: no physical page left in the region"
+body=$(region Includes/azl/books_math.hpp 's32 RaiseThroughKernel(Kernel& kernel, u32 bytes) {' '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | tr '\n' '|')
+[ "$body" = 's32 RaiseThroughKernel(Kernel& kernel, u32 bytes) {|kernel.Lift(bytes);|const s32 rc = ReserveThroughKernel(kernel, bytes);|if (rc != 0) {|kernel.Lower(bytes);|}|return rc;|}|' ] || \
+  fail "Includes/azl/books_math.hpp: RaiseThroughKernel no longer lifts the limit before the reservation and puts it back when the kernel refuses ($body)"
+body=$(region Includes/azl/books_math.hpp 's32 ChargeThroughKernel(Kernel& kernel, u32 bytes) {' '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | tr '\n' '|')
+[ "$body" = 's32 ChargeThroughKernel(Kernel& kernel, u32 bytes) {|s32 limit = 0;|s32 current = 0;|kernel.Read(&limit, &current);|const u32 lift = ChargeLift(limit, current, bytes);|kernel.Lift(lift);|const s32 rc = ReserveThroughKernel(kernel, bytes);|kernel.Lower(lift);|return rc;|}|' ] || \
+  fail "Includes/azl/books_math.hpp: ChargeThroughKernel no longer reads the books and lifts the limit by ChargeLift around the reservation only, back down by the same ($body)"
+#    The lift of a Charge covers what current already stands above the limit (2026-11-06, AVV-1): a game sized on limit - current with the gate's page settled after it
+#    stands above the limit by the page, and a lift of the block alone would be refused above the limit (0xC860180A) before the kernel looks for pages: no fallback.
+body=$(region Includes/azl/books_math.hpp 'inline u32 ChargeLift(s32 limit, s32 current, u32 bytes) {' '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | sed -n '2,$p' | tr '\n' '|')
+[ "$body" = 'const s64 over = static_cast<s64>(current) - limit;|return over > 0 ? bytes + static_cast<u32>(over) : bytes;|}|' ] || \
+  fail "Includes/azl/books_math.hpp: ChargeLift no longer lifts by the block and by what current stands above the limit ($body)"
+need_line Includes/azl/books_math.hpp 'constexpr s32 kAboveLimit = static_cast<s32>(0xC860180A);' "the kernel's refusal above the limit, which the lift keeps away from the Charge's own reservation"
+need_after Sources/ctr/kernel_books.cpp '    } else if (rc == books::kAboveLimit) {' '        s32 limit = 0;' "a Charge refused above the lifted limit has a line of its own, with the books (no fallback)"
+need_stmt Tests/kernel_books_test.cpp 'TestChargeAfterTheGatePage();' "... the whole launch of a late title, the gate's page, the heap (Monster Hunter XX's way and libctru's), the Settle before and after the Charge"
+body=$(region Includes/azl/books_math.hpp 's32 ChargeOrWrite(Kernel& kernel, u32 bytes, Way* way) {' '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | tr '\n' '|')
+[ "$body" = 's32 ChargeOrWrite(Kernel& kernel, u32 bytes, Way* way) {|*way = Way::Kernel;|const s32 rc = ChargeThroughKernel(kernel, bytes);|if (rc != kNoPages) {|return rc;|}|kernel.WriteCurrent(static_cast<s32>(bytes));|*way = Way::Written;|return 0;|}|' ] || \
+  fail "Includes/azl/books_math.hpp: ChargeOrWrite no longer charges through the kernel first and writes current[] only when the kernel had no pages ($body)"
+body=$(region Includes/azl/books_math.hpp 's32 UnchargeOrWrite(Kernel& kernel, u32 bytes, u32* released, Way* way) {' '}' | code_of | sed 's/^[[:space:]]*//' | grep -v '^$' | tr '\n' '|')
+[ "$body" = 's32 UnchargeOrWrite(Kernel& kernel, u32 bytes, u32* released, Way* way) {|*way = Way::Kernel;|const s32 rc = ReleaseThroughKernel(kernel, bytes, released);|if (rc != kNoPages) {|return rc;|}|kernel.WriteCurrent(-static_cast<s32>(bytes - *released));|*way = Way::Written;|return 0;|}|' ] || \
+  fail "Includes/azl/books_math.hpp: UnchargeOrWrite no longer releases through the kernel first and writes off current[] only what it could not release for want of pages ($body)"
+need_line Sources/ctr/kernel_books.cpp '    const s32 rc = books::ChargeOrWrite(kernel, size, &way);' "Charge through the kernel's reservation, written only when the kernel had no pages"
+need_line Sources/ctr/kernel_books.cpp '    const s32 rc = books::UnchargeOrWrite(kernel, size, &released, &way);' "Uncharge through the kernel's release, written only when no region had a page"
+need_after Sources/ctr/kernel_books.cpp '    const s32 rc = books::ChargeOrWrite(kernel, size, &way);' '    if (way == books::Way::Written) {' "the line of the Charge says which way it went"
+need_after Sources/ctr/kernel_books.cpp '    if (way == books::Way::Written) {' '        Log("books: charge of 0x%lx bytes WRITTEN in kernel mode: the kernel had no pages for its reservation (0x%08lx), the way of 1.0.13-1.1.1",' "... the written one with its own words"
+need_after Sources/ctr/kernel_books.cpp '    const s32 rc = books::UnchargeOrWrite(kernel, size, &released, &way);' '    if (way == books::Way::Written) {' "the line of the Uncharge says which way it went"
+need_line Sources/ctr/kernel_books.cpp '    *rc = books::RaiseThroughKernel(kernel, size);' "Raise through the lifted limit and the kernel's reservation, its result for the line of the fallback"
+need_line Sources/ctr/kernel_books.cpp '    return *rc == 0;' "... made only when the kernel reserved"
+need Sources/ctr/gate_page.cpp '"gate: no hooks: SYSTEM page failed: %s (0x%08lx, %lu bytes at 0x%08lx)' "the failure's line says the kernel's result of the Raise"
+need_stmt Tests/kernel_books_test.cpp 'TestCharge();' "the books' test charges through the made-up kernel, the game's budget spent"
+need_stmt Tests/kernel_books_test.cpp 'TestChargeOnAFullRegion();' "... a region with no page for the reservation (Monster Hunter XX on an Old 3DS): written, and the end in balance"
+need_stmt Tests/kernel_books_test.cpp 'TestChargeOrWriteKernelFirst();' "... the kernel's way first, and the write only for want of pages"
+need Tests/kernel_books_test.cpp 'CHECK(books::ChargeOrWrite(k, kBlock, &way) == 0);' "... the console's own Charge with its fallback"
+need Tests/kernel_books_test.cpp 'CHECK(books::UnchargeOrWrite(k, kBlock, &released, &way) == 0);' "... and its own Uncharge with its fallback"
+need_stmt Tests/kernel_books_test.cpp 'TestChargeBeforeTheBlock();' "... the charge before the block, a block refused, a process that dies in between, a block freed the wrong way"
+need_stmt Tests/kernel_books_test.cpp 'TestChargeRacedByTheGame();' "... a game thread that takes the lifted room first"
+need_stmt Tests/kernel_books_test.cpp 'TestUncharge();' "... and the Uncharge: whole, a page at a time, and what stays when it cannot be made"
+need Tests/kernel_books_test.cpp 'CHECK(books::RaiseThroughKernel(k, kPage) == 0);' "the test runs the console's own Raise steps"
+need Tests/kernel_books_test.cpp 'CHECK(books::ChargeThroughKernel(k, kBlock) == 0);' "... its own Charge steps"
+need Tests/kernel_books_test.cpp 'CHECK(books::ReleaseThroughKernel(k, kBlock, &released) == 0);' "... and its own Uncharge steps"
+CALLERS=$(grep -rnE --include='*.cpp' '\b(RaiseBooks|ChargeBooks)\(' Sources | awk '{ f = $0; sub(/:.*$/, "", f); l = $0; sub(/^[^:]*:[0-9]*:/, "", l); sub(/\/\/.*$/, "", l); if (l ~ /(RaiseBooks|ChargeBooks)\(/ && l !~ /^(bool|void) (RaiseBooks|ChargeBooks)\(/) { n[f ":" (l ~ /RaiseBooks\(/ ? "Raise" : "Charge")]++ } } END { for (k in n) print n[k], k }' | sort | tr '\n' ' ')
+[ "$CALLERS" = "1 Sources/ctr/gate_page.cpp:Raise 1 Sources/ctr/soc.cpp:Charge " ] || fail "RaiseBooks / ChargeBooks are called in '$CALLERS': Raise only for the gate's page (before any game thread), Charge only for the late socket block"
+for k in KernelReadBooks:4 KernelLiftBooks:0 KernelSettleBooks:0 KernelChargeBooks:0; do
+  need_line Tests/stack_usage.sh "budget kernel_books \"azl::ctr::{anonymous}::${k%%:*}\" ${k#*:}" "the books are read and their limit written in kernel mode, on the kernel's stack: leaves (one saved register at the most)"
+done
+need Tests/chain_sim/chain_sim.py '        scenario_swap_during_svc(elf, level)' "the whole-chain test plays the swap inside the gate's svc, before the call and 10,000 times"
+need_stmt Sources/ctr/plugin.cpp 'SettleGatePage();' "LateInit settles the books of the gate's page"
+need_order Sources/ctr/plugin.cpp 'void Plugin::LateInit() {' '    SettleGatePage();' "... in LateInit, long after the game sized its heap"
 # The plugin's own threads around the same swap (2026-11-02): stopping a thread does not take back its service call, and a service answering with the block gone stops the console (kernel panic, process `socket`: issues 3 and 5).
 # The gate's logic is held by Tests/swap_gate_test.cpp (and Tests/swap_gate_mutants.py); these pins hold its callers, which no test on the PC runs.
 [ "$(grep -c 'azl_c_soc_enter ();' Sources/enet/enet_3ds.c)" = "12" ] || fail "Sources/enet/enet_3ds.c: the twelve socket calls that move bytes through the plugin's memory go through the gate"
@@ -2251,60 +3433,163 @@ need Sources/ctr/plugin.cpp 'const SwapGateScope gate(kGateTrail);' "the lines o
 need Sources/ctr/swap_gate.cpp 'if (CTRPluginFramework::System::IsNew3DS()) {' "the gate stays off on a New 3DS"
 need Sources/ctr/swap_gate.cpp 'svcWaitSynchronization(g_gate_open, -1);' "a stopped thread waits with no end, until SWAP_EXIT"
 need Sources/ctr/plugin.cpp 'log_files_->SetStopCapture(&g_swap_gate.closed);' "the capture leaves the card when the gate closes: two writes on a slow card outlast the wait"
-need Makefile '-Wl,--wrap=PLGLDR__Reply' "on an Old 3DS the call sites go back in the hook when the block is back, before the game's thread wakes up inside its own svc (0xD8E007F7 on handle 0)"
+need Makefile '-Wl,--wrap=PLGLDR__Reply' "on an Old 3DS the gate opens as soon as the block is back and mapped (the framework's reply has returned)"
 need Sources/ctr/plugin.cpp 'extern "C" void __wrap_PLGLDR__Reply(s32 event) {' "the wrap of the framework's reply to Luma3DS is there"
-need Sources/ctr/plugin.cpp 'if (!swap_back_done_.exchange(false)) {' "SWAP_EXIT does not put the sites back a second time after OnSwapBack"
+need_order Sources/ctr/plugin.cpp '    __real_PLGLDR__Reply(event);' 'azl::ctr::Plugin::Get().OnSwapBack();' "the gate opens only after the framework's reply returned: before it the block is not mapped"
+need_after Sources/ctr/plugin.cpp 'void Plugin::OnSwapBack() {' '    OpenGate();' "the block is back: the gate opens"
 need Makefile '-Wl,--wrap=svcCreateThread -Wl,--wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv' "the framework's syscore worker is held off core 1 on an Old 3DS: a thread that has not begun escapes the stop at the swap"
 need Sources/ctr/thread_core.cpp 'g_moving = svcGetSystemInfo(&is_new, 0x10001, 0) != 0;' "only on an Old 3DS, by the very test of Luma's swap"
-need Sources/ctr/hook.cpp 'NoteReceiveSite(g_sites, g_site_count, g_ledger, tramp_return);' "the sites of APT:ReceiveParameter are noted while the hooks are in: at the swap back they are out"
-need Sources/ctr/plugin.cpp 'constexpr u32 kSwapGateTimeoutMs = 7000;' "the wait of the gate stays within what Luma waits for the answer (10 s, with the hooks' 1.7 s before it)"
-need Sources/ctr/svc_entry.s "SVC_ENTRY azl_svc23_entry, azl_hook_CloseHandle, 0" "CloseHandle never hands a call back"
-need Sources/ctr/svc_entry.s "bl   azl_handback_site" "the entry asks azl_handback_site before it makes the call"
-need Sources/ctr/svc_entry.s "cmpeq r3, #0x300" "the call is APT:ReceiveParameter for the application's id (Luma3DS's kernel hook tests the same)"
-need Sources/ctr/svc_entry.s ".word 0x000D0080" "... ReceiveParameter's command header"
-need Sources/ctr/svc_entry.s ".word azl_hooks_in_flight" "the entry counts the threads inside it in the counter the swap waits for"
-need Sources/ctr/svc_entry.s "ldr  pc, [sp], #4" "the hand-back ends at the call site with the stack as the game had it"
-[ "$(grep -c -E '^([0-9]:)?[[:space:]]+ldrex ' Sources/ctr/svc_entry.s)" = "3" ] || fail "Sources/ctr/svc_entry.s: the counter of the threads in the hook is counted in once and out twice (the normal way and the hand-back), each with ldrex"
-[ "$(grep -c -E '^[[:space:]]+DMB ' Sources/ctr/svc_entry.s)" = "3" ] || fail "Sources/ctr/svc_entry.s: a barrier before the counter goes down (the normal way and the hand-back) and after it went up"
-need Sources/ctr/hook.cpp 'volatile u32 azl_hooks_in_flight = 0;' "the counter the assembly entry counts in"
-need Sources/ctr/hook.cpp 'extern "C" u32 azl_handback_site(Handle, u32 tramp_return) {' "the question the entry asks"
-need Sources/ctr/hook.cpp '    if (!g_old_3ds) {' "a call is handed back only on an Old 3DS ..."
-need Sources/ctr/hook.cpp 'if (!g_home_seen || static_cast<u32>(now - g_home_ms) > kHomeWindowMs) {' "... and after a HOME button was seen, in the last seconds"
-need Sources/ctr/hook.cpp 'g_old_3ds = !CTRPluginFramework::System::IsNew3DS();' "the console is asked once, at the start"
-need Sources/ctr/hook.cpp 'constexpr u32 kHomeWindowMs = 10000;' "a HOME button is news for ten seconds"
-need_after Sources/ctr/hook.cpp 'if (answered && AptSignalPrecedesSwap(id)) {' 'g_home_ms = static_cast<u32>(platform::NowMs());' "the HOME and power notifications stamp the time ..."
+need Sources/ctr/plugin.cpp 'constexpr u32 kSwapGateTimeoutMs = 6100;' "the wait of the gate stays within what Luma waits for the answer (10 s: the mirror's 1 s, the trail's 40 ms and the hooks' 1.5 s before it, 8.64 s in all)"
+# The table of the game's real sessions the hook follows (1.1.2): around the swap some of the game's closes are not seen, and after 12 HOMEs the APT:A sessions were no longer
+# followed (issue 5, Pokemon Alpha Sapphire, Old 3DS): no HOME seen, the game woke up in freed memory. The logic is held by Tests/traced_sessions_test.cpp (and
+# Tests/traced_sessions_mutants.py); these pins hold its callers.
+need_stmt Sources/ctr/hook.cpp 'g_traced.Opened(session);' "every session the game opens frees the entries with its index, followed or not"
+need Sources/ctr/hook.cpp 'if (cmd[0] == kSrvGetServiceHandleReply && cmd[2] == kIpcMoveOneHandle) {' "only the answer of srv (one handle moved to the game) says a handle is new"
+need_stmt Sources/ctr/hook.cpp 'g_traced.Touch(*traced);' "an APT session the game keeps and uses is never the one a full table gives up"
+need_stmt Sources/ctr/hook.cpp 'g_traced.Add(session, name, apt);' "the followed services go in the table, the APT ones with their flag (a full table gives them the oldest APT slot)"
+need_stmt Sources/ctr/hook.cpp 'g_traced.Closed(handle);' "a close seen by the hook frees the entry"
+# Every file with 'game-thread code' regions has its game_thread_file line here: without it the printf scan skips the file without a word.
+for f in $(grep -rlE "$GT_BEGIN" Sources Includes | sort); do
+  grep -q "^game_thread_file $f " Tests/policy_check.sh || fail "$f has 'game-thread code' regions but no game_thread_file line in Tests/policy_check.sh (the scan for printf on game threads would skip it)"
+done
+need Sources/ctr/plugin.cpp 'followed sessions closed unseen %lu, APT slots reused %lu, sessions not followed %lu' "the log of the swap says what the table had to do without the closes"
 need Includes/azl/apt_sleep.hpp 'return signal == 1 || signal == 2 || signal == 8 || signal == 9;' "the power button comes before the swap too (a dump from an Old 3DS: the thread woke up in unmapped memory)"
-need Sources/ctr/hook.cpp '            g_home_seen = 1;' "... and is noted at every debug level"
-need_order Sources/ctr/hook.cpp '            g_home_seen = 1;' 'if (g_apt_observer && g_debug_level > 0 && answered) {' "the HOME button is noted before anything that depends on the log level"
-need Sources/ctr/hook.cpp 'HandBackSite(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, tramp_return, now);' "the question is answered by the tested logic"
-need Sources/ctr/hook.cpp 'SuspendSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);' "SWAP_ENTER takes every site out"
-need Sources/ctr/hook.cpp 'ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);' "SWAP_EXIT puts every site back"
-need Sources/ctr/hook.cpp 'RearmSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);' "a call handed back with no swap after it goes back into the hook"
-need_after Sources/ctr/hook.cpp 'void StoreOriginal(u32 address, const u32 words[2]) const {' 'Poke(address, words[0]);' "the game's svc goes back first (a thread that passes between the two stores finds svc + literal, never a jump into the second word)"
-need_after Sources/ctr/hook.cpp 'void StoreHook(u32 address, const u32 words[2]) const {' 'Poke(address + 4, words[1]);' "the literal goes in first (the jump is the last word to appear)"
-need_after Sources/ctr/hook.cpp 'void Sync() const {' 'svcInvalidateEntireInstructionCache();' "the instruction cache of every core is invalidated after the stores"
-[ "$(grep -c 'svcFlushProcessDataCache(CUR_PROCESS_HANDLE, address, 8);' Sources/ctr/hook.cpp)" = "2" ] || fail "Sources/ctr/hook.cpp: both stores of a site clean the data cache for its two words"
-need Sources/ctr/hook.cpp 'constexpr s64 kSwapGraceNs = 2000000;' "the threads that are in a trampoline's few instructions when the counter reads zero get 2 ms"
-need_order Sources/ctr/hook.cpp 'SuspendSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);' 'svcSleepThread(kSwapGraceNs);' "the sites are out BEFORE the wait for the threads inside"
 need Sources/ctr/plugin.cpp 'constexpr int kEventSwapEnter = 5;' "the framework's SWAP_ENTER"
 need Sources/ctr/plugin.cpp 'constexpr int kEventSwapExit = 6;' "the framework's SWAP_EXIT"
 need Sources/ctr/plugin.cpp 'static_cast<int>(Process::Event::SWAP_ENTER) == kEventSwapEnter &&' "the indices are checked against the framework's enum"
-need Sources/ctr/plugin.cpp 'SuspendSvcHooks(kSwapDrainTimeoutMs);' "SWAP_ENTER takes the hooks out before the framework answers Luma3DS"
-need Sources/ctr/plugin.cpp 'ResumeSvcHooks(); // (the block is back' "SWAP_EXIT puts the hooks back"
-need_order Sources/ctr/plugin.cpp 'SuspendSvcHooks(kSwapDrainTimeoutMs);' 'ResumeSvcHooks(); // (the block is back' "enter before exit"
+need Sources/ctr/plugin.cpp 'CloseGate(kSwapDrainTimeoutMs, dlp_hub_ ? &WakeHubForSwap : nullptr, dlp_hub_.get());' "SWAP_ENTER closes the svc hook's gate before the framework answers Luma3DS (and wakes the hub's queue)"
+need Sources/ctr/plugin.cpp 'OpenGate(); // (idempotent' "SWAP_EXIT opens it again (OnSwapBack opened it already)"
+need_order Sources/ctr/plugin.cpp 'CloseGate(kSwapDrainTimeoutMs,' 'OpenGate(); // (idempotent' "enter before exit"
+need_order Sources/ctr/plugin.cpp 'CloseGate(kSwapDrainTimeoutMs,' 'CloseSwapGate(kSwapGateTimeoutMs);' "the hook's gate closes before the plugin's threads stop: a game's thread in the plugin may wait for what a stopped thread holds"
 DRAIN=$(grep -o 'kSwapDrainTimeoutMs = [0-9]*' Sources/ctr/plugin.cpp | grep -o '[0-9]*$')
-{ [ -n "$DRAIN" ] && [ "$DRAIN" -ge 500 ] && [ "$DRAIN" -le 5000 ]; } || fail "Sources/ctr/plugin.cpp: the wait for the threads inside the hook is $DRAIN ms (between half a second and five seconds: Luma3DS gives up on the answer after 10 s)"
-need Sources/main.cpp 'azl::ctr::RearmHandedBackSites();' "a call handed back with no swap after it goes back into the hook from the frame callback"
-need Includes/azl/hook_swap.hpp 'constexpr u32 kRearmDelayMs = 2000;' "a site handed back with no swap goes back into the hook after two seconds"
-need Tests/stack_usage.sh '"$PY" Tests/hook_sim/entry_sim.py "$WORK/sim" || FAILED=1' "the stack check runs the assembly entry in the emulator"
+{ [ -n "$DRAIN" ] && [ "$DRAIN" -ge 500 ] && [ "$DRAIN" -le 5000 ]; } || fail "Sources/ctr/plugin.cpp: the wait for the game's threads counted in the gate is $DRAIN ms (between half a second and five seconds: Luma3DS gives up on the answer after 10 s)"
+TRAIL=$(grep -o 'kSwapTrailWaitMs = [0-9]*' Sources/ctr/plugin.cpp | grep -o '[0-9]*$')
+GATEMS=$(grep -o 'kSwapGateTimeoutMs = [0-9]*' Sources/ctr/plugin.cpp | grep -o '[0-9]*$')
+{ [ -n "$TRAIL" ] && [ -n "$DRAIN" ] && [ -n "$GATEMS" ] && [ $((1000 + TRAIL + DRAIN + GATEMS)) -le 9000 ]; } || fail "Sources/ctr/plugin.cpp: the waits of SWAP_ENTER (the mirror's 1 s + trail $TRAIL + hooks $DRAIN + gate $GATEMS ms) are over 9 s: Luma3DS gives up on the answer after 10 s"
+# (two calls since the in-game menu: a plain need was met by the menu's alone, and the frame callback's could go unnoticed)
+need Tests/stack_usage.sh '"$PY" Tests/hook_sim/gate_sim.py "$WORK/gate" || FAILED=1' "the stack check runs the gate (Sources/ctr/gate.s) in the emulator against the swap"
+need Tests/chain_sim/chain_sim.py '        self.run_game(site)' "the whole-chain test enters through the real gate of the ELF, from a one-word site"
 need Tests/stack_usage.sh 'budget hook "azl::ctr::NoteGameFailure" 56' "the line of a failed call runs on the game's thread: its frame is held"
 need Sources/ctr/plugin.cpp 'WaitForTrail(kSwapTrailWaitMs);' "SWAP_ENTER gives the trail its moment on the card before the threads stop"
-need Sources/ctr/hook.cpp 'if (answered && AptSignalPrecedesSwap(id)) {' "only a call that succeeded can arm the hand-back: a failed one leaves an old word in cmd[2]"
-need Tests/stack_usage.sh 'budget hook "azl_handback_site" 48' "the question of the entry is held to a small frame"
-need Tests/chain_sim/chain_sim.py 'def scenario_handback(elf, level):' "the whole-chain test has the hand-back scenario ..."
-need Tests/chain_sim/chain_sim.py '        scenario_power_handback(elf, level)' "the whole-chain test runs the power button of the Old 3DS's dump"
-need Tests/chain_sim/chain_sim.py '        scenario_handback(elf, level)' "... and runs it on the built plugin"
-need Tests/hook_sim/entry_sim.py 'scenario_receive(0x00123450, seed, counter0, mis)' "the entry test runs the hand-back"
+
+# The framework's link to Luma3DS's plugin loader (REGISTRO, phase N; azl/plg_guard.hpp): console 63 crashed in PLGLDR__FetchEvent on the NULL event pointer
+# that plgLdrInit leaves when its one connection to plg:ldr fails. The three wraps, the budget of the tries (about 2 s), the arbiter, the fetch that never
+# connects, the plugin out of the launch without the link, and the line that goes synchronously to the main log's file (never AzaharLink.mem).
+need Makefile '-Wl,--wrap=PLGLDR__Reply -Wl,--wrap=plgLdrInit -Wl,--wrap=PLGLDR__FetchEvent' "the framework's connection to plg:ldr and its fetch are guarded (and its reply, for the Old 3DS's gate)"
+need Sources/ctr/plugin.cpp 'extern "C" Result __wrap_plgLdrInit(void) {' "the wrap of the framework's connection to plg:ldr is there"
+need Sources/ctr/plugin.cpp 'extern "C" s32 __wrap_PLGLDR__FetchEvent(void) {' "the wrap of the framework's fetch of the events is there"
+need_line Includes/azl/plg_guard.hpp 'constexpr u32 kMaxTries = 100;' "the connection is tried 100 times"
+need_line Includes/azl/plg_guard.hpp 'constexpr u32 kRetryMs = 20;' "... 20 ms apart: about 2 s, which covers the loader's own session closing (it holds the port's one session just before)"
+need Includes/azl/plg_guard.hpp '    if (rc >= 0 && (arbiter != 0 || s->emulator)) {' "a try counts with the connection AND the arbiter (without it every reply leaves Luma3DS waiting 10 s); an emulator's loader excepted"
+need Sources/ctr/plugin.cpp '            cmd[3] = 0;' "the word the arbiter comes in is cleared before each try (a try whose IPC did not answer shows 0)"
+need Sources/ctr/plugin.cpp '            return azl::plgguard::Try{r, r >= 0 ? cmd[3] : 0u};' "the arbiter is read from word 3 of the answer, as plgLdrInit reads it (ldr [tls, #0x8c])"
+need Includes/azl/plg_guard.hpp '    return s.connected ? fetch() : 0;' "no event is fetched without a connection: 0 is 'no event' for KeepThreadMain (the NULL pointer is never read)"
+for fn in 'extern "C" Result __wrap_plgLdrInit(void) {' 'extern "C" s32 __wrap_PLGLDR__FetchEvent(void) {'; do
+  hit=$(region Sources/ctr/plugin.cpp "$fn" '}' | code_of | grep -E '\bLog[[:space:]]*\(|DebugEvent|std::|printf|\bnew\b|malloc|Plugin::Get|PostNotification' | head -1)
+  [ -z "$hit" ] || fail "Sources/ctr/plugin.cpp: $fn runs on the framework's keep-alive thread (4 KB) before anything of the plugin: no Log, no string, no heap ($hit)"
+done
+hit=$(region Sources/ctr/plugin.cpp 'extern "C" s32 __wrap_PLGLDR__FetchEvent(void) {' '}' | code_of | grep -E 'plgLdrInit|Connect\(|plgLdrExit' | head -1)
+[ -z "$hit" ] || fail "Sources/ctr/plugin.cpp: the fetch tries a connection ($hit): plg:ldr and the events are one loop of Rosalina, a try while it waits for our reply blocks 10 s and reads an old event"
+hit=$(region Includes/azl/plg_guard.hpp 's32 FetchOrNone(const State& s, Fetch fetch) {' '}' | code_of | grep -E 'Connect|try_once|After\(' | head -1)
+[ -z "$hit" ] || fail "Includes/azl/plg_guard.hpp: the fetch tries a connection ($hit)"
+need_after Sources/ctr/plugin.cpp '    const bool loader_linked = CheckPluginLoaderLink();' '    active_ = config_.enabled && config_.tunnel_enabled && loader_linked;' "without the link the plugin stays out of the launch: no hooks, no network, no chat, no mirror"
+need_order Sources/ctr/plugin.cpp '    const bool loader_linked = CheckPluginLoaderLink();' 'capture_ready = !active_ || DebugInit();' "the link decides before the capture, the socket block and the hooks"
+need_order Sources/ctr/plugin.cpp '    const bool loader_linked = CheckPluginLoaderLink();' 'hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' "the link decides before the hooks"
+need Sources/ctr/plugin.cpp "startup_issue_ = \"3DS Link: the plugin could not talk to Luma's plugin loader: restart the game\";" "the notice on screen without the link"
+need Sources/ctr/plugin.cpp '    if (active_ || startup_issue_.empty() || startup_issue_once_) {' "... once, not every minute"
+region Sources/ctr/plugin.cpp 'bool Plugin::CheckPluginLoaderLink() {' '}' | grep -q -F 'File::Open(out, kLogSyncPath, File::RWC | File::APPEND | File::SYNC)' || fail "Sources/ctr/plugin.cpp: the line of the link is no longer written synchronously to the main log's file"
+region Sources/ctr/plugin.cpp 'bool Plugin::CheckPluginLoaderLink() {' '}' | grep -q -E 'kMemPath|g_debug_level' && fail "Sources/ctr/plugin.cpp: the line of the link goes to AzaharLink.mem (read with sscanf, written over at every launch) or depends on the log level"
+need Sources/ctr/plugin.cpp '    if (plgguard::WorthALine(s)) {' "the synchronous line only when the link took more than a try, came without its arbiter or did not come"
+need Includes/azl/plg_guard.hpp '    return s.tries != 1 || (s.no_arbiter != 0 && !s.emulator) || !s.connected;' "... which is these three (an emulator's session without an arbiter at the first try is its normal case: no line)"
+need Tests/run.sh '  "$OUT/plg_guard_test"' "the guard's logic is run (fake plgLdrInit: busy port, never, no arbiter, emulator; the fetch)"
+need Tests/stack_usage.sh 'budget plugin "__wrap_plgLdrInit" 64' "the wrap of plgLdrInit runs on the framework's 4 KB keep-alive thread: its frame is held"
+need Tests/stack_usage.sh 'budget plugin "__wrap_PLGLDR__FetchEvent" 8' "the wrap of the fetch: a load and a tail call"
+need Tests/stack_usage.sh 'budget plugin "azl::ctr::Plugin::CheckPluginLoaderLink" 192' "the line of the link, on the keep-alive thread (its buffer is static; the framework's File and the clock on the stack)"
+# The close of a game in the sleep's trail (debug=1 only; REGISTRO, phase N, F2): which close left Luma3DS's block behind. The kinds of the trail have
+# numbers of their own (kFwExit, 5, is the end of a SLEEP: the EXIT of the process is kFwProcExit), Luma3DS's plugin word is read at HOME_ENTER /
+# HOME_EXIT / EXIT and after every ReceiveParameter, the lines after a close command have a budget of their own, srv's termination request is noted,
+# the trail's thread writes once more when it is told to stop, and the game's thread gives the trail 200 ms at most after the close command (12),
+# with the log on, never on an Old 3DS, ended by the gate's close.
+KINDS=$(cat Includes/azl/apt_sleep.hpp Includes/azl/sleep_crumbs.hpp | tr -d '\r' | grep -oE 'constexpr u32 k(AptNote|Fw|Mem)[A-Za-z]* = [0-9]+;' | grep -oE '[0-9]+;$' | tr -d ';' | sort -n)
+KDUP=$(printf '%s\n' "$KINDS" | uniq -d | tr '\n' ' ')
+KCOUNT=$(printf '%s\n' "$KINDS" | grep -c .)
+{ [ -z "$KDUP" ] && [ "$KCOUNT" -ge 25 ]; } || fail "the kinds of the sleep's trail (kAptNote*, kFw*, kMem*) share a number ($KDUP) or are fewer than 25 ($KCOUNT): a line would be read as another kind"
+need_line Includes/azl/sleep_crumbs.hpp '    static constexpr u32 kFwExit = 5;' "kFwExit is the end of a sleep (the EXIT of the process is kFwProcExit)"
+need_line Includes/azl/apt_sleep.hpp 'constexpr u32 kLumaPluginWordAddress = 0x1FF800F0;' "Luma3DS's plugin word in the configuration page"
+for push in 'NoteSleepEvent(SleepCrumbs::kFwProcExit, LumaPluginWord());' 'NoteSleepEvent(event == kEventHomeEnter ? SleepCrumbs::kFwProcHomeEnter : SleepCrumbs::kFwProcHomeExit, LumaPluginWord());'; do
+  tr -d '\r' < Sources/ctr/plugin.cpp | grep -B1 -F -- "$push" | head -1 | grep -q -F 'if (g_debug_level > 0) {' || fail "Sources/ctr/plugin.cpp: '$push' is gone or not behind 'if (g_debug_level > 0)' (the probes of the close cost nothing with the log off)"
+done
+need Sources/ctr/hook.cpp '            g_apt_observer(kAptNoteReceiveWord, LumaPluginWord());' "Luma3DS's word after every ReceiveParameter (the state the game is left in)"
+need Sources/ctr/hook.cpp '    const u32 take = g_receive_notes.Take(AptCommandCloses(command));' "the lines after a close command have their own budget (the 64 were used up by a game that polls)"
+need_line Includes/azl/apt_sleep.hpp '    static constexpr u32 kAfterClose = 32;' "... of 32"
+need Includes/azl/apt_sleep.hpp '    return command == kAptCommandCloseFromHome;' "the close command is 12 only (11 is the return from the HOME menu, 10 a library applet that exited)"
+need Sources/ctr/hook.cpp '        if (g_debug_level > 0 && g_apt_observer && (header == kAptAppletUtility || (header == kAptReceiveParameter && cmd[1] == 0x300))) {' "the lines of ReceiveParameter (and the wait after the close) only with the log on"
+need Sources/ctr/hook.cpp '    if (header == kSrvReceiveNotification) {' "srv's termination request to the game is noted (no 0x100 and no EXIT: killed by pm)"
+need_line Sources/ctr/hook.cpp 'constexpr u32 kMaxSrvNotes = 4;' "... a few times a launch"
+need Sources/ctr/hook.cpp 'cmd[2] == kSrvNotificationTerminate &&' "... only 0x100"
+need Sources/ctr/plugin.cpp '        for (bool last = false; !last;) {' "the trail's thread takes one more turn when it is told to stop (the EXIT of the process is pushed just before)"
+hit=$(region Sources/ctr/plugin.cpp '        for (bool last = false; !last;) {' '            crumb_written_.store(crumbs_.taken());' | code_of | grep -E '\bbreak\b|return' | head -1)
+[ -z "$hit" ] || fail "Sources/ctr/plugin.cpp: the trail's thread leaves without writing what was noted up to the stop ($hit)"
+region Sources/ctr/plugin.cpp 'void Plugin::RequestStop() {' '}' | grep -q -F '    crumb_stop_.store(true);' || fail "Sources/ctr/plugin.cpp: RequestStop no longer stops the trail's thread (it would live on through the framework's __ctru_exit if main() is late)"
+CLOSEMS=$(grep -o 'kCloseTrailWaitMs = [0-9]*' Sources/ctr/plugin.cpp | grep -o '[0-9]*$')
+{ [ -n "$CLOSEMS" ] && [ "$CLOSEMS" -ge 20 ] && [ "$CLOSEMS" -le 250 ]; } || fail "Sources/ctr/plugin.cpp: the game's thread waits $CLOSEMS ms for the trail after the close command (between 20 and 250 ms)"
+need Sources/ctr/hook.cpp '    if (command == kAptCommandCloseFromHome && g_trail_waiter) {' "the wait for the trail comes after the close command (12) only"
+WCT=$(region Sources/ctr/plugin.cpp 'void Plugin::WaitForCloseTrail() {' '}' | code_of)
+printf '%s\n' "$WCT" | grep -q -F 'if (g_debug_level <= 0 || self.swap_console_ || self.crumb_wake_ == 0) {' || fail "Sources/ctr/plugin.cpp: the wait after the close command is made with the log off or on an Old 3DS (its HOME goes through the swap and its own budget)"
+printf '%s\n' "$WCT" | grep -q -F 'waited < kCloseTrailWaitMs && !GateClosing() &&' || fail "Sources/ctr/plugin.cpp: the wait after the close command is not bounded by kCloseTrailWaitMs or not ended by the gate's close"
+need Sources/ctr/plugin.cpp 'swap_console_ = svcGetSystemInfo(&is_new, 0x10001, 0) != 0;' "an Old 3DS by the very test of Luma3DS's swap"
+need Includes/ctr/plugin.hpp '    bool swap_console_ = true;' "... and the safe side until EarlyInit knows"
+for fn in 'void Plugin::NoteProcessEvent(int event) {' 'void Plugin::OnSwapBack() {' 'extern "C" void __wrap_PLGLDR__Reply(s32 event) {' 'void Plugin::NoteSwapToTrail(u32 kind, u32 number) {'; do
+  hit=$(region Sources/ctr/plugin.cpp "$fn" '}' | code_of | grep -E 'WaitForCloseTrail|kCloseTrailWaitMs|g_trail_waiter' | head -1)
+  [ -z "$hit" ] || fail "Sources/ctr/plugin.cpp: the wait after the close command is on the swap's path ($fn): $hit"
+done
+[ "$(cat Sources/ctr/*.cpp Sources/*.cpp | tr -d '\r' | code_of | grep -c 'WaitForCloseTrail')" = "2" ] || fail "WaitForCloseTrail is used somewhere else than as the hook's TrailWaiter (EarlyInit) and its definition"
+need Tests/stack_usage.sh 'budget hook "azl::ctr::NoteSrvNotification" 16' "the note of srv's 0x100 runs on Tri Force Heroes' 464-byte thread"
+need Tests/stack_usage.sh 'budget plugin "azl::ctr::Plugin::WaitForCloseTrail" 24' "the wait after the close command, on the game's thread"
+need Tests/callgraph_check.py "    r'^azl::ctr::Plugin::WaitForCloseTrail\(\)\$'," "the call graph follows the hook's TrailWaiter (a wait on a game thread)"
+
+# The page "Public lobbies" (the branch public-lobbies): the rooms are asked without joining, without the console's MAC, not more often than
+# SELECT allows, and the job of the lists never writes the files the page uses (it leaves .new files the page applies on its own thread).
+# The logic is held by Tests/settings_test/public_lobbies_test.cpp, the asking by Tests/lobby_probe_test.cpp (against real rooms, integration.sh).
+need ConfigApp/source/lobby_probe.cpp "    w.MacAddress(azl::kNoPreferredMac);" "a public room is asked without the console's MAC"
+need ConfigApp/source/lobby_probe.cpp "    w.U32(kNoVersion);" "... and with a protocol version no room speaks, so that nobody is taken in"
+need ConfigApp/source/lobby_probe.cpp "        s.joined = true;" "... and a room that takes us in all the same is left at once"
+need ConfigApp/source/pages_lobbies.cpp "constexpr u64 kRefreshPauseMs = 10000;" "SELECT asks every public room again at most every 10 s (every ask reaches the games played in it)"
+need ConfigApp/source/update_worker.cpp '    return setup::WriteTextFile(path + ".new", text);' "the job of the lists writes the list it fetched beside the one the page uses, never over it"
+need ConfigApp/source/session.cpp "    lobbies::Scanner::Get().Shutdown(15000);" "the asking of the public rooms is stopped before the sockets go away for Titles Delivery"
+if grep -n -E 'timer|Timer|every [0-9]+ (s|min)' ConfigApp/source/pages_lobbies.cpp | grep -v -i 'refresh\|pause\|kRebuildMs\|kRetryMs' >/dev/null; then
+  fail "the page of the public lobbies asks the rooms on a timer: it asks them when it opens and on SELECT only"
+fi
+
+# The app's own allocator before main() (ConfigApp/source/heap_alloc.cpp; its decisions are heap_plan.hpp, held by Tests/settings_test/heap_plan_test.cpp).
+# heap_alloc.cpp does not build on a PC: what it says to the kernel is pinned here, line by line. The test's kernel takes these for granted: the
+# linear heap is asked for first (a refused linear heap costs nothing), a refusal says WHICH part it was (else the cut of the linear heap never
+# comes), the clock is in ms (in s the 3 s of waiting are 50 minutes before main()), the readings are the types the plan reads.
+HA=ConfigApp/source/heap_alloc.cpp
+need_line $HA 'extern "C" void __system_allocateHeaps(void) {' "the app's allocator replaces libctru's (weak) one"
+need_line $HA '    if (!heap_plan::Run(env, __ctru_heap_size, __ctru_linear_heap_size, g_record)) {' "the plan of heap_plan.hpp decides, with the sizes the program fixed"
+need_after $HA '    if (!heap_plan::Run(env, __ctru_heap_size, __ctru_linear_heap_size, g_record)) {' '        BreakWithNumbers(g_record);' "a stop leaves the numbers in the registers of the crash dump"
+need_line $HA '        __asm__ __volatile__("svc 0x3C"' "the stop is svcBreak (0x3C), as libctru's"
+need_line $HA '        r.used_rc = svcGetSystemInfo(&v, 0, 1);' "the region's used pages: svcGetSystemInfo(0, 1)"
+need_line $HA '        r.luma_rc = svcGetSystemInfo(&v, 0x10000, 0x80);' "the region's size from Luma: svcGetSystemInfo(0x10000, 0x80)"
+need_line $HA '        r.own_rc = svcGetProcessInfo(&v, CUR_PROCESS_HANDLE, 2);' "the app's own process: svcGetProcessInfo type 2 (another type and the books never see a game)"
+need_line $HA '        r.memtype_rc = svcGetProcessInfo(&v, CUR_PROCESS_HANDLE, 19);' "the memory type: svcGetProcessInfo type 19 (an applet counts the books alone)"
+need_line $HA '        Result rc = svcControlMemory(&linear_addr, 0x0, 0x0, linear, MEMOP_ALLOC_LINEAR, static_cast<MemPerm>(MEMPERM_READ | MEMPERM_WRITE));' "the linear heap is one request"
+need_line $HA '        rc = svcControlMemory(&heap_addr, OS_HEAP_AREA_BEGIN, 0x0, heap, MEMOP_ALLOC, static_cast<MemPerm>(MEMPERM_READ | MEMPERM_WRITE));' "the heap is one request, at the heap area"
+need_order $HA ', MEMOP_ALLOC_LINEAR, static_cast<MemPerm>' ', MEMOP_ALLOC, static_cast<MemPerm>' "the linear heap is asked for first: refused, it costs nothing (the kernel zeroes it only once found)"
+need_after $HA ', MEMOP_ALLOC_LINEAR, static_cast<MemPerm>' '            return heap_plan::Part::Linear;' "a refused linear heap says so: the plan cuts the linear heap, not the total"
+need_line $HA '            svcControlMemory(&unused, linear_addr, 0x0, linear, MEMOP_FREE, static_cast<MemPerm>(0)); // (the next request starts from nothing)' "a refused heap gives the linear heap back"
+need_after $HA ', MEMOP_FREE, static_cast<MemPerm>(0)); // (the next request starts from nothing)' '            return heap_plan::Part::Heap;' "a refused heap says so"
+need_order $HA ', MEMOP_ALLOC, static_cast<MemPerm>' '        return heap_plan::Part::None;' "done only after both requests"
+[ "$(tr -d '\r' < $HA | grep -c 'return heap_plan::Part::')" = 3 ] || fail "$HA: Try returns a Part in more or fewer than its three places (Linear, Heap, None)"
+need_line $HA '        return static_cast<u32>(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000));' "the plan's clock is in ms (the 3 s of waiting and the 1 s between equal requests)"
+need_line $HA '        svcSleepThread(static_cast<s64>(ms) * 1000000LL);' "a wait of the plan is in ms"
+# its log keeps the last starts (one line each, with the console's date and time and the time since boot): the sequences of a test session need them all
+need_line $HA '    if (setup::ReadTextFile(path, heap_plan::kLogReadBytes, old) == setup::LoadResult::Unreadable) {' "the old lines are read first (a file that could not be read is not written over)"
+need_line $HA '    setup::WriteTextFile(path, heap_plan::KeepLast(old, std::string(stamp) + line, heap_plan::kLogMaxLines, heap_plan::kLogMaxBytes));' "the heap log grows by one stamped line per start and keeps the last ones"
+need ConfigApp/source/heap_plan.hpp 'constexpr std::size_t kLogMaxLines = 50;' "the heap log keeps the last 50 starts"
+need ConfigApp/source/main.cpp '        heap_alloc::WriteStartLog(g.paths.datadir);' "every start but the first adds its line"
+need ConfigApp/source/pages_startup.cpp '        heap_alloc::WriteStartLog(g.paths.datadir);' "the first start adds its line once it may write"
 
 if [ "$FAILED" = 0 ]; then
   echo "policy check: defaults and switches as intended"

@@ -14,9 +14,11 @@
 // Every other start only scans the titles (the first screen only when there is no cache yet; otherwise it runs on behind the main page),
 // asks about the Plugin Loader when it is off, and opens the main page.
 #include "dlp_text.hpp"
+#include "heap_alloc.hpp"
 #include "pages.hpp"
 #include "plugin_resource.hpp"
 #include "titles.hpp"
+#include "zombie_census.hpp"
 
 using namespace ui;
 
@@ -190,6 +192,8 @@ private:
     // with the scan.
     void Begin() {
         g.OpenDataFolder();
+        heap_alloc::WriteStartLog(g.paths.datadir); // (the first start has its line too: heap_alloc.cpp)
+        zombie_census::Run(g.paths.datadir);        // (and its look at a closed game still in memory: zombie_census.cpp)
         g.RefreshLoader();
         steps_[0].label = "Reading your titles";
         steps_[1].label = "boot9.bin";

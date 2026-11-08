@@ -6,18 +6,31 @@
 #include <cstring>
 
 #include "azl/apt_sleep.hpp"
-#include "azl/arm_reloc.hpp"
+#include "azl/chat_host.hpp"
+#include "azl/gate_plan.hpp"
 #include "azl/gsp_wrapper.hpp"
 #include "azl/hook_swap.hpp"
-#include "azl/svc_patch.hpp"
+#include "azl/traced_sessions.hpp"
 #include "azl/log.hpp"
 #include "azl/platform.hpp"
 #include "azl/stats.hpp"
 #include "csvc.h"
+#include "ctr/gate_page.hpp"
+#include "ctr/input_mirror.hpp"
+#include "ctr/swap_gate.hpp"
+#include "ctr/zombie_probe.hpp"
 
-// Assembly entry points (svc_entry.s).
-extern "C" void azl_svc32_entry(void);
-extern "C" void azl_svc23_entry(void);
+// The gate (Sources/ctr/gate.s): the code that is copied into its page, and its two entries.
+extern "C" const u32 azl_gate_begin[];
+extern "C" const u32 azl_gate_end[];
+extern "C" const u32 azl_gate_32[];
+extern "C" const u32 azl_gate_23[];
+// The exit guard's trampoline (Sources/ctr/exit_tramp.s): copied into the tail of the gate's page; its three words written in the copy.
+extern "C" const u32 azl_exit_tramp_begin[];
+extern "C" const u32 azl_exit_tramp_end[];
+extern "C" const u32 azl_exit_tramp_state[];
+extern "C" const u32 azl_exit_tramp_fn[];
+extern "C" const u32 azl_exit_tramp_stack[];
 
 namespace azl {
 namespace ctr {
@@ -26,6 +39,8 @@ namespace {
 
 constexpr u32 kSvcSendSyncRequest = 0xEF000032; // svc 0x32
 constexpr u32 kSvcCloseHandle = 0xEF000023;     // svc 0x23
+constexpr u32 kSvcExitProcess = 0xEF000003;     // svc 0x03 (the exit guard: InstallExitGuard)
+constexpr u32 kExitTrampStubs = 16;             // the gate's page keeps this many stubs' worth (192 bytes) for the exit guard's trampoline (168)
 constexpr u32 kGameTextBase = 0x00100000;
 
 // Room for 2048 hooked call sites; a game has a few hundred (Final Fantasy Explorers: 421).
@@ -33,71 +48,47 @@ constexpr u32 kMaxSites = 2048;
 
 UdsHle* g_hle = nullptr;
 
-HookSite g_sites[kMaxSites];
+// The hooked call sites, in the order of their stubs in the gate's page (azl/gate_plan.hpp: SiteIndex): where, and the svc that was there.
+GateSite g_sites[kMaxSites];
 u32 g_site_count = 0;
 
-// The swap of the plugin's memory on an Old 3DS (azl/hook_swap.hpp): what is ours to remember between the two events.
-HandBackLedger g_ledger;
-volatile u32 g_hooks_state = kHooksActive;
-volatile u32 g_patch_lock = 0; // the plugin's threads that change the game's sites (the keep-alive thread, the frame callback) take turns; the game's thread never waits for it
-SwapStats g_swap_stats;
-bool g_old_3ds = false;
+// The gate's page (ctr/gate_page.hpp) and its header; the swap flips the header's flag (CloseGate, OpenGate) and nothing else.
+GatePage g_gate_page;
+GateHeader* g_gate = nullptr;
+u64 g_apt_receive_tick = 0; // the tick of the game's last APT ReceiveParameter(application) call (LastAptReceiveTick)
+u32 g_stubs_base = 0;
+HookGateStats g_gate_stats;
+u32 g_gate_last_open_ms = 0; // (the gate last opened at this time: the line of a failed call says how long ago)
 u32 g_gsp_stub_wrappers = 0; // what RewriteStubbedGspWrappers() rewrote (InstallSvcHooks reports it)
-
-/// The game's text, written and read as the host tests' array is: the words, the data cache cleaned for them, the instruction cache invalidated for all cores
-/// by Sync(). Luma3DS has made the whole process RWX in the MMU (see InstallSvcHooks), so the stores need no permission call.
-struct GameTextMemory {
-    u32 Load(u32 address) const {
-        return *reinterpret_cast<const volatile u32*>(address);
-    }
-    // (a thread that passes a site between the two stores finds the svc and then the literal word: the svc is the game's own, and the literal, a trampoline
-    //  address, runs as a conditional instruction that most often does nothing; the other order would jump into the second word)
-    void StoreOriginal(u32 address, const u32 words[2]) const {
-        Poke(address, words[0]);
-        Poke(address + 4, words[1]);
-        svcFlushProcessDataCache(CUR_PROCESS_HANDLE, address, 8);
-    }
-    void StoreHook(u32 address, const u32 words[2]) const {
-        Poke(address + 4, words[1]);
-        Poke(address, words[0]);
-        svcFlushProcessDataCache(CUR_PROCESS_HANDLE, address, 8);
-    }
-    void Sync() const {
-        svcInvalidateEntireInstructionCache();
-    }
-    static void Poke(u32 address, u32 value) {
-        *reinterpret_cast<volatile u32*>(address) = value;
-    }
-};
-
-// Executable scratch memory for the trampolines. It lives in the plugin's own image (.bss).
-alignas(0x1000) u32 g_trampolines[kMaxSites * kWordsPerTrampoline];
-u32 g_trampoline_words = 0;
 
 u32 ReadGameWord(void*, u32 address) {
     return *reinterpret_cast<const u32*>(address);
 }
 
-/// Builds the trampoline for the call site at `site` (whose svc is followed by `next`).
-bool BuildTrampoline(u32 site, u32 next, u32 entry, u32* tramp_address) {
-    if (g_trampoline_words + kWordsPerTrampoline > kMaxSites * kWordsPerTrampoline) {
-        return false;
+/// What WriteGate (azl/gate_plan.hpp) writes through: the gate's page with plain stores, ONE word of the game's text per site with the
+/// framework's Process::Patch (and its data cache cleaned), then the instruction cache of every core. Luma3DS has made the whole process
+/// RWX in the MMU (see InstallSvcHooks). This runs once, in EarlyInit, before the game's first instruction.
+struct GateTextMemory {
+    u32 page;
+    u32 bytes;
+    u32 Load(u32 address) const {
+        return *reinterpret_cast<const volatile u32*>(address);
     }
-    u32* t = &g_trampolines[g_trampoline_words];
-    const char* reason = "";
-    if (!BuildSvcTrampoline(site, next, reinterpret_cast<u32>(t), entry, ReadGameWord, nullptr, t,
-                            &reason)) {
-        static u32 logged = 0;
-        if (logged++ < 6) {
-            Log("hook: skipped svc at 0x%08lx (next insn 0x%08lx): %s", static_cast<unsigned long>(site),
-                static_cast<unsigned long>(next), reason);
+    void StorePage(u32 address, u32 word) const {
+        *reinterpret_cast<volatile u32*>(address) = word;
+    }
+    bool PatchText(u32 address, u32 word) const {
+        if (!CTRPluginFramework::Process::Patch(address, word)) {
+            return false;
         }
-        return false;
+        svcFlushProcessDataCache(CUR_PROCESS_HANDLE, address, 4);
+        return true;
     }
-    g_trampoline_words += kWordsPerTrampoline;
-    *tramp_address = reinterpret_cast<u32>(t);
-    return true;
-}
+    void Sync() const {
+        svcFlushProcessDataCache(CUR_PROCESS_HANDLE, page, bytes);
+        svcInvalidateEntireInstructionCache();
+    }
+};
 
 // ---------------------------------------------------------------------------------------------
 // Sites that CTRPluginFramework hooks itself
@@ -105,14 +96,12 @@ bool BuildTrampoline(u32 site, u32 next, u32 entry, u32* tramp_address) {
 // The framework's GSP service module (Services::GSP::Initialize, libctrpf 0.8.0) hooks the game's
 // GSPGPU::RegisterInterruptRelayQueue wrapper: it finds the wrapper by instruction pattern and
 // replaces the ONE word that holds its `svc 0x32` with a branch to its own stub, which performs the
-// svc itself and then resumes at the next word. That next word is where our own redirect keeps its
-// literal (the address of the trampoline): had we patched the same svc, the framework's stub would
-// run our literal as an instruction (a conditional load/store with arbitrary registers). Whether
-// that is harmless depends only on the address of the trampoline, that is on how the plugin happens
-// to be linked (presumably it was in 0.1.2 and 0.1.3, which booted the game). In 0.1.4 the literal
-// is 0x070B0420 = `streq r0, [fp, -r0, lsr #8]`: with fp = &cursor it zeroed the GPU command-list
-// pointer of Final Fantasy Explorers in the first second of the boot. We never need to see this
-// call (it is neither nwm::UDS nor ndm:u), so
+// svc itself and then resumes at the next word. Our gate wants that same word for its `b stub`: whoever
+// writes it last wins, and the other's code is never run. Up to 1.1.2 the hook took two words and the
+// framework's stub resumed on our second one, a literal (an address in the plugin's block), run as an
+// instruction: in 0.1.4 it was 0x070B0420 = `streq r0, [fp, -r0, lsr #8]`, and with fp = &cursor it
+// zeroed the GPU command-list pointer of Final Fantasy Explorers in the first second of the boot. We
+// never need to see this call (it is neither nwm::UDS nor ndm:u), so
 // the site is left to the framework. The patterns are the ones the framework itself searches for:
 // the libctru-compiled wrapper (hook at +0x2C) and the prologue of the Nintendo-SDK-compiled one
 // followed by the command header 0x00130042 somewhere in its first 0x50 bytes (hook at +0x28).
@@ -121,55 +110,8 @@ bool BuildTrampoline(u32 site, u32 next, u32 entry, u32* tramp_address) {
 // (the patterns themselves are in azl/gsp_wrapper.hpp, where the host tests can reach them)
 
 constexpr u32 kMaxFrameworkSites = 8;
-u32 g_framework_sites[kMaxFrameworkSites];
+u32 g_framework_sites[kMaxFrameworkSites]; // (azl/gsp_wrapper.hpp, FindFrameworkSites: the framework's svc 0x32 words, left as they are)
 u32 g_framework_site_count = 0;
-
-bool MatchWords(u32 address, const u32* words, u32 count) {
-    for (u32 i = 0; i < count; ++i) {
-        if (*reinterpret_cast<const u32*>(address + 4 * i) != words[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-void AddFrameworkSite(u32 address) {
-    if (g_framework_site_count < kMaxFrameworkSites) {
-        g_framework_sites[g_framework_site_count++] = address;
-    }
-}
-
-/// Finds the `svc 0x32` words the framework is going to hook (see above). [first, end) is the
-/// readable part of the game's .text.
-void FindFrameworkSites(u32 first, u32 end) {
-    g_framework_site_count = 0;
-    for (u32 addr = first; addr + 4 <= end; addr += 4) {
-        if (*reinterpret_cast<const u32*>(addr) != 0xE92D4070) {
-            continue; // both patterns start with push {r4-r6, lr}
-        }
-        if (addr + sizeof(kGspWrapperCtru) <= end &&
-            MatchWords(addr, kGspWrapperCtru, sizeof(kGspWrapperCtru) / 4)) {
-            AddFrameworkSite(addr + kGspWrapperCtruSvcOffset);
-        } else if (addr + kGspWrapperSdkHeaderWindow <= end &&
-                   MatchWords(addr, kGspWrapperSdk, sizeof(kGspWrapperSdk) / 4)) {
-            for (u32 off = 0; off < kGspWrapperSdkHeaderWindow; off += 4) {
-                if (*reinterpret_cast<const u32*>(addr + off) == kGspRegisterInterruptHeader) {
-                    AddFrameworkSite(addr + kGspWrapperSdkSvcOffset);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-bool IsFrameworkSite(u32 address) {
-    for (u32 i = 0; i < g_framework_site_count; ++i) {
-        if (g_framework_sites[i] == address) {
-            return true;
-        }
-    }
-    return false;
-}
 
 } // namespace
 
@@ -187,22 +129,34 @@ bool IsFrameworkSite(u32 address) {
 // ---------------------------------------------------------------------------------------------
 
 // >>> game-thread code (Tests/policy_check.sh)
-// The threads that are inside an entry of svc_entry.s right now (it counts them in and out; Tests/hook_sim/entry_sim.py holds the assembly, ctr/hook.cpp's
-// SuspendSvcHooks waits for it to reach zero before the framework answers Luma3DS and the plugin's block is freed).
-extern "C" {
-volatile u32 azl_hooks_in_flight = 0;
+// The gate's flag (azl/gate_plan.hpp, GateHeader::flag; ctr/gate_flag.hpp): 0 while the swap of the plugin's block closes the gate. Until
+// the gate's page exists (and for good when there is none: no game thread then comes into the plugin) it points at a word of the plugin's
+// own that stays 1; InstallSvcHooks points it at the header's flag (Tests/chain_sim writes the flag to play a swap).
+volatile u32 g_gate_always_open = 1;
+volatile u32* g_gate_flag = &g_gate_always_open;
+
+// What pre tells the gate (Sources/ctr/gate.s: r1 of pre, then ctx[3] for post): 0 = answered here (r0 is the result), 1 = make the svc,
+// 2 and up = make the svc, then call post, which reads in ctx[3] which of the posts below it is.
+constexpr u32 kActAnswer = 0;
+constexpr u32 kActSvc = 1;
+constexpr u32 kActPostFirst = 2;
+constexpr u32 kActPostIpc = 2;         // the debug line of a plain call (PassThroughPost)
+constexpr u32 kActPostGetService = 3;  // srv:GetServiceHandle (PassThroughGetServicePost)
+constexpr u32 kActPostTraced = 4;      // a command of a traced real service (PassThroughTracedPost)
+constexpr u32 kActPostApt = 5;         // the three commands of the sleep protocol (PassThroughAptPost)
+constexpr u32 kActPostAptNoted = 6;    // ReceiveParameter(application) / AppletUtility with the log on (PassThroughAptNotedPost)
+
+inline u64 PreReply(u32 r0, u32 action) {
+    return static_cast<u64>(action) << 32 | r0;
 }
 
 constexpr u32 kSrvGetServiceHandle = 0x00050100;
+constexpr u32 kSrvGetServiceHandleReply = 0x00050042; // (result, then one handle moved to the caller)
+constexpr u32 kIpcMoveOneHandle = 0x10;
 constexpr u32 kMaxTracedSessions = 16;
 constexpr u32 kMaxTraceLines = 160;
 
-struct TracedSession {
-    Handle handle;
-    char name[12];
-    bool apt; ///< an APT session: the system's notifications (home, sleep) come through it
-};
-TracedSession g_traced[kMaxTracedSessions];
+TracedTable<kMaxTracedSessions> g_traced; // (azl/traced_sessions.hpp: what keeps it true when a close is not seen)
 u32 g_trace_lines = 0;
 
 // Download Play (dlp:FKCL, the fake client of the games that join a Download Play session as a game with its own
@@ -223,7 +177,7 @@ u32 g_seen_count = 0;
 // The services that can change the console's network or power state, or that the sleep and lid logic of
 // the system talks through (ptm:u: the power manager, cfg:u: the profile and the console's settings, cecd:u:
 // StreetPass, dlp:*: download play, APT:*: the notifications). The network ones are followed command by
-// command; an APT session only for the three commands of the sleep protocol (see PassThroughApt).
+// command; an APT session only for the three commands of the sleep protocol (see PassThroughAptPre).
 bool IsTracedService(const char* name) {
     static const char* const kNames[] = {"ndm:u",   "ac:u",     "ac:i",     "nwm::EXT", "nwm::INF", "nwm::SOC",
                                          "nwm::UDS", "boss:U",   "frd:u",    "ptm:u",    "cfg:u",    "cecd:u"};
@@ -240,12 +194,7 @@ bool IsAptService(const char* name) {
 }
 
 TracedSession* FindTraced(Handle handle) {
-    for (TracedSession& s : g_traced) {
-        if (s.handle == handle && handle != 0) {
-            return &s;
-        }
-    }
-    return nullptr;
+    return g_traced.Find(handle);
 }
 
 // True for the first few times a (session, command) pair is seen.
@@ -277,12 +226,6 @@ constexpr u32 kAptReceiveParameter = 0x000D0080;
 constexpr u32 kAptAppletUtility = 0x004B00C2; // (utility id, input size, output size, static buffer descriptor, input)
 constexpr u32 kMaxAptLines = 120;
 
-// The HOME button and the power button as the game's APT session tells them (InquireNotification, AptSignalPrecedesSwap). On an Old 3DS the swap of the plugin's memory follows within a moment, and
-// it is the game's next APT:ReceiveParameter that raises it (azl_handback_site below): that call is only handed back to its call site in the seconds after this.
-constexpr u32 kHomeWindowMs = 10000;
-volatile u32 g_home_seen = 0;
-volatile u32 g_home_ms = 0;
-
 const char* AptSignalName(u32 id) {
     static const char* const kNames[] = {"none",          "home button",      "home button (2)", "sleep query",
                                          "sleep cancelled", "sleep begins",     "wake-up",         "shutdown",
@@ -293,6 +236,7 @@ const char* AptSignalName(u32 id) {
 static SleepObserver g_sleep_observer = nullptr;
 static HomeObserver g_home_observer = nullptr;
 static AptObserver g_apt_observer = nullptr;
+static TrailWaiter g_trail_waiter = nullptr;
 
 void SetSleepObserver(SleepObserver observer) {
     g_sleep_observer = observer;
@@ -306,59 +250,114 @@ void SetHomeObserver(HomeObserver observer) {
     g_home_observer = observer;
 }
 
-// The two calls of the transition to and from the HOME menu, with the log on: what the system answered, for the trail. Out of line: the other APT commands do not pay for these locals.
-u32 g_receive_notes = 0;
-constexpr u32 kMaxReceiveNotes = 64;
-
-// One more line for the trail, while there is room; the last one says that the limit is reached.
-inline bool TakeReceiveNote() {
-    if (g_receive_notes > kMaxReceiveNotes) {
-        return false;
-    }
-    if (++g_receive_notes > kMaxReceiveNotes) {
-        g_apt_observer(kAptNoteLimit, 0);
-        return false;
-    }
-    return true;
+void SetTrailWaiter(TrailWaiter waiter) {
+    g_trail_waiter = waiter;
 }
 
-__attribute__((noinline)) Result PassThroughAptNoted(Handle handle, u32 header) {
+// The two calls of the transition to and from the HOME menu, with the log on: what the system answered, for the trail. Out of line: the other APT commands do not pay for these locals.
+// Their lines: 64 a launch (kMaxReceiveNotes), and once a close command came 32 more of their own (azl/apt_sleep.hpp, AptNoteBudget): the lines after the
+// close are the ones a game closed without its EXIT needs (REGISTRO, phase N), and a game that polls these used the 64 up long before.
+AptNoteBudget g_receive_notes;
+constexpr u32 kMaxReceiveNotes = AptNoteBudget::kNormal;
+static_assert(kMaxReceiveNotes == 64, "the limit the trail's line says");
+
+// (before the call: what the request says, for the line after it. Nothing is taken here: the line's room is taken in the post, and a
+//  post that does not run - the plugin went away during the call - leaves nothing behind)
+__attribute__((noinline)) u32 PassThroughAptNotedPre(u32 header, u32* ctx) {
     u32* cmd = getThreadCommandBuffer();
-    const u32 id = cmd[1];
     u32 input = 0;
     if (header == kAptAppletUtility && cmd[2] >= 2 && cmd[5] != 0) {
         input = *reinterpret_cast<const u16*>(cmd[5]); // (the kernel would refuse the call with a bad pointer: the game's own buffer)
     }
-    const Result rc = svcSendSyncRequest(handle);
-    if (TakeReceiveNote()) { // (a game that polls these must not use up the lines of the trail)
-        if (header == kAptAppletUtility) {
+    ctx[0] = header;
+    ctx[1] = cmd[1];
+    ctx[2] = input;
+    return kActPostAptNoted;
+}
+
+__attribute__((noinline)) Result PassThroughAptNotedPost(Result rc, const u32* ctx) {
+    u32* cmd = getThreadCommandBuffer();
+    const u32 header = ctx[0];
+    const u32 id = ctx[1];
+    const u32 input = ctx[2];
+    if (!g_apt_observer) {
+        return rc;
+    }
+    const bool receive = header != kAptAppletUtility;
+    const bool answered = R_SUCCEEDED(rc) && static_cast<s32>(cmd[1]) >= 0;
+    const u32 command = receive && answered ? cmd[3] & 0xFFFF : 0;
+    const u32 take = g_receive_notes.Take(AptCommandCloses(command)); // (a game that polls these must not use up the lines of the trail)
+    if (take & AptNoteBudget::kNoteLimit) {
+        g_apt_observer(kAptNoteLimit, 0);
+    }
+    if (take & AptNoteBudget::kNoteCloseLimit) {
+        g_apt_observer(kAptNoteCloseLimit, 0);
+    }
+    if (take & AptNoteBudget::kNoteWrite) {
+        if (!receive) {
             g_apt_observer(kAptNoteUtility, input << 16 | (id & 0xFFFF));
             g_apt_observer(kAptNoteUtilityResult, R_SUCCEEDED(rc) ? cmd[1] : static_cast<u32>(rc));
         } else {
-            g_apt_observer(kAptNoteReceiveReply, R_SUCCEEDED(rc) && static_cast<s32>(cmd[1]) >= 0 ? cmd[2] << 16 | (cmd[3] & 0xFFFF) : kAptReceiveFailed);
+            g_apt_observer(kAptNoteReceiveReply, answered ? cmd[2] << 16 | command : kAptReceiveFailed);
+            // Luma3DS's word after the call (its kernel hook of this call raises HOME_EXIT at INHOME): the state the game is left in
+            g_apt_observer(kAptNoteReceiveWord, LumaPluginWord());
         }
+    }
+    if (command == kAptCommandCloseFromHome && g_trail_waiter) {
+        g_trail_waiter(); // (the close: its lines on the card before the game can be killed; bounded, ended by the gate's close, New 3DS only)
     }
     return rc;
 }
 
-Result PassThroughApt(Handle handle) {
+// The chat's keyboard over the running game (Sources/ctr/chat_overlay.cpp) closes, its draft kept, on the notifications that take the game
+// away (azl/chat_host.hpp, NoteAptNotification: HOME, power, sleep, close; the signal in the LOW BYTE of the word, which is where NS writes it:
+// 0x608 is the power button on an Old 3DS). Here they are only counted, for the plugin's thread to see: at every level of the log (the lines
+// below are the debug log's, the keyboard is not), out of line (the pass-through's own frame does not grow), no wait, no line, and the
+// game's answer untouched. And the game's input page goes back here, BEFORE the game acts on the notification (ctr/input_mirror.hpp: an
+// SDK that finalizes HID before an applet or the sleep unmaps the page, which fails with the mirror at its address); a try of the lock only.
+static __attribute__((noinline)) void NoteAptForChat(Result rc, u32 result_word, u32 raw) {
+    if (chat::NoteAptNotification(chat::g_signals, rc, result_word, raw)) {
+        MirrorRestoreFromGame();
+    }
+}
+
+// (The HOME notification is never taken away from the game: an SDK title's thread of the notifications panics on a notification 0 - Super
+// Street Fighter IV 3D, svcBreak at 0x610948 from 0x60D5CC, 2026-11-04 - see AzaharLink/analysis/ssf4-crash-menu-2026-11-04.)
+
+// (APT:ReceiveParameter(application) - the call at whose end Luma3DS raises the swap of the plugin's block on an Old 3DS - is a plain svc
+//  here, or a svc and a post with the log on: nothing of the plugin is held across it)
+__attribute__((noinline)) u32 PassThroughAptPre(u32* ctx) {
     u32* cmd = getThreadCommandBuffer();
     const u32 header = cmd[0];
     if (header != kAptInquireNotification && header != kAptReplySleepQuery &&
         header != kAptReplySleepNotificationComplete) {
-        if (g_debug_level > 0 && g_apt_observer && (header == kAptAppletUtility || (header == kAptReceiveParameter && cmd[1] == 0x300))) {
-            return PassThroughAptNoted(handle, header);
+        if (header == kAptReceiveParameter && cmd[1] == 0x300) {
+            // The anchor of an Old 3DS's SWAP_ENTER deadline (ctr/swap_gate.hpp): Luma3DS raises its event at the end of this very call, and
+            // waits for the framework's answer from there. One store at every debug level (the deadline is not a debug feature).
+            __atomic_store_n(&g_apt_receive_tick, svcGetSystemTick(), __ATOMIC_RELAXED);
         }
-        return svcSendSyncRequest(handle);
+        if (g_debug_level > 0 && g_apt_observer && (header == kAptAppletUtility || (header == kAptReceiveParameter && cmd[1] == 0x300))) {
+            return PassThroughAptNotedPre(header, ctx);
+        }
+        return kActSvc;
     }
-    const u32 app_id = cmd[1];
     const u32 reply = cmd[2]; // (ReplySleepQuery: the request word; the reply buffer replaces it)
     // The trail of a sleep (azl/sleep_crumbs.hpp): the game's two replies are noted BEFORE their call - the acknowledgement
     // of a sleep may not return from it for as long as the console sleeps, or ever.
     if (g_apt_observer && g_debug_level > 0 && header != kAptInquireNotification) {
         g_apt_observer(header == kAptReplySleepQuery ? kAptNoteReplyQuery : kAptNoteReplyComplete, reply);
     }
-    const Result rc = svcSendSyncRequest(handle);
+    ctx[0] = header;
+    ctx[1] = cmd[1]; // (the app id)
+    ctx[2] = reply;
+    return kActPostApt;
+}
+
+__attribute__((noinline)) Result PassThroughAptPost(Result rc, const u32* ctx) {
+    u32* cmd = getThreadCommandBuffer();
+    const u32 header = ctx[0];
+    const u32 app_id = ctx[1];
+    const u32 reply = ctx[2];
     const Result result = R_SUCCEEDED(rc) ? cmd[1] : rc;
     static u32 lines = 0;
     if (header == kAptInquireNotification) {
@@ -368,10 +367,7 @@ Result PassThroughApt(Handle handle) {
             return rc; // (polled all the time: only the notifications themselves are of interest)
         }
         const bool answered = R_SUCCEEDED(rc) && static_cast<s32>(cmd[1]) >= 0; // (a failed call leaves in cmd[2] what an earlier one left: with 8 bits that can look like a button)
-        if (answered && AptSignalPrecedesSwap(id)) {
-            g_home_ms = static_cast<u32>(platform::NowMs());
-            g_home_seen = 1;
-        }
+        NoteAptForChat(rc, cmd[1], raw);
         if (g_apt_observer && g_debug_level > 0 && answered) {
             g_apt_observer(kAptNoteNotification, raw); // (the word as it came; before the sleep observer below acts on it)
         }
@@ -442,13 +438,42 @@ Result PassThroughApt(Handle handle) {
 u32 g_last_service = 0;
 u32 g_last_service_ms = 0;
 
-// srv:GetServiceHandle: which real services the game opens (and the traced ones are remembered by session).
+// The zombie probe (debug only): a control-lane line for an IPC reply that hands the game a handle - which service, which
+// command, copy or move, and the handle's class token. It sees only srv's service opens (always a client session) and the
+// REPLIES of the traced services (IsTracedService and APT): gsp::Gpu, soc:U, ir:USER and hid:USER are not traced, and a
+// game-owned object a sysmodule keeps (gsp's RegisterInterruptRelayQueue event, soc's shared block) travels in a REQUEST,
+// so this line can neither confirm nor exclude the gsp/soc/ir/hid leads: who holds the zombie is the census's to say
+// (3DS Link, after the close). A handle the game receives dies with its table; the line maps what it was given.
+// Control lane (a frame flood never drops it); the type read is a Luma svc, gated and never on the hot pass-through path
+// (only service opens and traced commands reach here). No printf, no format: DebugLine only.
+__attribute__((noinline)) void NoteIpcHandleXfer(const char* service, u32 command, const u32* reply) {
+    if (g_debug_level <= 0) {
+        return;
+    }
+    const zombie::HandleXfer x = zombie::DecodeReplyHandleXfer(reply, 64);
+    if (!x.found) {
+        return;
+    }
+    u32 type = 0xFFFFFFFFu;
+    if (zombie::BackdoorOk()) {
+        s64 flags = 0;
+        if (R_SUCCEEDED(svcGetHandleInfo(&flags, x.handle, 0x10001))) { // 0x10001: the object's class token flags (Luma ext)
+            type = static_cast<u32>(flags);
+        }
+    }
+    DebugLine line;
+    line.Str("ipc-xfer ").Str(service).Str(" cmd 0x").Hex(command, 4).Str(x.move ? " move handle 0x" : " copy handle 0x")
+        .Hex(x.handle).Str(" type 0x").Hex(type, 2);
+}
+
+// srv:GetServiceHandle: which real services the game opens (and the traced ones are remembered by session). The name (8 bytes of the
+// request, which the reply overwrites) is kept in ctx[0..1] by PassThroughPre; the table takes the session here, after the call, and
+// only here: a post that does not run takes nothing.
 // Out of line, with a frame of its own: the common path below does not pay for these locals.
-__attribute__((noinline)) Result PassThroughGetService(Handle handle) {
+__attribute__((noinline)) Result PassThroughGetServicePost(Result rc, const u32* ctx) {
     u32* cmd = getThreadCommandBuffer();
     char name[9] = {};
-    std::memcpy(name, &cmd[1], 8);
-    const Result rc = svcSendSyncRequest(handle);
+    std::memcpy(name, ctx, 8);
     const Result service_rc = R_SUCCEEDED(rc) ? cmd[1] : rc;
     const Handle session = R_SUCCEEDED(service_rc) ? cmd[3] : 0;
     if (g_debug_level > 0) {
@@ -471,30 +496,44 @@ __attribute__((noinline)) Result PassThroughGetService(Handle handle) {
                      "'wireless must be turned on' and no tunnel for this game");
         }
     }
+    if (cmd[0] == kSrvGetServiceHandleReply && cmd[2] == kIpcMoveOneHandle) {
+        g_traced.Opened(session); // (a session closed out of the hook's sight frees its slot when its index comes back; only srv's own answer says a handle is new)
+        NoteIpcHandleXfer(name, kSrvGetServiceHandle >> 16, cmd); // (debug only: the session handle the game just received)
+    }
     const bool apt = IsAptService(name);
     if (session && (apt || IsTracedService(name))) {
-        for (TracedSession& s : g_traced) {
-            if (s.handle == 0) {
-                std::strncpy(s.name, name, sizeof(s.name) - 1);
-                s.apt = apt;
-                s.handle = session;
-                break;
-            }
-        }
+        g_traced.Add(session, name, apt);
     }
     return rc;
 }
 
-// A command of a traced real service (ndm:u, ac:u, nwm::*, ptm:u, cfg:u, ...): followed for the log only.
-__attribute__((noinline)) Result PassThroughTraced(Handle handle, const TracedSession* traced) {
-    u32* cmd = getThreadCommandBuffer();
+// A command of a traced real service (ndm:u, ac:u, nwm::*, ptm:u, cfg:u, ...): followed for the log only. Before the call: the session,
+// the command (and whether its line is worth writing: the top bit) and the first argument, by value. After it the session is looked up
+// again by its handle (no pointer into the table is carried across the call: another thread may close the session meanwhile, and then
+// there is no line).
+constexpr u32 kTracedLogIt = 0x80000000u;
+
+__attribute__((noinline)) u32 PassThroughTracedPre(Handle handle, u32* ctx) {
     if (g_debug_level <= 0) {
-        return svcSendSyncRequest(handle);
+        return kActSvc;
     }
+    u32* cmd = getThreadCommandBuffer();
     const u32 command = cmd[0] >> 16;
-    const u32 arg0 = cmd[1];
-    const bool log_it = WorthLogging(handle, command);
-    const Result rc = svcSendSyncRequest(handle);
+    ctx[0] = handle;
+    ctx[1] = command | (WorthLogging(handle, command) ? kTracedLogIt : 0u);
+    ctx[2] = cmd[1];
+    return kActPostTraced;
+}
+
+__attribute__((noinline)) Result PassThroughTracedPost(Result rc, const u32* ctx) {
+    const TracedSession* traced = FindTraced(ctx[0]);
+    if (!traced) {
+        return rc;
+    }
+    u32* cmd = getThreadCommandBuffer();
+    const u32 command = ctx[1] & 0xFFFFu;
+    const u32 arg0 = ctx[2];
+    const bool log_it = (ctx[1] & kTracedLogIt) != 0;
     const u32 result = R_SUCCEEDED(rc) ? cmd[1] : static_cast<u32>(rc);
     if (log_it) {
         ++g_trace_lines;
@@ -502,7 +541,10 @@ __attribute__((noinline)) Result PassThroughTraced(Handle handle, const TracedSe
         line.Str("svc: REAL ").Str(traced->name).Str(" command 0x").Hex(command, 4).Str(" (arg 0x").Hex(arg0)
             .Str(") -> 0x").Hex(result, 8);
     }
-    DebugSvcReal(traced->name, command, arg0, result);
+    DebugSvcReal(traced->name, command, arg0, result, ctx[0]); // (the session's handle: the diet counts its repeats)
+    if (R_SUCCEEDED(rc)) {
+        NoteIpcHandleXfer(traced->name, command, cmd); // (debug only: a handle a traced service returned, e.g. ndm's or APT's event)
+    }
     if (result == kDlpWirelessOff && !g_dlp_fail_noted && std::strcmp(traced->name, "dlp:FKCL") == 0) {
         g_dlp_fail_noted = true;
         LogLine note;
@@ -513,14 +555,13 @@ __attribute__((noinline)) Result PassThroughTraced(Handle handle, const TracedSe
 }
 
 // A call of the game that failed for good, with the log on: what a dump does not say, written down before the game goes on to its error screen. One line of the trail (AzaharLink.sleep.log): the thread,
-// the command buffer and the words of the stack that look like code: above the plugin's frames are the trampoline's return and the game's own lr. At most 8 invalid handles in a launch, 100 ms apart
+// the command buffer and the words of the stack that look like code: above the plugin's frames are the gate's return (stub + 8, in the gate's page) and the game's own lr. At most 8 invalid handles in a launch, 100 ms apart
 // (a thread that insists fills the ring in microseconds, and the writes are slow); a fatal error always, and it gives the thread of the trail time to write it: what follows the call may stop the process.
 constexpr u32 kKernelInvalidHandle = 0xD8E007F7;
 constexpr u32 kErrfThrow = 0x00010800; // err:f ThrowFatalError: type, result, pc, process, title in the words after the header
 constexpr u32 kFailureGapMs = 100;
 u32 g_failures_noted = 0;
 u32 g_failure_ms = 0;
-u32 g_resume_end_ms = 0; // (the call sites were last put back in the hook at this time: ResumeSvcHooks)
 u32 g_failure_busy = 0; // (one line at a time: two threads would mix their words)
 
 __attribute__((noinline)) void NoteGameFailure(u32 kind, Handle handle) {
@@ -549,8 +590,8 @@ __attribute__((noinline)) void NoteGameFailure(u32 kind, Handle handle) {
     g_apt_observer(kAptNoteWord, thread_id);
     g_apt_observer(kAptNoteWord, static_cast<u32>(priority));
     g_apt_observer(kAptNoteWord, static_cast<u32>(svcGetProcessorID()));
-    g_apt_observer(kAptNoteWord, g_hooks_state);
-    g_apt_observer(kAptNoteWord, now - g_resume_end_ms);
+    g_apt_observer(kAptNoteWord, GateClosing() ? 1u : 0u); // (0: the gate is open, the plugin is there; as the hooks' state of 1.1.2 was)
+    g_apt_observer(kAptNoteWord, now - g_gate_last_open_ms);
     g_apt_observer(kAptNoteWord, g_last_service);
     g_apt_observer(kAptNoteWord, now - g_last_service_ms);
     for (u32 i = 0; i < 7; ++i) {
@@ -566,89 +607,127 @@ __attribute__((noinline)) void NoteGameFailure(u32 kind, Handle handle) {
     }
     g_apt_observer(kAptNoteEnd, 0);
     __atomic_store_n(&g_failure_busy, 0u, __ATOMIC_RELEASE);
-    if (kind == kAptNoteFatal) {
+    if (kind == kAptNoteFatal && !GateClosing()) { // (not while the swap waits for this thread to leave the plugin: it would wait 50 ms of it)
         svcSleepThread(50000000LL);
     }
 }
 
-// What every IPC call of every thread of the game that no service of ours answers goes through. The common case -
-// a call to a real service nobody traces - keeps this frame small on purpose: it is the one that runs on the
-// srv-notification thread of Tri Force Heroes (464 bytes), and the branches with locals are out of line.
-Result PassThrough(Handle handle) {
+// srv:ReceiveNotification, with the log on (this post runs only then): the termination request (0x100) the game got, for the trail. pm sends it
+// when it terminates the application; when it cannot be sent, pm kills the process at once, with no EXIT (pm termination.c). A few lines a
+// launch (a game that subscribed to other notifications gets them through here too: only 0x100 is noted). Out of line: PassThroughPost's frame
+// is the one of the 464-byte thread of Tri Force Heroes, which is the very thread that makes this call.
+constexpr u32 kSrvReceiveNotification = 0x000B0000;
+constexpr u32 kSrvReceiveNotificationReply = 0x000B0080; // (result, the notification's id)
+constexpr u32 kSrvNotificationTerminate = 0x100;
+constexpr u32 kMaxSrvNotes = 4;
+u32 g_srv_notes = 0;
+
+__attribute__((noinline)) void NoteSrvNotification(Result rc, const u32* cmd) {
+    if (R_SUCCEEDED(rc) && cmd[0] == kSrvReceiveNotificationReply && static_cast<s32>(cmd[1]) >= 0 && cmd[2] == kSrvNotificationTerminate &&
+        g_apt_observer && g_srv_notes < kMaxSrvNotes) {
+        ++g_srv_notes;
+        g_apt_observer(kAptNoteSrvNotification, cmd[2]);
+    }
+}
+
+// What every IPC call of every thread of the game that no service of ours answers goes through, in two halves: this one before the
+// call, a post after it (azl_post32) when there is something to note. The common case - a call to a real service nobody traces - keeps
+// this frame small on purpose: it is the one that runs on the srv-notification thread of Tri Force Heroes (464 bytes), and the branches
+// with locals are out of line. Returns the handle for the svc in the low word and the action (kAct*) in the high one.
+__attribute__((noinline)) u64 PassThroughPre(Handle handle, u32* ctx) {
     u32* cmd = getThreadCommandBuffer();
     const u32 header = cmd[0];
     if (header == kSrvGetServiceHandle) {
-        return PassThroughGetService(handle);
+        ctx[0] = cmd[1]; // (the name, 8 bytes: the reply overwrites them)
+        ctx[1] = cmd[2];
+        return PreReply(handle, kActPostGetService);
     }
-    const TracedSession* traced = FindTraced(handle);
+    TracedSession* traced = FindTraced(handle);
     if (traced) {
-        return traced->apt ? PassThroughApt(handle) : PassThroughTraced(handle, traced);
+        if (traced->apt) {
+            g_traced.Touch(*traced); // (a session the game keeps and uses is never the one a full table gives up)
+            return PreReply(handle, PassThroughAptPre(ctx));
+        }
+        return PreReply(handle, PassThroughTracedPre(handle, ctx));
     }
     ++g_stats.pass_calls;
     if (g_debug_level <= 0) {
-        return svcSendSyncRequest(handle);
+        return PreReply(handle, kActSvc);
     }
     // Log on: every IPC request of the game (raw words in the ring: no formatting on this thread, whatever its stack is).
-    const u32 arg = cmd[1];
     if (header == kErrfThrow) {
         NoteGameFailure(kAptNoteFatal, handle); // (before the call: it does not come back)
     }
-    const Result rc = svcSendSyncRequest(handle);
+    ctx[0] = handle;
+    ctx[1] = header;
+    ctx[2] = cmd[1];
+    return PreReply(handle, kActPostIpc);
+}
+
+__attribute__((noinline)) Result PassThroughPost(Result rc, const u32* ctx) {
+    u32* cmd = getThreadCommandBuffer();
+    const Handle handle = ctx[0];
+    const u32 header = ctx[1];
+    const u32 arg = ctx[2];
     if (static_cast<u32>(rc) == kKernelInvalidHandle) {
         NoteGameFailure(kAptNoteBadHandle, handle);
+    }
+    if (header == kSrvReceiveNotification) {
+        NoteSrvNotification(rc, cmd);
     }
     DebugIpc(handle, header, arg, R_SUCCEEDED(rc) ? cmd[1] : static_cast<u32>(rc));
     return rc;
 }
 
-// Called by the assembly entries, with the game's registers. The result goes back to r0 exactly
-// like the result of the real svc.
-extern "C" Result azl_hook_SendSyncRequest(Handle handle) {
+// ---- pre and post: what the gate (Sources/ctr/gate.s) calls in the plugin's block, around the game's svc it makes itself ----
+// pre(handle, stub+8, ctx) answers a call of ours (a fake session: kActAnswer, r0 the result) or says what the gate is to do; post(result,
+// stub+8, ctx) runs after the svc, ctx[3] saying which post, and only while the plugin is there: a swap of the plugin's block during the svc
+// skips it. So nothing that pre takes may wait for post to be given back (the table of the traced sessions takes in post only), and
+// ctx[0..2] carry values only. stub+8 names the site (azl/gate_plan.hpp, SiteIndex); nothing here needs it yet.
+extern "C" u64 azl_pre32(Handle handle, u32 stub_ret, u32* ctx) {
+    (void)stub_ret;
     Result result;
     if (g_hle && g_hle->HandleSendSyncRequest(handle, &result)) {
-        return result;
+        return PreReply(static_cast<u32>(result), kActAnswer);
     }
-    return PassThrough(handle);
+    return PassThroughPre(handle, ctx);
 }
 
-extern "C" Result azl_hook_CloseHandle(Handle handle) {
+extern "C" Result azl_post32(Result result, u32 stub_ret, u32* ctx) {
+    (void)stub_ret;
+    switch (ctx[3]) {
+    case kActPostIpc:
+        return PassThroughPost(result, ctx);
+    case kActPostGetService:
+        return PassThroughGetServicePost(result, ctx);
+    case kActPostTraced:
+        return PassThroughTracedPost(result, ctx);
+    case kActPostApt:
+        return PassThroughAptPost(result, ctx);
+    case kActPostAptNoted:
+        return PassThroughAptNotedPost(result, ctx);
+    default:
+        return result;
+    }
+}
+
+// CloseHandle: the fake sessions and the table forget the handle BEFORE the call (taking out in pre is fine: nothing waits for a post).
+extern "C" u64 azl_pre23(Handle handle, u32 stub_ret, u32* ctx) {
+    (void)stub_ret;
+    (void)ctx;
     if (g_hle) {
         g_hle->NoteHandleClosed(handle);
     }
-    if (TracedSession* traced = FindTraced(handle)) {
-        traced->handle = 0; // the value may be reused for another object
-    }
-    return svcCloseHandle(handle);
+    g_traced.Closed(handle); // the value may be reused for another object
+    return PreReply(handle, kActSvc);
 }
 
-// Called by azl_svc32_entry (svc_entry.s) before it makes an APT:ReceiveParameter(application) call, with the trampoline's return address: the call at whose end
-// Luma3DS's kernel raises the swap of the plugin's block on an Old 3DS, on the calling thread, which it then puts to sleep until the block is gone and back.
-// Returns the call site the game's thread must go back to (its svc and next instruction are the game's own again) to make the call itself, or 0 to make it here.
-// A few loads on every path but the one answer (with the log on, a line for the trail: its ring and an event signal): no printf, no wait, and the frame is held by Tests/stack_usage.sh.
-inline void NoteReceiveCall(u32 kind, u32 where) {
-    if (g_apt_observer && g_debug_level > 0 && TakeReceiveNote()) { // (a game that polls this call must not use up the lines of the trail)
-        g_apt_observer(kind, where); // (SWAP_ENTER waits for the trail: the crash this is about comes at the end of the call, with the line on the card)
-    }
+extern "C" Result azl_post23(Result result, u32 stub_ret, u32* ctx) {
+    (void)stub_ret;
+    (void)ctx;
+    return result; // (never asked for: azl_pre23 says kActSvc)
 }
 
-extern "C" u32 azl_handback_site(Handle, u32 tramp_return) {
-    __atomic_fetch_add(&g_swap_stats.asked, 1u, __ATOMIC_RELAXED);
-    if (!g_old_3ds) {
-        return 0;
-    }
-    NoteReceiveSite(g_sites, g_site_count, g_ledger, tramp_return);
-    const u32 now = static_cast<u32>(platform::NowMs());
-    if (!g_home_seen || static_cast<u32>(now - g_home_ms) > kHomeWindowMs) {
-        __atomic_fetch_add(&g_swap_stats.no_home, 1u, __ATOMIC_RELAXED);
-        NoteReceiveCall(kAptNoteReceiveMade, tramp_return);
-        return 0;
-    }
-    const GameTextMemory memory;
-    const u32 site = HandBackSite(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, tramp_return, now);
-    __atomic_fetch_add(site ? &g_swap_stats.handbacks : &g_swap_stats.handback_refused, 1u, __ATOMIC_RELAXED);
-    NoteReceiveCall(site ? kAptNoteReceiveHanded : kAptNoteReceiveRefused, site ? site : tramp_return);
-    return site;
-}
 // <<< game-thread code
 
 u32 RewriteStubbedGspWrappers() {
@@ -678,14 +757,11 @@ u32 RewriteStubbedGspWrappers() {
     return rewritten;
 }
 
-HookStats InstallSvcHooks(UdsHle* hle) {
+HookStats InstallSvcHooks(UdsHle* hle, bool reserve_exit_tramp) {
     HookStats stats;
     g_hle = hle;
     g_site_count = 0;
-    g_trampoline_words = 0;
-    g_old_3ds = !CTRPluginFramework::System::IsNew3DS();
-    g_hooks_state = kHooksActive;
-    LedgerClear(g_ledger);
+    g_gate = nullptr;
 
     stats.text_start = kGameTextBase;
     stats.text_size = CTRPluginFramework::Process::GetTextSize();
@@ -693,88 +769,99 @@ HookStats InstallSvcHooks(UdsHle* hle) {
         Log("hook: could not determine the size of the game's .text");
         return stats;
     }
-
-    // The trampolines are code that we write at runtime: make the buffer executable.
-    if (!CTRPluginFramework::Process::ProtectMemory(reinterpret_cast<u32>(g_trampolines),
-                                                    sizeof(g_trampolines))) {
-        Log("hook: cannot make the trampoline buffer executable");
-        return stats;
-    }
-    // Not verified with svcQueryMemory on purpose: Luma3DS makes the whole process RWX in the MMU
-    // (PROCESSOP_SET_MMU_TO_RWX) while the kernel's logical permissions stay RW, so the query
-    // reports "not executable" for memory that does execute (it blocked every hook on hardware).
-    stats.trampolines_ready = true;
-
+    // (Nothing is checked with svcQueryMemory for the game's text: Luma3DS makes the whole process RWX in the MMU
+    //  (PROCESSOP_SET_MMU_TO_RWX) while the kernel's logical permissions stay RW, so the query reports "not executable" for memory that
+    //  does execute: it blocked every hook on hardware once. The gate's page says what the kernel says of it in its line, and no more.)
     const u32 first = stats.text_start;
-    const u32 last = stats.text_start + stats.text_size - 8;
-    const u32 send_entry = reinterpret_cast<u32>(&azl_svc32_entry);
-    const u32 close_entry = reinterpret_cast<u32>(&azl_svc23_entry);
+    const u32 end = stats.text_start + stats.text_size;
 
     // (A game whose GSP wrapper has its svc behind a stub has been dealt with already, by RewriteStubbedGspWrappers(): it runs from Plugin::EarlyInit
     //  whether the plugin is on or off, before this, so that the search for the framework's sites below finds the wrapper as the framework does.)
     stats.gsp_stub_wrappers = g_gsp_stub_wrappers;
 
     // The framework hooks one of the game's svc 0x32 words by itself: do not touch that one.
-    FindFrameworkSites(first, stats.text_start + stats.text_size);
+    g_framework_site_count = FindFrameworkSites(ReadGameWord, nullptr, first, end, g_framework_sites, kMaxFrameworkSites);
 
-    // Pass 1: build every trampoline (nothing in the game is modified yet).
-    struct Pending {
-        u32 site;
-        u32 tramp;
-        bool is_send;
-    };
-    static Pending pending[kMaxSites];
-    u32 pending_count = 0;
-
-    for (u32 addr = first; addr <= last && pending_count < kMaxSites; addr += 4) {
+    // The sites: every ARM svc 0x32 / 0x23 of the text (nothing in the game is written yet). One word each: the instruction after the svc
+    // stays the game's own, wherever it is and whatever it is.
+    u32 found = 0;
+    for (u32 addr = first; addr + 4 <= end; addr += 4) {
         const u32 word = *reinterpret_cast<const u32*>(addr);
-        const bool is_send = word == kSvcSendSyncRequest;
-        if (!is_send && word != kSvcCloseHandle) {
+        bool framework_site = false;
+        if (!IsHookSite(word, addr, g_framework_sites, g_framework_site_count, &framework_site)) {
+            if (framework_site) {
+                ++stats.framework_sites;
+                Log("hook: svc at 0x%08lx left to CTRPluginFramework (it hooks GSPGPU::RegisterInterruptRelayQueue)",
+                    static_cast<unsigned long>(addr));
+            }
             continue;
         }
-        if (is_send && IsFrameworkSite(addr)) {
-            ++stats.framework_sites;
-            Log("hook: svc at 0x%08lx left to CTRPluginFramework (it hooks GSPGPU::RegisterInterruptRelayQueue)",
-                static_cast<unsigned long>(addr));
-            continue;
-        }
-        const u32 next = *reinterpret_cast<const u32*>(addr + 4);
-        u32 tramp = 0;
-        if (BuildTrampoline(addr, next, is_send ? send_entry : close_entry, &tramp)) {
-            pending[pending_count++] = {addr, tramp, is_send};
-        } else {
-            ++stats.skipped_sites;
+        ++found;
+        if (g_site_count < kMaxSites) {
+            g_sites[g_site_count++] = {addr, word};
         }
     }
     // Thumb call sites are only counted (a Thumb "svc 0x32" is the halfword 0xDF32).
-    for (u32 addr = first; addr <= last; addr += 2) {
+    for (u32 addr = first; addr + 2 <= end; addr += 2) {
         if (*reinterpret_cast<const u16*>(addr) == 0xDF32) {
             ++stats.thumb_candidates;
         }
     }
 
-    // Make the trampolines visible to instruction fetch.
-    svcFlushDataCacheRange(g_trampolines, sizeof(g_trampolines));
-    svcInvalidateEntireInstructionCache();
-
-    // Pass 2: redirect the game's call sites. `ldr pc,[pc,#-4]` + the trampoline address replaces
-    // the svc and the instruction after it (which now lives in the trampoline).
-    g_site_count = 0;
-    for (u32 i = 0; i < pending_count; ++i) {
-        const u32 patch[2] = {kSiteJumpWord, pending[i].tramp};
-        HookSite& site = g_sites[g_site_count];
-        site.address = pending[i].site;
-        site.tramp = pending[i].tramp;
-        if (!CTRPluginFramework::Process::Patch(pending[i].site, const_cast<u32*>(patch),
-                                                sizeof(patch), site.original)) {
-            ++stats.skipped_sites;
-            continue;
+    // The gate's page, then the gate, the stubs and the sites (azl/gate_plan.hpp: WriteGate, the function the host tests run).
+    const GateBlob blob{azl_gate_begin, static_cast<u32>(reinterpret_cast<u32>(azl_gate_end) - reinterpret_cast<u32>(azl_gate_begin)),
+                        static_cast<u32>(reinterpret_cast<u32>(azl_gate_32) - reinterpret_cast<u32>(azl_gate_begin)),
+                        static_cast<u32>(reinterpret_cast<u32>(azl_gate_23) - reinterpret_cast<u32>(azl_gate_begin))};
+    GateWriteResult written;
+    if (g_site_count != 0) {
+        const u32 bytes = PageCount(g_site_count + (reserve_exit_tramp ? kExitTrampStubs : 0), blob.bytes) * kGatePageBytes; // (+ the exit guard's trampoline, InstallExitGuard: a New 3DS only)
+        g_gate_page = TakeGatePage(g_sites[0].address, g_sites[g_site_count - 1].address, bytes, &stats.no_gate);
+        if (g_gate_page.address != 0) {
+            const GatePointers pointers{reinterpret_cast<u32>(&azl_pre32), reinterpret_cast<u32>(&azl_post32), reinterpret_cast<u32>(&azl_pre23),
+                                        reinterpret_cast<u32>(&azl_post23)};
+            GateTextMemory memory{g_gate_page.address, g_gate_page.bytes};
+            written = WriteGate(memory, g_gate_page.address, g_gate_page.bytes, blob, pointers, g_sites, g_site_count);
+            if (!written.ok) {
+                stats.no_gate = "the gate could not be written into its page";
+                Log("gate: no hooks: the gate (%lu bytes, entries +0x%lx and +0x%lx) does not fit its page of %lu bytes",
+                    static_cast<unsigned long>(blob.bytes), static_cast<unsigned long>(blob.entry32), static_cast<unsigned long>(blob.entry23),
+                    static_cast<unsigned long>(g_gate_page.bytes));
+            }
         }
-        ++g_site_count;
-        if (pending[i].is_send) {
-            ++stats.send_sync_sites;
-        } else {
-            ++stats.close_sites;
+    }
+    if (written.ok) {
+        g_gate = reinterpret_cast<GateHeader*>(g_gate_page.address);
+        g_stubs_base = StubsBase(g_gate_page.address, blob.bytes);
+        g_gate_flag = &g_gate->flag; // (WriteGate opened it: from now on the waits on a game thread look at the swap's flag)
+        g_gate_last_open_ms = static_cast<u32>(platform::NowMs());
+        stats.gate_ready = true;
+        // The sites WriteGate hooked are the first `hooked`, in the order of their stubs; one whose word could not be written is not one.
+        u32 hooked = 0;
+        for (u32 i = 0; i < written.hooked; ++i) {
+            u32 jump = 0;
+            if (EncodeBranch(g_sites[i].address, g_stubs_base + i * kGateStubBytes, &jump) && *reinterpret_cast<const u32*>(g_sites[i].address) == jump) {
+                ++hooked;
+                if (g_sites[i].original == kSvcSendSyncRequest) {
+                    ++stats.send_sync_sites;
+                } else {
+                    ++stats.close_sites;
+                }
+            }
+        }
+        g_site_count = written.hooked;
+        stats.skipped_sites = found - hooked;
+        if (written.out_of_reach != 0 || written.foreign != 0 || written.no_room != 0 || written.patch_failed != 0 || found > kMaxSites) {
+            Log("gate: sites left as they are: %lu out of reach, %lu changed by someone else, %lu with no room in the page, %lu not written, "
+                "%lu over the %lu the plugin keeps",
+                static_cast<unsigned long>(written.out_of_reach), static_cast<unsigned long>(written.foreign),
+                static_cast<unsigned long>(written.no_room), static_cast<unsigned long>(written.patch_failed),
+                static_cast<unsigned long>(found > kMaxSites ? found - kMaxSites : 0), static_cast<unsigned long>(kMaxSites));
+        }
+    } else {
+        g_site_count = 0;
+        stats.skipped_sites = found;
+        if (found != 0 && stats.no_gate == nullptr) {
+            stats.no_gate = "the gate could not be written into its page";
         }
     }
 
@@ -792,91 +879,273 @@ HookStats InstallSvcHooks(UdsHle* hle) {
     return stats;
 }
 
+void SettleGatePage() {
+    SettleGateBooks(g_gate_page);
+}
+
 namespace {
 
-bool TakePatchLock() {
-    return __atomic_exchange_n(&g_patch_lock, 1u, __ATOMIC_ACQUIRE) == 0;
-}
-
-void ReleasePatchLock() {
-    __atomic_store_n(&g_patch_lock, 0u, __ATOMIC_RELEASE);
-}
-
-// The threads of the plugin that change the game's sites take turns (a re-hook and a suspend must not interleave: the block would be freed with a site pointing in
-// it). The suspend and the resume wait a little; the re-hook gives up and comes back with the next frame.
-void WaitPatchLock() {
-    for (u32 i = 0; i < 2000 && !TakePatchLock(); ++i) {
-        svcSleepThread(100000);
-    }
-}
-
-constexpr s64 kSwapStepNs = 100000;   // between two looks at the counter of threads in the hook
-constexpr s64 kSwapGraceNs = 2000000; // after the last one left: the few instructions each has left in its trampoline
+constexpr s64 kGateStepNs = 100000;          // between two looks at the count of the game's threads in the gate
+constexpr s64 kGateDrainStepNs = 1000000;    // ... in the second drain, which can last seconds on the keep-alive thread
 
 } // namespace
 
-u32 HooksInFlight() {
-    return __atomic_load_n(&azl_hooks_in_flight, __ATOMIC_ACQUIRE);
+u32 CloseGate(u32 timeout_ms, void (*wake)(void*), void* arg) {
+    if (g_gate == nullptr) {
+        return 0;
+    }
+    bool woken = false;
+    const u32 budget_ms = SwapClampMs(timeout_ms); // (the one deadline of SWAP_ENTER, ctr/swap_gate.hpp)
+    const u32 left = GateClose(
+        *g_gate, static_cast<u64>(budget_ms) * 1000, []() { return platform::NowUs(); },
+        [&]() {
+            if (!woken && wake != nullptr) { // (a thread counted in the gate that sleeps in slices: its slice ends now)
+                woken = true;
+                wake(arg);
+            }
+            svcSleepThread(kGateStepNs);
+        },
+        &g_gate_stats);
+    if (budget_ms < timeout_ms && left != 0) {
+        NoteSwapWaitCut(4); // (the deadline ended it with a game's thread still inside)
+    }
+    return left;
 }
 
-void SuspendSvcHooks(u32 timeout_ms) {
-    if (g_site_count == 0) {
-        return;
+u32 WaitGateDrained() {
+    // (reads the count only: the flag stays as CloseGate left it, closed. A game's thread still counted when the plugin's block goes wakes in
+    //  unmapped memory, a certain crash, so what is left of the deadline is better spent here than returned to Luma3DS early.)
+    if (g_gate == nullptr) {
+        return 0;
     }
-    WaitPatchLock(); // (not obtained after 200 ms: goes on without it, the block is about to go)
-    const GameTextMemory memory;
-    const u64 start = platform::NowUs();
-    g_swap_stats.in_flight = HooksInFlight();
-    SuspendSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, &g_swap_stats);
-    // The threads that are inside the hook already: a call that waits in a real service, a lock of the hub. (The thread that raised the swap is not one of
-    // them: it went back to the game's code, see azl_handback_site.)
-    u32 left = HooksInFlight();
-    for (;;) {
-        const u64 waited_us = platform::NowUs() - start;
-        if (left == 0 || waited_us >= static_cast<u64>(timeout_ms) * 1000) {
-            break;
+    u32 left = __atomic_load_n(&g_gate->in_flight, __ATOMIC_SEQ_CST);
+    while (left != 0 && SwapTicksLeft() > 0) {
+        svcSleepThread(kGateDrainStepNs);
+        left = __atomic_load_n(&g_gate->in_flight, __ATOMIC_SEQ_CST);
+    }
+    if (left != 0) {
+        NoteSwapWaitCut(16);
+    }
+    return left;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Luma3DS's plugin word through its uncached alias, and the exit guard (azl/exit_guard.hpp, Sources/ctr/exit_tramp.s).
+// ---------------------------------------------------------------------------------------------
+
+const volatile u32* g_luma_word_ptr = reinterpret_cast<const volatile u32*>(kLumaPluginWordAddress);
+namespace {
+volatile u32* g_luma_word_alias = nullptr;
+} // namespace
+
+bool SetupLumaWordAlias() {
+    s64 emulator = 0;
+    if (svcGetSystemInfo(&emulator, 0x20000, 0) == 0) {
+        return false; // (Citra's and Azahar's information type: no Luma3DS, no alias)
+    }
+    u32 pa = 0;
+    if (svcControlProcess(CUR_PROCESS_HANDLE, PROCESSOP_GET_PA_FROM_VA, reinterpret_cast<u32>(&pa), kLumaPluginWordAddress) != 0 || pa == 0 ||
+        pa >= 0x30000000) {
+        return false; // (Luma's kernel maps PA 0..0x30000000 at PA | 0x80000000: k11_extension main.c)
+    }
+    g_luma_word_alias = reinterpret_cast<volatile u32*>(pa | 0x80000000u);
+    g_luma_word_ptr = g_luma_word_alias;
+    return true;
+}
+
+volatile u32* LumaWordAliasForWrite() {
+    return g_luma_word_alias;
+}
+
+ExitGuardStats InstallExitGuard(void (*guard)(), u32 stack_top) {
+    ExitGuardStats stats;
+    const u32 text = kGameTextBase;
+    const u32 text_size = CTRPluginFramework::Process::GetTextSize();
+    if (g_gate == nullptr || g_gate_page.address == 0) {
+        stats.why_not = "no gate page";
+        return stats;
+    }
+    if (g_luma_word_alias == nullptr) {
+        stats.why_not = "no uncached alias of Luma's word";
+        return stats;
+    }
+    // The trampoline's copy: in the tail of the gate's page, after the stubs (InstallSvcHooks reserved kExitTrampStubs stubs' worth of it).
+    const u32 tramp_bytes = static_cast<u32>(reinterpret_cast<u32>(azl_exit_tramp_end) - reinterpret_cast<u32>(azl_exit_tramp_begin));
+    const u32 tramp = (g_stubs_base + g_site_count * kGateStubBytes + 7) & ~7u;
+    if (tramp_bytes == 0 || tramp_bytes > kExitTrampStubs * kGateStubBytes - 8 || tramp + tramp_bytes > g_gate_page.address + g_gate_page.bytes) {
+        stats.why_not = "no room for the trampoline in the gate's page";
+        return stats;
+    }
+    const u32 off_fn = static_cast<u32>(reinterpret_cast<u32>(azl_exit_tramp_fn) - reinterpret_cast<u32>(azl_exit_tramp_begin));
+    const u32 off_stack = static_cast<u32>(reinterpret_cast<u32>(azl_exit_tramp_stack) - reinterpret_cast<u32>(azl_exit_tramp_begin));
+    const u32 off_state = static_cast<u32>(reinterpret_cast<u32>(azl_exit_tramp_state) - reinterpret_cast<u32>(azl_exit_tramp_begin));
+    // (the sites first, counted, so that a game with none leaves the page as it was)
+    for (u32 addr = text; addr + 4 <= text + text_size; addr += 4) {
+        if (*reinterpret_cast<const u32*>(addr) == kSvcExitProcess) {
+            ++stats.sites;
         }
-        svcSleepThread(kSwapStepNs);
-        left = HooksInFlight();
     }
-    svcSleepThread(kSwapGraceNs);
-    left = HooksInFlight();
-    if (left != 0) { // (one more look: a thread that was in the trampoline's first instructions when the counter was zero)
-        svcSleepThread(kSwapStepNs);
-        left = HooksInFlight();
+    for (u32 addr = text; addr + 2 <= text + text_size; addr += 2) {
+        if (*reinterpret_cast<const u16*>(addr) == 0xDF03) {
+            ++stats.thumb;
+        }
     }
-    const u64 waited_us = platform::NowUs() - start;
-    g_swap_stats.in_flight_left = left;
-    g_swap_stats.waited_us = waited_us > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<u32>(waited_us);
-    ReleasePatchLock();
+    if (stats.sites == 0) {
+        stats.why_not = "no ARM svc 0x03 in the game's text";
+        return stats;
+    }
+    const u32* src = reinterpret_cast<const u32*>(azl_exit_tramp_begin);
+    for (u32 i = 0; i < tramp_bytes / 4; ++i) {
+        *reinterpret_cast<volatile u32*>(tramp + 4 * i) = src[i];
+    }
+    *reinterpret_cast<volatile u32*>(tramp + off_state) = 0;
+    *reinterpret_cast<volatile u32*>(tramp + off_stack) = stack_top & ~7u;
+    *reinterpret_cast<volatile u32*>(tramp + off_fn) = reinterpret_cast<u32>(guard);
+    svcFlushProcessDataCache(CUR_PROCESS_HANDLE, tramp, tramp_bytes);
+    svcInvalidateEntireInstructionCache();
+    stats.tramp = tramp;
+    for (u32 addr = text; addr + 4 <= text + text_size; addr += 4) {
+        if (*reinterpret_cast<const u32*>(addr) != kSvcExitProcess) {
+            continue;
+        }
+        u32 jump = 0;
+        if (EncodeBranch(addr, tramp, &jump) && CTRPluginFramework::Process::Patch(addr, jump)) {
+            svcFlushProcessDataCache(CUR_PROCESS_HANDLE, addr, 4);
+            ++stats.hooked;
+        }
+    }
+    svcInvalidateEntireInstructionCache();
+    return stats;
 }
 
-void ResumeSvcHooks() {
-    if (g_site_count == 0) {
+u64 LastAptReceiveTick() {
+    return __atomic_load_n(&g_apt_receive_tick, __ATOMIC_RELAXED);
+}
+
+namespace {
+
+// A slot marked closed whose handle is still alive (the gate marks before the svc: a game's thread of low priority may not have made it yet;
+// or the close was refused) is looked at again on every Plugin::Tick for kFakeEveryTick calls, then on one in kFakeSlowEvery, for as long
+// as the slot holds the same handle: never dropped while it could still be the closed one.
+constexpr u32 kFakeEveryTick = 30;
+constexpr u32 kFakeSlowEvery = 32;
+u32 g_fake_full = 0;               // fake sessions that found the gate's table full
+u32 g_fake_settled = 0;            // fake sessions closed with the flag 0 and forgotten once back
+u32 g_fake_pending = 0;            // bits of fake_closed taken whose handle was still alive (Plugin::Tick's thread only)
+u32 g_fake_looks[kGateFakeSlots] = {};
+Handle g_fake_seen[kGateFakeSlots] = {}; // the handle the pending bit was for
+
+} // namespace
+
+int GateFakeAdd(Handle handle, u32 result) {
+    if (g_gate == nullptr || handle == 0) {
+        return 0;
+    }
+    for (u32 i = 0; i < kGateFakeSlots; ++i) {
+        GateHeader::FakeSlot& slot = g_gate->fake[i];
+        if (__atomic_load_n(&slot.handle, __ATOMIC_RELAXED) == 0) {
+            __atomic_store_n(&slot.result, result, __ATOMIC_RELAXED);
+            __atomic_store_n(&slot.handle, handle, __ATOMIC_RELEASE); // (the result is there before the gate can match the handle)
+            return 1;
+        }
+    }
+    // Full: a slot whose session is gone the hook did not see close (a Thumb call, a site left out) is freed for the new one. (Under
+    // UdsHle's lock like every writer of the table; UdsHle forgets its own entry the next time a request finds the handle dead.)
+    for (u32 i = 0; i < kGateFakeSlots; ++i) {
+        GateHeader::FakeSlot& slot = g_gate->fake[i];
+        const Handle old = __atomic_load_n(&slot.handle, __ATOMIC_RELAXED);
+        if (old != 0 && R_FAILED(svcClearEvent(old))) {
+            __atomic_store_n(&slot.handle, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&slot.result, result, __ATOMIC_RELAXED);
+            __atomic_store_n(&slot.handle, handle, __ATOMIC_RELEASE);
+            return 1;
+        }
+    }
+    __atomic_add_fetch(&g_fake_full, 1, __ATOMIC_RELAXED);
+    return -1;
+}
+
+void GateFakeRemove(Handle handle) {
+    if (g_gate == nullptr || handle == 0) {
         return;
     }
-    WaitPatchLock();
-    const GameTextMemory memory;
-    ResumeSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);
-    ReleasePatchLock();
-    g_resume_end_ms = static_cast<u32>(platform::NowMs());
+    for (u32 i = 0; i < kGateFakeSlots; ++i) {
+        if (__atomic_load_n(&g_gate->fake[i].handle, __ATOMIC_RELAXED) == handle) {
+            __atomic_store_n(&g_gate->fake[i].handle, 0u, __ATOMIC_RELEASE);
+        }
+    }
 }
 
-void RearmHandedBackSites() {
-    if (!LedgerAny(g_ledger) || !TakePatchLock()) {
+void SettleGateFakeClosed() {
+    if (g_gate == nullptr) {
         return;
     }
-    const GameTextMemory memory;
-    RearmSites(memory, g_sites, g_site_count, g_ledger, &g_hooks_state, static_cast<u32>(platform::NowMs()), &g_swap_stats);
-    ReleasePatchLock();
+    // (the gate only sets bits, the slots are the plugin's: a bit is "look at this one", the kernel says whether the handle is gone)
+    const u32 bits = __atomic_exchange_n(&g_gate->fake_closed, 0u, __ATOMIC_ACQ_REL) | g_fake_pending;
+    if (bits == 0) {
+        return;
+    }
+    u32 pending = 0;
+    for (u32 i = 0; i < kGateFakeSlots; ++i) {
+        if ((bits & (1u << i)) == 0) {
+            continue;
+        }
+        const Handle handle = __atomic_load_n(&g_gate->fake[i].handle, __ATOMIC_ACQUIRE);
+        const bool fresh = (g_fake_pending & (1u << i)) == 0 || g_fake_seen[i] != handle; // (a new bit, or the slot holds another session now)
+        if (fresh) {
+            g_fake_seen[i] = handle;
+            g_fake_looks[i] = 0;
+        }
+        if (handle == 0) {
+            continue; // (forgotten already: the game's close went through the hook, or a request found it dead)
+        }
+        const u32 look = g_fake_looks[i]++;
+        if (look >= kFakeEveryTick && look % kFakeSlowEvery != 0) {
+            pending |= 1u << i; // (not this time)
+            continue;
+        }
+        if (R_FAILED(svcClearEvent(handle))) {
+            ++g_fake_settled;
+            Log("gate: the game closed its fake session 0x%08lx while the gate was shut (swap): forgotten now",
+                static_cast<unsigned long>(handle));
+            if (g_hle) {
+                g_hle->NoteHandleClosed(handle); // (forgets it, and its slot here: GateFakeRemove)
+            }
+            g_traced.Closed(handle);
+        } else {
+            pending |= 1u << i; // still alive: looked at again while the slot holds it
+        }
+    }
+    g_fake_pending = pending;
 }
 
-SwapStats GetSwapStats() {
-    SwapStats stats = g_swap_stats;
-    stats.handbacks = __atomic_load_n(&g_swap_stats.handbacks, __ATOMIC_RELAXED);
-    stats.handback_refused = __atomic_load_n(&g_swap_stats.handback_refused, __ATOMIC_RELAXED);
-    stats.asked = __atomic_load_n(&g_swap_stats.asked, __ATOMIC_RELAXED);
-    stats.no_home = __atomic_load_n(&g_swap_stats.no_home, __ATOMIC_RELAXED);
+void OpenGate() {
+    if (g_gate == nullptr) {
+        return;
+    }
+    GateOpen(*g_gate, &g_gate_stats);
+    g_gate_last_open_ms = static_cast<u32>(platform::NowMs());
+}
+
+GateStats GetGateStats() {
+    GateStats stats;
+    stats.gate = g_gate_stats;
+    if (g_gate != nullptr) {
+        stats.gate.post_skipped = __atomic_load_n(&g_gate->post_skipped, __ATOMIC_RELAXED);
+        const u32 index = SiteIndex(stats.gate.last_site, g_stubs_base, g_site_count);
+        stats.last_site_address = index == kNoGateSite ? 0 : g_sites[index].address;
+    }
+    stats.traced_stale = __atomic_load_n(&g_traced.stats.stale, __ATOMIC_RELAXED);
+    stats.traced_evicted = __atomic_load_n(&g_traced.stats.evicted, __ATOMIC_RELAXED);
+    stats.traced_dropped = __atomic_load_n(&g_traced.stats.dropped, __ATOMIC_RELAXED);
+    if (g_gate != nullptr) {
+        for (u32 i = 0; i < kGateFakeSlots; ++i) {
+            stats.fake_in_table += __atomic_load_n(&g_gate->fake[i].handle, __ATOMIC_RELAXED) != 0 ? 1 : 0;
+        }
+        stats.fake_hits = __atomic_load_n(&g_gate->fake_hits, __ATOMIC_RELAXED);
+    }
+    stats.fake_settled = g_fake_settled;
+    stats.fake_full = __atomic_load_n(&g_fake_full, __ATOMIC_RELAXED);
     return stats;
 }
 
@@ -884,7 +1153,8 @@ void ReportForeignPatches() {
     u32 foreign = 0;
     for (u32 i = 0; i < g_site_count; ++i) {
         const u32 now = *reinterpret_cast<const u32*>(g_sites[i].address);
-        if (now == kSiteJumpWord) {
+        u32 jump = 0;
+        if (EncodeBranch(g_sites[i].address, g_stubs_base + i * kGateStubBytes, &jump) && now == jump) {
             continue;
         }
         if (foreign++ < 6) {
@@ -893,7 +1163,7 @@ void ReportForeignPatches() {
         }
     }
     if (foreign) {
-        Log("hook: WARNING %lu site(s) are no longer ours: our literal word next to them may run as code",
+        Log("hook: WARNING %lu site(s) are no longer ours: whatever is there now runs instead of the gate",
             static_cast<unsigned long>(foreign));
     }
 }

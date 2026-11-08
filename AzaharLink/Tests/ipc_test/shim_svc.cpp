@@ -35,6 +35,19 @@ constexpr Result kErrInvalidHandle = 0xD8E007F7;
 
 } // namespace
 
+// The flag of the svc hook's gate (ctr/gate_flag.hpp; Sources/ctr/hook.cpp owns it in the plugin): open, as while the plugin is there.
+namespace azl {
+namespace ctr {
+static volatile u32 g_gate_open_word = 1;
+volatile u32* g_gate_flag = &g_gate_open_word;
+// The gate's table of the fake sessions (Sources/ctr/hook.cpp): no gate here, as in a plugin whose hooks are not in (the HLE goes on alone).
+int GateFakeAdd(Handle, u32) {
+    return 0;
+}
+void GateFakeRemove(Handle) {}
+} // namespace ctr
+} // namespace azl
+
 // The HLE the "game" talks to (set by the test).
 azl::ctr::UdsHle* g_test_hle = nullptr;
 std::atomic<unsigned> g_fake_friend_seed_low{0x11111111};

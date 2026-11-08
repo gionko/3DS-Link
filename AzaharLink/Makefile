@@ -25,6 +25,8 @@ CFLAGS		:=	$(ARCH) -Os -mword-relocations \
 				-fomit-frame-pointer -ffunction-sections -fno-strict-aliasing
 
 CFLAGS		+=	$(INCLUDE) -D__3DS__ -DAZL_USE_CTRPF -Wall -Wno-psabi
+# (a test build only: make EXTRA_CFLAGS=-DAZL_MENU_TOUR, the in-game menu walks itself and takes its screenshots; never in a release)
+CFLAGS		+=	$(EXTRA_CFLAGS)
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 
@@ -36,12 +38,14 @@ ASFLAGS		:=	$(ARCH)
 # startup search for the GSP call inside the game's code (Kirby Triple Deluxe / Planet Robobot).
 # --wrap=svcCreateThread and --wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv (the mangled CTRPluginFramework::Scheduler::Initialize) keep the
 # framework's syscore worker off core 1 on an Old 3DS (ctr/thread_core.hpp).
-# --wrap=PLGLDR__Reply puts the call sites back in the hook when the plugin's block comes back on an Old 3DS, before the game's thread wakes up (ctr/plugin.cpp).
+# --wrap=PLGLDR__Reply opens the svc hook's gate when the plugin's block is back and mapped on an Old 3DS (ctr/plugin.cpp, OnSwapBack).
+# --wrap=plgLdrInit and --wrap=PLGLDR__FetchEvent guard the framework's connection to Luma3DS's plugin loader (azl/plg_guard.hpp): tries for about 2 s,
+# the arbiter checked, and no event fetched (no NULL read) without a connection.
 LDFLAGS		:= -T $(TOPDIR)/3gx.ld $(ARCH) -Os -Wl,--gc-sections,--strip-discarded,--strip-debug \
 				-Wl,--wrap=srvGetServiceHandle -Wl,--wrap=free \
 				-Wl,--wrap=_ZN18CTRPluginFramework7Process11GetTextSizeEv \
 				-Wl,--wrap=svcCreateThread -Wl,--wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv \
-				-Wl,--wrap=PLGLDR__Reply
+				-Wl,--wrap=PLGLDR__Reply -Wl,--wrap=plgLdrInit -Wl,--wrap=PLGLDR__FetchEvent
 
 LIBS		:= -lctrpf -lctru
 LIBDIRS		:= 	$(CTRPFLIB) $(CTRULIB) $(PORTLIBS)

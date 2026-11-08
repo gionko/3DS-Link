@@ -281,21 +281,18 @@ static void TestOld3dsLines() {
     crumbs.Push(SleepCrumbs::kMemBase, SleepCrumbs::PackRegion(21u << 20, 20u << 20), 3000); // (used over total: never a huge number)
     CHECK(crumbs.pushed() != crumbs.taken());
     crumbs.Push(SleepCrumbs::kFwSwapExit, 3, 4000);
-    crumbs.Push(kAptNoteReceiveMade, 0x070D37C8, 4001);
-    crumbs.Push(kAptNoteReceiveHanded, 0x00123450, 4002);
-    crumbs.Push(kAptNoteReceiveRefused, 0x070D37C8, 4003);
+    crumbs.Push(8, 0x070D37C8, 4001); // (8 to 10: who made the call that raised the swap, up to 1.1.2; free since the gate: nothing is written for them)
+    crumbs.Push(9, 0x00123450, 4002);
+    crumbs.Push(10, 0x070D37C8, 4003);
     crumbs.Poll(4100, Os(4100), &lines);
     CHECK_EQ(crumbs.pushed(), crumbs.taken());
-    CHECK_EQ(lines.size(), std::size_t(8));
-    if (lines.size() == 8) {
+    CHECK_EQ(lines.size(), std::size_t(5));
+    if (lines.size() == 5) {
         CHECK(Has(lines[0], "framework event SWAP_ENTER #3:"));
         CHECK(Has(lines[1], "memory region SYSTEM: 40960 of 45056 KB used, 4096 KB free"));
         CHECK(Has(lines[2], "memory region APPLICATION: 65536 of 65536 KB used, 0 KB free"));
         CHECK(Has(lines[3], "memory region BASE: 21504 of 20480 KB used, 0 KB free"));
         CHECK(Has(lines[4], "framework event SWAP_EXIT #3:"));
-        CHECK(Has(lines[5], "by the plugin itself (trampoline return 0x070d37c8)"));
-        CHECK(Has(lines[6], "handed back to the game's own call at 0x00123450"));
-        CHECK(Has(lines[7], "the hand-back was refused (trampoline return 0x070d37c8)"));
     }
     lines.clear();
     crumbs.Push(SleepCrumbs::kFwSwapBack, 2017, 4499);
@@ -307,7 +304,7 @@ static void TestOld3dsLines() {
     crumbs.Poll(4600, Os(4600), &lines);
     CHECK_EQ(lines.size(), std::size_t(5));
     if (lines.size() == 5) {
-        CHECK(Has(lines[0], "call sites in the hook again in 2017 us, before the game's thread runs"));
+        CHECK(Has(lines[0], "the svc hook's gate open again in 2017 us"));
         CHECK(Has(lines[1], "reached their limit for this launch (64)"));
         CHECK(Has(lines[2], "APT:ReceiveParameter answered: sender 0x00000101, command 3"));
         CHECK(Has(lines[3], "APT:ReceiveParameter failed"));
@@ -332,6 +329,119 @@ static void TestOld3dsLines() {
     }
 }
 
+// The close of a game (REGISTRO, phase N): the framework's HOME_ENTER / HOME_EXIT / EXIT of the process and the word after every ReceiveParameter carry
+// Luma3DS's plugin word, read as the state (low 16 bits) and the events not handled yet (high 16). The vectors are what Luma3DS writes (rosalina
+// plgloader.c): HOME_ENTER 0x00010001 and HOME_EXIT 0x00010002 (the state is written after the reply), EXIT 0x00000003 (EXITING written whole,
+// events cleared, BEFORE the plugin is told: an EXIT callback never shows 0x00020001), 0x00000001 after the close command once HOME_EXIT went,
+// and the events HOME and EXIT together (0x00030001 / 0x00030002), which Luma3DS handles in no branch: never at a callback.
+static void TestCloseOfTheGame() {
+    std::printf("sleep crumbs: the close of a game: Luma3DS's plugin word at HOME_ENTER, HOME_EXIT, EXIT and after ReceiveParameter, srv's 0x100\n");
+    SleepCrumbs crumbs;
+    std::vector<std::string> lines;
+    crumbs.Poll(1000, Os(1000), &lines);
+    crumbs.Push(SleepCrumbs::kFwProcHomeEnter, 0x00010001, 2000);
+    crumbs.Push(kAptNoteReceiveReply, 0x0101000C, 2100);   // sender 0x101 (the HOME menu), command 12: Close
+    crumbs.Push(kAptNoteReceiveWord, 0x00010002, 2100);    // HOME_EXIT raised by Luma3DS's hook of the call, not handled yet
+    crumbs.Push(SleepCrumbs::kFwProcHomeExit, 0x00010002, 2101);
+    crumbs.Push(kAptNoteReceiveWord, 0x00000001, 2150);
+    crumbs.Push(kAptNoteSrvNotification, 0x100, 2200);
+    crumbs.Push(SleepCrumbs::kFwProcExit, 0x00000003, 2300);
+    crumbs.Push(kAptNoteReceiveWord, 0x00030001, 2400);    // the events together: seen only after a call
+    crumbs.Push(kAptNoteReceiveWord, 0x00030002, 2401);
+    crumbs.Push(kAptNoteReceiveWord, 0x00000000, 2402);    // (Azahar: no plugin word)
+    crumbs.Push(kAptNoteReceiveWord, 0x00070009, 2403);    // (nothing Luma3DS writes: said as it is)
+    crumbs.Push(kAptNoteCloseLimit, 0, 2404);
+    crumbs.Poll(2500, Os(2500), &lines);
+    CHECK_EQ(lines.size(), std::size_t(12));
+    if (lines.size() == 12) {
+        CHECK(Has(lines[0], "sleep: framework event HOME_ENTER of the process, Luma3DS's plugin word 0x00010001 (state 1 running, events HOME) | tick 2000 ms"));
+        CHECK(Has(lines[1], "APT:ReceiveParameter answered: sender 0x00000101, command 12"));
+        CHECK(Has(lines[2], "after APT:ReceiveParameter, Luma3DS's plugin word 0x00010002 (state 2 in the HOME menu, events HOME) | tick 2100 ms"));
+        CHECK(Has(lines[3], "framework event HOME_EXIT of the process, Luma3DS's plugin word 0x00010002 (state 2 in the HOME menu, events HOME)"));
+        CHECK(Has(lines[4], "after APT:ReceiveParameter, Luma3DS's plugin word 0x00000001 (state 1 running, events none)"));
+        CHECK(Has(lines[5], "srv notification 0x00000100 (the system asks the game to terminate) received by the game | tick 2200 ms"));
+        CHECK(Has(lines[6], "framework event EXIT of the process, Luma3DS's plugin word 0x00000003 (state 3 exiting, events none) | tick 2300 ms"));
+        CHECK(Has(lines[7], "0x00030001 (state 1 running, events HOME and EXIT together)"));
+        CHECK(Has(lines[8], "0x00030002 (state 2 in the HOME menu, events HOME and EXIT together)"));
+        CHECK(Has(lines[9], "0x00000000 (state 0 none, events none)"));
+        CHECK(Has(lines[10], "0x00070009 (state 9 ?, events 0x00000007)"));
+        CHECK(Has(lines[11], "the lines after the close command reached their own limit (32)"));
+    }
+    // the EXIT of the process is not the end of a sleep: kFwExit stays SLEEP_EXIT
+    lines.clear();
+    crumbs.Push(SleepCrumbs::kFwExit, 0, 2600);
+    crumbs.Poll(2700, Os(2700), &lines);
+    CHECK_EQ(lines.size(), std::size_t(1));
+    if (lines.size() == 1) {
+        CHECK(Has(lines[0], "framework event SLEEP_EXIT"));
+    }
+    // the numbers of the kinds are all different (a line read as another kind would be a wrong verdict)
+    const u32 kinds[] = {kAptNoteNotification, kAptNoteReplyQuery, kAptNoteReplyComplete, SleepCrumbs::kFwEnter, SleepCrumbs::kFwExit,
+                         SleepCrumbs::kFwSwapEnter, SleepCrumbs::kFwSwapExit, kAptNoteBadHandle, kAptNoteFatal, kAptNoteWord, kAptNoteEnd,
+                         SleepCrumbs::kMemSystem, SleepCrumbs::kMemApplication, SleepCrumbs::kMemBase, kAptNoteReceiveReply, kAptNoteUtility,
+                         kAptNoteUtilityResult, kAptNoteLimit, SleepCrumbs::kFwSwapBack, SleepCrumbs::kFwProcHomeEnter, SleepCrumbs::kFwProcHomeExit,
+                         SleepCrumbs::kFwProcExit, kAptNoteReceiveWord, kAptNoteSrvNotification, kAptNoteCloseLimit,
+                         SleepCrumbs::kExitGuardEnter, SleepCrumbs::kExitGuardRosalina, SleepCrumbs::kExitGuardWaited,
+                         SleepCrumbs::kExitGuardWordLast, SleepCrumbs::kExitGuardAction};
+    const std::size_t count = sizeof(kinds) / sizeof(kinds[0]);
+    for (std::size_t i = 0; i < count; ++i) {
+        for (std::size_t j = i + 1; j < count; ++j) {
+            CHECK(kinds[i] != kinds[j]);
+        }
+    }
+    CHECK_EQ(kLumaPluginWordAddress, 0x1FF800F0u);
+}
+
+// The budget of the ReceiveParameter / AppletUtility lines (azl/apt_sleep.hpp, AptNoteBudget): 64, the limit's line once; after a close command 32
+// more of their own, the close's own line among them even when it comes after the 64; then the close's limit line once, and nothing.
+static void TestNoteBudget() {
+    std::printf("sleep crumbs: the lines of ReceiveParameter: 64, then nothing until a close command, then 32 more\n");
+    AptNoteBudget budget;
+    for (u32 i = 0; i < 64; ++i) {
+        CHECK_EQ(budget.Take(false), AptNoteBudget::kNoteWrite);
+    }
+    CHECK_EQ(budget.Take(false), AptNoteBudget::kNoteLimit); // the 65th: the limit's line instead of it
+    for (u32 i = 0; i < 100; ++i) {
+        CHECK_EQ(budget.Take(false), 0u); // a game that polls: nothing more
+    }
+    CHECK_EQ(budget.Take(true), AptNoteBudget::kNoteWrite); // the close (12) is written all the same
+    for (u32 i = 1; i < 32; ++i) {
+        CHECK_EQ(budget.Take(false), AptNoteBudget::kNoteWrite); // and what follows it
+    }
+    CHECK_EQ(budget.Take(false), AptNoteBudget::kNoteCloseLimit);
+    CHECK_EQ(budget.Take(true), 0u);
+    CHECK_EQ(budget.Take(false), 0u);
+    // a close that comes as the 65th line: written, with the limit's line before it
+    AptNoteBudget early;
+    for (u32 i = 0; i < 64; ++i) {
+        early.Take(false);
+    }
+    CHECK_EQ(early.Take(true), AptNoteBudget::kNoteLimit | AptNoteBudget::kNoteWrite);
+    // a close within the 64: the normal lines go on, and after them the close's own
+    AptNoteBudget within;
+    CHECK_EQ(within.Take(true), AptNoteBudget::kNoteWrite);
+    for (u32 i = 1; i < 64; ++i) {
+        within.Take(false);
+    }
+    CHECK_EQ(within.Take(false), AptNoteBudget::kNoteLimit | AptNoteBudget::kNoteWrite);
+    // the close command: 12 only (the HOME menu's Close). 10 (a library applet exited) and 11 (the return from the HOME menu) close nothing; 3 (a response) neither
+    CHECK(AptCommandCloses(12));
+    CHECK(!AptCommandCloses(10) && !AptCommandCloses(11));
+    CHECK(!AptCommandCloses(3) && !AptCommandCloses(9) && !AptCommandCloses(13) && !AptCommandCloses(0));
+    CHECK_EQ(kAptCommandCloseFromHome, 12u);
+    // a HOME round trip (11) and a library applet (10) after the 64, then a game that polls, then the real close: the close's line is written
+    AptNoteBudget home_trip;
+    for (u32 i = 0; i < 64; ++i) {
+        home_trip.Take(false);
+    }
+    CHECK_EQ(home_trip.Take(AptCommandCloses(11)), AptNoteBudget::kNoteLimit);
+    CHECK_EQ(home_trip.Take(AptCommandCloses(10)), 0u);
+    for (u32 i = 0; i < 64 + 32; ++i) {
+        CHECK_EQ(home_trip.Take(AptCommandCloses(7)), 0u); // (no close-limit line: no close came)
+    }
+    CHECK_EQ(home_trip.Take(AptCommandCloses(12)), AptNoteBudget::kNoteWrite);
+}
+
 int main() {
     TestEventsBecomeLines();
     TestWakeMarker();
@@ -339,6 +449,8 @@ int main() {
     TestRingOverflowAndLimit();
     TestTwoProducersAndTheThread();
     TestOld3dsLines();
+    TestCloseOfTheGame();
+    TestNoteBudget();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

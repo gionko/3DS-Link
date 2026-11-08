@@ -11,10 +11,12 @@
 // wrapper it knows. Portable on purpose: the host tests run the very same code over the real image of the game.
 #pragma once
 
-#include "azl/arm_reloc.hpp"
 #include "azl/common.hpp"
 
 namespace azl {
+
+/// Reads a 32-bit word at a game address (the console reads the game's .text, the tests an image of it).
+using ReadWordFn = u32 (*)(void* context, u32 address);
 
 constexpr u32 kSvcSendSyncRequestWord = 0xEF000032; // svc 0x32
 constexpr u32 kBxLrWord = 0xE12FFF1E;               // bx lr
@@ -81,6 +83,58 @@ inline u32 FindStubbedGspWrappers(ReadWordFn read, void* context, u32 first, u32
         sites[found++] = site;
     }
     return found;
+}
+
+constexpr u32 kSvcCloseHandleWord = 0xEF000023; // svc 0x23
+
+/// Finds, in [first, end), the `svc 0x32` words CTRPluginFramework hooks by itself in GSP::Initialize (GSPGPU::RegisterInterruptRelayQueue):
+/// the libctru wrapper's (at +0x2C) and the SDK wrapper's that has the command header in its first 0x50 bytes (at +0x28). The svc hook must
+/// leave these words as they are: the framework's search wants them as the pattern has them (the libctru one contains the svc itself), and
+/// without them it aborts at the game's start (KeepThreadMain: the class of LEGO Batman 2 and Balloon Fight). Returns how many (at most max).
+inline u32 FindFrameworkSites(ReadWordFn read, void* context, u32 first, u32 end, u32* sites, u32 max) {
+    u32 found = 0;
+    for (u32 addr = first; found < max && addr + 4 <= end; addr += 4) {
+        if (read(context, addr) != kGspWrapperCtru[0]) {
+            continue; // both patterns start with push {r4-r6, lr}
+        }
+        bool ctru = end - addr >= 4 * kGspWrapperCtruWords;
+        for (u32 i = 1; i < kGspWrapperCtruWords && ctru; ++i) {
+            ctru = read(context, addr + 4 * i) == kGspWrapperCtru[i];
+        }
+        if (ctru) {
+            sites[found++] = addr + kGspWrapperCtruSvcOffset;
+            continue;
+        }
+        bool sdk = end - addr >= kGspWrapperSdkHeaderWindow;
+        for (u32 i = 1; i < kGspWrapperSdkWords && sdk; ++i) {
+            sdk = read(context, addr + 4 * i) == kGspWrapperSdk[i];
+        }
+        for (u32 off = 0; sdk && off < kGspWrapperSdkHeaderWindow; off += 4) {
+            if (read(context, addr + off) == kGspRegisterInterruptHeader) {
+                sites[found++] = addr + kGspWrapperSdkSvcOffset;
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+/// Whether the word at `address` is a call site of the svc hook: an ARM svc 0x32 or svc 0x23 of the game, and not one of the framework's
+/// (FindFrameworkSites). `framework_site` says when it was one of those (the line of the log, the count).
+inline bool IsHookSite(u32 word, u32 address, const u32* framework, u32 framework_count, bool* framework_site) {
+    *framework_site = false;
+    if (word != kSvcSendSyncRequestWord && word != kSvcCloseHandleWord) {
+        return false;
+    }
+    if (word == kSvcSendSyncRequestWord) {
+        for (u32 i = 0; i < framework_count; ++i) {
+            if (framework[i] == address) {
+                *framework_site = true;
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 } // namespace azl

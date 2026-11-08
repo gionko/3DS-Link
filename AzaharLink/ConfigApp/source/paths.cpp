@@ -179,6 +179,10 @@ Paths Paths::FromAppDir(const std::string& appdir) {
     p.boot9_godmode = JoinPath(kGodModeOutDir, kBoot9FileName);
     p.config_file = JoinPath(p.datadir, kConfigFileName);
     p.servers_file = JoinPath(p.datadir, kServersFileName);
+    p.lobbies_file = JoinPath(p.datadir, kLobbiesFileName);
+    p.lobbies_local = JoinPath(p.datadir, kLobbiesLocalFileName);
+    p.lobbies_ping = JoinPath(p.datadir, kLobbiesPingFileName);
+    p.titles_file = JoinPath(p.datadir, kTitlesFileName);
     p.games_cache = JoinPath(p.datadir, kGamesCacheFileName);
     p.catalog_cache = JoinPath(p.datadir, kCatalogCacheFileName);
     p.park_dir = JoinPath(p.datadir, kParkDirName);

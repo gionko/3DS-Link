@@ -9,8 +9,14 @@
 namespace azl {
 namespace ini {
 
-/// The chord the in-game menu opens with when it is switched on and no chord of the user is known (Select is always part of any chord).
-constexpr const char* kDefaultMenuKey = "L+R+Select";
+/// The chord the in-game menu opens with when it is switched on and no chord of the user is known (Select is always part of any chord):
+/// L, the D-pad's right and Select, beside Rosalina's L + down + Select. (L + left + Select is kept for the chat of the room.)
+constexpr const char* kDefaultMenuKey = "L+Right+Select";
+/// The default before 1.1.1, L+R+Select: a file that still holds exactly it never chose it, and takes the new default (MenuKeyFromFile).
+/// L+R with Select is close to the soft reset of several games.
+constexpr const char* kOldDefaultMenuKey = "L+R+Select";
+/// The chord that opens the chat of the room in a title (ini key chat_key): L, the D-pad's left and Select, the mirror of the menu's.
+constexpr const char* kDefaultChatKey = "L+Left+Select";
 /// What menu_key holds when the in-game menu is switched off.
 constexpr const char* kMenuKeyOff = "off";
 
@@ -21,6 +27,14 @@ constexpr int kPortDefault = 24872;
 constexpr int kRcvbufKbDefault = 64;
 /// ini key `sleep_stop`: THE place that says what a file without the key means, and what a new file contains (see SleepStop).
 constexpr int kSleepStopDefault = 0;
+
+/// ini key `chat_pos`: the corner of the top screen where the chat's lines show. The file holds a word (kChatPosWords), the
+/// programs the index; the order is the one the app's row and the in-game menu cycle through.
+enum ChatPos : int { kChatPosTopLeft = 0, kChatPosTopRight = 1, kChatPosBottomLeft = 2, kChatPosBottomRight = 3, kChatPosCount = 4 };
+/// Bottom left, the user's choice (2026-11-04): what a new file holds and what a missing key or a word that is none of the four means.
+constexpr int kChatPosDefault = kChatPosBottomLeft;
+constexpr const char* kChatPosWords[kChatPosCount] = {"top-left", "top-right", "bottom-left", "bottom-right"};
+constexpr const char* kChatPosLabels[kChatPosCount] = {"Top left", "Top right", "Bottom left", "Bottom right"};
 
 /// ini key `debug`: 0 = no log of any kind (no file is written), 1 = everything (AzaharLink.log and
 /// AzaharLink.debug.log). 0.1.14 and older also knew 2 (+ every IPC call): that is part of 1 now, so an old file
@@ -104,12 +118,79 @@ inline int RcvbufKb(const std::string& value) {
     return (stop != text.c_str() && *stop == '\0') ? static_cast<int>(kb) : kRcvbufKbDefault;
 }
 
+/// ini key `chat_pos`: one of the four words (any case, blanks around). Anything else - an empty value, a typo, a number - is the
+/// default: a slip must not move the chat over what the game shows elsewhere.
+inline int ParseChatPos(const std::string& value) {
+    const std::string word = Word(value);
+    for (int i = 0; i < kChatPosCount; ++i) {
+        if (word == kChatPosWords[i]) {
+            return i;
+        }
+    }
+    return kChatPosDefault;
+}
+
+/// A corner that is not one of the four (a field nobody parsed) is the default: the writer and the screens never index out of the tables.
+inline int ValidChatPos(int pos) {
+    return pos >= 0 && pos < kChatPosCount ? pos : kChatPosDefault;
+}
+
+/// The word the file holds, and the words the app and the in-game menu show.
+inline const char* ChatPosWord(int pos) {
+    return kChatPosWords[ValidChatPos(pos)];
+}
+inline const char* ChatPosLabel(int pos) {
+    return kChatPosLabels[ValidChatPos(pos)];
+}
+
+/// The corner after `pos` (step >= 0: A or D-pad right) or before it (step < 0: D-pad left), round the four.
+inline int NextChatPos(int pos, int step) {
+    const int at = ValidChatPos(pos);
+    return step < 0 ? (at + kChatPosCount - 1) % kChatPosCount : (at + 1) % kChatPosCount;
+}
+
 /// ini key `menu_key`: "off" or "none" (any case, spaces around are ignored) = the in-game menu never opens.
 /// Anything else is a chord (see ParseKeys in Sources/main.cpp); an empty value means "not set" and is never
 /// stored, so it is not "off" either.
 inline bool MenuKeyIsOff(const std::string& value) {
     const std::string word = Word(value);
     return word == "off" || word == "none";
+}
+
+/// ini key `menu_key` as the plugin and the app take it from the file: the old default chord (any case, blanks around) becomes the
+/// new one, every other value - a chord the user wrote, off - stays as it is.
+inline std::string MenuKeyFromFile(const std::string& value) {
+    return Word(value) == Word(kOldDefaultMenuKey) ? std::string(kDefaultMenuKey) : value;
+}
+
+/// The keys of a chord as the plugin takes them (ParseKeys in Sources/main.cpp: the twelve words in any case, '+', ' ' or ',' between
+/// them, a word it does not know is no key), one bit a word, Select always among them (the plugin adds it to both chords).
+inline unsigned ChordBits(const std::string& chord) {
+    static const char* const kNames[] = {"select", "start", "a", "b", "x", "y", "l", "r", "up", "down", "left", "right"};
+    unsigned bits = 1u; // (Select)
+    std::string token;
+    for (std::size_t i = 0; i <= chord.size(); ++i) {
+        const char c = i < chord.size() ? chord[i] : '+';
+        if (c == '+' || c == ' ' || c == ',') {
+            for (unsigned k = 0; k < sizeof(kNames) / sizeof(kNames[0]); ++k) {
+                if (token == kNames[k]) {
+                    bits |= 1u << k;
+                }
+            }
+            token.clear();
+        } else {
+            token += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        }
+    }
+    return bits;
+}
+
+/// Two chords one of which holds every key of the other (the same chord too): the menu's and the chat's cannot be such a pair, since
+/// holding the bigger completes the smaller on the way and the menu, looked at first, opens instead of the chat (or the chat, open,
+/// keeps the menu shut). The plugin does the same test on its keys (Sources/main.cpp).
+inline bool ChordsNested(const std::string& a, const std::string& b) {
+    const unsigned x = ChordBits(a), y = ChordBits(b);
+    return (x & y) == x || (x & y) == y;
 }
 
 /// One line of the file as key and value. A UTF-8 byte order mark at the start (some Windows editors add one), the CR of a
@@ -156,7 +237,8 @@ inline KeyValue SplitLine(const std::string& line) {
 }
 
 /// Every key of AzaharLink.ini, in the order both programs write them, with the value a new file holds. The plugin reads
-/// exactly these 15 (Tests/policy_check.sh checks it) and the 13 first are the keys of 0.1.14.
+/// exactly these 18 (Tests/policy_check.sh checks it), the 13 first are the keys of 0.1.14, chat and chat_key came with the in-game menu
+/// of 1.1.1, chat_pos with the chat itself.
 struct Fields {
     bool enabled = true;
     std::string host;
@@ -173,11 +255,14 @@ struct Fields {
     int debug = 0;
     int rcvbuf_kb = kRcvbufKbDefault;
     int sleep_stop = kSleepStopDefault;
+    bool chat = true;                       // the chat of the room shown over the title (on: the user's choice; it can be switched off)
+    std::string chat_key = kDefaultChatKey; // the chord that opens it
+    int chat_pos = kChatPosDefault;         // the corner of its lines (ParseChatPos; the file holds the word)
 };
-constexpr int kKeyCount = 15;
+constexpr int kKeyCount = 18;
 constexpr const char* kKeyNames[kKeyCount] = {
     "enabled", "host",      "port",  "nickname",       "password",  "tunnel",    "autoconnect", "radio_like",
-    "socket_buffers", "net_thread_core", "menu_key", "game_name", "debug", "rcvbuf_kb", "sleep_stop"};
+    "socket_buffers", "net_thread_core", "menu_key", "game_name", "debug", "rcvbuf_kb", "sleep_stop", "chat", "chat_key", "chat_pos"};
 
 /// Values are single lines: a stray newline would corrupt the file.
 inline std::string OneLine(std::string s) {
@@ -189,7 +274,7 @@ inline std::string OneLine(std::string s) {
     return s;
 }
 
-/// The whole file: all 15 keys, one per line, LF line ends, always the same order, then `extra` (lines the writer does not
+/// The whole file: all 18 keys, one per line, LF line ends, always the same order, then `extra` (lines the writer does not
 /// understand and keeps) as far as they fit in `max_bytes`. The plugin refuses a file larger than 4096 bytes.
 inline std::string Render(const Fields& f, const std::vector<std::string>& extra = std::vector<std::string>(),
                           std::size_t max_bytes = 3800) {
@@ -210,6 +295,9 @@ inline std::string Render(const Fields& f, const std::vector<std::string>& extra
     out += "debug=" + std::to_string(f.debug) + "\n";
     out += "rcvbuf_kb=" + std::to_string(f.rcvbuf_kb) + "\n";
     out += "sleep_stop=" + std::to_string(f.sleep_stop) + "\n";
+    out += std::string("chat=") + flag(f.chat) + "\n";
+    out += "chat_key=" + OneLine(f.chat_key) + "\n";
+    out += std::string("chat_pos=") + ChatPosWord(f.chat_pos) + "\n";
     for (const std::string& line : extra) {
         if (out.size() + line.size() + 1 > max_bytes) {
             break;

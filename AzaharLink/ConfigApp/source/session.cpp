@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "ui.hpp"
+#include "lobby_scan.hpp"
 #include "update_worker.hpp"
 
 using ui::g;
@@ -94,6 +95,7 @@ void SuspendNetwork() {
     }
     // A check of the update may be running: it stops at its next step, and the sockets are closed after it (the name of a host, the one call it cannot leave, takes seconds at worst).
     update::Worker::Get().Stop(15000);
+    lobbies::Scanner::Get().Shutdown(15000); // (the asking of the public rooms, the same way)
     CloseSockets();
     if (g.ac_ready) {
         acExit();
