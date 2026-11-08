@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.2 - not released yet
+## 1.1.2 - 2026-11-08
 
 **The lobby update: the public Azahar rooms in the app, with their ping, how many players are in and what they play, your favourite rooms, Quick join, and a chat inside the games with a rebuilt in-game menu. Also: a new way of hooking the game, written once before it starts, so that a thread asleep in a system call can no longer wake up on a rewritten instruction. The Old 3DS fixes of this version, one more game with the Download Play lobby (*Luigi's Mansion*, 2018), and guards for a game that is closed and the next one that starts. Tried on consoles of the New 3DS family only: nothing of it was tried on an Old 3DS yet.**
 
