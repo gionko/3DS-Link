@@ -40,7 +40,7 @@ WORK=$(mktemp -d)
 if [ -z "$KEEP_WORK" ]; then trap 'rm -rf "$WORK"' EXIT; else echo "stack usage: build copy kept in $WORK"; fi
 # (only what the Makefile builds from: the project folder also holds gigabytes of console logs, captures and installers, and a copy of
 #  all of it took minutes and 12 GB of the disk for a build that needs 2 MB)
-tar -cf - Makefile 3gx.ld CTRPluginFramework.plgInfo Includes Sources third_party | tar -xf - -C "$WORK"
+tar -cf - Makefile 3gx.ld CTRPluginFramework.plgInfo Includes Sources third_party ConfigApp/dlph/dlph_wire.c ConfigApp/dlph/dlph_wire.h | tar -xf - -C "$WORK"
 # (the Makefile's flags + -fstack-usage and the call graph of every unit, which Tests/dlp_chain_report.py joins; the build makes the ELF
 #  that the checks below read)
 sed -i 's/-fno-strict-aliasing/-fno-strict-aliasing -fstack-usage -fcallgraph-info=su/' "$WORK/Makefile"
@@ -204,6 +204,16 @@ budget dlp_hub "azl::DlpHub::EndsRole" 8
 budget dlp_hub "azl::DlpHub::Stamp" 16
 budget dlp_hub "azl::DlpHub::SetPlayerName" 24
 budget dlp_hub "azl::DlpHub::SetFriendSeed" 24
+# 1.1.3, phase F5: the adapter of the real Download Play (Sources/azl/dlp_real_net.cpp; only a game in RealDlp mode has one). A game thread runs
+# only these, in the hub's RunHere at the game's nwm::UDS Initialize when no network thread serves (measured 2026-11-09: Release 8, HostClose 0
+# - a jump to Release; Disconnect is the same code and the plugin's build folds it into HostClose, so it has no line of its own -, ScanClose 8,
+# the two clears 8; the whole window with the engine's Shutdown is Tests/chain_sim's scenario_hub_real_engine); everything else of it is the
+# network thread's (Tests/dlp_net_stack_check.sh: 288 per function).
+budget dlp_real_net "azl::RealDlpNet::Release" 16
+budget dlp_real_net "azl::RealDlpNet::HostClose" 8
+budget dlp_real_net "azl::RealDlpNet::ScanClose" 16
+budget dlp_real_net "azl::RealDlpNet::ClearHost" 16
+budget dlp_real_net "azl::RealDlpNet::ClearClient" 16
 # The IpcResolver of the lobby: the address of a buffer of the game is mapped by a range test with no local and no call (it runs inside
 # every command that has a buffer, under Serve; DESIGN-FASE3 sez. 5.3: at most 76 bytes, 0 measured)
 budget plugin "azl::ctr::{anonymous}::MapGameAddress" 76

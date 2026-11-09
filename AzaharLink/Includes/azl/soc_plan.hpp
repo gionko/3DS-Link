@@ -74,6 +74,25 @@ constexpr uint64_t kLateBlockTitles[] = {
     0x0004000000197100ull, // Monster Hunter XX (Japan: it has no other region)
 };
 
+// THE LIST of the games that open the system's sockets themselves before the plugin's first connection (soc:U InitializeSockets: the
+// module keeps one context per process and the first wins, 0xC8A0700B for the plugin): for these the plugin becomes a guest in the
+// game's context instead of giving up (Sources/ctr/soc.cpp, the guest; REGISTRO phase S). A game with the same symptom ("soc: socInit
+// failed (0xc8a0700b) ... the game initialised the sockets itself first" in AzaharLink.log) needs its title id here, every region of it.
+constexpr uint64_t kSocGuestTitles[] = {
+    0x0004000000113100ull, // Fantasy Life, Europe (seen: InitializeSockets at 1.9 s, Friend-A 2026-11-08)
+    0x0004000000113200ull, // Fantasy Life, USA (3DS Link's catalogue, family AFL)
+    0x000400000006D200ull, // Fantasy Life, Japan (3DS Link's catalogue, family AFL)
+};
+
+inline bool SharesGameSockets(uint64_t title_id) {
+    for (const uint64_t title : kSocGuestTitles) {
+        if (title == title_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline bool TakesBlockLate(uint64_t title_id) {
     for (const uint64_t title : kLateBlockTitles) {
         if (title == title_id) {

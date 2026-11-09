@@ -1680,7 +1680,8 @@ def scenario_log_cost(elf, level):
 #          client. Used where the game thread itself runs the lobby's network side (DlpHub::RunHere: no network thread alive).
 # The network thread is the sim's other thread: whenever the game thread waits or sleeps, DlpHub::Tick runs in its place.
 LOBBYNET_SLOTS = ('NowMs', 'NowTicks', 'HostOpen', 'HostUpdate', 'HostClose', 'Kick', 'ScanOpen', 'ScanClose', 'ScanRead',
-                  'ConnectBegin', 'ConnectPoll', 'Disconnect', 'MyNode', 'Members', 'ReadNode', 'Send', 'Receive')
+                  'ConnectBegin', 'ConnectPoll', 'Disconnect', 'MyNode', 'Members', 'ReadNode', 'Send', 'Receive',
+                  'Pump', 'Holds')   # (1.1.3: the two that are not pure; the hub calls them only of an adapter that is not its own)
 CLOCK_SLOTS = ('NowMs', 'NowTicks')
 TD_TID = 0x000400000010C000          # Kirby Triple Deluxe
 HOST_MAC = bytes([0x02, 0x00, 0x00, 0x00, 0xAB, 0xCD])
@@ -1702,9 +1703,11 @@ def hdr(cmd_id, normal, translate=0):
 
 
 class HubRig:
-    """A DlpHub built by the plugin's constructor, with the other thread (Tick) and, optionally, the spy LobbyNet or a real engine."""
+    """A DlpHub built by the plugin's constructor, with the other thread (Tick) and, optionally, the spy LobbyNet or a real engine. real=True
+    (1.1.3, a game in RealDlp mode): the lobby's network is the adapter of the real Download Play, RealDlpNet, built by its own compiled
+    constructor on the real engine and given to the hub as its backend, as MakeRealDlpHub does; its methods are watched like the hub's own adapter's."""
 
-    def __init__(self, sim, elf, engine='spy', room=False):
+    def __init__(self, sim, elf, engine='spy', room=False, real=False):
         self.sim, self.elf, self.kind = sim, elf, engine
         uc = sim.uc
         self.kernel = sim.alloc(16)
@@ -1715,15 +1718,23 @@ class HubRig:
         res = sim.alloc(8)
         p32(uc, res, 0)
         p32(uc, res + 4, elf.sym('_ZN3azl3ctr12_GLOBAL__N_1L14MapGameAddressEPvmm'))
+        self.real = 0
+        if real:
+            check(engine == 'engine', 'the adapter of the real Download Play is built on the real engine')
+            self.real = sim.alloc(2048, 8)
+            sim.call(elf.sym('_ZN3azl10RealDlpNetC1EPNS_9UdsEngineE'), [self.real, self.engine])
+            check(r32(uc, self.real) == elf.sym('_ZTVN3azl10RealDlpNetE') + 8, 'the real adapter was built (its vtable pointer is at +0)')
         self.hub = sim.alloc(512)
-        sim.call(elf.sym('_ZN3azl6DlpHubC1EPNS_9UdsEngineEPNS_9KernelOpsERKNS_11LobbyConfigERKNS_11IpcResolverE'),
-                 [self.hub, self.engine, self.kernel, cfg], stack_args=[res])
+        sim.call(elf.sym('_ZN3azl6DlpHubC1EPNS_9UdsEngineEPNS_9KernelOpsERKNS_11LobbyConfigERKNS_11IpcResolverEPNS_8LobbyNetE'),
+                 [self.hub, self.engine, self.kernel, cfg], stack_args=[res, self.real])
         vt = elf.sym('_ZTVN3azl14EngineLobbyNetE')
         check(r32(uc, self.hub) == vt + 8, 'the lobby adapter is the first member of the hub (its vtable pointer is at +0)')
         if engine == 'spy':
             self.install_spy(vt)
         else:
             self.install_watch(vt)
+        if real:
+            self.install_watch(elf.sym('_ZTVN3azl10RealDlpNetE'))
         sim.on_yield = self.net_thread
         self.dead = False       # True: the other thread does not run (the network thread is gone)
 
@@ -2532,6 +2543,62 @@ def scenario_hub_engine(elf, level):
     return sim
 
 
+def scenario_hub_real_engine(elf, level):
+    """1.1.3, phase F5: the hub of a game in RealDlp mode (Luigi's Mansion): its lobby runs on the adapter of the real Download Play (RealDlpNet,
+    built by its own compiled constructor and given to the compiled DlpHub as its backend), on the real engine. SRVR Initialize + StartAccepting
+    make the adapter host the real Download Play's network (BeginHostingDlp, the bind of channel 2); then the game starts its own nwm::UDS
+    (InitializeWithVersion): OnGameUdsStarting gives the engine back first - posted to the network thread when it is alive, run by the game's
+    nwm::UDS thread itself when it is gone (RunHere > the lobby's ServerReset > RealDlpNet::HostClose = Release > the engine's Shutdown and its
+    frames, the client's foreign-lobby filter off), with no room and in a room. Held as the dialect's same windows are (scenario_hub_engine):
+    alive, the window from DlpHub::OnGameUdsStarting down within HLE_CEILING; gone, within UDS_ENGINE_CALL (the UDS thread runs the engine's
+    Initialize right after, which needs as much)."""
+    for flavour, dead, room in (('alive', False, False), ('gone, no room', True, False), ('gone, room joined', True, True)):
+        sim = Sim(elf, level, hle=False)
+        rig = HubRig(sim, elf, engine='engine', room=room, real=True)
+        hle_for_hub(sim, elf, rig)
+        words = struct.unpack('<2I', name12('nwm::UDS'))
+        sim.set_request([0x00050100, words[0], words[1], 8, 0])
+        sim.enter('gate32', 0x14801F, 'open nwm::UDS', roomy=True)
+        uds = r32(sim.uc, sim.cmd() + 12)
+        rig.tick()
+        srvr = open_session(sim, 'dlp:SRVR')
+        dlp_call(sim, srvr, SV_INIT, [0x1000, 3, 0x1D, 0, 0x1000, 1, 0x04000000, 0, 0], 'srvr Initialize (real Download Play)')
+        dlp_call(sim, srvr, SV_START_ACCEPT, [1, 6], 'srvr StartAccepting (real Download Play)')
+        check(reply(sim, 2) == [hdr(0x05, 1), 0], 'SRVR StartAccepting opened the real Download Play on the real engine: %r' % ([hex(x) for x in reply(sim, 2)],))
+        check('HostOpen' in sim.net_calls, 'the network thread opened the host through the adapter of the real Download Play (%r)' % (sim.net_calls,))
+        # while the lobby holds the engine the game's own UDS commands are "wrong state" (the hub asks the adapter: LobbyNet::Holds)
+        sim.set_request([0x00020000])
+        sim.enter('gate32', uds, 'uds command 0x02 while the real Download Play holds the engine', roomy=True)
+        check(reply(sim, 2)[1] == WRONG_STATE, 'while the real Download Play holds the engine a nwm::UDS command answers "wrong state": %r' % (reply(sim, 2),))
+        rig.tick()   # (a round of the adapter's own pump: the network's first beacon)
+        if dead:
+            sim.ticks += 1200 * 268112
+            rig.dead = True
+        sim.observed.clear()
+        sim.net_calls.clear()
+        sim.window_begin(elf.sym('_ZN3azl6DlpHub17OnGameUdsStartingEv'))
+        sim.set_request([(0x1B << 16) | (12 << 6) | 2, 0x1000] + [0] * 10 + [0x0400, 0, 0])
+        r0, depth, ok = sim.enter('gate32', uds, 'nwm::UDS Initialize, real Download Play, %s' % flavour, roomy=True)
+        w = sim.window_depth(ROOMY_ENTRY_SP)
+        check(w is not None, 'DlpHub::OnGameUdsStarting was entered and left (real Download Play, %s)' % flavour)
+        if dead:
+            # (RealDlpNet::HostClose and ::Disconnect are the same code - Release - and the linker keeps one: the watch sees either name)
+            check(any(m in sim.observed for m in ('HostClose', 'Disconnect')),
+                  'network thread gone: the game thread gave the engine back itself (RunHere; the adapter saw %r)' % (sim.observed,))
+        else:
+            check(sim.observed == [], 'network thread alive: the game thread called no method of the adapter (%r)' % (sim.observed,))
+            check(any(m in sim.net_calls for m in ('HostClose', 'Disconnect')),
+                  'network thread alive: the network thread gave the engine back (%r)' % (sim.net_calls,))
+        if w is not None:
+            if dead:
+                record('hub: OnGameUdsStarting, real Download Play, network thread %s (window: DlpHub::OnGameUdsStarting down)' % flavour,
+                       level, w, UDS_ENGINE_CALL[level], 'dead')
+            else:
+                record('hub: OnGameUdsStarting, real Download Play, network thread alive (window: DlpHub::OnGameUdsStarting down)', level, w,
+                       HLE_CEILING[level], 'hle')
+    return sim
+
+
 def main():
     # --pass-through-only: the scenarios that exist in every version of the plugin (to run an older ELF and see what
     # the gate says about it: the 0.1.15 build must FAIL it). The two older ELFs are in analysis/baseline/ (outside git, like
@@ -2553,6 +2620,7 @@ def main():
             scenario_hub_close(elf, level)
             scenario_hub_found_dead(elf, level)
             scenario_hub_engine(elf, level)
+            scenario_hub_real_engine(elf, level)
             continue
         scenario_pure(elf, level)
         if only_pass_through:
@@ -2580,6 +2648,7 @@ def main():
             scenario_hub_close(elf, level)
             scenario_hub_found_dead(elf, level)
             scenario_hub_engine(elf, level)
+            scenario_hub_real_engine(elf, level)
     print()
     print('%-72s %5s %7s %7s' % ('path (bytes below the SP at azl_gate_32)', 'debug', 'used', 'budget'))
     for scenario, level, depth, budget, kind in results:

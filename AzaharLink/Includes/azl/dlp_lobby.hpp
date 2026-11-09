@@ -75,6 +75,10 @@ public:
     virtual bool ReadNode(u8 node, NodeEntry* out) = 0;  // identity of one present node
     virtual bool Send(u8 to_node, const u8* data, u32 size) = 0;  // unicast to ONE node 1..4; size <= kMaxMessage
     virtual bool Receive(u8* from_node, u8* data, u32 capacity, u32* size) = 0;  // pops one message; false = none
+    // 1.1.3 (the plugin's hub with an adapter of its own, azl/dlp_real_net.hpp). NOT pure: EngineLobbyNet and the tests' networks keep
+    // these defaults, and the hub asks them only of an adapter that is not its own EngineLobbyNet. The lobby itself never calls them.
+    virtual void Pump() {}                        // the network thread's round (the hub's Tick), before the lobby's own pump
+    virtual bool Holds() const { return false; }  // true while the adapter holds the engine (the hub's EngineHeld / FreeEngine)
 
 protected:
     ~LobbyNet() = default;  // nobody deletes through the interface
@@ -618,6 +622,10 @@ public:
     /// True while the lobby holds the network.
     bool active() const {
         return use_ != kUseNone;
+    }
+    /// The network the lobby runs on (the hub's own adapter, or the one it was given: 1.1.3, azl/dlp_hub.hpp). No member is added for it.
+    LobbyNet* net() const {
+        return net_;
     }
 
     /// The plugin's mode (phase 3, azl/dlp_hub.hpp): the network work is the network thread's and nobody else's. With it on,

@@ -6,7 +6,7 @@
 
 **Connect, share, play together.** 3DS Link is an application for the Nintendo 3DS family that carries local wireless games over the internet, and moves software between consoles without a PC.
 
-Current version: **1.1.2**. Download it from the [Releases](../../releases/latest) page.
+Current version: **1.1.3**. Download it from the [Releases](../../releases/latest) page.
 
 A player on a PC with Azahar, a player on a tablet with Azahar and a player on a real Nintendo 3DS can all be in the same match of the same game, over the internet.
 
@@ -90,18 +90,18 @@ With the main switch *3DS Link* off, or for a game that is not switched on, the 
 
 * **Keep the emulation at 100%** (between 99 and 101%, the speed Azahar shows at the bottom of its window). If Azahar runs slower or faster than the console, the match suffers. Graphics enhancements such as a higher resolution are fine as long as the speed stays at 100%.
 * **It is still emulation**, with its own bugs, and the network side of the games is not completely emulated. In *Tekken 3D Prime Edition*, for instance, two consoles work and a console can join a match created in Azahar, but Azahar cannot join a match created by a console: 100 ms after connecting the game asks the host for its application data (`GetApplicationData`, `nwm::UDS` command `0x11`) and Azahar, as a client, answers with zero bytes. When a game does not work between Azahar and a console, let the Azahar player create the match.
-* **Kirby: Triple Deluxe, Kirby: Planet Robobot, Mario Tennis Open**, and since 1.1.2 **Luigi's Mansion** (2018), find their group through a lobby that 3DS Link makes between consoles inside the room: an Azahar player cannot take part in that lobby (Azahar's Download Play cannot open the child game), so for these games all the players must be on real consoles with 3DS Link.
+* **Kirby: Triple Deluxe, Kirby: Planet Robobot, Mario Tennis Open** find their group through a lobby that 3DS Link makes between consoles inside the room: an Azahar player cannot take part in that lobby (Azahar's Download Play cannot open the child game), so for these games all the players must be on real consoles with 3DS Link.
+* **Luigi's Mansion** (2018), since 1.1.3, speaks the real Download Play, the same as Azahar's: consoles and Azahar players find each other, whoever hosts. Every console needs 1.1.3: a console with 1.1.2 does not see one with 1.1.3 in this game.
 * Some games do not work in Azahar at all: in *Heroes of Ruin* Azahar can neither create a local wireless match nor see one, not even with another Azahar. Between two consoles, with 3DS Link, the game works well: the limit is in the emulator, not in the room.
 
 ## Tested games
 
-The first two tables were tested by the project owner, on the owner's consoles and with consoles and Azahar instances of friends; the third lists games that the plugin handles since a recent version and that were played only once, with no score yet; the fourth lists what users reported or what was found not to work. **This is not a compatibility guarantee**: a game that is not in the tables has not been tried.
+The first two tables were tested by the project owner, on the owner's consoles and with consoles and Azahar instances of friends; the third lists what users reported or what was found not to work. **This is not a compatibility guarantee**: a game that is not in the tables has not been tried.
 
 | Table | Tested on | Debug log | Rating |
 |---|---|---|---|
 | [Tested on 1.0.10 or later](#tested-on-1010-or-later) | 1.0.10 or later (the version is in each row) | **off**, no logs, except where the row says (a log is only written with the debug log on, which changes how the games behave: see [Known limits](#known-limits)) | score 1 to 10 |
 | [Last tested on an older version](#last-tested-on-an-older-version) | the version written in the row | mostly on, as some rows say | none yet: the words used then |
-| [Tried once, no score yet](#tried-once-no-score-yet) | the version written in the row | not written down | none yet |
 | [Reported or known not to work](#reported-or-known-not-to-work) | — | — | — |
 
 How to read the columns:
@@ -131,12 +131,18 @@ How to read the columns:
 | Metroid Prime: Federation Force | 2 consoles over the internet (New 3DS and New 2DS) | **10/10** | 1.0.14 | — |
 | Terraria (Europe copy, update 1.0.5) | 2 consoles over the internet (New 3DS XL and New 2DS XL) | **10/10** | 1.0.15 | — |
 | Super Smash Bros. for Nintendo 3DS (Europe copy) | 2 consoles over the internet (New 3DS XL and New 2DS XL) | **10/10** | 1.0.15 | — |
+| Luigi's Mansion (2018, Europe copy), multiplayer | 2 consoles over the internet (New 2DS XL hosting, New 3DS XL), and a console with Azahar (PC), each hosting once; debug log on. About 20 fps in multiplayer: see the note below | **8/10** | 1.1.3 | 1.1.3 the real Download Play, the same as Azahar's (on 1.1.2: a lobby between consoles only) |
+| Fantasy Life (Europe copy), local multiplayer | 2 consoles over the internet (New 2DS XL hosting, New 3DS XL), and the New 2DS XL hosting Azahar (PC); debug log on | **9/10** | 1.1.3 | 1.1.3 the plugin uses the game's own network connection |
 
 **New on 1 November 2026:** *Luigi's Mansion 2* (9/10), *Metroid Prime: Federation Force* (10/10), *Monster Hunter XX* with two consoles (10/10), and *New Super Mario Bros. 2*, which was in the older table as "playable, with several slowdowns" and is now 7/10. They were tried over the internet with two consoles of the New 3DS family; the debug log setting of those tests was not written down.
 
 **New on 2 November 2026:** *Terraria* (10/10) and *Super Smash Bros. for Nintendo 3DS* (10/10), over the internet with two consoles of the New 3DS family; the debug log setting of those tests was not written down.
 
-Not tried yet with three or four players: the games that use the lobby (the two Kirby games, *Mario Tennis Open*, and *Luigi's Mansion* (2018), see below). Not tried with an Azahar player in the room: the same (the lobby is made between 3DS Link consoles, Azahar cannot take part in it). The title ids of the USA, Japanese and Taiwanese copies of *Mario Tennis Open* are in the plugin's table but were never seen on a console.
+**New on 9 November 2026:** *Luigi's Mansion* (2018) (8/10) and *Fantasy Life* (9/10), with two consoles of the New 3DS family over the internet and with Azahar on a PC, on 1.1.3.
+
+**Luigi's Mansion (2018): about 20 fps in multiplayer, and that is the game.** In its multiplayer mode the game runs at about 20 fps, on a console and on Azahar alike: drawing the second player costs it about 10 fps. It is how this port of the GameCube game is made, not the room, not the latency and not 3DS Link. So far it is the only game in these tables that loses frame rate in its multiplayer mode.
+
+Not tried yet with three or four players: the games that use the lobby (the two Kirby games, *Mario Tennis Open*). Not tried with an Azahar player in the room: the same (the lobby is made between 3DS Link consoles, Azahar cannot take part in it). The title ids of the USA, Japanese and Taiwanese copies of *Mario Tennis Open* are in the plugin's table but were never seen on a console.
 
 ### Last tested on an older version
 
@@ -153,22 +159,13 @@ These were not re-tested on 1.0.10 or later. The result is the one of the versio
 | Monster Hunter 4 Ultimate | single player | The C-stick works (issue 1) | 1.0.4 | 1.0.4 the C-stick works again |
 | Kirby Battle Royale | 2 consoles; a console and Azahar (debug log on) | Works: the lobby and a whole match; when an Azahar player is closed abruptly the console waited about 30 s | 1.0.6 | 1.0.6 the plugin answers the game's Download Play wireless check; 1.0.10 a room member that stopped playing is dropped after 3 s (not tested) |
 
-### Tried once, no score yet
-
-The plugin handles these games since the version in the row, and they were played through a room once, with no score given yet. Reports are welcome, with the debug log on.
-
-| Game | What was added | Tried | 3DS Link | Notes |
-|---|---|---|---|---|
-| Luigi's Mansion (2018) | the Download Play lobby inside the room, as for the Kirby games: its local multiplayer said the wireless was off | 2 New 3DS, 3DS to 3DS, once: it played | 1.1.2 | Europe copy; the USA, Japanese and Korean title ids are in the plugin's table but were never seen. Not tried with an Azahar player. Not *Luigi's Mansion 2*, which plays without the lobby |
-
 ### Reported or known not to work
 
 | Game | What happens | Since / notes |
 |---|---|---|
 | Mario Tennis Open (USA copy, Old 3DS) | After the online option the game says the Wi-Fi switch is off (issue 2) | Not confirmed fixed: the Europe copy plays between two New 2DS XL since 1.0.12; the report may be the game's internet mode, which 3DS Link does not carry. Not tried on an Old 3DS |
 | Balloon Fight (Virtual Console) | Closes at startup: the framework the plugin is built on aborts in Virtual Console games | Known limit |
-| Mario Party: Island Tour | Its local multiplayer asks for Download Play and says the wireless is off. The lobby that 3DS Link makes for the Kirby games was tried with it on two New 3DS, in a test build of 1.1.2: the game did not play with it | Not in 1.1.2; planned for 1.1.3 |
-| Fantasy Life | Never reaches the room: the game opens the console's network service before the plugin, and the plugin then has no network ("Network unavailable") | Tried on a New 3DS XL with test builds of 1.1.2. A fix is planned for 1.1.3: see [Known limits](#known-limits) |
+| Mario Party: Island Tour | Its local multiplayer asks for Download Play and says the wireless is off. The lobby that 3DS Link makes for the Kirby games was tried with it on two New 3DS, in a test build of 1.1.2: the game did not play with it | Not supported yet; not looked at in depth |
 | Pac-Man & Galaga Dimensions, Ridge Racer 3D, The Legend of Zelda: Ocarina of Time 3D | Close at launch on one of the test consoles with the plugin switched on (error `0xE0A01839`); with the game left off they run | See [Known limits](#known-limits) |
 
 ## Known limits
@@ -176,21 +173,21 @@ The plugin handles these games since the version in the row, and they were playe
 | Limit | In short | Status |
 |---|---|---|
 | **One plugin per game** | Another Luma plugin in the same game's folder: 3DS Link leaves that folder alone | By design |
-| **Download Play games** | Only *Kirby: Triple Deluxe*, *Kirby: Planet Robobot*, *Kirby Battle Royale*, *Mario Tennis Open* and, since 1.1.2, *Luigi's Mansion* (2018, tried once) work; *Mario Party: Island Tour* not yet; other Download Play games, single-copy Download Play and Virtual Console games do not | Not supported, except those five |
+| **Download Play games** | Only *Kirby: Triple Deluxe*, *Kirby: Planet Robobot*, *Kirby Battle Royale*, *Mario Tennis Open* and *Luigi's Mansion* (2018; with Azahar too since 1.1.3) work; *Mario Party: Island Tour* not yet; other Download Play games, single-copy Download Play and Virtual Console games do not | Not supported, except those five |
 | **Some 2011 titles** | *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D*, *Ocarina of Time 3D* close at launch (`0xE0A01839`) on one console, a New 3DS XL | A remedy exists in the notes, **not** applied on the New 3DS family; 1.1.0 applies the same move on the Old 3DS family for another reason, **not tried** with these titles |
 | **Old 3DS and Old 2DS** | No console of this kind in the test set. Going to HOME or using the power button could close the game or stop the console; coming back could end in `0xD8E007F7` | HOME, the game's threads: fixed in 1.0.12, confirmed by users. Three more fixes in 1.1.0, run by users on Old 3DS consoles, not settled, two in 1.1.1, and in 1.1.2 a new way of hooking the game and four more fixes: **1.1.1 and 1.1.2 not tried on an Old 3DS**, see below. *Monster Hunter XX* starts and plays, by a user's report (1.0.15) |
 | **The debug log** | Makes everything stutter; with it on the Kirby games, *Dragon Ball Z* and *Tekken* are not playable | Not fixable here: keep it off (the default) |
 | **Fast fighting games** | Can stutter on a slow connection; *Tekken 3D* lags between two consoles | Cause of Tekken's gaps not located |
 | **The Download Play lobby** (*Triple Deluxe*, *Planet Robobot*, *Mario Tennis Open*) | At most four players; tried with two consoles; *Triple Deluxe* found "a little slow" | Partly tried |
 | **"Couldn't set memblock size"** (New 3DS) | Seen with test builds of 1.1.2 on one New 3DS XL, after a game was closed: Luma had not learned that the game ended | Since 1.1.2 an exit guard; tried in 29 closes, where it never had to act |
-| **Games that use the console's internet themselves** | *Fantasy Life* takes the console's network service before the plugin: no room | Planned for 1.1.3 |
+| **Games that use the console's internet themselves** | A game that takes the console's network service before the plugin leaves it without a room | *Fantasy Life*: fixed in 1.1.3; other games one by one, when reported |
 | **The chat's keyboard** | C-stick, ZL and ZR still reach the game while you type; plain ASCII only | By design for now |
 | **The in-game menu** | Pauses the game: a game with a short network timeout can lose its match while it is open | By design |
 
 ### Details of the limits
 
 * **One plugin per game.** A game switched on in 3DS Link cannot also have another Luma plugin (cheats, CTGP-7, ...): 3DS Link detects it and leaves that game's folder alone.
-* **Download Play games.** The plugin carries the game's own local wireless (`nwm::UDS`). Four games use the Download Play service to find their group and work: *Kirby: Triple Deluxe* and *Kirby: Planet Robobot* because 3DS Link provides that part inside the room (since 1.0.10, between consoles only: Azahar cannot take part), *Mario Tennis Open* for the same reason (since 1.0.12), and *Kirby Battle Royale* because the plugin answers its wireless check (since 1.0.6; last tried on 1.0.6). *Luigi's Mansion* (2018) gets the same lobby since 1.1.2, from what its logs showed; it played with it once, on two New 3DS. *Mario Party: Island Tour* asks for Download Play the same way, but did not play with the lobby: not in 1.1.2. Other games that use Download Play to play together, single-copy Download Play (sending the game to a console that does not have it) and Virtual Console games do not work.
+* **Download Play games.** The plugin carries the game's own local wireless (`nwm::UDS`). Four games use the Download Play service to find their group and work: *Kirby: Triple Deluxe* and *Kirby: Planet Robobot* because 3DS Link provides that part inside the room (since 1.0.10, between consoles only: Azahar cannot take part), *Mario Tennis Open* for the same reason (since 1.0.12), and *Kirby Battle Royale* because the plugin answers its wireless check (since 1.0.6; last tried on 1.0.6). *Luigi's Mansion* (2018) got the same lobby in 1.1.2; since 1.1.3 it speaks the real Download Play instead, so Azahar players take part too (how it works: [CHANGELOG](CHANGELOG.md), 1.1.3). *Mario Party: Island Tour* asks for Download Play the same way, but did not play with the lobby: not in 1.1.2. Other games that use Download Play to play together, single-copy Download Play (sending the game to a console that does not have it) and Virtual Console games do not work.
 * **Some 2011 titles.** On a New 3DS XL, with the plugin enabled for the title, *Pac-Man & Galaga Dimensions*, *Ridge Racer 3D* and *Ocarina of Time 3D* end within five seconds with the error code `0xE0A01839` (the result of the game's own `svcCreateThread`). With the title not enabled they run, and the same plugin works with newer games on the same console. The analysis points at a worker thread of the plugin framework that is started on the second core for these titles. Since 1.1.0 that worker is on the first core on the Old 3DS family, for another reason (see below); on the New 3DS family it did not move, and these titles were not tried with the change. A game without local wireless can simply stay off in *Enable Titles*. The analysis and a diagnostic build of the plugin are in [`AzaharLink/diag/README.md`](AzaharLink/diag/README.md).
 * **Old 3DS and Old 2DS.** There is no console of this kind in the test set: what follows comes from users' reports, and the fixes were tested on a PC. On these consoles Luma frees the plugin's memory when the game goes to the HOME menu, and most of the problems come from that. **Nothing of 1.1.2 was tried on an Old 3DS yet:**
   * **A game's thread inside the plugin's hook** closed the game at HOME. Fixed in 1.0.12: **users confirm on Old 3DS consoles that HOME no longer closes the game for this reason.**
@@ -209,7 +206,7 @@ The plugin handles these games since the version in the row, and they were playe
 * **The debug log** (*Settings → Debug log*) writes a lot to the SD card. With it on, the Kirby games, *Dragon Ball Z* and *Tekken* are not playable (the capture probably saturates the card the game loads from: the game does not load or freezes, and the other consoles drop out), and some games with short network timeouts lose the room. Turn it on only to make a report. Writing the capture every 2 s instead of four times a second (1.0.8) did not solve it.
 * **Luma3DS 13.0 to 13.2** are untested.
 * **"Couldn't set memblock size"** (`0xD8A077F9`) on a New 3DS. With test builds of 1.1.2, on one New 3DS XL, a game closed from HOME was never seen as ended by Luma: the next game got that message, and once the console stopped and had to be switched off with the power button. The plugin does not write the state Luma looks at, and nothing showed that it caused this. Since 1.1.2 an **exit guard**, on the New 3DS family only, looks at that state when the game exits and puts it right if it is stale, so that Luma frees the plugin's memory. In 29 closes on two New 3DS the message never came back and the guard never had to act, so its action was tried on a PC only. It cannot help when the system kills the game without letting it exit. If the message still shows up, please send `AzaharLink.luma.log` and `AzaharLink.sleep.log`.
-* **Games that use the console's internet themselves.** The console's network service keeps one context per game, and the first to open it wins. *Fantasy Life* opens it before the plugin, which then has no network and never reaches the room. A fix, where the plugin uses the game's own context, is planned for 1.1.3. The other way round, a game's own online mode (*Tekken 3D Prime Edition*'s, for example) can fail when the plugin opened the service first.
+* **Games that use the console's internet themselves.** The console's network service keeps one context per game, and the first to open it wins. *Fantasy Life* opens it before the plugin, which then had no network and never reached the room. Since 1.1.3 the plugin uses the game's own context for the games in a short list (only *Fantasy Life* so far); another game with the same symptom needs its own entry. The other way round, a game's own online mode (*Tekken 3D Prime Edition*'s, for example) can fail when the plugin opened the service first.
 * **The chat.** While the keyboard is open the game gets a neutral copy of its input, but the C-stick, ZL and ZR come from another service and still reach it in the games that read them there (the *Monster Hunter* games, for example). The text is plain ASCII: any other character shows as `?`. Who joins and who leaves is new in 1.1.2 and not tried yet.
 * **Fast fighting games** feel the network more and can stutter on a slow connection. *Tekken 3D* lags between two consoles: gaps of 80 ms and more rather than latency.
 * **The Download Play lobby** (the two Kirby games and *Mario Tennis Open*) is made of at most four players and was tried with two consoles only. *Triple Deluxe* was found "a little slow" without saying where (no log: the debug log cannot be used with these games).

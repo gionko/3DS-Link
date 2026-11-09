@@ -34,8 +34,10 @@
 namespace azl {
 
 /// What the plugin does for a game (the table of plugin.cpp): nothing, answer the wireless check only (azl/dlp_fkcl_hle.hpp:
-/// Kirby Battle Royale), or carry the Download Play lobby over the room (Kirby Triple Deluxe, Planet Robobot).
-enum class DlpGameMode : u8 { None = 0, ProbeOnly = 1, Lobby = 2 };
+/// Kirby Battle Royale), carry the Download Play lobby over the room in the plugin's own dialect (Kirby Triple Deluxe, Planet Robobot),
+/// or carry the same lobby speaking the REAL Download Play on the wire (1.1.3, Luigi's Mansion: azl/dlp_real_net.hpp, the same hub on
+/// another LobbyNet, so that Azahar's Download Play and ours see each other).
+enum class DlpGameMode : u8 { None = 0, ProbeOnly = 1, Lobby = 2, RealDlp = 3 };
 
 class DlpHub {
 public:
@@ -51,7 +53,11 @@ public:
 
     /// `engine` and `kernel` outlive the hub. The hub puts the lobby in the external-poll mode and makes its event (kernel->CreateEvent).
     /// `resolver` maps the addresses of the game's buffers (the plugin's: a range test; the tests': their fake memory).
-    DlpHub(UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& resolver);
+    /// `backend` (1.1.3, DlpGameMode::RealDlp): the network the lobby runs on instead of the hub's own EngineLobbyNet - the adapter of the
+    /// real Download Play, which outlives the hub. Null (every other game) = the hub's own adapter, exactly as before. With a backend the
+    /// hub pumps it on the network thread (LobbyNet::Pump, before the lobby's own pump) and asks IT whether the engine is held (Holds).
+    /// No member is added for it: the lobby keeps the pointer (DlpLobby::net()).
+    DlpHub(UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& resolver, LobbyNet* backend = nullptr);
     ~DlpHub();
     DlpHub(const DlpHub&) = delete;
     DlpHub& operator=(const DlpHub&) = delete;

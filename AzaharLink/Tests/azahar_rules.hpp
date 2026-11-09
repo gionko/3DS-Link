@@ -24,6 +24,7 @@
 // thread.
 #pragma once
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -237,6 +238,14 @@ private:
                 } else {
                     host.admitted.insert(host.pending.front());
                     host.pending.pop_front();
+                }
+            } else {
+                // (a unicast one - the real Download Play's host sends every admission so since 1.1.3 - admits the MAC it goes to if
+                // that MAC asked; the copies to the members already in admit nobody)
+                const auto it = std::find(host.pending.begin(), host.pending.end(), p.destination_address);
+                if (it != host.pending.end()) {
+                    host.admitted.insert(*it);
+                    host.pending.erase(it);
                 }
             }
         }

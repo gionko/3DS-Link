@@ -418,6 +418,15 @@ need_line Tests/chat_host_test.cpp "    TestLatchLifts();" "the chat host's test
 need Sources/ctr/hook.cpp "static __attribute__((noinline)) void NoteAptForChat(Result rc, u32 result_word, u32 raw) {" "the chat's observer of the notifications is out of line"
 need_order Sources/ctr/hook.cpp "        NoteAptForChat(rc, cmd[1], raw);" "        if (g_apt_observer && g_debug_level > 0 && answered) {" "the chat counts the notifications at every level of the log, before the debug log's observer"
 need_order Sources/main.cpp "    azl::ctr::ChatProcessEvent(static_cast<int>(event));" "    Plugin::Get().NoteProcessEvent(static_cast<int>(event));" "the chat counts the framework's events before the plugin's swap work"
+# The plugin is made in PatchProcess, on the one thread that runs it, BEFORE the event callback is registered (it calls Plugin::Get()):
+# with the callback first, the framework's keep-alive thread and PatchProcess could be in the guard of the function-local static of
+# Plugin::Get() at once, and the plugin is built with -fno-exceptions (abort). Decision of 2026-11-09 (the fork build 57 of klark231).
+patch_process=$(tr -d '\r' < Sources/main.cpp | awk '/^void PatchProcess\(FwkSettings& settings\) \{$/ {on = 1} on {print} on && /^}$/ {exit}')
+pp_get=$(printf '%s\n' "$patch_process" | grep -n -F -x '    Plugin& plugin = Plugin::Get();' | cut -d: -f1)
+pp_cb=$(printf '%s\n' "$patch_process" | grep -n -F -x '    Process::SetProcessEventCallback(OnProcessEvent);' | cut -d: -f1)
+pp_init=$(printf '%s\n' "$patch_process" | grep -n -F -x '    plugin.EarlyInit();' | cut -d: -f1)
+{ [ -n "$pp_get" ] && [ -n "$pp_cb" ] && [ -n "$pp_init" ] && [ "$pp_get" -lt "$pp_cb" ] && [ "$pp_cb" -lt "$pp_init" ]; } || fail "Sources/main.cpp: PatchProcess must make the plugin (Plugin& plugin = Plugin::Get();) before SetProcessEventCallback, then call plugin.EarlyInit()"
+[ "$(cat Sources/*.cpp Sources/ctr/*.cpp | tr -d '\r' | grep -c 'SetProcessEventCallback(')" = "1" ] || fail "the event callback is registered somewhere else than in PatchProcess"
 need Sources/main.cpp "azl::ctr::ChatFrame(g_chat_keys, !g_menu_off);" "the chat's work runs every frame of the running game"
 need Sources/ctr/chat_overlay.cpp "    g_osk = new (std::nothrow) osk::Osk(o, g_draft);" "the chat's keyboard is made when it opens, from the draft"
 need Sources/ctr/chat_overlay.cpp "    u8* pixels = im ? new (std::nothrow) u8[chat::ImageBytes(format)] : nullptr;" "the keyboard's picture is made only while it is open"
@@ -1380,8 +1389,10 @@ if grep -n 'SetState(State::Joined)' Sources/azl/room_client.cpp; then
   fail "the network thread of Sources/azl/room_client.cpp sets Joined without checking that its session is still the client's (set_state())"
 fi
 [ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'log_files_->Flush()')" = "2" ] || fail "Sources/ctr/plugin.cpp calls log_files_->Flush() from more than the log writer's two places (the room state callback must not wait for the SD card)"
-# - the foreign-lobby filter: a host always refuses, a client only counts until the switch is turned (nothing in the plugin
-#   turns it)
+# - the foreign-lobby filter: a host always refuses, a client only counts until the switch is turned (nothing of the plugin's own code
+#   turns it; 1.1.3, decision Q8 of PROGETTO-DLP-VERO-1.1.3.md taken in the night session of 2026-11-09 and written in REGISTRO-MODIFICHE-ERRORI.md:
+#   the adapter of the real Download Play turns it on for a probe and a session of a RealDlp game only, and its Release turns it off on every
+#   path - pinned in the phase F3/F4/F5 blocks below)
 need Includes/azl/uds_engine.hpp "bool client_foreign_filter_enforced_ = false;" "a client only counts the frames of another lobby (until a session on hardware shows it can drop them)"
 if grep -rn "SetClientForeignFilterEnforced" Sources/ctr Sources/main.cpp >/dev/null 2>&1; then
   fail "the plugin turns the client's foreign-lobby filter on: that waits for a hardware session with zero would-be drops"
@@ -1753,7 +1764,7 @@ need_line Tests/stack_usage.sh 'budget hook "azl::ctr::PassThroughPre" 32' "the 
 # Test hygiene. A test that no script runs is a gate that is not there: every test source is built AND run by the script
 # that owns it (the host tests by Tests/run.sh, the 32-bit ones, which drive UdsHle, by Tests/ipc_test/build.sh and then
 # Tests/hle_tests.sh and Tests/integration.sh), and a new *_test.cpp that is in none of them fails here
-for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test chat_core_test chat_core_test_tsan chat_draw_test osk_test chat_host_test chat_host_test_tsan hid_mirror_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test update_test logrot_test log_module_test ncch_icon_test hook_swap_test hook_swap_test_tsan gate_plan_test kernel_books_test gsp_wrapper_test traced_sessions_test traced_sessions_test_tsan heap_plan_test; do
+for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_real_engine_test dlp_real_net_test dlp_real_client_test dlp_real_hub_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test chat_core_test chat_core_test_tsan chat_draw_test osk_test chat_host_test chat_host_test_tsan hid_mirror_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test update_test logrot_test log_module_test ncch_icon_test hook_swap_test hook_swap_test_tsan gate_plan_test kernel_books_test gsp_wrapper_test traced_sessions_test traced_sessions_test_tsan heap_plan_test; do
   tr -d '\r' < Tests/run.sh | grep -q -E "^  (timeout 1200 )?\"\\\$OUT/$t\"( |\$)" || fail "Tests/run.sh does not run the unit test $t (a line of its own that calls \"\$OUT/$t\")"
   need Tests/run.sh "-o \"\$OUT/$t\"" "the unit test $t is built by Tests/run.sh"
 done
@@ -1771,6 +1782,269 @@ done
 for f in Tests/ffe_host_golden.inc Tests/tfh_host_golden.inc Tests/lobby_trace.inc; do
   head -1 "$f" | grep -q "Generated by Tests/make_goldens.py" || fail "$f is not marked as generated by Tests/make_goldens.py"
 done
+# The golden data of the real Download Play (RealDlp, 1.1.3) are cut out of the capture 1c by Tests/make_dlp_real_goldens.py, with the game's
+# titles and icon replaced by the sum of their words (what is Nintendo's stays out of the repository; the checksums still hold)
+head -1 Tests/dlp_real_luigi_golden.inc | grep -q "^// Generated by Tests/make_dlp_real_goldens.py from the capture 1c" || fail "Tests/dlp_real_luigi_golden.inc is not marked as generated by Tests/make_dlp_real_goldens.py"
+need Tests/dlp_real_luigi_golden.inc '{"F0", "770.168", 1, 1, 65535, 768, kDlpRealLuigi_00_F0, 0xa85b0d4c, 0xbdfff7f2, {0x40, 0x2f8}},' "frame 0 of the announcement carries no title and no icon of the game (+0x40..+0x2F7 is its sum only)"
+# 1.1.3, phase F1: the codec of the real Download Play (azl/dlp_real_wire.hpp / .cpp) and the ONE file of the Download Play host library it builds on.
+# - the plugin's Makefile compiles dlph_wire.c of ConfigApp/dlph by its name alone: never the folder (dlph.c, the app's host, stays out of the plugin)
+need_line Makefile $'DLPH_WIRE\t:=\tdlph_wire.c' "the plugin builds one file of the Download Play host library, by name"
+need_line Makefile 'vpath $(DLPH_WIRE) $(TOPDIR)/ConfigApp/dlph' "dlph_wire.c is found by its name in ConfigApp/dlph, the folder is not a source folder"
+need Makefile '$(notdir $(wildcard $(dir)/*.c))) $(DLPH_WIRE)' "dlph_wire.c is among the C files of the plugin"
+[ "$(tr -d '\r' < Makefile | sed 's/#.*$//' | grep -c 'ConfigApp')" = "1" ] || fail "the plugin's Makefile names ConfigApp somewhere else than the vpath of dlph_wire.c (a source folder of the app, or another of its files, would go into the plugin)"
+! tr -d '\r' < Makefile | sed 's/#.*$//' | grep -E '^(SOURCES|INCLUDES)[[:space:]]' | grep -q -E 'ConfigApp|dlph' || fail "the plugin's SOURCES or INCLUDES name the app's folders (dlph.c would be built into the plugin)"
+need_line Sources/azl/dlp_real_wire.cpp '#include "../../ConfigApp/dlph/dlph_wire.h"  // (one file of the library, by name: the Makefile builds dlph_wire.c and nothing else of ConfigApp/dlph)' "the codec reaches the library through its wire header alone"
+hit=$(grep -r -n -E '#include[[:space:]]*"[^"]*(ConfigApp|dlph)' Sources Includes --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v '^Sources/azl/dlp_real_wire.cpp:' | head -3)
+[ -z "$hit" ] || fail "something else of the plugin includes a file of the app or of the Download Play host library (only azl/dlp_real_wire.cpp includes dlph_wire.h): $hit"
+# - what we send is sealed with the constant seed 0 (design 2.5, decision written in REGISTRO); the step of the checksum is the library's, explained where the codec says it
+need_line Includes/azl/dlp_real_wire.hpp 'inline constexpr u8 kTxSeed[4] = {0, 0, 0, 0};' "the seed of the checksum of what the plugin sends is the constant 0 (design 2.5)"
+need Includes/azl/dlp_real_wire.hpp 'h = ((h >> s) | (h << s)) ^ BE32(seed) with s = (seed[2] & 0xF) + 4. That step is NOT a rotation' "the codec says that the checksum's step is not a rotation, so that nobody corrects it"
+# - the notice A8 is Azahar's (index 0, 0x18 bytes, 1 and 9): the library's begin_ping (index 1, 0x20, +0x1D = 8) is an empty final to an Azahar client and is never used by the plugin
+[ "$(grep -r -c 'dlph_pk_begin_ping' Sources Includes | awk -F: '{s+=$2} END {print s+0}')" = "0" ] || fail "the plugin uses dlph_pk_begin_ping (an Azahar client takes it for the final with an empty passphrase: design 2.4)"
+need_after Sources/azl/dlp_real_wire.cpp 'std::size_t Notice(u8* buf, const u8 seed[4], u8 seq, const u8 rid[2]) {' 'Header(buf, kTypeBegin, kNoticeBytes, 0, seq, rid[0], rid[1]);' "the notice is index 0, 0x18 bytes"
+# - the codec is pure: no log, no printf family, no heap, no static storage of its own
+hit=$(tr -d '\r' < Sources/azl/dlp_real_wire.cpp | sed 's://.*$::' | grep -n -E '\bLog\(|DebugEvent\(|printf|\bnew\b|malloc|std::vector|std::string|^[[:space:]]*static[[:space:]]+[A-Za-z_:<>0-9]+[[:space:]]+[A-Za-z_0-9]+[[:space:]]*(\[|=|;)' | head -3)
+[ -z "$hit" ] || fail "Sources/azl/dlp_real_wire.cpp logs, allocates or keeps static storage (it is a pure codec): $hit"
+# - the suite builds and runs its test (W1..W10), with the sanitizers, and the test stops at the first undefined behaviour
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_wire_test.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" -o "$OUT/dlp_real_wire_test"' "the suite builds the codec's test against the library's dlph_wire.c"
+need Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' "the library's file is built with the sanitizers for the codec's test"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_wire_test"' "the suite runs the codec's test"
+need Tests/dlp_real_wire_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the codec's test stops at the first undefined behaviour"
+need Tests/dlp_real_wire_test.cpp '#include "dlp_real_luigi_golden.inc"' "the codec is tested against the golden bytes of the capture 1c"
+# 1.1.3, phase F2: the engine's half of the real Download Play (design E1/D13, D11, D12, D16; Tests/dlp_real_engine_test.cpp).
+# - the beacons of the real Download Play (its wlancommid, NO application data, any id8 / network id / attributes) are lobbies only under
+#   SetLobbyBeaconKind(RealDlp): an engine starts with the dialect's kind, whose rule stays the text it was
+need Includes/azl/uds_engine.hpp 'LobbyBeaconKind lobby_beacon_kind_ = LobbyBeaconKind::Ours;' "an engine files the dialect's beacons until the plugin says the game is of the real Download Play"
+need Sources/azl/uds_engine.cpp '        lobby = (!GetBeaconApplicationData(tags, &data, &size) || size == 0) && tags.network_size > kMaxAt &&' "a real Download Play's beacon has no application data (a tag too short for the size byte counts as none) and the node counts"
+need_after Sources/azl/uds_engine.cpp '        lobby = (!GetBeaconApplicationData(tags, &data, &size) || size == 0) && tags.network_size > kMaxAt &&' '                LoadBE32(tags.network + 4) == kLobbyWlanCommId;' "...and the Download Play's wlancommid, and nothing else of the beacon (Azahar leaves id8, network id and attributes uninitialised)"
+need Sources/azl/uds_engine.cpp '    } else if (!GetBeaconApplicationData(tags, &data, &size) || size == 0 || tags.network_size <= kMaxAt ||' "the dialect's kind keeps its own rule (the text it had), and the real kind is a branch of its own before it"
+need_after Sources/azl/uds_engine.cpp '    if (copied != 0) {' 'std::memcpy(slot->lobby.data, data, copied);' "no memcpy from the null pointer of a beacon with no data"
+# - the network the engine composes for it: the Download Play's ids, no application data, never the lobby's inbox; its flag is switched on by
+#   those two calls only, off by Shutdown only (the bodies are read without their comments; region() and code_of() come later in this file)
+[ "$(grep -c 'dlp_net_ = true;' Sources/azl/uds_engine.cpp)" = "2" ] || fail "Sources/azl/uds_engine.cpp: the real Download Play's network begins in two places (BeginHostingDlp, ConnectBeginDlp)"
+[ "$(grep -c 'dlp_net_ = false;' Sources/azl/uds_engine.cpp)" = "1" ] || fail "Sources/azl/uds_engine.cpp: the rules of the real Download Play's network end in one place (Shutdown)"
+need_after Sources/azl/uds_engine.cpp "    lobby_inbox_ = false; // (the lobby's end" '    dlp_net_ = false;' "Shutdown ends the rules of the real Download Play's network where it switches the lobby's inbox off"
+r=$(awk -v a='u32 UdsEngine::BeginHostingDlp(u8 max_nodes, u8 channel) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' Sources/azl/uds_engine.cpp | sed 's://.*$::')
+echo "$r" | grep -q 'StoreBE32(network_info_.wlan_comm_id_be, kLobbyWlanCommId);' && echo "$r" | grep -q 'network_info_.id = kLobbyId8;' || fail "BeginHostingDlp no longer hosts under the Download Play's ids"
+echo "$r" | grep -q -E 'lobby_inbox_|application_data|EnsureLobbyLocked|SetLobbyInbox' && fail "BeginHostingDlp touches the lobby's inbox or puts application data in the beacon (Azahar's client parses a tag of 52 bytes at most)"
+r=$(awk -v a='u32 UdsEngine::ConnectBeginDlp(const Mac& host, u8 channel, ConnectionType type) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' Sources/azl/uds_engine.cpp | sed 's://.*$::')
+echo "$r" | grep -q 'if (const u32 r = Gate(kIdle)) {' || fail "ConnectBeginDlp no longer checks the gate before it overwrites the NetworkInfo"
+echo "$r" | grep -q -E 'lobby_inbox_|SetLobbyInbox|heard|received_beacons_' && fail "ConnectBeginDlp touches the lobby's inbox or reads the host's beacon (its id8, network id and attributes are undefined in Azahar)"
+# - D16: a client that is Connecting takes no Logoff before its host's answer and none that names node 0 (a spectator's admission); a host notes
+#   no departure (every peer of that network says goodbye once: capture 1c). The dialect's two rules (below, by the churn fuzz) are untouched.
+need Sources/azl/uds_engine.cpp '        if (dlp_net_ && (!associated_ || (conn_type_ == ConnectionType::Client && logoff.assigned_node_id == 0))) {' "D16 a and b: the Logoffs a client of the real Download Play's network does not take"
+need_after Sources/azl/uds_engine.cpp '    if (!dlp_net_) {' '        NoteLeftLocked(packet.transmitter_address, now);' "D16 c: a host of the real Download Play's network notes no departure (no guard against a second goodbye that never comes)"
+[ "$(grep -c 'NoteLeftLocked(packet.transmitter_address, now);' Sources/azl/uds_engine.cpp)" = "1" ] || fail "Sources/azl/uds_engine.cpp: a departure is noted in one place (the Deauthentication a host handles)"
+# - D12: the spectators are counted on the node map (connected and spectator), never kept in step elsewhere
+need Sources/azl/uds_engine.cpp '        n += entry.second.connected && entry.second.spec ? 1u : 0u;' "SpectatorCount counts the connected spectators of the node map"
+# - nothing of the plugin calls these pieces but the engine and the adapter of the real Download Play (F3-F5)
+hit=$(grep -rn -E 'BeginHostingDlp|ConnectBeginDlp|SetLobbyBeaconKind|SpectatorCount' Sources Includes --include=*.cpp --include=*.hpp --include=*.h --include=*.c | grep -v -E '^(Sources/azl/uds_engine\.cpp|Includes/azl/uds_engine\.hpp|Sources/azl/dlp_real_net\.cpp|Includes/azl/dlp_real_net\.hpp):' | head -3)
+[ -z "$hit" ] || fail "something besides the engine and the adapter of the real Download Play calls its engine pieces: $hit"
+# - the suite builds and runs the engine's test of the real Download Play, which stops at the first undefined behaviour and runs every scenario
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_engine_test.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_engine_test"' "the suite builds the engine's test of the real Download Play"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_engine_test"' "the suite runs the engine's test of the real Download Play"
+need Tests/dlp_real_engine_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the engine's test of the real Download Play stops at the first undefined behaviour"
+for s in 'E1_Kinds()' 'D11_Calls()' 'D12_Spectators()' 'CH_Channels()' 'R7_Goodbyes(100)' 'R7_Goodbyes(2000)' 'R7_GameUnchanged()' 'R7b_Logoffs()' 'R7b_Together()' 'R11b_Ghost(500)' 'R11b_Ghost(1500)' 'R11b_Race()' 'R11b_Goodbye()' 'R11b_Foreign()' 'R11b_StaleNodeMap()' 'R13_Dialects()' 'Fuzz(seed, 22, 2);' 'Fuzz(seed, 22, 4);' 'CHECK_EQ(g_diverged, 0u);'; do
+  need_stmt Tests/dlp_real_engine_test.cpp "$s" "the scenario $s of the engine's test of the real Download Play runs in main()"
+done
+need_line Tests/dlp_real_engine_test.cpp '    for (u32 seed : {1u, 2u, 3u}) {' "the fuzz of two nodes (Luigi's Mansion) runs three seeds"
+need Tests/dlp_net_stack_check.sh '|EnsureLobbyLocked|BeginHostingDlp|ConnectBeginDlp|SetLobbyBeaconKind|SpectatorCount' "the engine's pieces of the real Download Play are held to the frame budget of the lobby's (64 bytes on ARM32)"
+# 1.1.3, phase F3: the HOST of the real Download Play (Includes/azl/dlp_real_net.hpp, Sources/azl/dlp_real_net.cpp: RealDlpNet under the lobby; design 4, 6.3, 6.4;
+# Tests/dlp_real_net_test.cpp in front of the model of Azahar's client, Tests/azahar_dlp_peer.hpp). What must not change by accident: that the game threads get no frame
+# and no allocation from it, that the announcement goes out only to a spectator and one frame at a time, that the dialogue's timers and bounds are the design's, that the
+# lobby hears a START_ACK / GO_ACK only for the answers that earn them, that the first passphrase is the one sent, and that it gives the engine back whole.
+game_thread_file Includes/azl/dlp_real_net.hpp 1
+game_thread_file Sources/azl/dlp_real_net.cpp 1
+need Includes/azl/dlp_real_net.hpp 'static_assert(sizeof(RealDlpNet) <= 2048,' "the adapter of the real Download Play stays under 2 KB (one frame buffer and some words)"
+for c in 'kAnnounceMs = 500;' 'kAuthResendMs = 300;' 'kDistResendMs = 400;' 'kFinishResendMs = 200;' 'kNoticeMs = 100;' 'kFinalResendMs = 500;' 'kFinalTries = 4;' 'kPumpMs = 10;' 'kPullsPerPump = 4;'; do
+  need Includes/azl/dlp_real_net.hpp "static constexpr u32 $c" "the host's timers and bounds are the design's (4.5): $c"
+done
+# - a game thread gets no frame from it: Send records the lobby's START / GO, Receive hands the acks earned, neither touches the wire
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='bool RealDlpNet::Send(u8 to_node, const u8* data, u32 size) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+echo "$r" | grep -q -E 'SendTo|SendDialogue|PullPacket|Step|Announce\(' && fail "RealDlpNet::Send puts something on the wire (a game thread runs StartDistribution and BeginGame: the Pump sends)"
+echo "$r" | grep -q 'if (!pass_set_) {' || fail "RealDlpNet::Send no longer keeps the FIRST passphrase (the game calls BeginGame again and again with new ones)"
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='bool RealDlpNet::Receive(u8* from_node, u8* data, u32 capacity, u32* size) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+echo "$r" | grep -q -E 'SendTo|SendDialogue|PullPacket' && fail "RealDlpNet::Receive touches the wire (it only hands the acks the dialogue earned)"
+# - the lobby hears an ack only when the client earned it: START_ACK at the Finish's answer (A6, no content), GO_ACK at the notice's answer (A9) in GoWait
+[ "$(grep -c 'peer.flags |= kOweStartAck;' Sources/azl/dlp_real_net.cpp)" = "1" ] || fail "Sources/azl/dlp_real_net.cpp: the lobby's START_ACK is earned in one place (A6)"
+[ "$(grep -c 'peer.flags |= kOweGoAck;' Sources/azl/dlp_real_net.cpp)" = "1" ] || fail "Sources/azl/dlp_real_net.cpp: the lobby's GO_ACK is earned in one place (A9)"
+need Sources/azl/dlp_real_net.cpp '} else if (p.kind == dlp_real::Kind::FinishAck && peer.st == kFinWait && !p.needs_content) {' "START_ACK only for the Finish's answer of a client that needs no content"
+need Sources/azl/dlp_real_net.cpp '} else if (p.kind == dlp_real::Kind::NoticeAck && peer.st == kGoWait) {' "GO_ACK only for a notice's answer after the final"
+need_after Sources/azl/dlp_real_net.cpp '        if (p.needs_content) {' '            engine_->EjectClient(node);' "a client that asks for the content (a download) is ejected: this mode carries none"
+# - the announcement: only while the host accepts and a spectator is in, ONE frame per Pump (the network thread holds the hub's mutex the game threads wait for)
+need Sources/azl/dlp_real_net.cpp 'const u32 specs = accepting_ ? engine_->SpectatorCount() : 0;' "the announcement only while the host accepts and a spectator is connected (design 4.3)"
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='void RealDlpNet::Announce(u32 now) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+[ "$(echo "$r" | grep -c 'engine_->SendTo(')" = "1" ] || fail "RealDlpNet::Announce sends more or less than one frame"
+echo "$r" | grep -q -E '\b(for|while)[[:space:]]*\(|[^:]Announce\(' && fail "RealDlpNet::Announce loops or calls itself: one frame of the announcement per Pump"
+need Sources/azl/dlp_real_net.cpp 'engine_->SendTo(kBroadcastNetworkNodeId, kChannelAnnounce, static_cast<u32>(len), 0, buf_, len);' "the announcement goes to every node on channel 1 (never with the management bit: Azahar ASSERTs)"
+# - the packets of channel 2 taken per Pump are bounded, and none can stay stuck in the bind (PullPacket may take out more than the buffer holds: the parser refuses it)
+need Sources/azl/dlp_real_net.cpp '    for (u32 i = 0; i < kPullsPerPump; ++i) {' "the Pump takes at most kPullsPerPump packets of the dialogue"
+need Sources/azl/dlp_real_net.cpp 'engine_->PullPacket(kHostBind, kPullMax, buf_, sizeof(buf_), &n, &src)' "a packet longer than the buffer is taken out (cut) and refused, never left at the head of the bind"
+need Includes/azl/dlp_real_net.hpp 'static constexpr u32 kPullMax = 0xFFFF;' "PullPacket may take out a frame of any length the ring can say (a longer one would stay at the head of the bind for ever)"
+# - the host's bind hands no handle out (nobody would close it), and the engine still gives the games theirs
+need Sources/azl/dlp_real_net.cpp 'engine_->Bind(kHostBind, kDialogueRing, kChannelDialogue, kBroadcastNetworkNodeId, nullptr)' "the adapter's bind takes no duplicate of its event (a handle nobody closes)"
+need_after Sources/azl/uds_engine.cpp '    if (game_event != nullptr) {' '        *game_event = kernel_->DuplicateForGame(event);' "a game's Bind still gets its duplicate of the event"
+# - the engine given back whole, the client's foreign-lobby filter off on every path (held or not), the adapter forgets a client no later than the lobby
+need_after Sources/azl/dlp_real_net.cpp 'void RealDlpNet::Release() {' '        engine_->Shutdown();' "Release gives the service back whole"
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='void RealDlpNet::Release() {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+echo "$r" | grep -q -E -x '    engine_->SetClientForeignFilterEnforced\(false\);[[:space:]]*' || fail "RealDlpNet::Release no longer switches the client's foreign-lobby filter off outside any condition (decision Q8: the engine keeps it across Shutdown)"
+need_after Sources/azl/dlp_real_net.cpp '    if (hosting_) {' '        ForgetGone(mask);' "the lobby's own Members makes the adapter forget a client that left (a node that comes back starts from the Auth)"
+# - it never uses the dialect's pieces of the engine (who builds it is phase F5's block below)
+hit=$(cat Sources/azl/dlp_real_net.cpp Includes/azl/dlp_real_net.hpp | tr -d '\r' | sed 's://.*$::' | grep -n -E 'BeginHostingLobby|ConnectBeginLobby|PopLobbyMessage|kLobbyChannel|SetLobbyInbox' | head -2)
+[ -z "$hit" ] || fail "the adapter of the real Download Play uses the dialect's pieces of the engine: $hit"
+# - the suite builds and runs its test, which stops at the first undefined behaviour and runs every scenario
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_net_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_net_test"' "the suite builds the host's test of the real Download Play"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_net_test"' "the suite runs the host's test of the real Download Play"
+need Tests/dlp_real_net_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the host's test of the real Download Play stops at the first undefined behaviour"
+need Tests/dlp_real_net_test.cpp '#include "azahar_dlp_peer.hpp"' "the host is tested against the model of Azahar's client"
+for s in 'R1_Sequence(0, true);' 'R1b_Announcement();' 'R1_Sequence(rtt, true);' 'R1_Sequence(700, false);' 'R5_Losses();' 'R6b_ThirdConsole();' 'R7_Rejoin(100);' 'R7_Rejoin(2000);' 'R9_Malformed();' 'R12_Full();' 'R14_Idempotent();' 'R14b_FinalsBounded();' 'Release_Paths();'; do
+  need_stmt Tests/dlp_real_net_test.cpp "$s" "the scenario $s of the host's test of the real Download Play runs in main()"
+done
+need_line Tests/dlp_real_net_test.cpp '    for (u32 rtt : {100u, 300u, 500u}) {' "R4: the round trips that must pass"
+# 1.1.3, phase F4: the SEARCHER of the real Download Play (the same adapter, RealDlpNet; design 5, NETCODE.md; Tests/dlp_real_client_test.cpp in front of
+# the model of Azahar's host, Tests/azahar_dlp_host.hpp). What must not change by accident: that the engine is taken for a probe only and given back
+# after it, that a probe reads only its own host (the filter, decision Q8), that its work per Pump is bounded, that a join needs nothing of the scan,
+# and that the searcher's binds take no handle.
+need_after Sources/azl/dlp_real_net.cpp 'RealDlpNet::RealDlpNet(UdsEngine* engine) : engine_(engine) {' '    engine_->SetLobbyBeaconKind(UdsEngine::LobbyBeaconKind::RealDlp);' "the adapter files the beacons of the real Download Play from its construction on (design 5.1: the game is of that mode for the whole session)"
+for c in 'kProbeEveryMs = 20;' 'kProbeFreshMs = 400;' 'kProbeConnectMs = 3000;' 'kProbeCollectMs = 1500;' 'kProbeRetryMs = 5000;' 'kPullsPerProbe = 2;' 'kProbeRing = 8192;'; do
+  need Includes/azl/dlp_real_net.hpp "static constexpr u32 $c" "the searcher's timers and bounds are the design's (5.2): $c"
+done
+# - ScanOpen takes no engine (a held engine would close nwm::UDS to the game for the whole scan: the gate); only a probe takes it, for itself
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='bool RealDlpNet::ScanOpen() {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+echo "$r" | grep -q -E 'Acquire\(|InitializeForLobby|ConnectBegin' && fail "RealDlpNet::ScanOpen takes the engine (design 5.2: only a probe does, for as long as it lasts)"
+need Sources/azl/dlp_real_net.cpp 'engine_->ConnectBeginDlp(beacon.host, beacon.channel, ConnectionType::Spectator)' "a probe reads the announcement as a spectator, on the channel of the host's beacon"
+need Sources/azl/dlp_real_net.cpp 'engine_->ConnectBeginDlp(host, beacon.channel, ConnectionType::Client)' "the join is a client's, on the channel of the host's beacon (NETCODE point 4: Luigi hosts on 6)"
+# - the probe's work per Pump is bounded (1.5 KB frames under the hub's mutex the game threads wait for), and it never loops
+need Sources/azl/dlp_real_net.cpp '    for (u32 k = 0; k < kPullsPerProbe; ++k) {' "a probe takes at most kPullsPerProbe frames of the announcement per Pump"
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='void RealDlpNet::Collect(u32 now) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+[ "$(echo "$r" | grep -c -E '\b(for|while)[[:space:]]*\(')" = "1" ] || fail "RealDlpNet::Collect has more than its one bounded loop"
+echo "$r" | grep -q 'engine_->PullPacket(kProbeBind, kPullMax, buf_, sizeof(buf_), &n, &src)' || fail "RealDlpNet::Collect no longer takes a frame longer than the buffer out of the bind (cut, then refused)"
+# - the foreign-lobby filter (decision Q8 of the session of 2026-11-09, REGISTRO): on only in this adapter, only after the engine was taken for a probe
+#   or a session, off in Release on every path (the pin of F3 above); nothing else of the plugin turns it on
+hit=$(grep -rn 'SetClientForeignFilterEnforced(true)' Sources Includes | grep -v '^Sources/azl/dlp_real_net\.cpp:' | head -2)
+[ -z "$hit" ] || fail "something besides the adapter of the real Download Play turns the client's foreign-lobby filter on: $hit"
+[ "$(grep -c 'engine_->SetClientForeignFilterEnforced(true);' Sources/azl/dlp_real_net.cpp)" = "2" ] || fail "Sources/azl/dlp_real_net.cpp turns the filter on in other places than the probe and the session"
+need Sources/azl/dlp_real_net.cpp '    engine_->SetClientForeignFilterEnforced(true);  // (two hosts in the room' "a probe reads its own host only: the filter is on for it"
+need Sources/azl/dlp_real_net.cpp '    engine_->SetClientForeignFilterEnforced(true);  // (a second host of the Download Play' "a session hears its own host only: the filter is on for it"
+# - a probe ends on the network thread: its 8 KB ring freed there, then the engine given back
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='void RealDlpNet::EndProbe(u8 verdict, u32 now) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+echo "$r" | awk '/engine_->Unbind\(kProbeBind\);/ { u = NR } /^    Release\(\);/ { r = NR } END { exit !(u && r && u < r) }' || fail "RealDlpNet::EndProbe no longer frees the probe's bind before it gives the engine back"
+# - a join needs nothing of the scan: the channel comes from the engine's table of beacons, never from the probes' cache (NETCODE point 7: StopScan empties it)
+r=$(tr -d '\r' < Sources/azl/dlp_real_net.cpp | awk -v a='bool RealDlpNet::ConnectBegin(const Mac& host, const Identity& me) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+echo "$r" | grep -q 'if (!BeaconOf(host, kProbeConnectMs, &beacon)) {' || fail "RealDlpNet::ConnectBegin no longer takes the host's channel from the engine's table of beacons"
+echo "$r" | grep -q -E 'FindHeard|heard_' && fail "RealDlpNet::ConnectBegin depends on the probes' cache (the lobby joins after StopScan, which empties it)"
+# - the searcher's binds: channel 1 / channel 2 from the host (node 1) only, no handle handed out
+need Sources/azl/dlp_real_net.cpp 'engine_->Bind(kProbeBind, kProbeRing, kChannelAnnounce, kHostNode, nullptr)' "the probe binds channel 1 from the host only, with no handle"
+need Sources/azl/dlp_real_net.cpp 'engine_->Bind(kSessionBind, kDialogueRing, kChannelDialogue, kHostNode, nullptr)' "the session binds channel 2 from the host only, with no handle"
+# - the lobby hears StartDistribution and the final once each; the answers leave from the Pump, never from a game thread
+need Sources/azl/dlp_real_net.cpp '            session_flags_ = static_cast<u8>(session_flags_ | kSawStart | kOweStart);' "the host's StartDistribution is the lobby's START, once"
+need Sources/azl/dlp_real_net.cpp '                session_flags_ = static_cast<u8>(session_flags_ | kSawFinal | kOweGo);' "the host's FIRST final is the lobby's GO with its passphrase"
+[ "$(grep -c '| kOweGo);' Sources/azl/dlp_real_net.cpp)" = "1" ] || fail "Sources/azl/dlp_real_net.cpp: the lobby's GO is owed in one place (the first final)"
+# - the suite builds and runs its test, which stops at the first undefined behaviour and runs every scenario
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test"' "the suite builds the searcher's test of the real Download Play"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_client_test"' "the suite runs the searcher's test of the real Download Play"
+need Tests/dlp_real_client_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the searcher's test of the real Download Play stops at the first undefined behaviour"
+need Tests/dlp_real_client_test.cpp '#include "azahar_dlp_host.hpp"' "the searcher is tested against the model of Azahar's host"
+for s in 'R2_Sequence(1, false);' 'R2_Sequence(2, false);' 'R2_Sequence(3, true);' 'R5b_Losses(false);' 'R5b_Losses(true);' 'R5c_ProbeLosses(false);' 'R5c_ProbeLosses(true);' 'R6f_Full();' 'R6_Three();' 'R9c_R12c();' 'R3a_Ours();' 'Rel_Paths();'; do
+  need_stmt Tests/dlp_real_client_test.cpp "$s" "the scenario $s of the searcher's test of the real Download Play runs in main()"
+done
+need Tests/dlp_real_client_test.cpp 'return after == std::vector<u32>({5, 6, 9});' "R2: the statuses of our lobby after the join are 5, 6, 9 (NETCODE point 1: never 7)"
+# 1.1.3, phase F5: the real Download Play IN THE PLUGIN (design 6.1, D1-D10; Tests/plugin_dlp_test.cpp runs the decision of EarlyInit for every row of the table,
+# Tests/dlp_real_hub_test.cpp the hub with the adapter in both directions and in both modes). What must not change by accident: that only a RealDlp row gets
+# the adapter (and the Lobby rows exactly what they had), that the hub keeps no member for it and pumps / asks it only when it is not its own adapter,
+# that MakeDlpHub is untouched, that nothing but the plugin's two files and the adapter's own name it.
+# - D1, D2: the mode, and the four Luigi's Mansion rows in it (the other rows are pinned with the table of phase 3)
+need Includes/azl/dlp_hub.hpp 'enum class DlpGameMode : u8 { None = 0, ProbeOnly = 1, Lobby = 2, RealDlp = 3 };' "the modes of the table: RealDlp is a new value, the old ones keep theirs"
+for t in 0x00040000001D1A00ull 0x00040000001D1900ull 0x00040000001D1800ull 0x00040000001D4F00ull; do
+  need Sources/ctr/plugin.cpp "{$t, DlpGameMode::RealDlp}," "Luigi's Mansion ($t) speaks the real Download Play (1.1.3; back to Lobby with this row if O5 fails)"
+done
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'DlpGameMode::RealDlp}')" = "4" ] || fail "Sources/ctr/plugin.cpp: the RealDlp rows are the four Luigi's Mansion ones and no other (a new one comes with its own Azahar - Azahar oracle, design F7)"
+# - D3, D5: the branch of EarlyInit after the Lobby one (whose line is pinned above), the adapter made there and only there, kept by the plugin before the hub
+need_line Sources/ctr/plugin.cpp '    } else if (DlpModeOf(game_id_) == DlpGameMode::RealDlp && active_) {' "the real Download Play's hub exists only for a RealDlp game, only when the plugin is active, right after the Lobby branch"
+[ "$(grep -r -c 'new (std::nothrow) RealDlpNet(engine_.get())' Sources Includes | awk -F: '{ n += $2 } END { print n + 0 }')" = "1" ] || fail "the adapter of the real Download Play is made in one place (the RealDlp branch of EarlyInit)"
+need_after Sources/ctr/plugin.cpp '        dlp_real_.reset(new (std::nothrow) RealDlpNet(engine_.get()));' '            dlp_hub_ = MakeRealDlpHub(engine_.get(), &kernel_, game_id_, console_mac_, dlp_real_.get());' "the hub of a RealDlp game runs on the adapter just made, and only if it was made"
+need_after Sources/ctr/plugin.cpp '        dlp_real_.reset(new (std::nothrow) RealDlpNet(engine_.get()));' '        if (dlp_real_) {' "no hub without the adapter (MakeRealDlpHub gives it its identity)"
+need_order Includes/ctr/plugin.hpp 'std::unique_ptr<RealDlpNet> dlp_real_;' 'std::unique_ptr<DlpHub> dlp_hub_;' "the adapter is declared before the hub that points to it"
+# - D4: MakeDlpHub untouched (its return line is pinned above and is the start of the extractor's search), MakeRealDlpHub right after it with the same configuration
+need Sources/ctr/plugin.cpp 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));' "MakeRealDlpHub gives the hub the adapter as the lobby's network"
+need_order Sources/ctr/plugin.cpp 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver));' 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));' "MakeRealDlpHub comes right after MakeDlpHub (the extractor cuts both)"
+need Sources/ctr/plugin.cpp '    real->SetIdentity(probe);' "the probes take the lobby's own identity (F4's open point: it was zero)"
+need Tests/plugin_dlp_extract.py "marker = 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));" "the extractor cuts the plugin's text to the end of MakeRealDlpHub"
+need Tests/plugin_dlp_extract.py "wiring_start = text.index('    if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {" "the extractor also cuts the decision of EarlyInit, from the Lobby line"
+need Tests/plugin_dlp_test.cpp '#include "plugin_dlp_wiring.inc"' "the plugin test runs the decision of EarlyInit itself"
+need_stmt Tests/plugin_dlp_test.cpp 'azl::ctr::WiringTest();' "the plugin test runs the decision for every row, other games and an inactive plugin"
+need_stmt Tests/plugin_dlp_test.cpp 'azl::ctr::RealHubTest();' "the plugin test checks MakeRealDlpHub's configuration"
+need Tests/plugin_dlp_test.cpp 'CHECK_EQ(lobby_hubs, 7u);' "the seven Lobby rows get the hub of the dialect, on the hub's own adapter"
+need Tests/plugin_dlp_test.cpp 'CHECK_EQ(real_hubs, 4u);' "the four RealDlp rows get the adapter of the real Download Play"
+need Tests/run.sh 'g++ $CXXFLAGS -I"$OUT" Tests/plugin_dlp_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/plugin_dlp_test"' "the plugin test links the adapter of the real Download Play (the wiring makes one)"
+need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/plugin_dlp_test.cpp Sources/azl/dlp_hub.cpp' "the library's dlph_wire.o is built before the plugin test that links it"
+# - D6-D10: the hub's backend: no member, the lobby keeps the pointer; pumped first and asked whether it holds the engine only when it is not the hub's own adapter
+need Sources/azl/dlp_hub.cpp ': net_(engine), lobby_(backend != nullptr ? backend : &net_, cfg), resolver_(resolver), kernel_(kernel) {' "the hub's lobby runs on the backend when it has one, on its own adapter otherwise (every Lobby game)"
+need Includes/azl/dlp_hub.hpp 'DlpHub(UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& resolver, LobbyNet* backend = nullptr);' "the backend is the hub's last argument, null by default"
+need_after Sources/azl/dlp_hub.cpp 'void DlpHub::Refresh() {' 'const bool held = b != &net_ ? b->Holds() : net_.engine_held();' "the hub's EngineHeld is the backend's Holds for a RealDlp game, its own adapter's otherwise"
+need_after Sources/azl/dlp_hub.cpp 'void DlpHub::FreeEngine() {' 'if (b != &net_) {' "the give-back of a RealDlp game asks its adapter"
+need_order Sources/azl/dlp_hub.cpp '        b->Pump();  // (1.1.3' '    lobby_.Pump();' "the backend does its wire work before the lobby's pump, in the same Tick under the same lock"
+[ "$(grep -c -- '->Pump();' Sources/azl/dlp_hub.cpp)" = "1" ] || fail "Sources/azl/dlp_hub.cpp pumps the backend in one place (Tick)"
+hit=$(grep -n -E 'RealDlpNet|dlp_real' Sources/azl/dlp_hub.cpp Includes/azl/dlp_hub.hpp | grep -v -E '//.*(dlp_real_net|real Download Play)' | head -2)
+[ -z "$hit" ] || fail "the hub names the adapter of the real Download Play (it knows only LobbyNet: a backend of any kind): $hit"
+need Includes/azl/dlp_lobby.hpp '    virtual void Pump() {}' "LobbyNet::Pump is not pure: the dialect's adapter and the tests' networks keep the default"
+need Includes/azl/dlp_lobby.hpp '    virtual bool Holds() const { return false; }' "LobbyNet::Holds is not pure either"
+need Includes/azl/dlp_lobby.hpp '    LobbyNet* net() const {' "the lobby tells the hub which network it runs on (no member of the hub for it)"
+need Includes/azl/dlp_real_net.hpp '    void Pump() override;' "the adapter's Pump is the hub's (LobbyNet::Pump)"
+need Includes/azl/dlp_real_net.hpp '    bool Holds() const override {' "the adapter's Holds is the hub's (LobbyNet::Holds)"
+# - who names the adapter: its own two files, the plugin's two (the member and the branch: an exception to the rule of the hub's header, decided in
+#   the design 7.4 point 13) and the tests; the app knows nothing of it
+hit=$(grep -r -n -E 'azl/dlp_real_net\.hpp"' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v -E '^(Sources/azl/dlp_real_net\.cpp|Includes/ctr/plugin\.hpp):' | head -3)
+[ -z "$hit" ] || fail "something other than plugin.hpp and the adapter itself includes azl/dlp_real_net.hpp: $hit"
+hit=$(grep -r -n -E 'RealDlpNet' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v -E '^(Sources/azl/dlp_real_net\.cpp|Includes/azl/dlp_real_net\.hpp|Includes/ctr/plugin\.hpp|Sources/ctr/plugin\.cpp):' | head -3)
+[ -z "$hit" ] || fail "something other than the plugin and the adapter itself names RealDlpNet: $hit"
+# - the stack and the size (design 7.4 points 3, 4, 12): the adapter's size on ARM32, the frames of its two units and of what a game thread runs of it,
+#   the give-back of a RealDlp game on the game's nwm::UDS thread in the chain test
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(RealDlpNet) <= 2048,' "the adapter of the real Download Play is at most 2 KB on ARM32: a growth is a decision"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpHub) <= 408,' "the hub keeps its 408 bytes with a backend (no member for it)"
+need Tests/dlp_net_stack_check.sh 'FRAME_REAL=288 ' "no function of the real Download Play's adapter and codec has a frame over 288 bytes on ARM32"
+need Tests/dlp_net_stack_check.sh 'FRAME_REAL_GAME=80 ' "what a game thread runs of that adapter has a frame of 80 bytes at most"
+need Tests/dlp_net_stack_check.sh "REAL_GAME_FUNCTIONS='NowMs|NowTicks|Holds|HostClose|Disconnect|ScanClose|Release|ClearHost|ClearClient'" "the functions of the adapter a game thread runs (the hub's RunHere, the clock)"
+need Tests/dlp_net_stack_check.sh '-c Sources/azl/dlp_real_net.cpp -o "$W/real_net.o"' "the check compiles the adapter of the real Download Play strictly"
+need Tests/dlp_net_stack_check.sh '-c Sources/azl/dlp_real_wire.cpp -o "$W/real_wire.o"' "... and its codec"
+need Tests/dlp_net_stack_check.sh 'for o in real_net real_wire; do' "the two units of the real Download Play keep no static storage"
+need Tests/stack_usage.sh 'budget dlp_real_net "azl::RealDlpNet::Release" 16' "the adapter's Release, which a game thread may run, keeps its frame"
+need Tests/chain_sim/chain_sim.py 'def scenario_hub_real_engine(elf, level):' "the chain test gives the engine back on the game's nwm::UDS thread for a RealDlp game, with and without a network thread"
+need Tests/chain_sim/chain_sim.py "sim.call(elf.sym('_ZN3azl10RealDlpNetC1EPNS_9UdsEngineE'), [self.real, self.engine])" "the chain test builds the adapter with its own compiled constructor"
+[ "$(tr -d '\r' < Tests/chain_sim/chain_sim.py | grep -c -x '            scenario_hub_real_engine(elf, level)')" = "2" ] || fail "Tests/chain_sim/chain_sim.py does not run the RealDlp give-back in both of its lists (--hub-only and the whole run)"
+# - the hub test of the real Download Play: built, run, every scenario in main()
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_hub_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_hub_test"' "the suite builds the hub test of the real Download Play"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_hub_test"' "the suite runs the hub test of the real Download Play"
+need Tests/dlp_real_hub_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the hub test of the real Download Play stops at the first undefined behaviour"
+need Tests/dlp_real_hub_test.cpp 'static const Scenario all[] = {{"R3", R3}, {"R8", R8}, {"R10", R10}, {"R11b", R11b}, {"R13", R13}};' "the scenarios of the hub test of the real Download Play"
+need Tests/dlp_real_hub_test.cpp 'const std::vector<std::string> lobby = RunR3(false, clients);' "R3 runs the same commands in the dialect's mode ..."
+need Tests/dlp_real_hub_test.cpp 'const std::vector<std::string> real = RunR3(true, clients);' "... and in the real Download Play's, and compares what the games saw"
+need Tests/dlp_real_hub_test.cpp 'TCHECK(lobby[i] == real[i]);' "R3: what the games see is the same line for line"
+need Tests/dlp_real_hub_test.cpp 'TCHECK(has("searcher Bob: statuses 5 6 9"));' "R3: the searcher's statuses after the join are 5, 6, 9 (NETCODE point 1)"
+need_line Tests/dlp_real_hub_test.cpp '    for (u32 clients : {1u, 3u}) {' "R3 runs with 1 and 3 clients"
+need_line Tests/dlp_real_hub_test.cpp '    for (const bool alive : {true, false}) {' "R8 runs with the network thread alive and gone"
+# 1.1.3, review of F0-F5 (analysis/notte-2026-11-09/CORREZIONI.md): what the three reviews found and the fixes keep.
+# - protocol 1: in the real Download Play's network the Logoff of an admission reaches its members only (Azahar's nwm adopts ANY Logoff while it is
+#   Connecting): a spectator's to the spectator alone, a client's to every member; every other network broadcasts as before
+need_after Sources/azl/uds_engine.cpp '        if (!dlp_net_) {' '            SendEapolLogoffLocked(kBroadcastMac, node.network_node_id);' "outside the real Download Play the Logoff of an admission is broadcast as since 1.0"
+need_line Sources/azl/uds_engine.cpp '            SendEapolLogoffLocked(packet.transmitter_address, node.network_node_id);' "a spectator's admission goes to the spectator alone"
+need_line Sources/azl/uds_engine.cpp '                    SendEapolLogoffLocked(member.first, node.network_node_id);' "a client's admission goes to every member of the network, never to the room"
+[ "$(tr -d '\r' < Sources/azl/uds_engine.cpp | grep -c 'SendEapolLogoffLocked(kBroadcastMac,')" = "1" ] || fail "Sources/azl/uds_engine.cpp: a Logoff is broadcast in more or fewer than one place (a game's admission)"
+# - protocol 2: the real Download Play's host closed to clients still takes spectators (Azahar's host never closes; its searchers refused wait 3 s inside the
+#   emulation); the door to spectators or to everyone keeps them out; never a member's association dropped while it is closed
+need_line Sources/azl/uds_engine.cpp '    return dlp_net_ && (admission_attributes_ & (kAttrBlockSpectators | kAttrBlockAll)) == 0;' "spectators welcome at a closed host only in the real Download Play, and not past the bits that close to them"
+need_line Sources/azl/uds_engine.cpp '        if (AdmissionBlocked() && !(spectator && SpectatorsWelcomeLocked())) {' "a closed host takes no client's EAPoL-Start"
+need_line Sources/azl/uds_engine.cpp '        (!SpectatorsWelcomeLocked() || (known != node_map_.end() && known->second.connected))) {' "a closed host answers no Authentication of a member (its association stays)"
+# - integration 2-3: a full host is never probed (it answers no spectator; Azahar's asserts on a late EAPoL-Start)
+need_after Sources/azl/dlp_real_net.cpp '        if (beacon.total_nodes >= beacon.max_nodes) {' '            continue;' "a full host is not probed, nor filed in the cache"
+# - the tests of the fixes run: RV1-RV2 (engine), RV3-RV4 (searcher), R1b with the closed host and a signed first-group time (host)
+need_line Tests/dlp_real_engine_test.cpp '    RV1_LogoffsStayInTheNetwork();' "RV1 runs: the Logoffs reach the members only"
+need_line Tests/dlp_real_engine_test.cpp '    RV2_ClosedHostTakesSpectators();' "RV2 runs: a closed host takes spectators, never a client"
+need_line Tests/dlp_real_client_test.cpp '    RV3_FullNotProbed();' "RV3 runs: a full host is not probed"
+need_line Tests/dlp_real_client_test.cpp '    RV4_StartBeforeGo();' "RV4 runs: START before GO when both are in hand"
+need Tests/dlp_real_net_test.cpp 'CHECK(!groups.empty() && groups[0] >= t_conn && groups[0] <= t_in + 100);' "R1b: the first group between the connect and 100 ms after it (no unsigned difference that wraps)"
+need Tests/dlp_real_net_test.cpp 'CHECK_EQ(h.net.counters().announce, ann_closed);' "R1b: a spectator let in at a closed host reads no announcement"
+need Tests/azahar_rules.hpp 'const auto it = std::find(host.pending.begin(), host.pending.end(), p.destination_address);' "the rule checker admits the MAC a unicast admission goes to"
 need Tests/trace_replay_test.cpp '#include "ffe_host_golden.inc"' "the FFE host replay runs on the golden data of PROVA 2"
 need Tests/trace_replay_test.cpp '#include "tfh_host_golden.inc"' "the TFH host replay runs on the golden data of the first TFH trace"
 need Tests/trace_replay_test.cpp '#include "lobby_trace.inc"' "the lid episode and the client stretch run on the frames of the real traces"
@@ -2518,7 +2792,7 @@ need Sources/ctr/plugin.cpp '{0x000400000007C800ull, DlpGameMode::Lobby, true}' 
 need Sources/ctr/plugin.cpp '{0x000400000007C700ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, USA is a Lobby game: the room carries its Download Play lobby"
 need Sources/ctr/plugin.cpp '{0x0004000000064D00ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Japan is a Lobby game: the room carries its Download Play lobby"
 need Sources/ctr/plugin.cpp '{0x00040000000B9100ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Taiwan is a Lobby game: the room carries its Download Play lobby"
-need Sources/ctr/plugin.cpp '{0x00040000001D1A00ull, DlpGameMode::Lobby}' "Luigi's Mansion 2018 (Europe, seen: dlp:SRVR / dlp:FKCL InitializeWithName) is a Lobby game"
+need Sources/ctr/plugin.cpp '{0x00040000001D1A00ull, DlpGameMode::RealDlp}' "Luigi's Mansion 2018 (Europe, seen: dlp:SRVR / dlp:FKCL InitializeWithName) is a RealDlp game (1.1.3: the real Download Play on the wire)"
 need Sources/ctr/plugin.cpp '{0x00040000001C2100ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale answers the wireless check only (the probe)"
 need Sources/ctr/plugin.cpp '{0x00040000001C2000ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale, the other region's id, answers the wireless check only"
 hit=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -i -E '0x000400000010C000|0x000400000010BF00|0x0004000000183600|0x00040000001C2100|0x00040000001C2000|0x000400000007C800|0x000400000007C700|0x0004000000064D00|0x00040000000B9100' | grep -v 'DlpGameMode::' | head -3)
@@ -2527,7 +2801,7 @@ need Sources/ctr/plugin.cpp 'constexpr DlpGame kDlpGames[] = {' "the table of ga
 need Sources/ctr/plugin.cpp 'return DlpModeOf(title_id) == DlpGameMode::ProbeOnly;' "the probe is for the ProbeOnly games and nobody else"
 need Sources/ctr/plugin.cpp 'if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {' "the hub exists only for a Lobby game, and only when the plugin is active"
 need Sources/ctr/plugin.cpp 'new (std::nothrow) DlpHub(engine, kernel, config, resolver)' "the hub is the one allocation of the lobby and a refusal leaves the real services"
-need Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' "the HLE is given the hub"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c -F 'hle_->SetDlpHub(dlp_hub_.get());')" = "2" ] || fail "Sources/ctr/plugin.cpp: the HLE is given the hub in both branches of EarlyInit, Lobby and RealDlp (the line twice)"
 need_order Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' 'hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' "the hub is set before the hooks are installed (a game's first call finds it)"
 need_after Sources/ctr/plugin.cpp 'engine_->Tick(now_ms);' 'dlp_hub_->Tick();' "the hub serves after the engine's own Tick, on the network thread"
 need_order Sources/ctr/plugin.cpp 'dlp_hub_->Stop();' 'room_->StopWithin(kNetStopTimeoutMs)' "the hub is stopped before the room: no request waits for a network thread that is going away"
@@ -2541,7 +2815,7 @@ need Sources/ctr/plugin.cpp 'dlp_hub_->SetFriendSeed(console_seed);' "the lobby 
 need Includes/azl/dlp_lobby.hpp 'id_.seed = seed;' "the lobby's seed can be set (SetFriendSeed)"
 need Sources/azl/dlp_hub.cpp 'lobby_.SetFriendSeed(seed);' "the hub gives the seed to the lobby under its lock"
 need Tests/dlp_hub_test.cpp 'a.hub.SetFriendSeed(kHostSeed);' "F6 gives the hub a friend code seed"
-need Sources/ctr/plugin.cpp 'static const char kDefaultName[] = "3DS Link";' "the name before the profile name is known"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c -F 'static const char kDefaultName[] = "3DS Link";')" = "2" ] || fail "Sources/ctr/plugin.cpp: the name before the profile name is known, in MakeDlpHub and in MakeRealDlpHub (the line twice)"
 need Sources/ctr/plugin.cpp 'u64 hash = 0xCBF29CE484222325ull;' "the friend code seed is FNV-1a-64 of the console's MAC (unique per console)"
 need Sources/ctr/plugin.cpp 'hash *= 0x100000001B3ull;' "... FNV-1a-64's prime"
 need Sources/ctr/plugin.cpp 'constexpr u32 kLow = 0x00100000;' "the resolver of the game's buffers refuses an address below the code"
@@ -2807,7 +3081,7 @@ need Tests/dlp_stack_check.sh 'read -r _text data bss _rest < <("$ARM_SIZE" "$W/
 need_after Tests/dlp_stack_check.sh '"$W/probe_$pass.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the fake lobby keeps no static storage: data and bss of the probe are 0 (a static buffer would hide from sizeof and from the frames)"
 need_after Tests/dlp_stack_check.sh '"$W/probe_H.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the hub's header keeps no static storage: data and bss of the probe with the hub are 0"
 # A test of the lobby that hangs (a loop that waits for something a regression no longer does) must fail the suite after 20 minutes, not stop it for good.
-for t in dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test; do
+for t in dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_real_engine_test dlp_real_hub_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test; do
   need_line Tests/run.sh "  timeout 1200 \"\$OUT/$t\"" "the suite runs $t under a timeout: a hang is a failure, not a stop"
 done
 ARM_ARCH=$(tr -d '\r' < Makefile | sed -n 's/^ARCH[[:space:]]*:=[[:space:]]*//p')
@@ -2910,7 +3184,7 @@ need Sources/azl/uds_engine.cpp 'if (initialized_ || service_state_ != kServiceR
 need Sources/azl/uds_engine.cpp 'version_ = kMaxVersion; // (a host sends the Deauthentications of its goodbye from version 0x200 on)' "the lobby's host says goodbye to its clients: a goodbye lost leaves them connected to a host that is gone"
 need Sources/azl/uds_engine.cpp 'return initialized_ && (status == static_cast<u32>(NetworkStatus::ConnectedAsClient) ||' "ConnectPoll says 1 only for a node that is a client of its network"
 need Sources/azl/uds_engine.cpp 'network_info_.application_data_size = static_cast<u8>(app_size);' "the lobby's announcement is the application data of its beacon"
-need Sources/azl/uds_engine.cpp 'StoreBE32(network_info_.network_id_be, network_id | 1u);' "the lobby's network has a network id of its own (never 0)"
+[ "$(grep -c -F 'StoreBE32(network_info_.network_id_be, network_id | 1u);' Sources/azl/uds_engine.cpp)" = "2" ] || fail "Sources/azl/uds_engine.cpp: the lobby's network (BeginHostingLobby) and the real Download Play's (BeginHostingDlp, 1.1.3) each have a network id of their own, never 0 (the line twice)"
 # - the adapter: it takes the engine only when it is free, gives it back whole, and keeps nothing
 need Sources/azl/dlp_lobby_net.cpp 'if (engine_->InitializeForLobby(me.seed, me.name) != res::kSuccess) {' "the lobby takes the service only when no game has it"
 need Sources/azl/dlp_lobby_net.cpp 'return !engine_->initialized() && engine_->PrepareLobby();' "a scan is possible unless a game has the service, and it asks the engine to keep the lobbies it hears"
@@ -2930,6 +3204,17 @@ need_line Tests/run.sh '  bash Tests/dlp_net_stack_check.sh' "the suite runs the
 need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_net_test.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dlp_net_test"' "the unit test of the adapter over the engine is built with the adapter and the core"
 need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_room_probe"' "the probe of the lobby over a real room is built (with the monotonic clock of the other room tests)"
 need Tests/integration.sh '/tmp/azl_tests/dlp_room_probe $R1 24872' "the integration run plays the lobby over the real room server"
+# 1.1.3, design 7.5: the real Download Play over the real room (I1-I3), built by the suite and played by the integration run
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_real_room_probe"' "the probe of the real Download Play over a real room is built (with the monotonic clock of the other room tests)"
+need Tests/integration.sh '/tmp/azl_tests/dlp_real_room_probe $R1 24872' "the integration run plays the real Download Play over the real room server (I1-I3)"
+need Tests/dlp_real_room_probe.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the probe of the real Download Play stops at the first undefined behaviour"
+for s in TestI1 TestI2 TestI3; do
+  need_line Tests/dlp_real_room_probe.cpp "    $s(host, port);" "the scenario $s of the real Download Play over the real room runs in main()"
+done
+[ "$(grep -c 'CHECK(false);' Tests/dlp_real_room_probe.cpp)" = "2" ] || fail "Tests/dlp_real_room_probe.cpp: a room that cannot be joined is a failure (TwoIn for I1 and I3, and I2's own; a probe that returns green without checking anything proves nothing)"
+need_line Tests/dlp_real_room_probe.cpp '    CHECK(sent == got);' "I1: the frames of the announcement reach the searcher whole (each one the host sent, with its length)"
+need_line Tests/dlp_real_room_probe.cpp '    CHECK_EQ(ghosts, 0u);' "I3: the searcher is node 2 in every round (no ghost node left by the round before)"
+need_line Tests/dlp_real_room_probe.cpp '    CHECK(mem_most <= mem_after2 + 64 * 1024);  // (stable: a leak of a round would add up over 18 rounds)' "I3: the memory of the process is stable over the rounds"
 need_line Tests/dlp_net_stack_check.sh 'ARM_FLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Os -mword-relocations -fomit-frame-pointer -ffunction-sections -fno-strict-aliasing -Wall -Wno-psabi -fno-rtti -fno-exceptions -std=gnu++17 -D__3DS__ -DAZL_USE_CTRPF"' "the adapter and the engine are compiled with the flags of the Makefile and the plugin's 3DS defines"
 # - what the review of 2026-10-29 asked for: a client of a lobby drops the frames of another lobby, its roster follows the departures, the engine keeps lobby state only when a lobby is used
 need Sources/azl/uds_engine.cpp 'PurgeLobbyMessagesLocked(node.node_id);' "a node that leaves takes its unread lobby messages with it"
@@ -3139,6 +3424,12 @@ need Tests/stack_usage.sh '    "$PY" Tests/hook_sim/exit_tramp_sim.py "$WORK/gat
 # The chat says who came into the room and who left it (2026-11-08, asked by the testers): from the list of members, on the network thread
 need Sources/ctr/plugin.cpp '                sink->OnPresence(c.nickname.data(), c.nickname.size(), c.joined, now_ms);' "the chat tells who comes and goes"
 need_order Sources/ctr/plugin.cpp 'void Plugin::OnRoomInfo(const room::RoomInfo& info) {' '    NoteRoomMembers(info);' "the presence lines are pushed on the network thread (the room's list of members), the chat ring's one writer"
+# The guest in the game's sockets (Fantasy Life, REGISTRO phase S): only on 0xC8A0700B; never ShutdownSockets nor socInit as a guest
+need Sources/ctr/soc.cpp '    if (rc == kSocAlreadyInitialized && g_guest_allowed && EnterGuest()) {' "the plugin becomes a guest only when the game initialised its sockets first, and only for a title of the list"
+need Includes/azl/soc_plan.hpp '    0x0004000000113100ull, // Fantasy Life, Europe (seen: InitializeSockets at 1.9 s, Friend-A 2026-11-08)' "Fantasy Life shares the game's sockets"
+need_order Sources/ctr/soc.cpp '    if (g_guest) {' '    const Result rc = socExit();' "a guest leaves before socExit (its ShutdownSockets would end the game's sockets)"
+need Sources/ctr/soc.cpp '    d.name = "soc";' "the guest's device is named soc (libctru's sendto and the others check the name)"
+need Sources/ctr/soc.cpp '    azl_enet_rcvbuf_bytes = azl_rcvbuf_limit(azl_enet_rcvbuf_bytes, kGuestPoolBytes);' "a guest's receive ring fits the game's smallest pool"
 # Old 3DS: Rosalina's wait for the answer raised to 15 s in the plugin's own header, only from the exact 10 s Luma3DS writes
 need Sources/ctr/plugin.cpp '    if (*wait_ns != kRosalinaReplyWaitNs) {' "Rosalina's wait is raised only from the 10 s Luma3DS writes"
 need Sources/ctr/plugin.cpp 'constexpr u64 kRosalinaReplyWaitRaisedNs = 15000000000ull;  // Old 3DS: 15 s' "Rosalina's wait raised to 15 s"

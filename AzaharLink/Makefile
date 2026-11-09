@@ -15,6 +15,10 @@ PLGINFO 	:= 	CTRPluginFramework.plgInfo
 BUILD		:= 	Build
 INCLUDES	:= 	Includes
 SOURCES 	:= 	Sources Sources/azl Sources/ctr Sources/enet
+# ONE file of the Download Play host library that the app carries (ConfigApp/dlph = DlpLink/host unchanged, Tests/dlph_vendor_check.sh):
+# dlph_wire.c, the bytes of the real Download Play that azl/dlp_real_wire.cpp builds on (1.1.3, RealDlp). By name, never the folder
+# (dlph.c is the app's host and stays out of the plugin): Tests/policy_check.sh.
+DLPH_WIRE	:=	dlph_wire.c
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -64,7 +68,7 @@ export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
 
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
 
-CFILES			:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CFILES			:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c))) $(DLPH_WIRE)
 CPPFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES			:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 
@@ -97,6 +101,9 @@ re: clean all
 else
 
 DEPENDS	:=	$(OFILES:.o=.d)
+
+# (the one file of ConfigApp/dlph is found by its name alone)
+vpath $(DLPH_WIRE) $(TOPDIR)/ConfigApp/dlph
 
 #---------------------------------------------------------------------------------
 # main targets

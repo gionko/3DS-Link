@@ -18,6 +18,8 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 tar -C "$TREE" --exclude=Build --exclude=analysis --exclude='*.elf' --exclude='*.3gx' --exclude=dist --exclude=Tests \
     --exclude=ConfigApp --exclude=diag -cf - . | tar -xf - -C "$WORK"
+# (of the app's folder the plugin builds ONE file, by name: the wire of the Download Play host library, 1.1.3 - Makefile, DLPH_WIRE)
+tar -C "$TREE" -cf - ConfigApp/dlph/dlph_wire.c ConfigApp/dlph/dlph_wire.h | tar -xf - -C "$WORK"
 build() {
   (cd "$WORK" && MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W 2>/dev/null || pwd):/src" -w /src \
       pablomk7/libctrpf:0.8.0 make >"$WORK/build.log" 2>&1) || { tail -20 "$WORK/build.log"; echo "build id test FAILED: the build failed"; exit 1; }

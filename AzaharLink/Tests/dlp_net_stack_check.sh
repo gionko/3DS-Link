@@ -25,8 +25,12 @@ FRAME_ADAPTER=80   # bytes: a method of EngineLobbyNet (ScanRead, which holds th
 FRAME_ENGINE=64    # bytes: a function of the engine that a lobby method calls on the game's thread
 FRAME_HUB=40       # bytes: a function of DlpHub (Serve and AnswerUnserved, 40 and 24 since the always-succeed branch has a frame of its own): the code a game thread runs to serve a dlp:FKCL / dlp:SRVR call
 FRAME_HUB_UNIT=64  # bytes: any function of the hub's translation unit (the hub, and the lobby and the service compiled into it: PollScan holds the lobby heard)
+FRAME_REAL=288     # bytes: any function of the real Download Play's adapter and codec (1.1.3, design 6.4: the network thread runs them; ScanRead 88 measured)
+FRAME_REAL_GAME=80 # bytes: the functions of that adapter a game thread runs (the hub's RunHere at the game's nwm::UDS Initialize, the clock): as the dialect's adapter
+REAL_GAME_FUNCTIONS='NowMs|NowTicks|Holds|HostClose|Disconnect|ScanClose|Release|ClearHost|ClearClient'
 # (Phase 3: the hub, Sources/azl/dlp_hub.cpp, is compiled strictly like the adapter and its frames and static storage are held the same way)
-ENGINE_FUNCTIONS='BeginHostingLobby|HeardLobbyAt|ConnectBegin|ConnectBeginLobby|ConnectPoll|InitializeForLobby|SetLobbyInbox|PopLobbyMessage|NodeSnapshot|StartHostingLocked|StartConnectLocked|BeginServiceLocked|PrepareLobby|EnsureLobbyLocked'
+ENGINE_FUNCTIONS='BeginHostingLobby|HeardLobbyAt|ConnectBegin|ConnectBeginLobby|ConnectPoll|InitializeForLobby|SetLobbyInbox|PopLobbyMessage|NodeSnapshot|StartHostingLocked|StartConnectLocked|BeginServiceLocked|PrepareLobby|EnsureLobbyLocked|BeginHostingDlp|ConnectBeginDlp|SetLobbyBeaconKind|SpectatorCount'
+# (1.1.3: the last four are the real Download Play's, phase F2; the network thread runs them, and they are held to the same budget)
 
 ARM_FLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Os -mword-relocations -fomit-frame-pointer -ffunction-sections -fno-strict-aliasing -Wall -Wno-psabi -fno-rtti -fno-exceptions -std=gnu++17 -D__3DS__ -DAZL_USE_CTRPF"
 
@@ -82,12 +86,25 @@ check_su "$W/good.su" 'EngineLobbyNet::' 80 selftest >/dev/null || { echo "dlp n
 "$ARM_GXX" $ARM_FLAGS -fstack-usage -c Sources/azl/uds_engine.cpp -o "$W/engine.o"
 
 "$ARM_GXX" $ARM_FLAGS -Wextra -Wpedantic -Wshadow -Werror -fstack-usage -c Sources/azl/dlp_hub.cpp -o "$W/hub.o"
+# (1.1.3, phase F5: the real Download Play's adapter and codec, compiled strictly like the dialect's adapter, their frames and static storage held)
+"$ARM_GXX" $ARM_FLAGS -Wextra -Wpedantic -Wshadow -Werror -fstack-usage -c Sources/azl/dlp_real_net.cpp -o "$W/real_net.o"
+"$ARM_GXX" $ARM_FLAGS -Wextra -Wpedantic -Wshadow -Werror -fstack-usage -c Sources/azl/dlp_real_wire.cpp -o "$W/real_wire.o"
 
 rc=0
 check_su "$W/adapter.su" 'EngineLobbyNet::' $FRAME_ADAPTER "the adapter" || rc=1
 check_su "$W/hub.su" 'DlpHub::' $FRAME_HUB "the hub" || rc=1
 check_su "$W/hub.su" '.' $FRAME_HUB_UNIT "the hub's unit" || rc=1
 check_su "$W/engine.su" "UdsEngine::($ENGINE_FUNCTIONS)\\(" $FRAME_ENGINE "the engine's lobby functions" || rc=1
+check_su "$W/real_net.su" '.' $FRAME_REAL "the real Download Play's adapter" || rc=1
+check_su "$W/real_wire.su" '.' $FRAME_REAL "the real Download Play's codec" || rc=1
+check_su "$W/real_net.su" "RealDlpNet::($REAL_GAME_FUNCTIONS)\\(" $FRAME_REAL_GAME "the real adapter's functions of a game thread" || rc=1
+for o in real_net real_wire; do
+  read -r _text data bss _rest < <("$ARM_SIZE" "$W/$o.o" | awk 'NR == 2')
+  if [ "$data" != 0 ] || [ "$bss" != 0 ]; then
+    echo "  the real Download Play's $o keeps static storage (data $data, bss $bss): its whole state is the adapter the plugin makes"
+    rc=1
+  fi
+done
 read -r _text data bss _rest < <("$ARM_SIZE" "$W/adapter.o" | awk 'NR == 2')
 if [ "$data" != 0 ] || [ "$bss" != 0 ]; then
   echo "  the adapter keeps static storage (data $data, bss $bss)"
@@ -105,4 +122,5 @@ if [ "$rc" != 0 ]; then
 fi
 big=$(awk -F'\t' '$1 ~ /EngineLobbyNet::/ { if ($2 + 0 > m) m = $2 + 0 } END { print m + 0 }' "$W/adapter.su")
 hubbig=$(awk -F'	' '$1 ~ /DlpHub::/ { if ($2 + 0 > m) m = $2 + 0 } END { print m + 0 }' "$W/hub.su")
-echo "dlp net stack: ok (the largest frame of the adapter is $big bytes, budget $FRAME_ADAPTER; the engine's lobby functions are within $FRAME_ENGINE; the largest frame of the hub is $hubbig bytes, budget $FRAME_HUB; no static storage)"
+realbig=$(awk -F'\t' '{ if ($2 + 0 > m) m = $2 + 0 } END { print m + 0 }' "$W/real_net.su" "$W/real_wire.su")
+echo "dlp net stack: ok (the largest frame of the adapter is $big bytes, budget $FRAME_ADAPTER; the engine's lobby functions are within $FRAME_ENGINE; the largest frame of the hub is $hubbig bytes, budget $FRAME_HUB; of the real Download Play $realbig, budget $FRAME_REAL and $FRAME_REAL_GAME on a game thread; no static storage)"

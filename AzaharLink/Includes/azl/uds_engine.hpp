@@ -161,7 +161,8 @@ public:
     u32 Flush(u8 aggregator);
 
     /// A bind is a receive queue for the frames of one data channel (from one node or from any). Like nwm's,
-    /// binds are not touched by the end of a session: only Shutdown and a service stop free them.
+    /// binds are not touched by the end of a session: only Shutdown and a service stop free them. `game_event` null = no
+    /// handle is handed out (the plugin's own bind, azl/dlp_real_net.hpp); else it gets a duplicate of the bind's event.
     u32 Bind(u32 bind_node_id, u32 recv_buffer_size, u8 data_channel, u16 network_node_id,
              u32* game_event);
     /// What Unbind tells the game besides the id: the channel and source of the bind and how many frames
@@ -241,7 +242,8 @@ public:
         u8 size;
         u8 data[kHeardDataMax];
     };
-    /// The `index`-th (0..) lobby - a beacon of kLobbyWlanCommId / kLobbyId8 with application data - whose last beacon was heard
+    /// The `index`-th (0..) lobby - a beacon of kLobbyWlanCommId / kLobbyId8 with application data, or of kLobbyWlanCommId with none
+    /// under SetLobbyBeaconKind(RealDlp) (then `size` is 0) - whose last beacon was heard
     /// at most `max_age_ms` ago, in the order the engine keeps them (stable between two calls: a lobby keeps its place). The
     /// network thread files the beacons as they come, so this is a copy under the lock and nothing more; it needs no Initialize
     /// (beacons are heard in any state) but PrepareLobby (before it nothing is filed). A lobby whose host now beacons under other ids
@@ -286,12 +288,44 @@ public:
     /// a spectator).
     bool NodeSnapshot(u16* my_node, u16* node_bitmask) const;
 
+    // ---- The REAL Download Play (1.1.3, the RealDlp mode: analysis/luigi-azahar-2026-11-09/PROGETTO-DLP-VERO-1.1.3.md) ----------
+    // The games of that mode find their group with the Download Play that Azahar emulates: a network of the Download Play's
+    // wlancommid with NO application data (the announcement goes in data frames, on channel 1 to the spectators), and the dialogue
+    // on channel 2 through binds. These pieces are the engine's half of it; the lobby's own (BeginHostingLobby, ConnectBeginLobby,
+    // the inbox) are never used for it. Network thread only, like the lobby's; none blocks.
+
+    /// Which beacons NoteLobbyBeaconLocked files in the table of lobbies heard (HeardLobbyAt). Ours (the default): the dialect of the
+    /// fake lobby (kLobbyWlanCommId / kLobbyId8 WITH application data). RealDlp: the real Download Play's (kLobbyWlanCommId and NO
+    /// application data, whatever the id8, network id and attribute word: Azahar leaves those three uninitialised); a beacon of the
+    /// other kind is no lobby, and is forgotten like a game's. A change empties the table. Not reset by Shutdown: it belongs to the
+    /// game (the plugin sets it once for a game of that mode).
+    enum class LobbyBeaconKind : u8 { Ours = 0, RealDlp = 1 };
+    void SetLobbyBeaconKind(LobbyBeaconKind kind);
+
+    /// BeginHostingNetwork of a real Download Play's network, with the NetworkInfo the engine composes (as BeginHostingLobby
+    /// does: no 264-byte structure on the caller's stack): kLobbyWlanCommId, kLobbyId8, attribute word 0, `channel` (0 = the
+    /// default), the network id from our MAC, `max_nodes`, NO application data (the beacon's tag is 52 bytes, what Azahar's client
+    /// parses). Answers what BeginHostingLobby answers (no memory is needed). On success the engine is in the real Download Play's
+    /// network (see dlp_net_), never in a lobby's (the inbox stays off).
+    u32 BeginHostingDlp(u8 max_nodes, u8 channel);
+    /// ConnectBegin to the real Download Play's network of `host` as a client or a spectator (`type`), with the NetworkInfo the
+    /// engine composes: the host's MAC, `channel` (0 = keep the last one), initialised, the OUI; nothing of the host's beacon is
+    /// used (Azahar's id8, network id and attributes are undefined). kBadArgument for another type, else what ConnectBegin
+    /// answers. On success the engine is in the real Download Play's network, the inbox stays off.
+    u32 ConnectBeginDlp(const Mac& host, u8 channel, ConnectionType type);
+    /// How many spectators the network this engine hosts has now (0 when it hosts none). Spectators never count as nodes: they
+    /// are not in the node mask, GetConnectingClients does not see them. Counted on the node map, nothing kept in step.
+    u32 SpectatorCount() const;
+
     /// The foreign-lobby filter of a CLIENT (or spectator): a data frame, a node map or a Logoff whose transmitter is
     /// neither the host nor a node the host announced belongs to another network in the same room (a second lobby of
     /// the game has the same node ids). Off (the default), such frames are only counted and logged, as the scan filter
     /// is, until a hardware session shows that nothing the game needs is among them; on, they are dropped. A HOST
     /// always drops them: the node map it built is exact.
     void SetClientForeignFilterEnforced(bool enforced);
+    /// Whether that filter is on now (the tests of the real Download Play: its adapter turns it on for a probe and a session, and off
+    /// whenever it gives the engine back).
+    bool client_foreign_filter_enforced() const;
 
     // ---- Introspection (for the UI) -------------------------------------------------------------
     NetworkStatus status() const;
@@ -381,6 +415,10 @@ private:
     void SetAttributeLocked(u16 mask, bool set);
     /// True while the host refuses new members (the admission copy of the attribute word).
     bool AdmissionBlocked() const;
+    /// The real Download Play's host (dlp_net_) still lets SPECTATORS in while it refuses clients: Azahar's host never closes (its
+    /// UpdateNetworkAttribute is a stub), and an Azahar searcher refused waits 3 s inside its emulation and asks again ~100 ms later.
+    /// Only the bits that close the door to everyone, or to the spectators, keep them out. False in every other network.
+    bool SpectatorsWelcomeLocked() const;
 
     /// Says so (once per session) when a peer announces the same friend code seed as this console.
     void NotePeerSeedLocked(const NodeInfo& peer);
@@ -460,6 +498,13 @@ private:
     };
     std::unique_ptr<LobbyState> lobby_; ///< null until a lobby is used (PrepareLobby)
     bool lobby_inbox_ = false;
+    /// The engine is in a real Download Play's network (BeginHostingDlp / ConnectBeginDlp; off at Shutdown, where the inbox goes
+    /// off). Its rules (design D16): a client that is Connecting takes no Logoff before its host answered the Authentication, and no
+    /// Logoff that names node 0 (a spectator's admission, broadcast); a host notes no departure (every peer of that network, Azahar's
+    /// Download Play and the plugin, says goodbye ONCE: the guard of a late second goodbye would swallow the real one of a searcher
+    /// that came in as a spectator and joins at once, or of a client that leaves, rejoins and leaves again).
+    bool dlp_net_ = false;
+    LobbyBeaconKind lobby_beacon_kind_ = LobbyBeaconKind::Ours;
     /// The one place connection_status_.status changes (the mirror Tick reads without the lock follows it).
     void SetStatusLocked(NetworkStatus status);
     /// After the node table was rebuilt from the host's Logoff: a slot that emptied or holds another console now loses the

@@ -18,7 +18,8 @@ import tempfile
 
 root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 copy_dirs = ['Sources', 'Includes', 'third_party']
-copy_files = ['Makefile', 'CTRPluginFramework.plgInfo', '3gx.ld']
+copy_files = ['Makefile', 'CTRPluginFramework.plgInfo', '3gx.ld',
+              'ConfigApp/dlph/dlph_wire.c', 'ConfigApp/dlph/dlph_wire.h']  # (the one file of the app's folder the plugin builds, by name: Makefile, DLPH_WIRE)
 image = 'pablomk7/libctrpf:0.8.0'
 
 mutants = [
@@ -174,6 +175,7 @@ for name, rel, old, new in mutants:
         for d in copy_dirs:
             shutil.copytree(os.path.join(root, d), os.path.join(tmp, d))
         for f in copy_files:
+            os.makedirs(os.path.dirname(os.path.join(tmp, f)), exist_ok=True)
             shutil.copy(os.path.join(root, f), os.path.join(tmp, f))
         if rel:
             p = os.path.join(tmp, rel)

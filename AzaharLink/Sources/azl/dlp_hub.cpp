@@ -18,8 +18,8 @@ struct PostUnlock {
 
 } // namespace
 
-DlpHub::DlpHub(UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& resolver)
-    : net_(engine), lobby_(&net_, cfg), resolver_(resolver), kernel_(kernel) {
+DlpHub::DlpHub(UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& resolver, LobbyNet* backend)
+    : net_(engine), lobby_(backend != nullptr ? backend : &net_, cfg), resolver_(resolver), kernel_(kernel) {
     lobby_.SetExternalPoll(true);  // (the network work is the network thread's: Tick)
     svc_.SetLobby(&lobby_);
     event_ = kernel_->CreateEvent();  // 0 = no event: every request then fails at once (Post)
@@ -243,13 +243,23 @@ void DlpHub::WakeForSwap() {
 }
 
 void DlpHub::FreeEngine() {
+    LobbyNet* const b = lobby_.net();
+    if (b != &net_) {
+        // (1.1.3, the real Download Play's adapter: after the lobby gave its role back it holds nothing - a probe ends with the scan - and if it
+        // still did, its HostClose is its Release, whatever it was doing)
+        if (b->Holds()) {
+            b->HostClose();
+        }
+        return;
+    }
     if (net_.engine_held()) {
         net_.HostClose();  // (the adapter's Release: the engine is shut down and free)
     }
 }
 
 void DlpHub::Refresh() {
-    const bool held = net_.engine_held();
+    LobbyNet* const b = lobby_.net();
+    const bool held = b != &net_ ? b->Holds() : net_.engine_held();
     engine_held_.store(held, std::memory_order_relaxed);
     active_.store(held || lobby_.active(), std::memory_order_relaxed);
 }
@@ -318,6 +328,9 @@ void DlpHub::Tick() {
         Stamp();    // (a request that stalled the engine for long: the requester released by the answer must find the thread alive)
         state_.store(kDone, std::memory_order_release);
         kernel_->SignalEvent(event_);
+    }
+    if (LobbyNet* const b = lobby_.net(); b != &net_) {
+        b->Pump();  // (1.1.3: the real Download Play's adapter does its own wire work - the announcement, the probes, the dialogues - first)
     }
     lobby_.Pump();
     lobby_.SetOnNet(false);

@@ -334,7 +334,7 @@ else
     exit 1
   fi
   # (the header's own functions - the counters, EngineHeld - and the wrappers: none over FRAME_MAX, none dynamic)
-  if ! awk -F'\t' -v max="$FRAME_MAX" '$1 ~ /dlp_hub[.]hpp|dlp_lobby_net[.]hpp|p_hub_/ && (($2 + 0 > max + 0) || ($3 !~ /static/)) { print "dlp stack [H] FAILED: " $1 " " $2 " " $3; bad = 1 } END { exit bad }' "$W/probe_H.su"; then
+  if ! awk -F'\t' -v max="$FRAME_MAX" '$1 ~ /dlp_hub[.]hpp|dlp_lobby_net[.]hpp|dlp_real_net[.]hpp|p_hub_/ && (($2 + 0 > max + 0) || ($3 !~ /static/)) { print "dlp stack [H] FAILED: " $1 " " $2 " " $3; bad = 1 } END { exit bad }' "$W/probe_H.su"; then
     exit 1
   fi
   if [ -x "$ARM_SIZE" ]; then

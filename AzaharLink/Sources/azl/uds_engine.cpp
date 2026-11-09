@@ -462,6 +462,10 @@ bool UdsEngine::AdmissionBlocked() const {
     return (admission_attributes_ & (kAttrBlockClients | kAttrBlockAll)) != 0;
 }
 
+bool UdsEngine::SpectatorsWelcomeLocked() const {
+    return dlp_net_ && (admission_attributes_ & (kAttrBlockSpectators | kAttrBlockAll)) == 0;
+}
+
 void UdsEngine::BroadcastNodeMap() {
     // Note: this is not how UDS on a real 3DS does it, but Azahar relies on it.
     std::vector<NodeMapEntry> entries;
@@ -688,6 +692,11 @@ void UdsEngine::SetClientForeignFilterEnforced(bool enforced) {
     client_foreign_filter_enforced_ = enforced;
 }
 
+bool UdsEngine::client_foreign_filter_enforced() const {
+    Guard lock(this);
+    return client_foreign_filter_enforced_;
+}
+
 // A Deauthentication a host handled, so that the same MAC authenticating again a moment later is known to have a
 // second copy of it on its way (see Node::deauth_guard).
 void UdsEngine::NoteLeftLocked(const Mac& mac, u64 now_ms) {
@@ -858,14 +867,17 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
             SendEapolLogoffLocked(packet.transmitter_address, node_it->second.node_id);
             return;
         }
-        if (AdmissionBlocked()) {
-            return; // (a closed lobby refuses with a Logoff the Azahar side could not read: stay silent)
-        }
         if (connection_status_.max_nodes == connection_status_.total_nodes) {
             return;
         }
         EapolStart start;
         if (!ParseEapolStartFrame(packet.data, &start)) {
+            return;
+        }
+        const bool spectator = start.connection_type == static_cast<u8>(ConnectionType::Spectator);
+        // (a closed lobby refuses with a Logoff the Azahar side could not read: stay silent; the real Download Play's host still takes
+        // a spectator, SpectatorsWelcomeLocked)
+        if (AdmissionBlocked() && !(spectator && SpectatorsWelcomeLocked())) {
             return;
         }
         NodeInfo node = start.node;
@@ -905,8 +917,23 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
             return; // (a Logoff with id 0 would be adopted by every client that is still Connecting)
         }
 
-        // Azahar broadcasts the EAPoL-Logoff (a real 3DS would only unicast it to the new client).
-        SendEapolLogoffLocked(kBroadcastMac, node.network_node_id);
+        if (!dlp_net_) {
+            // Azahar broadcasts the EAPoL-Logoff (a real 3DS would only unicast it to the new client).
+            SendEapolLogoffLocked(kBroadcastMac, node.network_node_id);
+        } else if (spectator) {
+            // The real Download Play's network (1.1.3): Azahar's nwm adopts ANY Logoff while it is Connecting (no look at the sender or
+            // the id), and a searcher's spectator comes at every probe. Broadcast, its admission would make an Azahar console that is
+            // joining (this host or another of the room) node 0, every frame for its own node then "not for me". It changes no node
+            // list: to the spectator alone.
+            SendEapolLogoffLocked(packet.transmitter_address, node.network_node_id);
+        } else {
+            // A client's: to every member of the network (the joiner among them: their node lists stay whole), never to the room.
+            for (const auto& member : node_map_) {
+                if (member.second.connected) {
+                    SendEapolLogoffLocked(member.first, node.network_node_id);
+                }
+            }
+        }
 
         QueueSignalLocked(connection_status_event_);
     } else if (status == NetworkStatus::Connecting) {
@@ -917,6 +944,12 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
         // (a Logoff answers our Start, which goes out when the host's AssociationResponse arrives: in a lobby the host also sends one
         // when a fellow leaves, and a console that is Connecting again while the host still holds its old node must not take it)
         if (lobby_inbox_ && !associated_) {
+            return;
+        }
+        // The real Download Play's network (design D16 a, b): the same wait for the host's answer, and a client takes no Logoff
+        // that names node 0: that one admits a SPECTATOR (every searcher comes in as one first, and the host broadcasts its
+        // admission); taken, it would make this console node 0, and every frame for its own node "not for me".
+        if (dlp_net_ && (!associated_ || (conn_type_ == ConnectionType::Client && logoff.assigned_node_id == 0))) {
             return;
         }
         // (the Logoff that admits us comes from the host we asked: another lobby's host admitting somebody else is not it)
@@ -1227,11 +1260,16 @@ void UdsEngine::HandleAuthenticationFrame(const WifiPacket& packet) {
     if (seq != AuthSeq::Seq1) {
         return;
     }
-    if (connection_status_.status != static_cast<u32>(NetworkStatus::ConnectedAsHost) ||
-        AdmissionBlocked()) {
+    if (connection_status_.status != static_cast<u32>(NetworkStatus::ConnectedAsHost)) {
         return;
     }
     auto known = node_map_.find(packet.transmitter_address);
+    // (a closed network answers nobody; the real Download Play's host answers a newcomer, who may be a spectator - the EAPoL-Start
+    // says which, and refuses a client there - but never drops a member's association while it is closed)
+    if (AdmissionBlocked() &&
+        (!SpectatorsWelcomeLocked() || (known != node_map_.end() && known->second.connected))) {
+        return;
+    }
     if (known != node_map_.end() && known->second.connected) {
         // A client we admitted authenticates again: it left without a Deauthentication (a dropped
         // link, a restarted game). The new association replaces the old one, as a real host's station
@@ -1308,7 +1346,11 @@ void UdsEngine::HandleDeauthenticationFrame(const WifiPacket& packet) {
         }
     }
     ++g_stats.deauth_rx[0];
-    NoteLeftLocked(packet.transmitter_address, now);
+    // (design D16 c: in the real Download Play's network every peer says goodbye once - capture 1c - and a searcher comes in as a
+    //  spectator, leaves, and joins as a client a second later: a departure noted there would arm the guard against its real goodbye)
+    if (!dlp_net_) {
+        NoteLeftLocked(packet.transmitter_address, now);
+    }
     const u16 left_node = it->second.node_id;
     if (RemoveNodeLocked(it, kRemovedDeauth)) {
         QueueSignalLocked(connection_status_event_);
@@ -1680,6 +1722,7 @@ u32 UdsEngine::Shutdown() {
     Guard lock(this);
     RoleTrace trace(this);
     lobby_inbox_ = false; // (the lobby's end, or a game's: nothing unread is kept for whoever has the service next)
+    dlp_net_ = false;     // (and the rules of the real Download Play's network are not those of whoever has it next)
     if (lobby_) {
         lobby_->rx_first = 0;
         lobby_->rx_count = 0;
@@ -1975,6 +2018,65 @@ u32 UdsEngine::ConnectBeginLobby(const Mac& host) {
     network_info_.channel = heard->lobby.channel;
     StartConnectLocked(ConnectionType::Client, nullptr);
     return res::kSuccess;
+}
+
+u32 UdsEngine::BeginHostingDlp(u8 max_nodes, u8 channel) {
+    Guard lock(this);
+    RoleTrace trace(this);
+    if (const u32 r = Gate(kIdle)) {
+        return r;
+    }
+    if (max_nodes < 2 || max_nodes > kUdsMaxNodes) {
+        return res::kBadId;
+    }
+    std::memset(&network_info_, 0, sizeof(network_info_)); // (attribute word 0, no application data)
+    network_info_.channel = channel;
+    network_info_.initialized = 1;
+    StoreBE32(network_info_.wlan_comm_id_be, kLobbyWlanCommId);
+    network_info_.id = kLobbyId8;
+    // (the network id as BeginHostingLobby makes it: the FNV-1a hash of our MAC, bit 0 set; Azahar's client reads none of it)
+    const Mac mac = GetMacAddress();
+    u32 network_id = 2166136261u;
+    for (u8 byte : mac) {
+        network_id = (network_id ^ byte) * 16777619u;
+    }
+    StoreBE32(network_info_.network_id_be, network_id | 1u);
+    network_info_.max_nodes = max_nodes;
+    dlp_net_ = true; // (before the first frame of the network: the rules of D16 hold from its first admission)
+    StartHostingLocked();
+    return res::kSuccess;
+}
+
+u32 UdsEngine::ConnectBeginDlp(const Mac& host, u8 channel, ConnectionType type) {
+    Guard lock(this);
+    RoleTrace trace(this);
+    if (const u32 r = Gate(kIdle)) {
+        return r;
+    }
+    if (type != ConnectionType::Client && type != ConnectionType::Spectator) {
+        return res::kBadArgument;
+    }
+    std::memset(&network_info_, 0, sizeof(network_info_));
+    network_info_.host_mac_address = host;
+    network_info_.channel = channel;
+    network_info_.initialized = 1;
+    std::memcpy(network_info_.oui_value, kNintendoOui, sizeof(kNintendoOui));
+    network_info_.oui_type = 21; // NintendoTagId::NetworkInfo
+    dlp_net_ = true; // (before the first frame of the handshake: a spectator's Logoff must not be taken for ours)
+    StartConnectLocked(type, nullptr);
+    return res::kSuccess;
+}
+
+u32 UdsEngine::SpectatorCount() const {
+    Guard lock(this);
+    if (connection_status_.status != static_cast<u32>(NetworkStatus::ConnectedAsHost)) {
+        return 0;
+    }
+    u32 n = 0;
+    for (const auto& entry : node_map_) {
+        n += entry.second.connected && entry.second.spec ? 1u : 0u;
+    }
+    return n;
 }
 
 void UdsEngine::StartConnectLocked(ConnectionType type, u32* attempt) {
@@ -2470,7 +2572,9 @@ u32 UdsEngine::Bind(u32 bind_node_id, u32 recv_buffer_size, u8 data_channel, u16
         static_cast<unsigned long>(bind_node_id), data_channel, network_node_id,
         static_cast<unsigned long>(recv_buffer_size), static_cast<unsigned long>(slot->ring.total_units() * 32),
         static_cast<unsigned long>(bind_budget_), static_cast<unsigned long>(shared_memory_size_));
-    *game_event = kernel_->DuplicateForGame(event);
+    if (game_event != nullptr) { // (null: the plugin's own bind - the real Download Play's adapter - takes no handle to close)
+        *game_event = kernel_->DuplicateForGame(event);
+    }
     return res::kSuccess;
 }
 
@@ -2685,9 +2789,21 @@ void UdsEngine::NoteLobbyBeaconLocked(const WifiPacket& packet, u64 now) {
     const BeaconTags tags = FindBeaconTags(packet.data);
     const u8* data = nullptr;
     u32 size = 0;
-    if (!GetBeaconApplicationData(tags, &data, &size) || size == 0 || tags.network_size <= kMaxAt ||
+    // The real Download Play's kind (design E1): its wlancommid and NO application data (a tag too short to hold the size byte counts
+    // as none), whatever the id8, network id and attributes say (Azahar leaves those uninitialised); the dialect's beacons, which
+    // carry the announcement, are not of this kind. Nothing of the data is copied (there is none: `data` stays null, `size` 0).
+    bool lobby = true;
+    if (lobby_beacon_kind_ == LobbyBeaconKind::RealDlp) {
+        lobby = (!GetBeaconApplicationData(tags, &data, &size) || size == 0) && tags.network_size > kMaxAt &&
+                LoadBE32(tags.network + 4) == kLobbyWlanCommId;
+        data = nullptr;
+        size = 0;
+    } else if (!GetBeaconApplicationData(tags, &data, &size) || size == 0 || tags.network_size <= kMaxAt ||
         LoadBE32(tags.network + 4) != kLobbyWlanCommId || tags.network[8] != kLobbyId8) {
-        // (not a lobby: a game's network, or a beacon with no application data. A host that WAS a lobby and now beacons its game's
+        lobby = false;
+    }
+    if (!lobby) {
+        // (not a lobby of this kind: a game's network, or a beacon of the other kind. A host that WAS a lobby and now beacons its game's
         //  network is no lobby any more: a searcher that still has it in a list must not be able to join the game's network)
         for (HeardLobbySlot& slot : lobby_->heard) {
             if (slot.used && slot.lobby.host == packet.transmitter_address) {
@@ -2726,7 +2842,9 @@ void UdsEngine::NoteLobbyBeaconLocked(const WifiPacket& packet, u64 now) {
     slot->lobby.max_nodes = tags.network[kMaxAt];
     slot->lobby.size = static_cast<u8>(copied);
     std::memset(slot->lobby.data, 0, sizeof(slot->lobby.data));
-    std::memcpy(slot->lobby.data, data, copied);
+    if (copied != 0) {
+        std::memcpy(slot->lobby.data, data, copied); // (never with a null `data`: the real Download Play's beacons have none)
+    }
 }
 
 bool UdsEngine::HeardLobbyAt(u32 index, u32 max_age_ms, HeardLobby* out) const {
@@ -2826,6 +2944,19 @@ void UdsEngine::SetLobbyInbox(bool on) {
     if (lobby_) {
         lobby_->rx_first = 0;
         lobby_->rx_count = 0;
+    }
+}
+
+void UdsEngine::SetLobbyBeaconKind(LobbyBeaconKind kind) {
+    Guard lock(this);
+    if (kind == lobby_beacon_kind_) {
+        return;
+    }
+    lobby_beacon_kind_ = kind;
+    if (lobby_) {
+        for (HeardLobbySlot& slot : lobby_->heard) {
+            slot.used = false; // (what was filed was of the other kind)
+        }
     }
 }
 

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "azl/dlp_hub.hpp"
+#include "azl/dlp_real_net.hpp"
 #include "azl/ini_values.hpp"
 #include "azl/link_policy.hpp"
 #include "azl/log_files.hpp"
@@ -27,7 +28,7 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.1.2"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.2: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.1.3"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.3: Tests/set_version.py writes all of them)
 
 /// "Mon DD YYYY HH:MM:SS" of the last build that changed any object: Sources/ctr/build_id.cpp, which the Makefile recompiles
 /// after every other object. The log header prints it instead of plugin.cpp's own __DATE__ / __TIME__, which stay as old as
@@ -298,6 +299,10 @@ private:
     std::unique_ptr<RoomClient> room_;
     std::unique_ptr<UdsEngine> engine_;
     std::unique_ptr<UdsHle> hle_;
+    /// 1.1.3: the adapter of the real Download Play (azl/dlp_real_net.hpp), the network of the hub's lobby: only for the games in RealDlp mode,
+    /// null for every other (Lobby games included). Made with the hub and never replaced; declared before it, so that the hub - which points
+    /// to it - would go first (it never goes: the plugin is a leaked singleton).
+    std::unique_ptr<RealDlpNet> dlp_real_;
     /// The fake Download Play lobby (azl/dlp_hub.hpp): only for the games in Lobby mode (kDlpGames in plugin.cpp), null for the others.
     /// Made once in EarlyInit before the room can start and the hooks are installed, and never replaced; stopped at the end of
     /// the plugin (Shutdown) and never destroyed - like the engine and the HLE, which the game's threads keep using. (The members

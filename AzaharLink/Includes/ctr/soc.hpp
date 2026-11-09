@@ -19,6 +19,10 @@ bool InitSockets();
 /// Why the last InitSockets() failed, in words for the screen (empty after a success).
 const char* SocketInitFailure();
 void ShutdownSockets();
+/// The game initialised its own sockets first and the plugin's live in its context (see Sources/ctr/soc.cpp, the guest).
+bool SocketsAreGuest();
+/// EarlyInit, for a title of socplan::kSocGuestTitles: on 0xC8A0700B the plugin becomes a guest in the game's sockets (else it gives up).
+void AllowSocketGuest();
 
 } // namespace ctr
 } // namespace azl

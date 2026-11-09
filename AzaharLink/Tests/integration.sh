@@ -13,6 +13,7 @@
 #     0.2 s -> 2 decoded (one member's share) and one of A amid them kept, 5000 characters -> the room's 500 bytes -> 128 with "...",
 #     one of ours a second, a chat switched off,
 #   - dlp_room_probe: the fake Download Play lobby over the real room (the whole lobby then the game's UDS, four players, a client that leaves and a creator that goes),
+#   - dlp_real_room_probe: the REAL Download Play of 1.1.3 over the real room (I1 our host and our searcher, I2 our host and a model of Azahar's client, I3 20 rounds),
 #   - ipc_test: libctru's real uds.c / ndm.c -> UdsHle -> the room (32-bit, fake kernel),
 #   - ffe_replay_test: the FFE golden replay through UdsHle against an Azahar host model and two Azahar client models,
 #   - trace_replay_test: the real traces of the console (FFE and TFH as host, the lid episode with a second lobby in the
@@ -59,6 +60,7 @@ MSYS_NO_PATHCONV=1 docker run --rm --network $NET -v "$(cd .. && (pwd -W 2>/dev/
       /tmp/azl_tests/room_routing_probe $R1 24872 &&
       /tmp/azl_tests/chat_room_probe $R1 24872 &&
       /tmp/azl_tests/dlp_room_probe $R1 24872 &&
+      /tmp/azl_tests/dlp_real_room_probe $R1 24872 &&
       bash Tests/ipc_test/build.sh && /tmp/azl_tests32/ipc_test $R1 24872 &&
       /tmp/azl_tests32/ffe_replay_test && /tmp/azl_tests32/trace_replay_test && /tmp/azl_tests32/result_closure_test &&
       /tmp/azl_tests32/command_matrix_test && /tmp/azl_tests32/ndm_wiring_test && /tmp/azl_tests32/dlp_fkcl_test &&

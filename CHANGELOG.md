@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.1.3 - 2026-11-10
+
+**Luigi's Mansion (2018) now speaks the real Download Play, so consoles and Azahar play it together, and Fantasy Life reaches the room: the plugin now uses the game's own network connection. Tried with two consoles of the New 3DS family and with Azahar on a PC; not tried on an Old 3DS.**
+
+> Where the reports came from. [Issue 7](https://github.com/gionko/3DS-Link/issues/7) sent the logs of *Luigi's Mansion* between a 3DS and Azahar, taken at the same moment from both sides: Azahar joined the 3DS's network, then waited for Download Play packets that never came. A tester found that *Fantasy Life* never reached the room. A fork of 3DS Link (klark231) pointed out the order in which the plugin is created at the start of a game.
+>
+> What was tried. On 9 November 2026, with the debug log on: a New 2DS XL, a New 3DS XL over the internet, and Azahar on a PC, all in one room. *Luigi's Mansion*: the New 2DS XL hosted and the New 3DS XL joined; the New 2DS XL hosted and Azahar joined; Azahar hosted and the New 2DS XL joined. All three played. *Fantasy Life*: the New 2DS XL hosted, and the New 3DS XL joined, then Azahar joined. Both played. **Not tried on any Old 3DS or Old 2DS.** A console with 1.0.14 or later is offered this version by the app; an older one installs it by hand.
+
+### At a glance
+
+| Area | Before | Now | Since |
+|---|---|---|---|
+| ***Luigi's Mansion* (2018) with Azahar** | the console made its own lobby: two consoles understood each other, Azahar did not ("could not receive all DLP packets") | the console speaks the **real Download Play**, the same as Azahar's. 3DS to 3DS and 3DS to Azahar, both ways. **8/10** | 1.1.3 |
+| *Luigi's Mansion* (2018), frame rate | | about **20 fps in multiplayer**, on a console and on Azahar alike: that is the game itself, not the room (see the note in the [README](README.md#tested-games)) | - |
+| ***Fantasy Life*** | never reached the room ("Network unavailable"): the game opens the console's network service before the plugin | the plugin uses the game's own connection instead of opening its own. 3DS to 3DS, and a console hosting Azahar. **9/10** | 1.1.3 |
+| The start of a game | the plugin was created by whichever thread asked for it first | it is created once, before anything else can ask for it. Reported by klark231 | 1.1.3 |
+| Every other game | | unchanged: the same paths as 1.1.2, checked game by game on a PC | - |
+
+### Not fixed or not tried
+
+| What | Notes |
+|---|---|
+| Everything on an Old 3DS or Old 2DS | **not tried**. Reports are very welcome |
+| *Luigi's Mansion* (2018) with 1.1.2 on one side | **a console with 1.1.2 and one with 1.1.3 do not see each other** in this game: the old lobby and the real Download Play are two different languages. Update both |
+| *Luigi's Mansion* (2018), New 3DS XL hosting the New 2DS XL | not tried yet: between the two consoles only the New 2DS XL hosted. The USA, Japanese and Korean copies were never seen |
+| *Fantasy Life* with Azahar hosting | not tried: a console hosted. The USA and Japanese copies were never seen |
+| *Mario Party: Island Tour* | **still not supported**. Not looked at in depth yet |
+| The debug log in *Luigi's Mansion* | one line still says "the Download Play lobby is carried by the room": it is the real Download Play. Only the words are wrong |
+
+### Technical notes
+
+<details>
+<summary>How the real Download Play works for Luigi's Mansion (2018)</summary>
+
+*Luigi's Mansion* finds the other player through Download Play, as if it sent its game to them. On a real 3DS, the system's Download Play cannot run in a room (the console stays on your access point), so the plugin answers the game's Download Play itself.
+
+**Until 1.1.2: a lobby of our own.**
+* The host's beacon held a short announcement of 3DS Link's own, and the steps of the join went over a private channel.
+* Two consoles with 3DS Link understood each other. Two Azahar instances understood each other too, with Azahar's own Download Play.
+* Azahar did not understand the console: it joined as a spectator, waited one second for the title information, and gave up.
+
+**Since 1.1.3: the real Download Play, for this game only.**
+1. **Host (console).** The beacon is a Download Play host's, with no data of ours. To a console or an Azahar that is looking, it sends the title information in 5 packets every 0.5 s, on the channel Azahar listens to.
+2. **Searching player.** It joins for a moment as a spectator, reads the title information, and the game lists the host.
+3. **Join.** The join dialogue of Download Play, on its own channel: who joins, "the content is not needed" (every player has the game), then the passphrase of the game's network.
+4. **Game.** The game opens its own network with that passphrase, as it does with real wireless, and the plugin carries it through the room as for any other game.
+
+The packets were checked against a recording of two Azahar instances and against Azahar's source. Only *Luigi's Mansion*'s four title ids use this; *Kirby: Triple Deluxe*, *Kirby: Planet Robobot* and *Mario Tennis Open* keep the lobby of 1.1.2, which works between consoles.
+
+</details>
+
+<details>
+<summary>Fantasy Life: a guest in the game's connection</summary>
+
+The console's network service keeps one context per game, and the first to open it wins. *Fantasy Life* opens it itself before the plugin, so the plugin's own attempt failed and it never reached the room. For the games in a short list (*Fantasy Life*: Europe, USA, Japan), the plugin now opens its own session inside the game's context instead of a new one, with a smaller receive buffer (32 KB). It leaves the game's context untouched when the game ends. Other games are not affected.
+
+</details>
+
 ## 1.1.2 - 2026-11-08
 
 **The lobby update: the public Azahar rooms in the app, with their ping, how many players are in and what they play, your favourite rooms, Quick join, and a chat inside the games with a rebuilt in-game menu. Also: a new way of hooking the game, written once before it starts, so that a thread asleep in a system call can no longer wake up on a rewritten instruction. The Old 3DS fixes of this version, one more game with the Download Play lobby (*Luigi's Mansion*, 2018), and guards for a game that is closed and the next one that starts. Tried on consoles of the New 3DS family only: nothing of it was tried on an Old 3DS yet.**

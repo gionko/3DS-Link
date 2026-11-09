@@ -12,6 +12,9 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 cp -r "$PLUGIN/Sources" "$PLUGIN/Includes" "$WORK/"
 cp "$PLUGIN/3gx.ld" "$PLUGIN/CTRPluginFramework.plgInfo" "$PLUGIN/Makefile" "$PLUGIN/VERSION" "$WORK/"
+# (of the app's folder the plugin builds ONE file, by name: the wire of the Download Play host library, 1.1.3 - Makefile, DLPH_WIRE)
+mkdir -p "$WORK/ConfigApp/dlph"
+cp "$PLUGIN/ConfigApp/dlph/dlph_wire.c" "$PLUGIN/ConfigApp/dlph/dlph_wire.h" "$WORK/ConfigApp/dlph/"
 # the one change: the flag (the product Makefile keeps its own line)
 sed -i 's/-DAZL_USE_CTRPF/-DAZL_USE_CTRPF -DAZL_BOOT_DIAG/' "$WORK/Makefile"
 grep -q -- '-DAZL_BOOT_DIAG' "$WORK/Makefile" || { echo "the flag did not go into the copy of the Makefile" >&2; exit 1; }

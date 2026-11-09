@@ -350,8 +350,13 @@ std::string ReadIconSelfNcch(u8 language) {
 //     ("invalid state") and the game answers with an error screen, 0xE0A0AC01). The room carries their lobby: BOTH services are
 //     served by the plugin's DlpHub (azl/dlp_hub.hpp), the host's announcement and the four messages of the creator go over the
 //     room like the game's own UDS frames, and the engine is given back to the game's nwm::UDS whole when the game starts it.
-// A game that is not listed keeps the real services, as before (Zelda Tri Force Heroes has no entry). Only the games in Lobby mode get
-// a hub: nothing of it exists in the others.
+//   RealDlp (1.1.3, Luigi's Mansion): the same hub and the same lobby, on another network: the adapter of the REAL Download Play
+//     (azl/dlp_real_net.hpp), which speaks on the wire what Azahar's Download Play emulates (the "fake client" case: every player has the
+//     game, nothing is downloaded) instead of the plugin's own dialect, so that a console and Azahar see each other's lobby. Its beacon and
+//     its messages are not the dialect's: a console of 1.1.2 (Lobby) and one of 1.1.3 (RealDlp) do not see each other in this game.
+//     Moving a game between Lobby and RealDlp is its row, and nothing else: no switch at run time (design PROGETTO-DLP-VERO-1.1.3.md 3.4).
+// A game that is not listed keeps the real services, as before (Zelda Tri Force Heroes has no entry). Only the games in Lobby and RealDlp
+// mode get a hub, and only the RealDlp ones its adapter: nothing of either exists in the others.
 // console_seed (Mario Tennis Open): the game keeps the players of the Download Play lobby in a table and, when the game's own network starts,
 // zeroes their ids and gives each one back by comparing the friend code seed of the lobby with the seed of the player's nwm::UDS node
 // (Tests: written from the debugger's reading of a stalled game, 2026-11-01). The seed the game gives nwm::UDS is the console's own, read from
@@ -376,11 +381,13 @@ constexpr DlpGame kDlpGames[] = {
     // dlp:SRVR InitializeWithName (0x0F) as the host and dlp:FKCL InitializeWithName (0x11) as the client - and the real modules answered
     // 0xC940AC04 (wireless off); with the lobby it played (two New 3DS, 2026-11-09). The other regions' ids are 3DS Link's catalogue
     // (ConfigApp titles.txt: the family BGN), not seen. (Mario Party: Island Tour opens dlp:SRVR the same way but did not play with the lobby:
-    // it waits for 1.1.3.)
-    {0x00040000001D1A00ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), Europe (seen)
-    {0x00040000001D1900ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), USA (catalogue)
-    {0x00040000001D1800ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), Japan (catalogue)
-    {0x00040000001D4F00ull, DlpGameMode::Lobby},     // Luigi's Mansion (2018), Korea (catalogue)
+    // it has no Download Play client of its own.) 1.1.3: RealDlp, the real Download Play on the wire (the Azahar - Azahar capture of this
+    // game, analysis/luigi-azahar-2026-11-09, is the contract), so that a console and Azahar play it together; back to Lobby with these four
+    // rows if the test of two consoles (O5) fails.
+    {0x00040000001D1A00ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), Europe (seen)
+    {0x00040000001D1900ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), USA (catalogue)
+    {0x00040000001D1800ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), Japan (catalogue)
+    {0x00040000001D4F00ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), Korea (catalogue)
 };
 
 DlpGameMode DlpModeOf(u64 title_id) {
@@ -447,6 +454,29 @@ std::unique_ptr<DlpHub> MakeDlpHub(UdsEngine* engine, KernelOps* kernel, u64 gam
     resolver.ctx = nullptr;
     resolver.map = &MapGameAddress;
     return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver));
+}
+
+/// The hub of a game in RealDlp mode, or null (no memory: the game keeps the real services): the configuration of MakeDlpHub, word for word, and
+/// the adapter of the real Download Play as the lobby's network (`real`, made by the caller and kept alive by it). The probes of the searcher take
+/// the engine as a spectator with the identity the lobby starts with (the hash of the MAC, "3DS Link"): nobody shows a spectator's.
+std::unique_ptr<DlpHub> MakeRealDlpHub(UdsEngine* engine, KernelOps* kernel, u64 game_tid, const Mac& console_mac, RealDlpNet* real) {
+    LobbyConfig config = {};
+    config.game_tid = game_tid;
+    config.friend_seed = Fnv1a64(console_mac.data(), console_mac.size());
+    static const char kDefaultName[] = "3DS Link";
+    for (std::size_t i = 0; i < kNameUnits && kDefaultName[i] != '\0'; ++i) {
+        config.name[i] = static_cast<u16>(kDefaultName[i]);
+    }
+    IpcResolver resolver;
+    resolver.ctx = nullptr;
+    resolver.map = &MapGameAddress;
+    Identity probe = {};
+    probe.seed = config.friend_seed;
+    for (std::size_t i = 0; i < kNameUnits; ++i) {
+        probe.name[i] = config.name[i];
+    }
+    real->SetIdentity(probe);
+    return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2211,6 +2241,9 @@ void Plugin::EarlyInit() {
         // reservation finds them and goes the kernel's way ("made through the kernel's reservation"); the fallback written in kernel mode
         // (books::ChargeOrWrite, kNoPages) and the Uncharge over the three regions run only where the game holds the whole region, an Old
         // 3DS with Monster Hunter XX: only there are they tried.
+        if (socplan::SharesGameSockets(game_id_)) {
+            AllowSocketGuest(); // (a game that opens its own sockets first: the plugin is a guest in them, ctr/soc.cpp)
+        }
         const bool late = socplan::TakesBlockLate(game_id_);
         if (late) {
             const bool from_system = File::Exists("/3ds/3DSLink/soc-from-system") == 1;
@@ -2264,6 +2297,25 @@ void Plugin::EarlyInit() {
                 static_cast<unsigned long>(seed >> 32), static_cast<unsigned long>(seed), static_cast<unsigned long>(sizeof(DlpHub)));
         } else {
             Log("dlp: no memory for the Download Play lobby: dlp:FKCL and dlp:SRVR stay the real services for this game");
+        }
+    } else if (DlpModeOf(game_id_) == DlpGameMode::RealDlp && active_) {
+        // 1.1.3, the real Download Play (Luigi's Mansion): the same hub, made at the same point and never changed, on the adapter that speaks
+        // the real Download Play on the wire (azl/dlp_real_net.hpp). Two allocations, the adapter and the hub; the other games have neither.
+        dlp_real_.reset(new (std::nothrow) RealDlpNet(engine_.get()));
+        if (dlp_real_) {
+            dlp_hub_ = MakeRealDlpHub(engine_.get(), &kernel_, game_id_, console_mac_, dlp_real_.get());
+        }
+        if (dlp_hub_) {
+            hle_->SetDlpHub(dlp_hub_.get());
+            const u64 seed = Fnv1a64(console_mac_.data(), console_mac_.size());
+            Log("dlp: the real Download Play is carried by the room for this game (title id %08lx%08lx): dlp:FKCL and dlp:SRVR are served by"
+                " the plugin and speak Azahar's Download Play, friend code seed %08lx%08lx, %lu bytes of hub and %lu of adapter",
+                static_cast<unsigned long>(game_id_ >> 32), static_cast<unsigned long>(game_id_),
+                static_cast<unsigned long>(seed >> 32), static_cast<unsigned long>(seed), static_cast<unsigned long>(sizeof(DlpHub)),
+                static_cast<unsigned long>(sizeof(RealDlpNet)));
+        } else {
+            dlp_real_.reset();
+            Log("dlp: no memory for the real Download Play: dlp:FKCL and dlp:SRVR stay the real services for this game");
         }
     }
 

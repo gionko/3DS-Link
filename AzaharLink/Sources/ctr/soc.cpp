@@ -12,12 +12,28 @@
 // the game starts, so it is charged to the game's commit when games still size their heap from what is
 // left; see Includes/azl/soc_plan.hpp for where it goes and why it is as small as it is. A game that cannot
 // spare it (socplan::kLateBlockTitles) gets it at the first InitSockets() instead.
+//
+// A guest in the game's sockets (REGISTRO phase S, 2026-11-09): the soc module keeps ONE context per process, and the first
+// InitializeSockets of a process wins (0xC8A0700B for the next). A game that opens its own sockets before the plugin's first connection
+// (Fantasy Life: soc:U InitializeSockets at 1.9 s, the plugin at 5.6 s) left the plugin with no room at all. But the module finds a
+// socket call's context by the caller's PID, which the kernel writes, and not by the session (read in its code, 0004013000002E02:
+// Socket 0x12cbfc -> 0x12e29c, the PID table 0x112af4; Azahar's soc_u.cpp Socket() does the same): so on 0xC8A0700B the plugin opens a
+// soc:U session of its own WITHOUT InitializeSockets, gives it to libctru (SOCU_handle) with a device of its own named "soc" (libctru's is
+// local to soc_init.o; its socket() finds the device by "soc:", and sendto, recvfrom and the others check the name "soc"), and its sockets
+// live in the game's context. The receive ring is then held to 32 KB (the smallest pool a game can have is 64 KB: rcvbuf.h). Never a
+// ShutdownSockets (0x00190000) nor a socInit while a guest: the first would take the game's network away (on Azahar, all the sockets of the
+// process), the second finds the device and fails with -1 after zeroing SOCU_handle (soc_init.o). The guest leaves with its own sockets
+// closed, its session closed and its device removed.
 #include "ctr/soc.hpp"
 
 #include <3ds.h>
 
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
+#include <sys/iosupport.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "azl/log.hpp"
 #include "azl/platform.hpp"
@@ -28,6 +44,7 @@
 
 extern "C" Result __real_srvGetServiceHandle(Handle* out, const char* name);
 extern "C" int azl_enet_rcvbuf_bytes; // Sources/enet/enet_3ds.c: the SO_RCVBUF ENet asks for
+extern "C" Handle SOCU_handle;        // libctru (soc_common.o): the session every socket call of libctru goes through
 
 extern "C" Result __wrap_srvGetServiceHandle(Handle* out, const char* name) {
     const Result rc = __real_srvGetServiceHandle(out, name);
@@ -52,6 +69,40 @@ namespace azl {
 namespace ctr {
 
 namespace {
+// ---- the guest's device (see the top of the file) ----
+constexpr Result kSocAlreadyInitialized = static_cast<Result>(0xC8A0700B);
+constexpr u32 kGuestPoolBytes = 0x10000; // (the smallest pool a game can give soc:U: the ring of a guest is held to what it holds)
+bool g_guest = false;
+bool g_guest_allowed = false; // a title of socplan::kSocGuestTitles (AllowSocketGuest, EarlyInit)
+
+// libctru's soc_close, for a device of the plugin's own: CloseSocket (0x000B0042) on the session, the fd and the caller's PID.
+int GuestClose(struct _reent* r, void* fd) {
+    const Handle sockfd = *static_cast<Handle*>(fd);
+    u32* cmd = getThreadCommandBuffer();
+    cmd[0] = IPC_MakeHeader(0xB, 1, 2);
+    cmd[1] = sockfd;
+    cmd[2] = IPC_Desc_CurProcessId();
+    const Result rc = svcSendSyncRequest(SOCU_handle);
+    if (rc != 0) {
+        r->_errno = ENODEV;
+        return -1;
+    }
+    if (static_cast<Result>(cmd[1]) != 0 || static_cast<s32>(cmd[2]) < 0) {
+        r->_errno = EIO; // (the game's context may be gone: the socket is gone with it)
+        return -1;
+    }
+    return 0;
+}
+
+devoptab_t MakeGuestDevoptab() {
+    devoptab_t d{};
+    d.name = "soc";             // (sendto and the others: strcmp(devoptab_list[...]->name, "soc"))
+    d.structSize = sizeof(Handle); // (socket(): the fd of soc:U inside the newlib handle)
+    d.close_r = GuestClose;
+    return d;
+}
+devoptab_t g_guest_devoptab = MakeGuestDevoptab();
+
 bool g_soc_ready = false;
 bool g_reserve_tried = false;
 bool g_reserve_late = false;   // a title of socplan::kLateBlockTitles
@@ -280,6 +331,52 @@ const char* SocketInitFailure() {
     return g_init_failure;
 }
 
+// The guest (see the top of the file): a soc:U session of the plugin's own, never InitializeSockets, libctru's sockets through it and the
+// device above. A socket made and closed at once proves the game's context takes the plugin's calls; else the guest is left at once.
+bool EnterGuest() {
+    Handle session = 0;
+    srvSetBlockingPolicy(true); // (a port with no session free answers at once instead of blocking the plugin's thread)
+    const Result got = srvGetServiceHandle(&session, "soc:U");
+    srvSetBlockingPolicy(false);
+    if (R_FAILED(got) || session == 0) {
+        Log("soc: guest: no soc:U session of its own (0x%08lx): no room in this game", static_cast<unsigned long>(got));
+        return false;
+    }
+    SOCU_handle = session;
+    if (AddDevice(&g_guest_devoptab) < 0) {
+        svcCloseHandle(session);
+        SOCU_handle = 0;
+        Log("soc: guest: the device could not be added: no room in this game");
+        return false;
+    }
+    const int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe < 0) {
+        const int err = errno;
+        RemoveDevice("soc:");
+        svcCloseHandle(session);
+        SOCU_handle = 0;
+        Log("soc: guest: the game's context refused a socket (errno %d): no room in this game", err);
+        return false;
+    }
+    close(probe);
+    g_guest = true;
+    g_soc_ready = true;
+    g_init_failure[0] = '\0';
+    azl_enet_rcvbuf_bytes = azl_rcvbuf_limit(azl_enet_rcvbuf_bytes, kGuestPoolBytes);
+    Log("soc: the game initialised its own sockets first: the plugin is a guest in the game's context (its own soc:U session 0x%08lx, "
+        "no InitializeSockets; SO_RCVBUF held to %d KB)",
+        static_cast<unsigned long>(session), azl_enet_rcvbuf_bytes / 1024);
+    return true;
+}
+
+void AllowSocketGuest() {
+    g_guest_allowed = true;
+}
+
+bool SocketsAreGuest() {
+    return g_guest;
+}
+
 bool InitSockets() {
     if (g_soc_ready) {
         return true;
@@ -291,13 +388,16 @@ bool InitSockets() {
         return false;
     }
     const Result rc = socInit(reinterpret_cast<u32*>(g_soc_buffer), g_soc_size);
+    if (rc == kSocAlreadyInitialized && g_guest_allowed && EnterGuest()) {
+        return true; // (the game's own sockets: the plugin's live in its context)
+    }
     if (R_FAILED(rc)) {
         const char* name = socplan::InitFailureName(static_cast<u32>(rc));
         Log("soc: socInit failed (0x%08lx) with a 0x%lx byte buffer at 0x%08lx%s%s", static_cast<unsigned long>(rc),
             static_cast<unsigned long>(g_soc_size), static_cast<unsigned long>(g_soc_buffer),
             name ? ": " : "", name ? name : "");
         // (the text for the screen: short, with the code)
-        const char* shown = rc == static_cast<Result>(0xC8A0700B) ? "The game already uses soc:U (0x%08lx)"
+        const char* shown = rc == kSocAlreadyInitialized ? "This game uses its own network and the plugin could not share it (0x%08lx)"
                             : rc == static_cast<Result>(0xC8A07004) ? "soc:U session already started (0x%08lx)"
                             : g_debug_level > 0 ? "Could not start the network layer (0x%08lx)" // (the log has the details)
                                                 : "Could not start the network layer (0x%08lx): set debug=1 for details";
@@ -319,6 +419,17 @@ bool InitSockets() {
 
 void ShutdownSockets() {
     if (!g_soc_ready) {
+        return;
+    }
+    if (g_guest) {
+        // Never socExit: its ShutdownSockets would end the GAME's sockets (the context is the game's). The plugin's sockets are closed by
+        // now (the room client is stopped first); the session and the device go.
+        RemoveDevice("soc:");
+        svcCloseHandle(SOCU_handle);
+        SOCU_handle = 0;
+        g_guest = false;
+        g_soc_ready = false;
+        Log("soc: guest: left the game's sockets (session closed, device removed; the game's context untouched)");
         return;
     }
     // (the end of the sockets is the last thing the log says about them: how long soc:U took to let go, and what it answered)

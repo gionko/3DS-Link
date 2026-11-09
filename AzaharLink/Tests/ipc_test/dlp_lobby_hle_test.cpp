@@ -81,6 +81,7 @@
 
 #include "azl/dlp_hub.hpp"
 #include "azl/log.hpp"
+#include "azl/stats.hpp"
 
 #include "../hle_harness.hpp"
 
@@ -953,6 +954,7 @@ static void L3() {
 
     // The game of A starts its own network: Initialize (0x1B). The lobby gives the engine back FIRST (posted to the network thread), whole.
     const u32 posted_a = a.hub->served_posted();
+    LogTakeBusyDrops();  // (the window starts: a line of a game thread is given up, and counted, when the log's lock is busy - azl/log.cpp)
     const size_t mark_init = LogSize();
     r = UdsInit(a, au, 0xA1A1, "GameHost");
     TCHECK_EQ(r.hdr(), 0x001B0042u);
@@ -961,7 +963,16 @@ static void L3() {
     TCHECK(r.w[3] != 0);
     TCHECK_EQ(a.hub->served_posted(), posted_a + 1);  // (OnGameUdsStarting was posted)
     TCHECK(!a.hub->EngineHeld());
-    TCHECK_EQ(LogCount("dlp: nwm::UDS Initialize (cmd 0x1b) while the Download Play lobby held the network: given back first", mark_init), 1);
+    {
+        // The line is written on the game's thread, which never waits for the log: with the lock busy (the network threads log too) it is
+        // given up and counted. Seen once in a full round (integration, 2026-11-09): the line is there, or it was given up and counted.
+        const int seen = LogCount("dlp: nwm::UDS Initialize (cmd 0x1b) while the Download Play lobby held the network: given back first", mark_init);
+        const u32 given_up = LogTakeBusyDrops();
+        if (seen == 0 && given_up != 0) {
+            std::printf("  (the line of the given-back engine was given up for the busy log lock: %u lines given up in the window)\n", given_up);
+        }
+        TCHECK(seen == 1 || (seen == 0 && given_up != 0));
+    }
     TCHECK(a.e().initialized());  // (the game's Initialize, not the lobby's: its identity follows)
     TCHECK_EQ(ga.ServerState(), 1u);  // the lobby is back at "initialised", its table dropped
     TCHECK_EQ(ga.ClientsTotal(), 0u);

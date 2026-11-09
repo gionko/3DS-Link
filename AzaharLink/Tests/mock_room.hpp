@@ -145,6 +145,9 @@ struct Console {
         tr.get_mac = [this] { return mac; };
         engine.reset(new UdsEngine(kernel_ops, tr));
         index = room_.AddMember(mac, [this](const WifiPacket& p) {
+            if (drop && drop(p)) {
+                return; // tests: the frame is lost on its way to this member
+            }
             if (tap) {
                 tap(p); // tests: observe / emulate extra behaviour of this member
             }
@@ -152,6 +155,7 @@ struct Console {
         });
     }
     MockRoom& room_;
+    std::function<bool(const WifiPacket&)> drop;  // true = the frame never reaches this member (set before the traffic starts)
     std::function<void(const WifiPacket&)> tap;   // every frame that reaches the engine
     std::function<void(const WifiPacket&)> sniff; // every frame the engine sends
     FakeKernel fake_kernel;

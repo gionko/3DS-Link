@@ -77,6 +77,7 @@ PROBE_NOINLINE void p_SetExternalPoll(DlpLobby* l, bool on) { l->SetExternalPoll
 PROBE_NOINLINE void p_SetOnNet(DlpLobby* l, bool on) { l->SetOnNet(on); }
 PROBE_NOINLINE void p_SetDefaultName(DlpLobby* l, const u16* name) { l->SetDefaultName(name); }
 PROBE_NOINLINE bool p_active(const DlpLobby* l) { return l->active(); }
+PROBE_NOINLINE LobbyNet* p_net(const DlpLobby* l) { return l->net(); }
 PROBE_NOINLINE u32 p_bad_messages(const DlpLobby* l) { return l->bad_messages(); }
 PROBE_NOINLINE u32 p_client_state(const DlpLobby* l) { return l->client_state(); }
 PROBE_NOINLINE u32 p_server_state(const DlpLobby* l) { return l->server_state(); }
@@ -105,17 +106,20 @@ PROBE_NOINLINE u32 p_counters(const DlpService* s) {
 // Tests/stack_usage.sh (the unit's .su listing of the plugin's own build).
 #if defined(DLP_PROBE_HUB)
 #include "azl/dlp_hub.hpp"
+#include "azl/dlp_real_net.hpp"
 
 #define HUB_NOINLINE __attribute__((noinline))
 
 static_assert(sizeof(DlpHub) <= 408, "DlpHub: 408 bytes (the lobby 272, the service 40, the adapter 12, the slot and the counters); raise this on purpose");
 static_assert(sizeof(EngineLobbyNet) <= 12, "the adapter: a vtable pointer, the engine's and a flag");
+// 1.1.3: the adapter of the real Download Play (a heap block of its own, only for a game in RealDlp mode; the hub keeps no member for it)
+static_assert(sizeof(RealDlpNet) <= 2048, "RealDlpNet: one frame buffer, the probes' cache and some words (1784 bytes measured); raise this on purpose");
 static_assert(sizeof(IpcResolver) == 8, "the game's address mapper: a context and a function");
 static_assert(DlpHub::kQueuedMs >= 1000 && DlpHub::kQueuedMs <= 4000, "a request nobody takes is given up after 1 to 4 seconds");
 static_assert(DlpHub::kAliveMs <= DlpHub::kQueuedMs, "a network thread is dead before a request waiting for it gives up");
 
-HUB_NOINLINE void p_hub_ctor(void* where, UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& r) {
-    ::new (where) DlpHub(engine, kernel, cfg, r);
+HUB_NOINLINE void p_hub_ctor(void* where, UdsEngine* engine, KernelOps* kernel, const LobbyConfig& cfg, const IpcResolver& r, LobbyNet* backend) {
+    ::new (where) DlpHub(engine, kernel, cfg, r, backend);
 }
 HUB_NOINLINE bool p_hub_IsInline(DlpKind kind, u32 id) { return DlpHub::IsInline(kind, id); }
 HUB_NOINLINE u32 p_hub_Serve(DlpHub* h, DlpKind kind, u32* cmd, const u32* sbuf) { return static_cast<u32>(h->Serve(kind, cmd, sbuf)); }
