@@ -97,14 +97,14 @@ The console's network service keeps one context per game, and the first to open 
 | What | Notes |
 |---|---|
 | Everything of this version on an Old 3DS or Old 2DS | **not tried**: the hooks, HOME and the power button, the public lobbies, the chat |
-| *Mario Party: Island Tour* | its local multiplayer asks for Download Play too, and still says the wireless is off. The same lobby was tried on two New 3DS and the game did not play with it, so it is not in this version: **for 1.1.3** |
+| *Mario Party: Island Tour* | its local multiplayer asks for Download Play too, and still says the wireless is off. The same lobby was tried on two New 3DS and the game did not play with it, so it is not in this version. Still not supported in 1.1.3 |
 | *Luigi's Mansion* (2018) | **tried once**, 3DS to 3DS with two players; no score yet, not with three or four. **Not tried with an Azahar player.** The Europe copy was seen in logs; the other regions come from a catalogue and were never seen |
 | The exit guard | it has **never had to act** on a console: the failure did not come back during the test. It cannot help when the system kills the game without letting it exit, or when Luma's loader has already lost its link to the game (one of the failures seen). It runs on the New 3DS family only |
 | C-stick, ZL and ZR while the chat's keyboard is open | the game still receives them in the games that read them through the Circle Pad Pro service (*Monster Hunter*, for example). A known limit |
 | Characters in the chat | printable ASCII only: any other character shows as `?` |
 | The in-game menu pauses the game | a game with a short network timeout can lose its match while the menu is open |
 | Public lobbies: how a room is asked | it relies on how an Azahar room answers someone who has not joined; a future Azahar may change it, and then the players show `-` and the ping stays. Each check makes the room send its information again to everyone in it, the players too: what that costs a game in play was not measured |
-| *Fantasy Life* | still no room: the game opens the console's network service before the plugin, and the plugin then has no network. A fix is planned for 1.1.3 |
+| *Fantasy Life* | still no room: the game opens the console's network service before the plugin, and the plugin then has no network. Fixed in 1.1.3 |
 | `0xD8E007F7` from `csnd`, once, at the 22nd HOME without a room, on an Old 3DS | no dump; the plugin was already blind to HOME then. **Not known if the plugin has anything to do with it** |
 | The power button during a game on an Old 3DS, then opening the game again | the game did not come back, and opening it again stopped Luma's loader with `0xD86007F3` (no memory). **Open** |
 
