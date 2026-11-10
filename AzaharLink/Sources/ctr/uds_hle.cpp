@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "azl/dlp_hub.hpp"
+#include "azl/latency.hpp"
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
 #include "ctr/gate_flag.hpp"
@@ -1124,6 +1125,9 @@ void UdsHle::Dispatch(u32* cmd) {
             Reply(cmd, id, r);
             break;
         }
+        if (data_size != 0 && out.ptr) {
+            latency::OnRecv(src_node, static_cast<u8>(bind_node_id), out.ptr, std::min(data_size, capacity)); // (the latency log; nothing while the log is off)
+        }
         cmd[0] = Hdr(id, 3, 2);
         cmd[1] = res::kSuccess;
         cmd[2] = data_size;
@@ -1146,6 +1150,9 @@ void UdsHle::Dispatch(u32* cmd) {
         const std::size_t available = cmd[7] >> 14;
         const u8* data = reinterpret_cast<const u8*>(cmd[8]);
         const u32 r = data ? engine_->SendTo(dest, channel, size, flags, data, available) : res::kTooLarge;
+        if (r == res::kSuccess) {
+            latency::OnSend(dest, channel, data, static_cast<u32>(std::min<std::size_t>(size, available))); // (the latency log; nothing while the log is off)
+        }
         Reply(cmd, id, r);
         break;
     }

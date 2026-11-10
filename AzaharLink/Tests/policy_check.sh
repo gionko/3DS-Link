@@ -1717,6 +1717,7 @@ game_thread_file Includes/azl/traced_sessions.hpp 1
 game_thread_file Includes/azl/link_policy.hpp 1
 game_thread_file Includes/azl/sleep_crumbs.hpp 1
 game_thread_file Sources/azl/ndm_hle.cpp 1
+game_thread_file Sources/azl/latency.cpp 2
 game_thread_file Includes/azl/chat_core.hpp 2
 # ... and the chat's drawing (the OSD callback runs on the game's thread that presents a frame): the stores and the text, and the lines
 game_thread_file Includes/azl/gfx_surface.hpp 1

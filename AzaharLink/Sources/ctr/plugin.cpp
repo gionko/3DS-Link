@@ -12,6 +12,7 @@
 
 #include "azl/chat_core.hpp"
 #include "azl/exit_guard.hpp"
+#include "azl/latency.hpp"
 #include "azl/log.hpp"
 #include "azl/plg_guard.hpp"
 #include "azl/plugin_compare.hpp"
@@ -41,6 +42,10 @@ namespace azl {
 namespace ctr {
 
 namespace {
+
+// The latency module (azl/latency.hpp), asked from the room's tick (the network thread): is the console in a network, as of the last check.
+u64 g_lat_check_ms = 0;
+bool g_lat_in_session = false;
 
 // The framework's connection to Luma3DS's plugin loader (azl/plg_guard.hpp): made by __wrap_plgLdrInit (at the end of this file) on the keep-alive
 // thread before PatchProcess, read by __wrap_PLGLDR__FetchEvent and by EarlyInit; and the line about it (EarlyInit: the synchronous file, then the log).
@@ -2328,6 +2333,15 @@ void Plugin::EarlyInit() {
         if (dlp_hub_) {
             dlp_hub_->Tick();
         }
+        // the latency of the other players, from the game's UDS packets: its ring begins when the console hosts, joins or watches a
+        // network (the engine's status, asked at most 4 times a second); with the log on it writes "lat: ..." lines
+        if (now_ms - g_lat_check_ms >= 250) {
+            g_lat_check_ms = now_ms;
+            const NetworkStatus st = engine_->status();
+            g_lat_in_session = st == NetworkStatus::ConnectedAsHost || st == NetworkStatus::ConnectedAsClient ||
+                               st == NetworkStatus::ConnectedAsSpectator || st == NetworkStatus::Connecting;
+        }
+        latency::Tick(now_ms, g_lat_in_session);
     });
     room_->SetRoomInfoCallback([this](const room::RoomInfo& info) { OnRoomInfo(info); });
     // (chat=0: no block, no sink - the room's chat packets go where they always went, unread. A file the card could not give yet
