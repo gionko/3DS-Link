@@ -1,14 +1,17 @@
 // Host-side test of azl/latency.hpp: the latency of the other players from the game's own UDS packets.
 //   1. before the console joins a lobby nothing is taken and nothing is written (no ring: a game thread returns at the first test)
 //   1b. the estimate does not depend on the log: with the log off (g_debug_level 0) the ring still works and Snapshot() has the values
-//   1c. with the log on a "lat: cpu" line says what the module used
+//   (the module has no CPU counter of its own: 3DS Link's "stats:" line already measures the CPU of every thread, the module's included)
 //   2. Pia: the timer echo gives the round trip; after enough packets the estimator locks on Pia and says so
 //   3. PRUDP v1: the ping with a stamp (79-byte request, 91-byte reply) gives the round trip; the lock is on PRUDP
 //   4. a game that sends neither: the packets are counted as other and the first bytes of one are kept
 //   5. the ring never overflows into the estimator: a burst bigger than the ring drops the oldest, not the process
 // The clock is the real one (platform::NowTicks): the delays are made with sleeps, so the checks have a tolerance.
-// Build & run: Tests/run.sh   (argument: off | nolog | cpu | pia | prudp | other | burst; no argument runs all, one process each)
+// Build & run: Tests/run.sh   (argument: off | nolog | pia | prudp | other | burst | file; no argument runs all, one process each)
 #include <chrono>
+#include <ctime>
+#include <map>
+#include <regex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -121,27 +124,6 @@ static void TestNoLog() {
     CHECK(n.age_ms >= 0 && n.rtt_ms >= 28 && n.rtt_ms <= 80); // ... but the estimate is kept
 }
 
-static void TestCpu() {
-    Start();
-    for (int i = 0; i < 60; ++i) {
-        const u16 timer = static_cast<u16>(1000 + i * 100);
-        std::vector<u8> out = PiaPacket(timer, 0);
-        latency::OnSend(2, 0, out.data(), static_cast<u32>(out.size()));
-        SleepMs(5);
-        std::vector<u8> in = PiaPacket(static_cast<u16>(5000 + i * 100), timer);
-        latency::OnRecv(2, 0, in.data(), static_cast<u32>(in.size()));
-    }
-    latency::Tick(2000, true);
-    latency::Tick(11000, true); // 11 s later: the cpu line is due
-    bool found = false;
-    for (const std::string& l : g_lines) {
-        if (l.find("lat: cpu hook") != std::string::npos && l.find("(120 packets)") != std::string::npos && l.find("% of a core") != std::string::npos) found = true;
-    }
-    if (!found) {
-        for (const std::string& l : g_lines) std::printf("  linea: %s\n", l.c_str());
-    }
-    CHECK(found);
-}
 static void TestPia() {
     Start();
     // 40 round trips of about 40 ms with node 2: I send timer T, it answers with echo T (and its own timer)
@@ -213,10 +195,144 @@ static void TestBurst() {
     CHECK(Node(1).age_ms >= 0 || Node(2).age_ms >= 0 || Node(3).age_ms >= 0);
 }
 
+// ---- latency.log: the lines go to their own file, each begun by the console's clock ----
+struct MemFiles : FileLayer {
+    std::map<std::string, std::string> data;
+    int opens = 0, flushes = 0;
+    struct H {
+        std::string path;
+    };
+    void* OpenAppend(const std::string& path) override {
+        ++opens;
+        data[path];
+        return new H{path};
+    }
+    u64 Size(void* f) override { return data[static_cast<H*>(f)->path].size(); }
+    void Write(void* f, const char* d, std::size_t n) override { data[static_cast<H*>(f)->path].append(d, n); }
+    void Flush(void*) override { ++flushes; }
+    void Close(void* f) override { delete static_cast<H*>(f); }
+    void Remove(const std::string& p) override { data.erase(p); }
+    void Rename(const std::string& a, const std::string& b) override {
+        data[b] = data[a];
+        data.erase(a);
+    }
+    bool Exists(const std::string& p) override { return data.count(p) != 0; }
+};
+
+static u64 g_fake_os_ms = 0;
+static u64 FakeClock() {
+    return g_fake_os_ms;
+}
+
+// 2026-11-11 12:20:31.482 on the console's clock (ms since 1900-01-01)
+static u64 OsMs(int y, int mo, int d, int h, int mi, int s, int ms) {
+    struct tm t = {};
+    t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_hour = h; t.tm_min = mi; t.tm_sec = s;
+#ifdef _WIN32
+    const time_t e = _mkgmtime(&t);
+#else
+    const time_t e = timegm(&t);
+#endif
+    return (static_cast<u64>(e) + 2208988800ULL) * 1000ULL + static_cast<u64>(ms);
+}
+
+static bool IsStamped(const std::string& line) { // "hh:mm:ss.mmm lat: ..."
+    if (line.size() < 18) return false;
+    for (int i : {0, 1, 3, 4, 6, 7, 9, 10, 11}) {
+        if (line[i] < '0' || line[i] > '9') return false;
+    }
+    return line[2] == ':' && line[5] == ':' && line[8] == '.' && line.compare(12, 5, " lat:") == 0;
+}
+
+static void TestFile() {
+    MemFiles fs;
+    {
+        latency::LatencyFile file(&fs, "/3ds/3DSLink/");
+        latency::SetSink(&file, &FakeClock);
+        latency::SetNameSource([](int node, char* out, u32 cap) { // (the game's name for node 2; none for the others)
+            if (node != 2 || cap < 4) return false;
+            std::strcpy(out, "Bob");
+            return true;
+        });
+        g_fake_os_ms = OsMs(2026, 11, 11, 12, 20, 31, 482);
+        // log off: the ring still works, nothing is queued for a file, nothing is created
+        SetLogSink([](const char* line) { g_lines.push_back(line); });
+        g_debug_level = 0;
+        latency::Tick(0, false);
+        file.Flush();
+        CHECK(fs.data.empty() && fs.opens == 0);
+        // log on, the console joins a lobby: the ring begins and the file's first line says the day
+        g_debug_level = 1;
+        latency::Tick(0, true);
+        for (int i = 0; i < 40; ++i) {
+            const u16 timer = static_cast<u16>(1000 + i * 100);
+            std::vector<u8> out = PiaPacket(timer, 0);
+            latency::OnSend(2, 0, out.data(), static_cast<u32>(out.size()));
+            SleepMs(20);
+            std::vector<u8> in = PiaPacket(static_cast<u16>(5000 + i * 100), timer);
+            latency::OnRecv(2, 0, in.data(), static_cast<u32>(in.size()));
+        }
+        latency::Tick(2000, true);
+        CHECK(fs.data.empty()); // (queued: the network thread never touches the card)
+        file.Flush();
+        CHECK(fs.data.count("/3ds/3DSLink/latency.log") == 1);
+        const std::string text = fs.data["/3ds/3DSLink/latency.log"];
+        std::printf("latency.log:\n%s", text.c_str());
+        CHECK(!text.empty());
+        std::size_t pos = 0, lines = 0;
+        bool all_stamped = true;
+        while (pos < text.size()) {
+            const std::size_t e = text.find('\n', pos);
+            if (e == std::string::npos) { all_stamped = false; break; }
+            all_stamped = all_stamped && IsStamped(text.substr(pos, e - pos));
+            ++lines;
+            pos = e + 1;
+        }
+        CHECK(all_stamped && lines >= 2);
+        CHECK(text.compare(0, 13, "12:20:31.482 ") == 0); // (the console's clock, hours:minutes:seconds.milliseconds)
+        CHECK(text.find("lat: ---- the console joined a lobby, console clock 2026-11-11 12:20:31.482 ----\n") == 13);
+        CHECK(text.find("lat: n2 \"Bob\" ") != std::string::npos); // (who it was, by name)
+        CHECK(!std::regex_search(text, std::regex("[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}"))); // (and never an address of a console: six pairs of hex digits with colons)
+        CHECK(text.find("lat: nodes sending") != std::string::npos);
+        CHECK(fs.flushes >= 1);
+        // nothing of the module in the main log's sink any more
+        CHECK(!HasLine("lat:"));
+        // the file is written again with the next lines (appended, one handle)
+        g_fake_os_ms += 5000;
+        latency::Tick(9000, true);
+        file.Flush();
+        CHECK(fs.opens == 1);
+        CHECK(fs.data["/3ds/3DSLink/latency.log"].size() > text.size());
+        // the log goes off: what was queued is dropped, nothing more is written
+        latency::Tick(15000, true);
+        g_debug_level = 0;
+        const std::size_t size_off = fs.data["/3ds/3DSLink/latency.log"].size();
+        file.Append("12:00:00.000 lat: late\n", static_cast<u32>(std::strlen("12:00:00.000 lat: late\n")));
+        file.Flush();
+        CHECK(fs.data["/3ds/3DSLink/latency.log"].size() == size_off);
+        latency::SetSink(nullptr, nullptr);
+        latency::SetNameSource(nullptr);
+    }
+    // rotation: when the file reaches its size it becomes latency.1.log (the one before it goes) and a fresh one begins
+    {
+        MemFiles r;
+        g_debug_level = 1;
+        latency::LatencyFile file(&r, "/d/", 100);
+        for (int i = 0; i < 12; ++i) {
+            file.Append("12:00:00.000 lat: 0123456789012345678901234567890\n", static_cast<u32>(std::strlen("12:00:00.000 lat: 0123456789012345678901234567890\n")));
+            file.Flush();
+        }
+        CHECK(r.data.count("/d/latency.1.log") == 1 && r.data.count("/d/latency.log") <= 1);
+        CHECK(r.data.size() <= 2);
+        CHECK(r.data["/d/latency.1.log"].size() >= 100 && r.data["/d/latency.1.log"].size() <= 200);
+        file.Close();
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         int bad = 0;
-        for (const char* mode : {"off", "nolog", "cpu", "pia", "prudp", "other", "burst"}) {
+        for (const char* mode : {"off", "nolog", "pia", "prudp", "other", "burst", "file"}) {
             const std::string cmd = std::string("\"") + argv[0] + "\" " + mode;
             if (std::system(cmd.c_str()) != 0) ++bad;
         }
@@ -226,11 +342,11 @@ int main(int argc, char** argv) {
     const std::string mode = argv[1];
     if (mode == "off") TestOff();
     else if (mode == "nolog") TestNoLog();
-    else if (mode == "cpu") TestCpu();
     else if (mode == "pia") TestPia();
     else if (mode == "prudp") TestPrudp();
     else if (mode == "other") TestOther();
     else if (mode == "burst") TestBurst();
+    else if (mode == "file") TestFile();
     SetLogSink(nullptr);
     if (g_failures) std::printf("%s: %d failure(s)\n", mode.c_str(), g_failures);
     return g_failures ? 1 : 0;

@@ -1,6 +1,7 @@
 // Latency of the other players of a local match, from the game's own UDS packets. See azl/latency.hpp.
 #include "azl/latency.hpp"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -9,11 +10,113 @@
 #include "azl/platform.hpp"
 #include "azl/stats.hpp"
 #include "azl/ticks.h"
+#include "azl/wallclock.hpp"
 
 namespace azl {
 namespace latency {
 
+// ---- latency.log: the queue and the file (the writer thread's side), see latency.hpp ----
 namespace {
+constexpr const char* kFileName = "latency.log";
+constexpr const char* kOldFileName = "latency.1.log";
+constexpr std::size_t kMaxPending = 32 * 1024; // lines waiting for the writer (a second of this module is ~300 bytes)
+} // namespace
+
+LatencyFile::LatencyFile(FileLayer* files, std::string dir, u64 rotate_bytes)
+    : files_(files), dir_(std::move(dir)), rotate_bytes_(rotate_bytes) {}
+
+LatencyFile::~LatencyFile() {
+    Close();
+}
+
+void LatencyFile::Append(const char* text, u32 size) {
+    if (!platform::TryLockBriefly(queue_mutex_)) {
+        if (!platform::IsLogWriterThread()) {
+            __atomic_fetch_add(&dropped_, 1u, __ATOMIC_RELAXED);
+            return;
+        }
+        queue_mutex_.lock();
+    }
+    if (pending_.size() + size <= kMaxPending) {
+        pending_.append(text, size);
+    } else {
+        __atomic_fetch_add(&dropped_, 1u, __ATOMIC_RELAXED);
+    }
+    queue_mutex_.unlock();
+}
+
+void LatencyFile::RotateLocked() {
+    files_->Close(file_);
+    file_ = nullptr;
+    files_->Remove(dir_ + kOldFileName);
+    files_->Rename(dir_ + kFileName, dir_ + kOldFileName);
+    size_ = 0;
+}
+
+void LatencyFile::Flush() {
+    std::string text;
+    {
+        platform::LockGuard lock(queue_mutex_);
+        if (pending_.empty()) {
+            return;
+        }
+        text.swap(pending_);
+    }
+    if (g_debug_level <= 0) {
+        return; // the log was switched off: nothing is created or written (what was queued is dropped)
+    }
+    platform::LockGuard lock(file_mutex_);
+    if (!file_) {
+        file_ = files_->OpenAppend(dir_ + kFileName);
+        if (!file_) {
+            return;
+        }
+        size_ = files_->Size(file_);
+    }
+    files_->Write(file_, text.data(), text.size());
+    files_->Flush(file_);
+    size_ += text.size();
+    if (size_ >= rotate_bytes_) {
+        RotateLocked();
+    }
+}
+
+void LatencyFile::Close() {
+    Flush();
+    platform::LockGuard lock(file_mutex_);
+    if (file_) {
+        files_->Close(file_);
+        file_ = nullptr;
+    }
+}
+
+namespace {
+
+LatencyFile* g_file = nullptr;
+u64 (*g_clock_ms)() = nullptr;
+bool (*g_name_of)(int node, char* out, u32 cap) = nullptr;
+char g_node_name[9][24] = {}; // the last name given for each node (index = node number 1..8) // the name the game gave a node (plain ASCII), for the lines of the log
+
+/// One line of this module: with a file, "hh:mm:ss.mmm text\n" (the console's clock) into latency.log's queue; without, Log().
+void Emit(const char* fmt, ...) {
+    char text[420];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    if (!g_file || !g_clock_ms) {
+        Log("%s", text);
+        return;
+    }
+    char stamp[24];
+    FormatConsoleClock(g_clock_ms(), stamp); // "YYYY-MM-DD hh:mm:ss.mmm": the time of the day is from the 12th character
+    char line[460];
+    const int n = std::snprintf(line, sizeof(line), "%s %s\n", stamp + 11, text);
+    if (n > 0 && n < static_cast<int>(sizeof(line))) {
+        g_file->Append(line, static_cast<u32>(n));
+    }
+}
+
 
 // ---- the ring the game's threads write and the network thread reads ----
 constexpr int kRing = 256; // packets waiting between two rounds of the network thread: a few dozen at most
@@ -34,10 +137,6 @@ Rec* volatile g_ring = nullptr; // created by Tick() when the console joins a lo
 volatile u32 g_head = 0;
 u32 g_tail = 0;
 u32 g_dropped = 0;
-// the CPU this module used (ARM11 ticks), counted only with the log on: the hook on the game's threads, and Tick() on the network thread
-u32 g_cpu_hook_ticks = 0;
-u32 g_cpu_hook_calls = 0;
-u32 g_cpu_tick_ticks = 0;
 
 inline u64 NowUs() {
     return azl_ticks_to_us(platform::NowTicks());
@@ -519,25 +618,11 @@ void OnSend(u16 dest_node, u8 channel, const u8* data, u32 size) {
     if (!g_ring || !data || !size || dest_node > 255) {
         return;
     }
-    if (g_debug_level > 0) { // the log is on: count the ticks this takes (two clock reads), for the "lat: cpu" line
-        const u64 t0 = platform::NowTicks();
-        Push('S', static_cast<u8>(dest_node), channel, size, data);
-        __sync_fetch_and_add(&g_cpu_hook_ticks, static_cast<u32>(platform::NowTicks() - t0));
-        __sync_fetch_and_add(&g_cpu_hook_calls, 1u);
-        return;
-    }
     Push('S', static_cast<u8>(dest_node), channel, size, data);
 }
 
 void OnRecv(u16 src_node, u8 channel, const u8* data, u32 size) {
     if (!g_ring || !data || !size || src_node > 255) {
-        return;
-    }
-    if (g_debug_level > 0) {
-        const u64 t0 = platform::NowTicks();
-        Push('R', static_cast<u8>(src_node), channel, size, data);
-        __sync_fetch_and_add(&g_cpu_hook_ticks, static_cast<u32>(platform::NowTicks() - t0));
-        __sync_fetch_and_add(&g_cpu_hook_calls, 1u);
         return;
     }
     Push('R', static_cast<u8>(src_node), channel, size, data);
@@ -569,39 +654,22 @@ int Pump() {
 struct LogState {
     u64 last_ms = 0;
     u64 proto_ms = 0;
-    u64 cpu_ms = 0;
     u32 mask = 0xFFFFFFFFu;
     int shown[9];
     u64 shown_ms[9];
 };
 LogState g_log;
 
-// "lat: cpu ...": what this module cost in the last window, in ms of CPU per second of wall time (the ticks of the two clock reads that
-// measure it are in it too). hook = the game's threads (OnSend / OnRecv), tick = this thread (Pump, estimates, log lines).
-void LogCpu(u64 now_ms) {
-    const u64 window_ms = now_ms - g_log.cpu_ms;
-    if (window_ms < 9000) {
-        return;
-    }
-    g_log.cpu_ms = now_ms;
-    const u32 hk = g_cpu_hook_ticks, calls = g_cpu_hook_calls, tk = g_cpu_tick_ticks;
-    __sync_fetch_and_sub(&g_cpu_hook_ticks, hk);
-    __sync_fetch_and_sub(&g_cpu_hook_calls, calls);
-    __sync_fetch_and_sub(&g_cpu_tick_ticks, tk);
-    // hundredths of a millisecond of CPU per second: ticks / AZL_TICKS_PER_MS ms in window_ms ms
-    const u64 den = static_cast<u64>(AZL_TICKS_PER_MS) * window_ms;
-    const u64 hook100 = static_cast<u64>(hk) * 100000ULL / den;
-    const u64 tick100 = static_cast<u64>(tk) * 100000ULL / den;
-    const u64 total100 = hook100 + tick100;
-    const u64 pct100 = total100 / 10; // 1 ms/s = 0.1 % of a core: hundredths of a per cent
-    Log("lat: cpu hook %lu.%02lu ms/s (%lu packets), tick %lu.%02lu ms/s, total %lu.%02lu ms/s = %lu.%02lu%% of a core | ring %lu KB, %lu lost",
-        static_cast<unsigned long>(hook100 / 100), static_cast<unsigned long>(hook100 % 100), static_cast<unsigned long>(calls),
-        static_cast<unsigned long>(tick100 / 100), static_cast<unsigned long>(tick100 % 100), static_cast<unsigned long>(total100 / 100),
-        static_cast<unsigned long>(total100 % 100), static_cast<unsigned long>(pct100 / 100), static_cast<unsigned long>(pct100 % 100),
-        static_cast<unsigned long>(sizeof(Rec) * kRing / 1024), static_cast<unsigned long>(g_dropped));
+} // namespace
+
+void SetSink(LatencyFile* file, u64 (*console_clock_ms)()) {
+    g_file = file;
+    g_clock_ms = console_clock_ms;
 }
 
-} // namespace
+void SetNameSource(bool (*name_of)(int node, char* out, u32 cap)) {
+    g_name_of = name_of;
+}
 
 void Tick(u64 now_ms, bool in_session) {
     if (!g_ring) {
@@ -619,16 +687,15 @@ void Tick(u64 now_ms, bool in_session) {
         }
         g_log.last_ms = now_ms;
         g_log.proto_ms = now_ms;
-        g_log.cpu_ms = now_ms;
         g_ring = ring;
+        if (g_debug_level > 0 && g_file && g_clock_ms) { // the file says which day it is once, here: its lines only carry the time of day
+            char day[24];
+            FormatConsoleClock(g_clock_ms(), day);
+            Emit("lat: ---- the console joined a lobby, console clock %s ----", day);
+        }
     }
-    const bool timing = g_debug_level > 0;
-    const u64 t0 = timing ? platform::NowTicks() : 0;
     Pump();
     if (g_debug_level <= 0 || now_ms - g_log.last_ms < 1000) {
-        if (timing) {
-            g_cpu_tick_ticks += static_cast<u32>(platform::NowTicks() - t0);
-        }
         return;
     }
     g_log.last_ms = now_ms;
@@ -642,7 +709,7 @@ void Tick(u64 now_ms, bool in_session) {
     }
     if (mask != g_log.mask) {
         g_log.mask = mask;
-        Log("lat: nodes sending %X", static_cast<unsigned>(mask));
+        Emit("lat: nodes sending %X", static_cast<unsigned>(mask));
     }
     for (int i = 0; i < 8; ++i) {
         const NodeRtt& o = nr[i];
@@ -654,18 +721,30 @@ void Tick(u64 now_ms, bool in_session) {
         if (moved >= 2 || now_ms - g_log.shown_ms[o.node] >= 5000) {
             g_log.shown[o.node] = o.rtt_ms;
             g_log.shown_ms[o.node] = now_ms;
-            Log("lat: n%d %d ms (%d samples, %c)", o.node, o.rtt_ms, o.samples, o.stale ? 'S' : (o.estimated ? 'E' : 'M'));
+            // (the name the game gave the node - its UDS username, plain ASCII, never an address - so that who had which latency can be crossed with who did what)
+            // (the last name the engine gave this node is kept: the engine forgets a node that left, and its last lines still say who it was)
+            char* name = g_node_name[o.node];
+            if (g_name_of != nullptr) {
+                char fresh[sizeof(g_node_name[0])];
+                fresh[0] = '\0';
+                if (g_name_of(o.node, fresh, sizeof(fresh)) && fresh[0] != '\0') {
+                    std::memcpy(name, fresh, sizeof(fresh));
+                }
+            }
+            if (name[0] != '\0') {
+                Emit("lat: n%d \"%s\" %d ms (%d samples, %c)", o.node, name, o.rtt_ms, o.samples, o.stale ? 'S' : (o.estimated ? 'E' : 'M'));
+            } else {
+                Emit("lat: n%d %d ms (%d samples, %c)", o.node, o.rtt_ms, o.samples, o.stale ? 'S' : (o.estimated ? 'E' : 'M'));
+            }
         }
     }
     if (now_ms - g_log.proto_ms >= 30000) {
         g_log.proto_ms = now_ms;
         char pr[300];
         if (ProtoSummary(pr, sizeof(pr)) > 0) {
-            Log("lat: protocol %s", pr);
+            Emit("lat: protocol %s", pr);
         }
     }
-    g_cpu_tick_ticks += static_cast<u32>(platform::NowTicks() - t0); // (the lines above are part of the cost; the cost line itself is not)
-    LogCpu(now_ms);
 }
 
 int Snapshot(NodeRtt out[8]) {

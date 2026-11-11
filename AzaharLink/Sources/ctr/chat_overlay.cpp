@@ -451,6 +451,29 @@ bool ChatNotice(const char* text) {
     return g_overlay.board.Show(text, now_ms);
 }
 
+bool ChatLatencyDue(u32 now_ms) {
+    static u32 last_ms = 0;        // (the network thread's own)
+    static bool published = false; // a picture is in the board
+    const u32 seen = g_overlay.lat_wanted.load(std::memory_order_relaxed);
+    if (seen == 0 || !chat::Recent(now_ms, seen, chat::kLatWantedMs)) {
+        if (published) {
+            published = false;
+            g_overlay.lat.Publish(nullptr, 0); // (the chat went off the screen: the next time it shows, nothing old is under it)
+        }
+        return false;
+    }
+    if (published && now_ms - last_ms < chat::kLatPublishMs) {
+        return false;
+    }
+    last_ms = now_ms;
+    published = true;
+    return true;
+}
+
+void ChatLatencyPublish(const chat::Line* rows, u32 n) {
+    g_overlay.lat.Publish(rows, n);
+}
+
 void ChatNoteNotify() {
     StatsNotePluginOsdNotify(); // (the plugin's own notification, not the chat's: counted apart)
     g_overlay.notices.Note(static_cast<u32>(platform::NowMs()));

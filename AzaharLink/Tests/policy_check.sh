@@ -153,7 +153,7 @@ need_order Sources/ctr/plugin.cpp "config_.chat_pos = ini::ParseChatPos(value);"
 # messages kept in all, 128 characters each (125 and "..." past that), a nick of 20, more than 4 a second dropped before the decoding, one of
 # ours a second. The header allocates nothing and does not use the reader of room_proto.hpp (PacketReader::String mallocs a std::string per
 # field): the packet's lengths are read by hand.
-need Includes/azl/chat_core.hpp "constexpr u32 kLines = 5; " "the chat keeps 5 messages in all"
+need Includes/azl/chat_core.hpp "#define AZL_LINES 5 " "the chat keeps 5 messages in all"
 need Includes/azl/chat_core.hpp "constexpr u32 kTextMax = 128; " "a message is kept to 128 characters"
 need Includes/azl/chat_core.hpp "constexpr u32 kNickMax = 20; " "a nick is kept to 20 characters (the room's own rule)"
 need Includes/azl/chat_core.hpp "constexpr u32 kRateMax = 4; " "more than 4 messages a second are dropped"
@@ -249,8 +249,11 @@ need Tests/chat_draw_test.cpp "    CHECK(chat::ShownLines(v, 0xFFFFFF00u + 10000
 need Includes/azl/chat_draw.hpp "constexpr gfx::Rgb kBg = {13, 14, 17};" "the chat's strips are opaque, in the background of 3DS Link"
 need Includes/azl/chat_draw.hpp "constexpr int kRightEdge = 390; " "the right corners end where the framework's notifications do"
 need Includes/azl/chat_draw.hpp "return notices == 0 ? kBottomY : ((230 - 15 * static_cast<int>(notices) - 3) & ~3);" "the bottom-right corner climbs above the plugin's notifications"
-need Includes/azl/chat_draw.hpp "            const gfx::Rgb bar = l.nick_len == 0 ? kNoticeBar : kNick[NickColour(l.nick, l.nick_len)];" "every block is drawn with its nick's colour, a notification of the plugin with its own"
-need Includes/azl/chat_draw.hpp "            DrawBlock(s, x0, y0, l, w, gfx::Raw(bar, s.format), text_raw, bg_raw);" "every block is drawn with the colour of its bar"
+need Includes/azl/chat_draw.hpp "            const gfx::Rgb bar = l.nick_len == 0 ? kNoticeBar : l.pad >= 1 && l.pad <= kNodeColours ? kNodeColour[l.pad - 1] : kNick[NickColour(l.nick, l.nick_len)];" "every block is drawn with the colour of its player's node (1 light blue, 2 green, 3 yellow, 4 orange, 5 red, 6 purple, 7 white, 8 fuchsia), else its nick's hash, a notification of the plugin with its own"
+need Includes/azl/chat_draw.hpp "constexpr gfx::Rgb kNodeColour[kNodeColours] = {{70, 178, 255}, {74, 218, 128}, {255, 198, 88}, {255, 140, 56}, {255, 72, 72}, {186, 140, 255}, {255, 255, 255}, {255, 90, 210}};" "the colours of the nodes: light blue, green, yellow, orange, red, purple, white, fuchsia (the user's decision, 2026-11-11)"
+need Sources/ctr/plugin.cpp "        sink->SetNodeSource(&ChatNodeOfNick); // (before it is published: the colour of a message follows the node of the player)" "the colour of a message of the chat follows the node of its player"
+need Includes/azl/chat_draw.hpp "            DrawBlock(s, x0, y0, l, w, gfx::Raw(bar, s.format), text_raw, bg_raw, 0, translucent);" "every block is drawn with the colour of its bar, with a shadow instead of a background when asked"
+need Includes/azl/chat_draw.hpp "        gfx::RunColumnFgOnly(left, right, h, ma, mb, ms, ink, bpp);" "the chat's lines have NO black behind them and a black shadow instead (the user's decision, 2026-11-11): written only, nothing of the game is read"
 # Their cost: the lines are drawn on the presenting game thread every frame for 10 s after a message, and the worst frame (5 blocks of two
 # full lines, the 3D on) was 1.7-1.9 million instructions, 6-15 ms of an Old 3DS's frame, when every pixel called the colour's picker and
 # every column divided stride by bpp (the ARM11 has no division: a call to the library's). The pixel's colour is worked out in line, the
@@ -522,7 +525,7 @@ need_line Tests/chat_host_test.cpp "    TestPostWatch();" "the chat host's test 
 need Includes/azl/chat_draw.hpp "    return 3 - corner; // (top-left <-> bottom-right, top-right <-> bottom-left)" "the plugin's notifications go to the corner opposite the chat"
 need Includes/azl/chat_host.hpp "    const int across = Opposite(corner);" "the callback draws the notifications in the corner opposite the chat"
 need Includes/azl/chat_host.hpp "    if (notes != 0 && DrawChatLines(fb, board, notes, across, across == kBottomRight ? young : 0, kNoLimit, &limit) != 0) {" "the notifications are drawn first, and say where their stack ends"
-need Includes/azl/chat_host.hpp "    if (shown != 0 && DrawChatLines(fb, v, shown, corner, corner == kBottomRight ? young : 0, limit) != 0) {" "the chat's stack stops where the notifications' begins"
+need Includes/azl/chat_host.hpp "    if (shown != 0 && DrawChatLines(fb, v, shown, corner, corner == kBottomRight ? young : 0, limit, nullptr, true) != 0) {" "the chat's stack stops where the notifications' begins, and its lines are translucent (the notifications of the plugin stay opaque)"
 need_after Includes/azl/chat_host.hpp "    if (!TopUsable(fb)) {" "        o.top_seen.store(0, std::memory_order_relaxed);" "a top screen the layer refuses is told to the plugin's thread: its notifications go to the framework"
 need Includes/azl/chat_host.hpp "constexpr u32 kTopSeenMs = 500; " "a notification goes to the chat's callback only if it drew the top screen in the last half second"
 need Sources/ctr/chat_overlay.cpp "    if (!g_osd_running || g_overlay.on.load(std::memory_order_relaxed) == 0) {" "with the chat off or never on the notifications are the framework's"
@@ -530,6 +533,25 @@ need Sources/ctr/chat_overlay.cpp "    if (seen == 0 || !chat::Recent(now_ms, se
 need_after Sources/ctr/chat_overlay.cpp "void Notify(const char* text) {" "    if (ChatNotice(text)) {" "the chat's own notifications go to the opposite corner too"
 need_after Sources/main.cpp "        if (!azl::ctr::ChatNotice(message.c_str())) {" "            OSD::Notify(message);" "a notification the chat's callback cannot show is the framework's, whole"
 need_line Tests/chat_host_test.cpp "    TestNotices();" "the chat host's test draws the notifications in the opposite corner of every corner, and a refused screen told"
+# The latency of the other players on the chat's screen (the user's request, 2026-11-11): drawn ONLY while the keyboard of the chat is open (not when messages come in: the user's request, 2026-11-11),
+# like a message of the chat (a block of one line, bar and nick in the colour of the scale), in the free corner beside the notifications' (same row, the half of the
+# screen the chat does not use: 3 players at most, so no message of the chat reaches it), under the plugin's notifications; the chat's stack stops where it begins, should it ever; the plugin's thread builds the lines only while the
+# drawing asks for them (and the log's lines of the module go to latency.log, each with the console's clock: the file is written by the log writer).
+need Includes/azl/chat_draw.hpp "    return rtt_ms < 0 ? 5 : rtt_ms <= 30 ? 0 : rtt_ms <= 60 ? 1 : rtt_ms <= 100 ? 2 : rtt_ms <= 150 ? 3 : 4;" "the colour scale: blue to 30 ms, green 31-60, yellow 61-100, orange 101-150, red over 150, grey with no value"
+need Includes/azl/chat_host.hpp "    const int lat_corner = corner ^ 2;" "the latency goes in the free corner beside the notifications', on the half of the screen the chat does not use"
+need Includes/azl/chat_host.hpp "    const bool lat_drawn = sink != nullptr && keyboard && DrawLatency(o, fb, now_ms, corner, young, &lat_edge);" "the latency is drawn only while the keyboard is open, at the height of the notifications (before them: a notification wins where they meet), and the chat's stack stops where the farthest of the two begins"
+need Includes/azl/chat_latency.hpp "    if (present > kLatShown) { // more than four players in the lobby: one strip of tiles, \"<node digit or H for the host><latency colour>\" a player (see kLatTiles)" "up to four players in the lobby one block each, more than that one strip of tiles with every player in it"
+need Includes/azl/chat_draw.hpp "constexpr u8 kLatTiles = 0xFF;" "the board of a big lobby is one line marked as tiles"
+need Includes/azl/chat_host.hpp "    o.lat_wanted.store(now_ms | 1u, std::memory_order_relaxed);" "the drawing asks the plugin's thread for the latency lines"
+need Includes/azl/chat_host.hpp "    if (lv.count == 0 || !Recent(now_ms, lv.lines[lv.count - 1].t_ms, kLatStaleMs)) {" "a picture nobody refreshed lately is not drawn"
+need Sources/ctr/chat_overlay.cpp "    if (seen == 0 || !chat::Recent(now_ms, seen, chat::kLatWantedMs)) {" "the plugin's thread builds the latency lines only while the drawing asks for them"
+need Sources/ctr/plugin.cpp "        if (ChatLatencyDue(static_cast<u32>(now_ms))) { // (the keyboard is open: its latency lines, 4 a second)" "the network thread builds the chat's latency lines when they are due"
+need Sources/ctr/plugin.cpp "    latency::SetSink(g_latency_file, g_latency_file ? &ConsoleClockMs : nullptr);" "the lines of the latency module go to latency.log with the console's clock"
+need Sources/ctr/plugin.cpp "            g_latency_file->Flush(); // (latency.log: on this thread, inside the swap gate, like the main log)" "latency.log is written by the log writer thread, inside the swap gate"
+need Sources/azl/latency.cpp '    const int n = std::snprintf(line, sizeof(line), "%s %s\n", stamp + 11, text);' "every line of latency.log begins with the time of day of the console's clock"
+need_line Tests/chat_host_test.cpp "    TestLatencyScreen();" "the chat host's test draws the latency in every corner, only with the keyboard open, and holds the chat's stack back"
+need Sources/azl/latency.cpp 'Emit("lat: n%d \"%s\" %d ms (%d samples, %c)", o.node, name,' "the lines of latency.log say who a node is by the name the game gave it (never an address)"
+need_line Tests/latency_test.cpp "static void TestFile() {" "the latency test holds latency.log: stamped lines, nothing with the log off, the rotation"
 hit=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -n -E '(->|\.)(Post|OutboxBusy)\(' | head -2)
 [ -z "$hit" ] || fail "Sources/ctr/chat_overlay.cpp posts to the chat's box by itself (chat::SubmitDraft asks the box first: a draft is never lost): $hit"
 # On the game's thread only the copy (review of the chat, O11): the OSD callback's region never sends, feeds or redraws the keyboard nor cleans
@@ -1724,7 +1746,7 @@ game_thread_file Includes/azl/gfx_surface.hpp 1
 game_thread_file Includes/azl/chat_draw.hpp 1
 # ... and the chat over the running game: the hook's count of the notifications, the handshake of the keyboard's picture and the callback's
 # drawing (Includes/azl/chat_host.hpp), and the callback itself (Sources/ctr/chat_overlay.cpp)
-game_thread_file Includes/azl/chat_host.hpp 4
+game_thread_file Includes/azl/chat_host.hpp 5
 game_thread_file Sources/ctr/chat_overlay.cpp 1
 # ... and the input mirror's way back, which the hook runs on the game's thread that got a notification (Sources/ctr/input_mirror.cpp,
 # MirrorRestoreFromGame and the kernel's calls under it; Includes/azl/hid_mirror.hpp, the Switcher)
