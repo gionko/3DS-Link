@@ -6,6 +6,8 @@
 
 #include <3ds.h>
 
+#include "azl/chat_core.hpp"
+
 namespace azl {
 namespace ctr {
 
@@ -24,6 +26,14 @@ bool ChatNotice(const char* text);
 
 /// Next to every OSD::Notify of the plugin's thread: the bottom-right corner of the chat climbs above the notifications on screen.
 void ChatNoteNotify();
+
+/// The network thread, every round: true when the lines of the latency are to be built now - the keyboard is open (its drawing asked for them
+/// within chat::kLatWantedMs) and chat::kLatPublishMs went by since the last time. False otherwise (and the picture is emptied once when the chat
+/// goes off the screen). Costs a load and a compare when the chat is not shown.
+bool ChatLatencyDue(u32 now_ms);
+
+/// The network thread: the picture of the latency is these `n` rows (chat::BuildLatencyRows), at most chat::kLines, oldest first.
+void ChatLatencyPublish(const chat::Line* rows, u32 n);
 
 /// The framework's process events, on its keep-alive thread, BEFORE Plugin::NoteProcessEvent: only counted (HOME_ENTER, SWAP_ENTER, SLEEP_ENTER
 /// and EXIT close the keyboard at the next frame; between SWAP_ENTER and SWAP_EXIT it does not open).

@@ -32,7 +32,10 @@ namespace chat {
 constexpr u8 kIdChatMessage = 6;   ///< room::IdChatMessage (room_client.cpp asserts they are the same)
 constexpr u32 kNickMax = 20;       ///< the room's own rule for a nickname: [ a-zA-Z0-9._-]{4,20}
 constexpr u32 kTextMax = 128;      ///< characters kept of a message, and the most one of ours may have
-constexpr u32 kLines = 5;          ///< messages kept in all: the next one pushes the oldest out
+#ifndef AZL_LINES
+#define AZL_LINES 5 // (the screenshots' tool tries more)
+#endif
+constexpr u32 kLines = AZL_LINES;  ///< messages kept in all: the next one pushes the oldest out
 constexpr u32 kRateMax = 4;        ///< messages decoded in any sliding second ...
 constexpr u32 kRateWindowMs = 1000; ///< ... of this length
 constexpr u32 kRatePerMember = 2;  ///< of them, the most from one member (one flooding leaves the others 2 a second)
@@ -127,6 +130,28 @@ inline u32 Sanitize(const u8* in, std::size_t n, char* out, u32 cap, bool ellips
     return len;
 }
 
+/// Characters of a nick on the screen (the user's decision, 2026-11-11, for the chat and the latency: what a game's own names are, 8 at most).
+constexpr u32 kNickShown = 8;
+
+/// A nick as the screen shows it: at most kNickShown characters, then a "." when there were more ("Carlo Ma." for "Carlo Magno 2"; "Kamisama" whole). No space is left
+/// before the dot. `nick` holds the cleaned nick (kNickMax + 1 bytes) and `len` its length; returns the new length. The colour of a message does not come from this
+/// text (it comes from the player's node), and the node is found from the whole nick before the cut.
+inline u32 CutNick(char* nick, u32 len, u32 shown = kNickShown) {
+    if (len <= shown) {
+        return len;
+    }
+    u32 n = shown;
+    while (n > 0 && nick[n - 1] == ' ') {
+        --n;
+    }
+    nick[n++] = '.';
+    nick[n] = '\0';
+    return n;
+}
+
+/// Line::pad of a message whose writer is not a player of the match this console is in (1..8 = his node, 0 = not known / no match): see chat_draw.hpp kOutside.
+constexpr u8 kPadOutside = 9;
+
 /// One line of the chat. Its size is a whole number of words: the ring copies it a word at a time.
 struct Line {
     u32 t_ms = 0;   ///< when it came (or went), on the clock of the network thread
@@ -136,6 +161,7 @@ struct Line {
     u8 pad = 0;
     char nick[kNickMax + 1] = {};
     char text[kTextMax + 1] = {};
+    char sep = ' '; ///< the character after "Nick:" - a space; 0: none ("Ana:28ms", the latency lines). In the padding that rounds the line up to a word
 };
 constexpr u32 kLineWords = (sizeof(Line) + 3) / 4;
 static_assert(sizeof(Line) == kLineWords * 4, "a line is copied a word at a time");
@@ -266,6 +292,29 @@ public:
         seq_.store(s + 2, std::memory_order_release);
     }
 
+    /// The writer (the network thread only): the ring becomes exactly these `n` lines (kLines at most; 0 empties it), oldest first, under ONE
+    /// sequence: a reader sees the old picture or the new one, never a mix (Push of n lines would show it half changed). For a board whose
+    /// content is replaced, not appended to: the latency lines of the chat (azl/chat_host.hpp, LatencyBoard).
+    void Replace(const Line* lines, u32 n) {
+        if (n > kLines) {
+            lines += n - kLines; // (the newest kLines: as n pushes would keep)
+            n = kLines;
+        }
+        const u32 s = seq_.load(std::memory_order_relaxed);
+        seq_.store(s + 1, std::memory_order_relaxed);
+        for (u32 i = 0; i < n; ++i) {
+            u32 words[kLineWords];
+            std::memcpy(words, &lines[i], sizeof(Line));
+            for (u32 w = 0; w < kLineWords; ++w) {
+                __atomic_store_n(&slots_[i][w], words[w], __ATOMIC_RELEASE);
+            }
+        }
+        head_ = n % kLines; // (the reader finds line i of n in slot (head + kLines - n + i) % kLines = i)
+        count_ = n;
+        __atomic_store_n(&meta_, head_ | (count_ << 8), __ATOMIC_RELEASE);
+        seq_.store(s + 2, std::memory_order_release);
+    }
+
     u32 seq() const {
         return seq_.load(std::memory_order_acquire);
     }
@@ -355,6 +404,14 @@ public:
     ChatSink(const ChatSink&) = delete;
     ChatSink& operator=(const ChatSink&) = delete;
 
+    /// Who writes under a nickname: the node (1..8) of the player in the match, kPadOutside = not a player of the match this console is in, 0 = not known (no match).
+    /// Set once by the plugin before the sink is used; the network thread calls it
+    /// for every message taken and every message of ours kept, and the node goes into the line (Line::pad), whose colour the drawing takes from it (kNodeColour).
+    using NodeOfNick = u8 (*)(const char* nick, u32 len);
+    void SetNodeSource(NodeOfNick f) {
+        node_of_ = f;
+    }
+
     // ---- the network thread ----
     /// The rate limit, before the decoding: false (and counted) for a message past kRateMax in the last second, or past
     /// kRatePerMember of its sender's (`tag`: chat::SenderTag of the packet).
@@ -374,6 +431,8 @@ public:
             return false;
         }
         line.t_ms = now_ms;
+        line.pad = node_of_ != nullptr ? node_of_(line.nick, line.nick_len) : 0; // (from the whole nick: the cut comes after)
+        line.nick_len = static_cast<u8>(chat::CutNick(line.nick, line.nick_len));
         ring.Push(line);
         counters.taken.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -409,6 +468,8 @@ public:
             line.text_len = static_cast<u8>(out_len_);
             line.own = 1;
             line.t_ms = now_ms;
+            line.pad = node_of_ != nullptr ? node_of_(line.nick, line.nick_len) : 0;
+            line.nick_len = static_cast<u8>(chat::CutNick(line.nick, line.nick_len));
             ring.Push(line);
             has_sent_ = true;
             last_send_ms_ = now_ms;
@@ -468,6 +529,7 @@ public:
 private:
     chat::RateLimit rate_;      ///< the network thread's
     u32 send_gap_ms_;
+    NodeOfNick node_of_ = nullptr; ///< see SetNodeSource: set before the sink is used, never changed
     bool has_sent_ = false;     ///< the network thread's ...
     u32 last_send_ms_ = 0;      ///< ... when ours last went
     std::atomic<u32> out_full_{0};

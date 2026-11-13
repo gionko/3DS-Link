@@ -11,7 +11,9 @@
 #include <new>
 
 #include "azl/chat_core.hpp"
+#include "azl/chat_latency.hpp"
 #include "azl/exit_guard.hpp"
+#include "azl/latency.hpp"
 #include "azl/log.hpp"
 #include "azl/plg_guard.hpp"
 #include "azl/plugin_compare.hpp"
@@ -23,6 +25,7 @@
 #include "azl/ticks.h"
 #include "azl/wallclock.hpp"
 #include "ctr/boot_diag.hpp"
+#include "ctr/chat_overlay.hpp"
 #include "ctr/gate_page.hpp"
 #include "ctr/input_mirror.hpp"
 #include "ctr/soc.hpp"
@@ -41,6 +44,10 @@ namespace azl {
 namespace ctr {
 
 namespace {
+
+// The latency module (azl/latency.hpp), asked from the room's tick (the network thread): is the console in a network, as of the last check.
+u64 g_lat_check_ms = 0;
+bool g_lat_in_session = false;
 
 // The framework's connection to Luma3DS's plugin loader (azl/plg_guard.hpp): made by __wrap_plgLdrInit (at the end of this file) on the keep-alive
 // thread before PatchProcess, read by __wrap_PLGLDR__FetchEvent and by EarlyInit; and the line about it (EarlyInit: the synchronous file, then the log).
@@ -651,6 +658,56 @@ Plugin& Plugin::Get() {
 
 namespace {
 
+/// latency.log (azl/latency.hpp): made in EarlyInit, never deleted (like Plugin::Get: a thread that outlives Shutdown may still hold it); written by the log writer thread.
+latency::LatencyFile* g_latency_file = nullptr;
+
+/// The name of a node: the NICKNAME the room lists for the player (the one the chat writes, so the two always agree - found through the node's MAC, which
+/// is never written anywhere), else its UDS username as plain ASCII ("P<node>" when it has none). `out` holds chat::kNickMax + 1. For the chat's latency lines
+/// and latency.log; from the engine the room callback was given.
+UdsEngine* g_lat_engine = nullptr;
+bool NodeDisplayName(int node, char* out) {
+    if (g_lat_engine == nullptr) {
+        return false;
+    }
+    Mac mac;
+    if (g_lat_engine->NodeMac(static_cast<u16>(node), &mac) && Plugin::Get().RoomNickOfMac(mac, out)) {
+        return true;
+    }
+    NodeInfo info;
+    if (g_lat_engine->GetNodeInformation(static_cast<u16>(node), &info) != res::kSuccess) {
+        return false;
+    }
+    chat::LatencyName(node, info.username, out);
+    return true;
+}
+bool LatencyNameOf(int node, char* out, u32 cap) {
+    char name[chat::kNickMax + 1];
+    if (cap < sizeof(name) || !NodeDisplayName(node, name)) {
+        return false;
+    }
+    std::memcpy(out, name, sizeof(name));
+    return true;
+}
+
+/// The latency lines of the chat (azl/chat_latency.hpp), built on the network thread while the keyboard is open (ChatLatencyDue): the estimates
+/// of the nodes that still send, with the names the game gave them (the UDS node information).
+void PublishChatLatency(UdsEngine& engine, u32 now_ms) {
+    static chat::Line rows[chat::kLines]; // (the network thread's: static, not on its stack)
+    static char names[9][chat::kNickMax + 1];
+    static bool has_name[9];
+    latency::NodeRtt nr[8];
+    latency::Snapshot(nr);
+    for (int i = 0; i < 8; ++i) {
+        const int node = nr[i].node;
+        has_name[node] = false;
+        if (nr[i].age_ms < 0) {
+            continue;
+        }
+        has_name[node] = NodeDisplayName(node, names[node]);
+    }
+    ChatLatencyPublish(rows, chat::BuildLatencyRows(nr, names, has_name, now_ms, rows));
+}
+
 /// The file layer of the log on the console: CTRPluginFramework's File.
 class CtrFiles : public FileLayer {
 public:
@@ -691,6 +748,62 @@ public:
 
 } // namespace
 
+bool Plugin::RoomNickOfMac(const Mac& mac, char* out) {
+    if (!platform::TryLockBriefly(members_mutex_)) {
+        return false; // (the list is being changed: the name comes the next time)
+    }
+    bool found = false;
+    for (const RoomMemberRow& m : room_members_) {
+        if (m.mac == mac) {
+            const u32 n = chat::Sanitize(reinterpret_cast<const u8*>(m.nickname.data()), m.nickname.size(), out, chat::kNickMax, false);
+            out[n] = '\0';
+            found = n > 0;
+            break;
+        }
+    }
+    members_mutex_.unlock();
+    return found;
+}
+
+u8 Plugin::NodeOfNick(const char* nick, u32 len) {
+    if (!engine_ || len == 0) {
+        return 0;
+    }
+    Mac mac{};
+    bool found = false;
+    if (!platform::TryLockBriefly(members_mutex_)) {
+        return 0; // (the list is being changed: this message has the colour of its nick's hash)
+    }
+    for (const RoomMemberRow& m : room_members_) {
+        char clean[chat::kNickMax + 1];
+        const u32 n = chat::Sanitize(reinterpret_cast<const u8*>(m.nickname.data()), m.nickname.size(), clean, chat::kNickMax, false);
+        if (n == len && std::memcmp(clean, nick, len) == 0) {
+            mac = m.mac;
+            found = true;
+            break;
+        }
+    }
+    members_mutex_.unlock();
+    // Who writes is not a player of OUR match (not in the room's list any more, or with no node): while this console is in a match his messages are
+    // grey (chat::kPadOutside), never the colour of a node - the hash of a nick falls on the colours of nodes 1, 2, 3, 4 and 6, and he would look
+    // like one of the players the latency lists. Out of a match (nobody has a node) the nicks keep the colours of their hash, as always.
+    const u16 mine = engine_->MyNodeId();
+    const u8 none = mine >= 1 && mine <= 8 ? chat::kPadOutside : 0;
+    if (!found) {
+        return none;
+    }
+    for (u16 node = 1; node <= 8; ++node) {
+        Mac node_mac;
+        if (engine_->NodeMac(node, &node_mac) && node_mac == mac) {
+            return static_cast<u8>(node);
+        }
+    }
+    if (room_ && mac == room_->mac() && mine >= 1 && mine <= 8) {
+        return static_cast<u8>(mine); // (it is us: our own node)
+    }
+    return none;
+}
+
 bool Plugin::SetDebugLevel(int level) {
     level = level >= 1 ? 1 : 0;
     config_.debug = level;
@@ -718,6 +831,11 @@ void Plugin::SetChatOn(bool on) {
     Log("chat: %s (from the in-game menu)", on ? "ON" : "OFF");
 }
 
+// ChatSink::SetNodeSource: the node of the player who writes under a nick (the colour of his messages).
+static u8 ChatNodeOfNick(const char* nick, u32 len) {
+    return Plugin::Get().NodeOfNick(nick, len);
+}
+
 void Plugin::WireChat(bool on) {
     if (!active_ || !room_) {
         return; // (the plugin off: nothing of the chat exists, whatever the switch says)
@@ -732,6 +850,7 @@ void Plugin::WireChat(bool on) {
             Log("chat: no memory for its %lu bytes: the chat stays off for this launch", static_cast<unsigned long>(sizeof(ChatSink)));
             return;
         }
+        sink->SetNodeSource(&ChatNodeOfNick); // (before it is published: the colour of a message follows the node of the player)
         chat_sink_.store(sink, std::memory_order_release);
         Log("chat: %lu bytes for the lines and the box, kept until the game ends", static_cast<unsigned long>(sizeof(ChatSink)));
     }
@@ -760,6 +879,9 @@ void Plugin::ServiceLog() {
             LogClockLine(last_clock_ms_ == 0 ? "log started" : "every minute");
         }
         log_files_->Flush();
+        if (g_latency_file) {
+            g_latency_file->Flush(); // (latency.log: on this thread, inside the swap gate, like the main log)
+        }
     }
 }
 
@@ -1301,6 +1423,7 @@ void Plugin::LogStats(u64 now_ms) {
     // What the window says goes on the screen at every level: the numbers of the menu's status page and the
     // warnings. Only the lines below are the log's.
     const RoomClient::LinkStats link = room_->link_stats();
+    latency::NoteLink(link.rtt_ms, link.rtt_var_ms, link.loss_permille); // (latency.log writes this console's own link next to the players' latency)
     NoteStatusNumbers(s, dt, link);
     CheckStatsWarnings(s, now_ms);
     CheckDebugLoad(s);
@@ -2106,6 +2229,8 @@ void Plugin::EarlyInit() {
     log_files_->SetConsoleClock(&ConsoleClockMs); // (the first line of every capture file)
     log_files_->SetStopCapture(&g_swap_gate.closed); // (the writer leaves the card when an Old 3DS is about to swap the block out)
     SetLogSink([this](const char* line) { log_files_->Append(line); });
+    g_latency_file = new (std::nothrow) latency::LatencyFile(file_layer_.get(), kDataDir); // (latency.log: the lines of the latency module, with the console's clock)
+    latency::SetSink(g_latency_file, g_latency_file ? &ConsoleClockMs : nullptr);
 
     // The settings come first. Two of them have to be known BEFORE the game runs and before the first line is
     // logged: whether the plugin is on at all (the hooks cannot be taken out later without breaking sessions the
@@ -2323,10 +2448,24 @@ void Plugin::EarlyInit() {
     room_->SetWifiPrefilter([this](const u8* message, std::size_t size) { return engine_->TryDiscardEncoded(message, size); });
     // (after the engine's own round: the hub serves the request a game thread left and pumps the lobby, on this thread - the one
     // thread that may call the lobby's network side. dlp_hub_ is set above, before the room exists as a thread, and never changed.)
+    g_lat_engine = engine_.get(); // (the log of the latency module names the nodes: latency::SetNameSource)
+    latency::SetNameSource(&LatencyNameOf);
     room_->SetTickCallback([this](u64 now_ms) {
         engine_->Tick(now_ms);
         if (dlp_hub_) {
             dlp_hub_->Tick();
+        }
+        // the latency of the other players, from the game's UDS packets: its ring begins when the console hosts, joins or watches a
+        // network (the engine's status, asked at most 4 times a second); with the log on it writes "lat: ..." lines
+        if (now_ms - g_lat_check_ms >= 250) {
+            g_lat_check_ms = now_ms;
+            const NetworkStatus st = engine_->status();
+            g_lat_in_session = st == NetworkStatus::ConnectedAsHost || st == NetworkStatus::ConnectedAsClient ||
+                               st == NetworkStatus::ConnectedAsSpectator || st == NetworkStatus::Connecting;
+        }
+        latency::Tick(now_ms, g_lat_in_session);
+        if (ChatLatencyDue(static_cast<u32>(now_ms))) { // (the keyboard is open: its latency lines, 4 a second)
+            PublishChatLatency(*engine_, static_cast<u32>(now_ms));
         }
     });
     room_->SetRoomInfoCallback([this](const room::RoomInfo& info) { OnRoomInfo(info); });
@@ -2992,6 +3131,9 @@ void Plugin::Shutdown() {
         // (A breadcrumb thread that is stuck in a write holds only the trail's lock, which Close() does not wait for.) With the
         // log off there is nothing to write and no file is open.
         log_files_->Close();
+        if (g_latency_file) {
+            g_latency_file->Close();
+        }
     } else {
         // The writer is still in a write to the card and holds the file lock; it stops after that write (BeginShutdown set its
         // deadline). The main log's last lines - 'shutdown: done' above all - get a short wait for the lock, not Close()'s full

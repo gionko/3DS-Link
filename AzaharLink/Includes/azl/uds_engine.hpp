@@ -287,6 +287,11 @@ public:
     /// and the mask of the nodes present (bit n-1 = node n). False, with both 0, when we are not in a network (a host, a client or
     /// a spectator).
     bool NodeSnapshot(u16* my_node, u16* node_bitmask) const;
+    /// The MAC of node `node_id` of the network this engine is in (the host's for node 1); false when it is not known. For the plugin to name a node by
+    /// the room member that has that MAC (the latency lines of the chat). The MAC is never written anywhere.
+    bool NodeMac(u16 node_id, Mac* out) const;
+    /// Our own node number in the network this engine is in (1 for a host), 0 when it is not in one. For the colour of our own messages.
+    u16 MyNodeId() const;
 
     // ---- The REAL Download Play (1.1.3, the RealDlp mode: analysis/luigi-azahar-2026-11-09/PROGETTO-DLP-VERO-1.1.3.md) ----------
     // The games of that mode find their group with the Download Play that Azahar emulates: a network of the Download Play's

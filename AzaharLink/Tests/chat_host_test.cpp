@@ -35,6 +35,7 @@ static unsigned long g_stores[5]; // [1], [2], [4]: stores of that many bytes
 #define AZL_GFX_COUNT_STORE(bytes) (++g_stores[(bytes)])
 
 #include "azl/chat_host.hpp"
+#include "azl/chat_latency.hpp"
 #include "azl/osk_draw.hpp"
 
 using namespace azl;
@@ -1210,6 +1211,469 @@ static void TestNotices() {
     CHECK(g_draw_allocs == 0);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The latency of the other players on the chat's screen (the user's request, 2026-11-11)
+// ---------------------------------------------------------------------------------------------
+
+static int CountColour(const Fb& fb, int xa, int xb, int ya, int yb, gfx::Rgb c) { // pixels of colour c in the columns xa..xb-1 and rows ya..yb-1
+    int n = 0;
+    for (int x = xa; x < xb; ++x) {
+        for (int y = ya; y < yb; ++y) {
+            n += IsColour(fb, x, y, c) ? 1 : 0;
+        }
+    }
+    return n;
+}
+
+// The colour of the messages of the chat follows the NODE of the player (the user's decision, 2026-11-11): 1 light blue, 2 green, 3 yellow, 4 orange, 5 red,
+// 6 purple, 7 white, 8 fuchsia - whatever the nick; a player with no node (not known) keeps the colour of his nick's hash.
+static u8 TestNodeOf(const char* nick, u32 len) {
+    if (len == 3 && std::memcmp(nick, "Ana", 3) == 0) return 3;
+    if (len == 3 && std::memcmp(nick, "Bob", 3) == 0) return 8;
+    if (len == 3 && std::memcmp(nick, "Eve", 3) == 0) return chat::kPadOutside; // (in the room, not a player of this console's match)
+    return 0;
+}
+
+static void TestChatNodeColour() {
+    static ChatSink sink;
+    sink.SetNodeSource(&TestNodeOf);
+    u8 packet[256];
+    const u32 t0 = 700000;
+    CHECK(sink.OnPacket(packet, PacketOf(packet, "Ana", "hello"), t0));
+    CHECK(sink.OnPacket(packet, PacketOf(packet, "Dan", "hi"), t0 + 2000));
+    CHECK(sink.OnPacket(packet, PacketOf(packet, "Bob", "yo"), t0 + 4000));
+    CHECK(sink.OnPacket(packet, PacketOf(packet, "Eve", "me too"), t0 + 4005));
+    const chat::View& v = sink.reader.Refresh(sink.ring);
+    CHECK(v.count == 4 && v.lines[0].pad == 3 && v.lines[1].pad == 0 && v.lines[2].pad == 8 && v.lines[3].pad == chat::kPadOutside);
+    chat::Overlay o;
+    o.sink.store(&sink);
+    o.on.store(1);
+    o.corner.store(chat::kTopLeft); // the blocks go down from row 8: one line each, 12 rows and a gap of 4
+    Fb top(gfx::kBGR8, 240, 400);
+    CHECK(Draw(o, top.s, true, t0 + 4010) == chat::kDrewLines);
+    CHECK(IsColour(top, 6, 8, chat::kNodeColour[2]));                                   // Ana, node 3: yellow
+    CHECK(IsColour(top, 6, 24, chat::kNick[chat::NickColour("Dan", 3)]));               // Dan, no node: the hash's colour
+    CHECK(IsColour(top, 6, 40, chat::kNodeColour[7]));                                   // Bob, node 8: fuchsia
+    CHECK(IsColour(top, 6, 48, chat::kOutside));                                         // Eve, outside the match (the 4th block: rows 44-55): grey ...
+    for (u32 i = 0; i < chat::kNodeColours; ++i) {                                       // ... which is no node's colour (the hash's colours are those of nodes 1, 2, 3, 4, 6)
+        CHECK(std::memcmp(&chat::kOutside, &chat::kNodeColour[i], sizeof(chat::kOutside)) != 0);
+    }
+    // the name too, not only the bar: Ana's "Ana" is yellow
+    CHECK(CountColour(top, 6 + 6, 6 + 6 + 3 * 6, 8, 20, chat::kNodeColour[2]) > 15);
+    // no source (the PC probe's sink, the tests of the chat): every message is the hash's colour, pad 0
+    static ChatSink plain;
+    CHECK(plain.OnPacket(packet, PacketOf(packet, "Ana", "hello"), t0));
+    CHECK(plain.reader.Refresh(plain.ring).lines[0].pad == 0);
+}
+// The estimates of nodes: nodes[i] = {node, rtt, stale}; the others do not send.
+struct LatNode {
+    int node;
+    int rtt;
+    bool stale;
+};
+static u32 MakeRows(const LatNode* in, int n, const char* const* names, u32 now_ms, chat::Line* rows) {
+    latency::NodeRtt nr[8];
+    char units[9][chat::kNickMax + 1] = {}; // (the name to show for each node: the room's nickname of the player, else its console name)
+    bool has[9] = {};
+    for (int i = 0; i < 8; ++i) {
+        nr[i].node = i + 1;
+    }
+    for (int k = 0; k < n; ++k) {
+        latency::NodeRtt& o = nr[in[k].node - 1];
+        o.age_ms = 5;
+        o.rtt_ms = in[k].rtt;
+        o.stale = in[k].stale;
+        if (names != nullptr && names[k] != nullptr) {
+            has[in[k].node] = true;
+            std::strncpy(units[in[k].node], names[k], chat::kNickMax);
+        }
+    }
+    return chat::BuildLatencyRows(nr, units, has, now_ms, rows);
+}
+
+static void TestLatencyRows() {
+    // the colour scale: blue to 30, green 31-60, yellow 61-100, orange 101-150, red over 150, grey for none
+    const int edges[][2] = {{0, 0}, {30, 0}, {31, 1}, {60, 1}, {61, 2}, {100, 2}, {101, 3}, {150, 3}, {151, 4}, {900, 4}, {-1, 5}};
+    for (const auto& e : edges) {
+        CHECK(chat::LatencyColour(e[0]) == e[1]);
+    }
+    CHECK(chat::kLatColour[0].r == chat::kNick[0].r && chat::kLatColour[0].g == chat::kNick[0].g); // (the blue of 3DS Link's nick)
+    {   // the value's text: "64ms", "~64ms" for an old value, "64ms!" while the last 2 s are shown instead of the window (a spike), "--" for none
+        char t[12];
+        CHECK(chat::LatencyText(64, false, t) == 4 && std::strcmp(t, "64ms") == 0);
+        CHECK(chat::LatencyText(64, true, t) == 5 && std::strcmp(t, "~64ms") == 0);
+        CHECK(chat::LatencyText(480, false, t, true) == 6 && std::strcmp(t, "480ms!") == 0);
+        CHECK(chat::LatencyText(-1, false, t, true) == 2 && std::strcmp(t, "--") == 0);
+    }
+    // the rows: in the order of the nodes, the host marked, a name read from the username, "P<node>" for none or for no plain ASCII
+    {
+        const LatNode in[] = {{1, 64, false}, {3, -1, false}, {2, 31, true}};
+        const char* names[] = {"Ana", nullptr, nullptr};
+        chat::Line rows[chat::kLines];
+        const u32 n = MakeRows(in, 3, names, 777, rows);
+        CHECK(n == 3);
+        CHECK(std::strcmp(rows[0].nick, "[H] Ana") == 0 && rows[0].nick_len == 7 && rows[0].sep == '\0' && std::strcmp(rows[0].text, "64ms") == 0 && rows[0].pad == 2); // ("[H] Ana:64ms": the host is marked before its name, no space after the colon)
+        CHECK(std::strcmp(rows[1].nick, "P2") == 0 && rows[1].sep == '\0' && std::strcmp(rows[1].text, "~31ms") == 0 && rows[1].pad == 1);
+        CHECK(std::strcmp(rows[2].nick, "P3") == 0 && rows[2].sep == '\0' && std::strcmp(rows[2].text, "--") == 0 && rows[2].pad == 5);
+        CHECK(rows[0].t_ms == 777 && rows[2].t_ms == 777);
+        // the colour of a line is the colour of the node (1 light blue, 2 green, 3 yellow ...): whatever the name
+        CHECK(rows[0].own == 0 && rows[1].own == 1 && rows[2].own == 2);
+        // a name is shown as the chat shows a nick (CutNick): 8 characters at most, then a "." when there were more - "Carlo Ma." - and "Kamisama" (8) whole; the host, marked "[H]", has the same 8 (the name read in the chat is the name read here)
+        const LatNode two[] = {{1, 10, false}, {2, 10, false}};
+        const char* longs[] = {"abcdefghijklmnopqrst", "Dan-the_Man"}; // the 20 characters of the room's longest nickname, and 11
+        CHECK(MakeRows(two, 2, longs, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] abcdefgh.") == 0 && rows[0].nick_len == 13);
+        CHECK(std::strcmp(rows[1].nick, "Dan-the_.") == 0 && rows[1].own == 1 && rows[1].sep == '\0');
+        const char* mid[] = {"Kamisama", "Kamisama"}; // 8 characters whole, the host's as another player's
+        CHECK(MakeRows(two, 2, mid, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] Kamisama") == 0 && rows[0].nick_len == 12 && rows[0].own == 0);
+        CHECK(std::strcmp(rows[1].nick, "Kamisama") == 0 && rows[1].nick_len == 8);
+        const char* host13[] = {"Carlo Magno 2", "Ana"}; // the host's name is cut exactly as the chat cuts it: "Carlo Ma."
+        CHECK(MakeRows(two, 2, host13, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] Carlo Ma.") == 0);
+        const char* mid2[] = {"Ana", "Carlo Magno 2"}; // 13: "Carlo Ma." (the user's own example)
+        CHECK(MakeRows(two, 2, mid2, 5, rows) == 2 && std::strcmp(rows[1].nick, "Carlo Ma.") == 0);
+        const char* spaced[] = {"abcdefg hijkl", nullptr}; // the cut leaves a space at its end: it goes, as in the chat
+        const LatNode solo[] = {{2, 10, false}};
+        CHECK(MakeRows(solo, 1, spaced, 5, rows) == 1 && std::strcmp(rows[0].nick, "abcdefg.") == 0);
+        // the console name (UDS username, 10 UTF-16 units) as a fallback: plain ASCII kept and trimmed, "P<node>" for nothing or no plain ASCII        {
+        {
+            const u16 plain[chat::kLatName] = {'B', 'o', 'b', ' ', ' ', 0};
+            const u16 kana[chat::kLatName] = {0x3042, 0x3044, 0};
+            char out[chat::kNickMax + 1];
+            CHECK(chat::LatencyName(2, plain, out) == 3 && std::strcmp(out, "Bob") == 0);
+            CHECK(chat::LatencyName(2, kana, out) == 2 && std::strcmp(out, "P2") == 0);
+            CHECK(chat::LatencyName(12, nullptr, out) == 3 && std::strcmp(out, "P12") == 0);
+        }
+        const LatNode one[] = {{4, 152, false}};
+        const char* bob[] = {"Bob"};
+        CHECK(MakeRows(one, 1, bob, 5, rows) == 1 && std::strcmp(rows[0].nick, "Bob") == 0 && std::strcmp(rows[0].text, "152ms") == 0 && rows[0].pad == 4);
+    }
+    // up to three others (four players in the lobby): one row each; more than that (a Tetris-like game, up to 8 in the lobby): ONE row of tiles
+    // with every player in it - "<node digit><colour>" - and the colour of each from its own value
+    {
+        const LatNode three[] = {{2, 10, false}, {3, 10, false}, {4, 10, false}};
+        chat::Line rows[chat::kLines];
+        CHECK(MakeRows(three, 3, nullptr, 1, rows) == 3 && chat::kLatShown == 3);
+        CHECK(std::strcmp(rows[0].nick, "P2") == 0 && std::strcmp(rows[2].nick, "P4") == 0 && rows[0].pad != chat::kLatTiles);
+        const LatNode in[] = {{2, 10, false}, {3, 45, false}, {4, 80, false}, {5, 120, false}, {6, 200, false}, {7, -1, false}, {8, 10, true}};
+        CHECK(MakeRows(in, 7, nullptr, 1, rows) == 1);
+        // two characters a player: the node's digit (H for the host) and the latency colour
+        const auto tile = [](int node, int colour) {
+            std::string s;
+            s += node == 1 ? 'H' : static_cast<char>('0' + node);
+            s += static_cast<char>('0' + colour);
+            return s;
+        };
+        CHECK(rows[0].text_len == 14 && rows[0].text == tile(2, 0) + tile(3, 1) + tile(4, 2) + tile(5, 3) + tile(6, 4) + tile(7, 5) + tile(8, 0));
+        const LatNode four[] = {{1, 10, false}, {2, 10, false}, {3, 10, false}, {4, 10, false}};
+        CHECK(MakeRows(four, 4, nullptr, 1, rows) == 1 && rows[0].pad == chat::kLatTiles && rows[0].text == tile(1, 0) + tile(2, 0) + tile(3, 0) + tile(4, 0) /* node 1, the host: an H */);
+        CHECK(MakeRows(three, 0, nullptr, 1, rows) == 0);
+    }
+    // nobody sends: no rows
+    {
+        chat::Line rows[chat::kLines];
+        CHECK(MakeRows(nullptr, 0, nullptr, 1, rows) == 0);
+    }
+}
+
+static void TestLatencyBoard() {
+    // the board is replaced whole: a reader sees the old picture or the new one, never a mix; an empty one empties it
+    chat::LatencyBoard board;
+    chat::Line a[3], b[2];
+    for (int i = 0; i < 3; ++i) {
+        a[i].nick_len = 1; a[i].nick[0] = 'a'; a[i].text_len = 1; a[i].text[0] = static_cast<char>('0' + i);
+    }
+    for (int i = 0; i < 2; ++i) {
+        b[i].nick_len = 1; b[i].nick[0] = 'b'; b[i].text_len = 1; b[i].text[0] = static_cast<char>('0' + i);
+    }
+    CHECK(board.Refresh().count == 0);
+    board.Publish(a, 3);
+    CHECK(board.Refresh().count == 3 && board.Refresh().lines[2].text[0] == '2' && board.Refresh().lines[0].nick[0] == 'a');
+    board.Publish(b, 2);
+    CHECK(board.Refresh().count == 2 && board.Refresh().lines[0].nick[0] == 'b' && board.Refresh().lines[1].text[0] == '1');
+    board.Publish(nullptr, 0);
+    CHECK(board.Refresh().count == 0);
+    // more than kLines: the newest kLines
+    chat::Line many[8];
+    for (int i = 0; i < 8; ++i) {
+        many[i].nick_len = 1; many[i].nick[0] = 'm'; many[i].text_len = 1; many[i].text[0] = static_cast<char>('0' + i);
+    }
+    board.Publish(many, 8);
+    CHECK(board.Refresh().count == chat::kLines && board.Refresh().lines[0].text[0] == static_cast<char>('0' + 8 - chat::kLines));
+    // two threads (ASan / TSan): the writer replaces pictures whose rows all carry one number, the reader checks that every row of a view
+    // it gets carries the same one, and that the count matches
+    board.Publish(nullptr, 0);
+    CHECK(board.Refresh().count == 0); // (the one reader shows the empty picture before the thread takes over)
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned> torn{0}, views{0};
+    std::thread reader([&] {
+        chat::LatencyBoard& bd = board;
+        while (!stop.load()) {
+            const chat::View& v = bd.Refresh();
+            views.fetch_add(1);
+            for (u32 i = 1; i < v.count; ++i) {
+                if (v.lines[i].text[0] != v.lines[0].text[0] || v.lines[i].nick[0] != v.lines[0].nick[0]) {
+                    std::fprintf(stderr, "  torn rows: count %u row %u nick %d/%d text %d/%d seq %u\n", v.count, i, v.lines[0].nick[0], v.lines[i].nick[0], v.lines[0].text[0], v.lines[i].text[0], v.seq);
+                    torn.fetch_add(1);
+                }
+            }
+            if (v.count != 0 && static_cast<u32>(v.lines[0].nick[0] - 'A') % 5 + 1 != v.count) {
+                std::fprintf(stderr, "  torn view: count %u first nick %d text %d\n", v.count, v.lines[0].nick[0], v.lines[0].text[0]);
+                torn.fetch_add(1);
+            }
+        }
+    });
+    for (int round = 0; round < 20000; ++round) {
+        const u32 n = static_cast<u32>(round % 5) + 1; // (1..5 rows; the picture's letter says how many)
+        chat::Line rows[chat::kLines];
+        for (u32 i = 0; i < n; ++i) {
+            rows[i] = chat::Line();
+            rows[i].nick_len = 1;
+            rows[i].nick[0] = static_cast<char>('A' + n - 1);
+            rows[i].text_len = 1;
+            rows[i].text[0] = static_cast<char>('a' + round % 20);
+        }
+        board.Publish(rows, n);
+    }
+    stop.store(true);
+    reader.join();
+    CHECK(torn.load() == 0);
+    CHECK(views.load() > 0);
+}
+
+
+static void TestLatencyScreen() {
+    static ChatSink sink;
+    u8 packet[256];
+    const u32 t0 = 200000;
+    CHECK(sink.OnPacket(packet, PacketOf(packet, "Gionko", "hi"), t0));
+    const gfx::Rgb nick = chat::kNick[chat::NickColour("Gionko", 6)];
+    const LatNode two[] = {{1, 64, false}, {3, 130, false}};
+    const char* names[] = {"Ana", "Bob"};
+    chat::Line rows[chat::kLines];
+    CHECK(MakeRows(two, 2, names, t0, rows) == 2);
+    // the bar and the name are in the colour of the player's node, the value in the colour of the scale
+    const gfx::Rgb ana = chat::kNodeColour[0], bob = chat::kNodeColour[2]; // (Ana is node 1, the host, light blue; Bob node 3, yellow)
+    CHECK(std::memcmp(&ana, &chat::kLatColour[2], sizeof(ana)) != 0 && std::memcmp(&bob, &chat::kLatColour[3], sizeof(bob)) != 0); // (the test tells name from value by colour)
+    const int w0 = chat::BlockWidth(static_cast<u32>(std::strlen("[H] Ana:64ms")));
+    const int w1 = chat::BlockWidth(static_cast<u32>(std::strlen("Bob:130ms")));
+    const auto x_of = [](int corner, int width) { return corner == chat::kTopRight || corner == chat::kBottomRight ? 390 - width : 6; };
+    // where the first / second block of an n-block stack sits: a top stack from row 8, a bottom one up from 236 with the first at its top
+    const auto y_of = [](int corner, int index, int n) {
+        return corner == chat::kTopLeft || corner == chat::kTopRight ? 8 + 12 * index : 236 - 12 * (n - index); // (blocks of 12 rows, no gap between them)
+    };
+    for (int corner = 0; corner < 4; ++corner) {
+        const int lat = corner ^ 2; // (the other corner on the chat's side: above or below it)
+        chat::Overlay o;
+        o.sink.store(&sink);
+        o.on.store(1);
+        o.corner.store(static_cast<u32>(corner));
+        o.lat.Publish(rows, 2);
+        // a message came in and the keyboard is closed: the chat's line is on the screen, the latency is NOT, and the plugin's thread is not asked for it
+        Fb quiet(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, quiet.s, true, t0 + 10) == chat::kDrewLines);
+        CHECK(!IsColour(quiet, x_of(lat, w0), y_of(lat, 0, 2), ana));
+        CHECK(CountColour(quiet, x_of(lat, w0), x_of(lat, w0) + w0, y_of(lat, 0, 2), y_of(lat, 0, 2) + 12, chat::kLatColour[2]) == 0);
+        CHECK(o.lat_wanted.load() == 0);
+        // the user opens the keyboard: the latency appears, and the drawing asks the plugin's thread for it
+        o.keyboard.store(1);
+        Fb top(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, top.s, true, t0 + 10) == chat::kDrewLines);
+        CHECK(o.lat_wanted.load() == ((t0 + 10) | 1u));
+        CHECK(IsColour(top, x_of(lat, w0), y_of(lat, 0, 2), ana)); // (the bar: the name's colour)
+        // the NAME and its ": " are in the node's colour and the VALUE in the colour of the scale ("[H] Ana: 64ms": 7 characters of name, ": ", then "64ms": yellow)
+        {
+            const int bx = x_of(lat, w0), by = y_of(lat, 0, 2);
+            CHECK(CountColour(top, bx + 6, bx + 6 + 8 * 6, by, by + 12, ana) > 20);
+            CHECK(CountColour(top, bx + 6, bx + 6 + 8 * 6, by, by + 12, chat::kLatColour[2]) == 0);
+            CHECK(CountColour(top, bx + 6 + 8 * 6, bx + 6 + 12 * 6, by, by + 12, chat::kLatColour[2]) > 20); // (yellow: 64ms)
+            CHECK(CountColour(top, bx + 6 + 8 * 6, bx + 6 + 12 * 6, by, by + 12, ana) == 0);
+            CHECK(CountColour(top, bx + 6 + 8 * 6, bx + 6 + 12 * 6, by, by + 12, chat::kText) == 0);
+        }
+        CHECK(IsColour(top, x_of(lat, w1), y_of(lat, 1, 2), bob));
+        CHECK(CountColour(top, x_of(lat, w1) + 6 + 4 * 6, x_of(lat, w1) + 6 + 9 * 6, y_of(lat, 1, 2), y_of(lat, 1, 2) + 12, chat::kLatColour[3]) > 20); // 130ms: orange
+        CHECK(IsColour(top, x_of(corner, chat::BlockWidth(6 + 2 + 2)), y_of(corner, 0, 1), nick)); // (the chat's own, in its corner)
+        // the keyboard closes (B, SELECT or Close): the latency goes at once, the chat's line stays its 10 s, the plugin's thread is not asked any more
+        o.keyboard.store(0);
+        o.lat_wanted.store(0);
+        o.lat.Publish(rows, 2);
+        Fb gone(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, gone.s, true, t0 + 20) == chat::kDrewLines);
+        CHECK(!IsColour(gone, x_of(lat, w0), y_of(lat, 0, 2), ana));
+        CHECK(o.lat_wanted.load() == 0);
+        // 10 s later the chat's line is gone too: nothing at all
+        Fb late(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, late.s, true, t0 + chat::kShowMs + 5) == chat::kDrewNothing);
+        CHECK(o.lat_wanted.load() == 0);
+        // the keyboard open again, whatever the age of the chat's lines
+        o.keyboard.store(1);
+        const u32 tk = t0 + chat::kShowMs + 5;
+        chat::Line fresh[chat::kLines];
+        CHECK(MakeRows(two, 2, names, tk, fresh) == 2);
+        o.lat.Publish(fresh, 2); // (what the plugin's thread made when it was asked)
+        Fb kb(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, kb.s, true, tk) == chat::kDrewLines);
+        CHECK(IsColour(kb, x_of(lat, w0), y_of(lat, 0, 2), ana));
+        CHECK(o.lat_wanted.load() == (tk | 1u));
+        // a picture nobody refreshed for kLatStaleMs is not drawn (the keyboard still open)
+        Fb stale(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, stale.s, true, tk + chat::kLatStaleMs + 50) == chat::kDrewLines); // (the chat's own line is still there: only the latency is not)
+        CHECK(!IsColour(stale, x_of(lat, w0), y_of(lat, 0, 2), ana));
+        // the chat off: nothing at all
+        o.on.store(0);
+        Fb off(gfx::kBGR8, 240, 400);
+        ResetStores();
+        o.lat.Publish(rows, 2);
+        CHECK(Draw(o, off.s, true, t0 + 20) == chat::kDrewNothing);
+        CHECK(g_stores[1] + g_stores[2] + g_stores[4] == 0);
+    }
+    // no chat block (never on): nothing, and the latency is not asked for
+    {
+        chat::Overlay o;
+        o.on.store(1);
+        o.lat.Publish(rows, 2);
+        Fb top(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, top.s, true, t0 + 10) == chat::kDrewNothing);
+        CHECK(o.lat_wanted.load() == 0);
+    }
+    // beside a notification of the plugin (in the corner opposite the chat, the same row as the latency): at its height, not under it
+    {
+        chat::Overlay o;
+        o.sink.store(&sink);
+        o.on.store(1);
+        o.corner.store(chat::kBottomLeft); // notifications top right, latency top left
+        o.keyboard.store(1);
+        o.lat.Publish(rows, 2);
+        CHECK(o.board.Show("Joined room \"Test\" (2 of 4 players)", t0));
+        Fb top(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, top.s, true, t0 + 10) == chat::kDrewLines);
+        CHECK(IsColour(top, 6, 8, ana)); // (at the notification's own height: row 8, side by side with it)
+        CHECK(IsColour(top, 6 + 0, 8 + 12, bob));
+    }
+    // The latency is in a corner no message of the chat reaches: three players at most (3 x 12 rows), and the chat's five longest messages (5 x 32
+    // rows) never get to it - in every corner, nothing is held back and nothing is covered
+    static ChatSink busy;
+    const u32 td = t0 + 8000; // (one message every 2 s: the rate limit of one member lets them all in)
+    for (int i = 0; i < 5; ++i) {
+        const std::string text(120, static_cast<char>('a' + i));
+        CHECK(busy.OnPacket(packet, PacketOf(packet, "Gionko", text.c_str()), t0 + 2000u * static_cast<u32>(i)));
+    }
+    {
+        const LatNode three[] = {{2, -1, false}, {3, -1, false}, {4, -1, false}};
+        chat::Line grey[chat::kLines];
+        CHECK(MakeRows(three, 3, nullptr, td + 10, grey) == 3);
+        const int chat_w = chat::BlockWidth(62), grey_w = chat::BlockWidth(static_cast<u32>(std::strlen("P2:--")));
+        for (int corner = 0; corner < 4; ++corner) {
+            const int lat = corner ^ 2;
+            chat::Overlay o;
+            o.sink.store(&busy);
+            o.on.store(1);
+            o.corner.store(static_cast<u32>(corner));
+            o.keyboard.store(1);
+            o.lat.Publish(grey, 3);
+            Fb top(gfx::kBGR8, 240, 400);
+            CHECK(Draw(o, top.s, true, td + 20) == chat::kDrewLines);
+            for (int i = 0; i < 3; ++i) {
+                CHECK(IsColour(top, x_of(lat, grey_w), y_of(lat, i, 3), chat::kNodeColour[1 + i])); // (bars: the colours of nodes 2, 3, 4; the values are grey)
+            }
+            // the five messages of 3 lines (32 rows, no gap): from the bottom they begin at rows 204, 172, 140, 108 and 76; from the top at 8, 40, ...
+            for (int i = 0; i < 5; ++i) {
+                const int y = corner == chat::kTopLeft || corner == chat::kTopRight ? 8 + 32 * i : 204 - 32 * i;
+                CHECK(IsColour(top, x_of(corner, chat_w), y, nick));
+            }
+        }
+    }
+    // (the defence, should a board ever carry more: five rows of grey (60 rows) under a chat of five long messages (160 rows): both fit, 8 + 60 + 160 < 236)
+    {
+        chat::Overlay o;
+        o.sink.store(&busy);
+        o.on.store(1);
+        o.corner.store(chat::kBottomLeft);
+        o.keyboard.store(1);
+        chat::Line grey[chat::kLines];
+        for (u32 i = 0; i < chat::kLines; ++i) {
+            grey[i].t_ms = td + 10;
+            grey[i].nick_len = 2;
+            grey[i].nick[0] = 'P';
+            grey[i].nick[1] = static_cast<char>('2' + i);
+            grey[i].text_len = 2;
+            grey[i].text[0] = '-';
+            grey[i].text[1] = '-';
+            grey[i].pad = 5;
+            grey[i].own = 4; // (red: a bar that is not the chat's own)
+        }
+        o.lat.Publish(grey, chat::kLines);
+        Fb top(gfx::kBGR8, 240, 400);
+        CHECK(Draw(o, top.s, true, td + 20) == chat::kDrewLines);
+        for (int i = 0; i < 5; ++i) {
+            CHECK(IsColour(top, 6, 8 + 12 * i, chat::kNodeColour[4])); // (all five lines of the latency: 8 .. 67)
+        }
+        for (int y = 8; y < 68; ++y) {
+            CHECK(!IsColour(top, 6, y, nick)); // (no bar of the chat in that stack's rows)
+        }
+        CHECK(IsColour(top, 6, 204, nick));
+        CHECK(IsColour(top, 6, 76, nick)); // (the oldest of the five messages begins at row 76, under the latency's stack)
+    }
+    // Many players (a lobby of 8): one strip of tiles, the colour of each player's value, the node's digit in black on it - in every corner, and
+    // the chat, full, does not touch it
+    {
+        const LatNode eight[] = {{1, 10, false}, {2, 45, false}, {3, 80, false}, {4, 120, false}, {5, 200, false}, {6, -1, false}, {7, 10, false}};
+        chat::Line tiles[chat::kLines];
+        CHECK(MakeRows(eight, 7, nullptr, td + 10, tiles) == 1);
+        const int chat_w = chat::BlockWidth(62);
+        const int want[7] = {0, 1, 2, 3, 4, 5, 0};
+        for (int corner = 0; corner < 4; ++corner) {
+            const int lat = corner ^ 2;
+            chat::Overlay o;
+            o.sink.store(&busy);
+            o.on.store(1);
+            o.corner.store(static_cast<u32>(corner));
+            o.keyboard.store(1);
+            o.lat.Publish(tiles, 1);
+            Fb top(gfx::kBGR8, 240, 400);
+            CHECK(Draw(o, top.s, true, td + 20) == chat::kDrewLines);
+            // three rows of tiles, 3 + 2 + 2, side by side with no black between them and nothing at the sides (no bar, no padding), each row 16 rows (the tiles' 12, the bars' 2 and
+            // 2 of black): a top stack from row 8, a bottom one up from 236 - the height of three blocks of names
+            const bool lat_top = lat == chat::kTopLeft || lat == chat::kTopRight;
+            const int y_first = lat_top ? 8 : 236 - 48;
+            const u32 per_row[3] = {3, 2, 2};
+            CHECK(chat::TilesInRow(7, 0) == 3 && chat::TilesInRow(7, 1) == 2 && chat::TilesInRow(7, 2) == 2 && chat::TileRowsFor(7) == 3);
+            int t = 0;
+            for (int r = 0; r < 3; ++r) {
+                const int width = chat::TilesWidth(per_row[r]);
+                CHECK(width == 8 * static_cast<int>(per_row[r]));
+                const int x0 = x_of(lat, width), yr = y_first + 16 * r;
+                for (u32 j = 0; j < per_row[r]; ++j, ++t) {
+                    const int tx = x0 + 8 * static_cast<int>(j); // (the first tile begins at the edge of the corner: nothing before it)
+                    CHECK(IsColour(top, tx, yr, chat::kLatColour[want[t]]) && IsColour(top, tx, yr + 11, chat::kLatColour[want[t]]));
+                    CHECK(IsColour(top, tx + 7, yr + 5, chat::kLatColour[want[t]]));
+                    if (j + 1 < per_row[r]) {
+                        CHECK(IsColour(top, tx + 8, yr + 5, chat::kLatColour[want[t + 1]])); // (the next tile begins at once: no black between them)
+                    }
+                    // under the tile, directly: 2 rows in the colour of the node as wide as the tile, then 2 rows of black
+                    const gfx::Rgb who = chat::kNodeColour[t]; // (the tiles are nodes 1 .. 7)
+                    CHECK(IsColour(top, tx, yr + 12, who) && IsColour(top, tx + 7, yr + 13, who) && IsColour(top, tx + 3, yr + 12, who));
+                    CHECK(!IsColour(top, tx + 3, yr + 14, who) && !IsColour(top, tx + 3, yr + 15, who)); // (the two rows under the bar are the game's, darkened)
+                }
+            }
+            CHECK(!IsColour(top, x_of(lat, 24) - 1 + (lat == chat::kTopRight || lat == chat::kBottomRight ? 0 : 0), y_first + 5, chat::kNoticeBar)); // (no white bar before the tiles)
+                        for (int i = 0; i < 5; ++i) {
+                const int y = corner == chat::kTopLeft || corner == chat::kTopRight ? 8 + 32 * i : 204 - 32 * i;
+                CHECK(IsColour(top, x_of(corner, chat_w), y, nick)); // (all five messages of the chat are there)
+            }
+        }
+    }    // a screen the layer refuses: nothing (the latency neither)
+    {
+        chat::Overlay o;
+        o.sink.store(&sink);
+        o.on.store(1);
+        o.lat.Publish(rows, 2);
+        Fb narrow(gfx::kBGR8, 240, 320);
+        ResetStores();
+        CHECK(Draw(o, narrow.s, true, t0 + 10) == chat::kDrewNothing);
+        CHECK(g_stores[1] + g_stores[2] + g_stores[4] == 0);
+    }
+    CHECK(g_draw_allocs == 0);
+}
+
 int main() {
     TestSignals();
     TestRules();
@@ -1226,6 +1690,10 @@ int main() {
     TestSubmit();
     TestPostWatch();
     TestNotices();
+    TestChatNodeColour();
+    TestLatencyRows();
+    TestLatencyBoard();
+    TestLatencyScreen();
     std::printf("chat_host_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

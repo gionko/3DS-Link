@@ -132,6 +132,12 @@ public:
     ChatSink* chat_sink() const {
         return chat_sink_.load(std::memory_order_acquire);
     }
+    /// The nickname the room lists for the member that has `mac` (cleaned like the chat's nicks: the same text, so the same colour), for the latency lines to
+    /// carry the name the chat shows. The network thread. False when the room has no such member (yet) or its list is busy. `out` holds chat::kNickMax + 1.
+    bool RoomNickOfMac(const Mac& mac, char* out);
+    /// The node (1..8) of the player the room lists under `nick` (cleaned like the chat's nicks): through his MAC, in the node list of the engine. 0 when not known (no such member, or
+    /// the match has not given him a node yet). The network thread. For the colour of his messages (ChatSink::SetNodeSource).
+    u8 NodeOfNick(const char* nick, u32 len);
 
     /// True when the settings switch the in-game menu off (menu_key=off): it never opens, so everything that
     /// needs it (the room address, joining) has to come from the settings.
