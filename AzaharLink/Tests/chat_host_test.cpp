@@ -1230,6 +1230,7 @@ static int CountColour(const Fb& fb, int xa, int xb, int ya, int yb, gfx::Rgb c)
 static u8 TestNodeOf(const char* nick, u32 len) {
     if (len == 3 && std::memcmp(nick, "Ana", 3) == 0) return 3;
     if (len == 3 && std::memcmp(nick, "Bob", 3) == 0) return 8;
+    if (len == 3 && std::memcmp(nick, "Eve", 3) == 0) return chat::kPadOutside; // (in the room, not a player of this console's match)
     return 0;
 }
 
@@ -1241,8 +1242,9 @@ static void TestChatNodeColour() {
     CHECK(sink.OnPacket(packet, PacketOf(packet, "Ana", "hello"), t0));
     CHECK(sink.OnPacket(packet, PacketOf(packet, "Dan", "hi"), t0 + 2000));
     CHECK(sink.OnPacket(packet, PacketOf(packet, "Bob", "yo"), t0 + 4000));
+    CHECK(sink.OnPacket(packet, PacketOf(packet, "Eve", "me too"), t0 + 4005));
     const chat::View& v = sink.reader.Refresh(sink.ring);
-    CHECK(v.count == 3 && v.lines[0].pad == 3 && v.lines[1].pad == 0 && v.lines[2].pad == 8);
+    CHECK(v.count == 4 && v.lines[0].pad == 3 && v.lines[1].pad == 0 && v.lines[2].pad == 8 && v.lines[3].pad == chat::kPadOutside);
     chat::Overlay o;
     o.sink.store(&sink);
     o.on.store(1);
@@ -1252,6 +1254,10 @@ static void TestChatNodeColour() {
     CHECK(IsColour(top, 6, 8, chat::kNodeColour[2]));                                   // Ana, node 3: yellow
     CHECK(IsColour(top, 6, 24, chat::kNick[chat::NickColour("Dan", 3)]));               // Dan, no node: the hash's colour
     CHECK(IsColour(top, 6, 40, chat::kNodeColour[7]));                                   // Bob, node 8: fuchsia
+    CHECK(IsColour(top, 6, 48, chat::kOutside));                                         // Eve, outside the match (the 4th block: rows 44-55): grey ...
+    for (u32 i = 0; i < chat::kNodeColours; ++i) {                                       // ... which is no node's colour (the hash's colours are those of nodes 1, 2, 3, 4, 6)
+        CHECK(std::memcmp(&chat::kOutside, &chat::kNodeColour[i], sizeof(chat::kOutside)) != 0);
+    }
     // the name too, not only the bar: Ana's "Ana" is yellow
     CHECK(CountColour(top, 6 + 6, 6 + 6 + 3 * 6, 8, 20, chat::kNodeColour[2]) > 15);
     // no source (the PC probe's sink, the tests of the chat): every message is the hash's colour, pad 0
@@ -1292,6 +1298,13 @@ static void TestLatencyRows() {
         CHECK(chat::LatencyColour(e[0]) == e[1]);
     }
     CHECK(chat::kLatColour[0].r == chat::kNick[0].r && chat::kLatColour[0].g == chat::kNick[0].g); // (the blue of 3DS Link's nick)
+    {   // the value's text: "64ms", "~64ms" for an old value, "64ms!" while the last 2 s are shown instead of the window (a spike), "--" for none
+        char t[12];
+        CHECK(chat::LatencyText(64, false, t) == 4 && std::strcmp(t, "64ms") == 0);
+        CHECK(chat::LatencyText(64, true, t) == 5 && std::strcmp(t, "~64ms") == 0);
+        CHECK(chat::LatencyText(480, false, t, true) == 6 && std::strcmp(t, "480ms!") == 0);
+        CHECK(chat::LatencyText(-1, false, t, true) == 2 && std::strcmp(t, "--") == 0);
+    }
     // the rows: in the order of the nodes, the host marked, a name read from the username, "P<node>" for none or for no plain ASCII
     {
         const LatNode in[] = {{1, 64, false}, {3, -1, false}, {2, 31, true}};
@@ -1305,14 +1318,16 @@ static void TestLatencyRows() {
         CHECK(rows[0].t_ms == 777 && rows[2].t_ms == 777);
         // the colour of a line is the colour of the node (1 light blue, 2 green, 3 yellow ...): whatever the name
         CHECK(rows[0].own == 0 && rows[1].own == 1 && rows[2].own == 2);
-        // a name is shown as the chat shows a nick (CutNick): 8 characters at most, then a "." when there were more - "Carlo Ma." - and "Kamisama" (8) whole; the host, marked "[H]", has 5
+        // a name is shown as the chat shows a nick (CutNick): 8 characters at most, then a "." when there were more - "Carlo Ma." - and "Kamisama" (8) whole; the host, marked "[H]", has the same 8 (the name read in the chat is the name read here)
         const LatNode two[] = {{1, 10, false}, {2, 10, false}};
         const char* longs[] = {"abcdefghijklmnopqrst", "Dan-the_Man"}; // the 20 characters of the room's longest nickname, and 11
-        CHECK(MakeRows(two, 2, longs, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] abcde.") == 0 && rows[0].nick_len == 10);
+        CHECK(MakeRows(two, 2, longs, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] abcdefgh.") == 0 && rows[0].nick_len == 13);
         CHECK(std::strcmp(rows[1].nick, "Dan-the_.") == 0 && rows[1].own == 1 && rows[1].sep == '\0');
-        const char* mid[] = {"Kamis", "Kamisama"}; // the host: 5 characters whole; another player: 8 whole
-        CHECK(MakeRows(two, 2, mid, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] Kamis") == 0 && rows[0].nick_len == 9 && rows[0].own == 0);
+        const char* mid[] = {"Kamisama", "Kamisama"}; // 8 characters whole, the host's as another player's
+        CHECK(MakeRows(two, 2, mid, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] Kamisama") == 0 && rows[0].nick_len == 12 && rows[0].own == 0);
         CHECK(std::strcmp(rows[1].nick, "Kamisama") == 0 && rows[1].nick_len == 8);
+        const char* host13[] = {"Carlo Magno 2", "Ana"}; // the host's name is cut exactly as the chat cuts it: "Carlo Ma."
+        CHECK(MakeRows(two, 2, host13, 5, rows) == 2 && std::strcmp(rows[0].nick, "[H] Carlo Ma.") == 0);
         const char* mid2[] = {"Ana", "Carlo Magno 2"}; // 13: "Carlo Ma." (the user's own example)
         CHECK(MakeRows(two, 2, mid2, 5, rows) == 2 && std::strcmp(rows[1].nick, "Carlo Ma.") == 0);
         const char* spaced[] = {"abcdefg hijkl", nullptr}; // the cut leaves a space at its end: it goes, as in the chat

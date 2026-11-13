@@ -784,8 +784,13 @@ u8 Plugin::NodeOfNick(const char* nick, u32 len) {
         }
     }
     members_mutex_.unlock();
+    // Who writes is not a player of OUR match (not in the room's list any more, or with no node): while this console is in a match his messages are
+    // grey (chat::kPadOutside), never the colour of a node - the hash of a nick falls on the colours of nodes 1, 2, 3, 4 and 6, and he would look
+    // like one of the players the latency lists. Out of a match (nobody has a node) the nicks keep the colours of their hash, as always.
+    const u16 mine = engine_->MyNodeId();
+    const u8 none = mine >= 1 && mine <= 8 ? chat::kPadOutside : 0;
     if (!found) {
-        return 0;
+        return none;
     }
     for (u16 node = 1; node <= 8; ++node) {
         Mac node_mac;
@@ -793,11 +798,10 @@ u8 Plugin::NodeOfNick(const char* nick, u32 len) {
             return static_cast<u8>(node);
         }
     }
-    const u16 my_node = room_ && mac == room_->mac() ? engine_->MyNodeId() : 0;
-    if (my_node >= 1 && my_node <= 8) {
-        return static_cast<u8>(my_node); // (it is us: our own node)
+    if (room_ && mac == room_->mac() && mine >= 1 && mine <= 8) {
+        return static_cast<u8>(mine); // (it is us: our own node)
     }
-    return 0;
+    return none;
 }
 
 bool Plugin::SetDebugLevel(int level) {
@@ -1419,6 +1423,7 @@ void Plugin::LogStats(u64 now_ms) {
     // What the window says goes on the screen at every level: the numbers of the menu's status page and the
     // warnings. Only the lines below are the log's.
     const RoomClient::LinkStats link = room_->link_stats();
+    latency::NoteLink(link.rtt_ms, link.rtt_var_ms, link.loss_permille); // (latency.log writes this console's own link next to the players' latency)
     NoteStatusNumbers(s, dt, link);
     CheckStatsWarnings(s, now_ms);
     CheckDebugLoad(s);

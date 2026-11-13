@@ -149,6 +149,9 @@ inline u32 CutNick(char* nick, u32 len, u32 shown = kNickShown) {
     return n;
 }
 
+/// Line::pad of a message whose writer is not a player of the match this console is in (1..8 = his node, 0 = not known / no match): see chat_draw.hpp kOutside.
+constexpr u8 kPadOutside = 9;
+
 /// One line of the chat. Its size is a whole number of words: the ring copies it a word at a time.
 struct Line {
     u32 t_ms = 0;   ///< when it came (or went), on the clock of the network thread
@@ -401,7 +404,8 @@ public:
     ChatSink(const ChatSink&) = delete;
     ChatSink& operator=(const ChatSink&) = delete;
 
-    /// Who writes under a nickname: the node (1..8) of the player in the match, 0 = not known. Set once by the plugin before the sink is used; the network thread calls it
+    /// Who writes under a nickname: the node (1..8) of the player in the match, kPadOutside = not a player of the match this console is in, 0 = not known (no match).
+    /// Set once by the plugin before the sink is used; the network thread calls it
     /// for every message taken and every message of ours kept, and the node goes into the line (Line::pad), whose colour the drawing takes from it (kNodeColour).
     using NodeOfNick = u8 (*)(const char* nick, u32 len);
     void SetNodeSource(NodeOfNick f) {

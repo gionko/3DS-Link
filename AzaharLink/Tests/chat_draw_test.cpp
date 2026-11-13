@@ -732,7 +732,7 @@ static bool BlockIsRight(const Fb& fb, int e, const Rect& r, const chat::Line& l
 // the right and one down of every pixel of every letter): the bar is written in full, a glyph pixel is its colour, a shadow pixel is the background's black, and every other pixel of the block is
 // the game's own, as it was (nothing is read: the pixel is simply not written).
 static bool BlockIsRightShadow(const Fb& fb, int e, const Rect& r, const chat::Line& l) {
-    const Rgb nick = l.nick_len == 0 ? chat::kNoticeBar : l.pad >= 1 && l.pad <= chat::kNodeColours ? chat::kNodeColour[l.pad - 1] : chat::kNick[chat::NickColour(l.nick, l.nick_len)];
+    const Rgb nick = l.nick_len == 0 ? chat::kNoticeBar : chat::NickRgb(l.pad, chat::NickColour(l.nick, l.nick_len));
     const chat::Wrap w = chat::WrapLine(l);
     const int pad = w.lines == 2 ? 2 : 1;
     // 0 = not a glyph pixel, 1 = a pixel in the nick's colour, 2 = in the text colour

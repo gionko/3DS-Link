@@ -3,7 +3,7 @@
 //
 // One line a player that still sends packets, in the order of the nodes, while there are at most kLatShown others (up to four players in the lobby);
 // with more, ONE line of tiles with every player in it (all of them are in latency.log, with their names and values, whatever the screen shows). nick = the name (the UDS username: 10 UTF-16 units, kept when they are plain ASCII, else "P<node>";
-// the host, node 1, is marked "[H] " before its name, cut to 5: "[H] Ana:28ms"), text = "64ms" ("~64ms" for an old value, "--" for none yet), pad = the colour's index (LatencyColour).
+// the host, node 1, is marked "[H] " before its name, which is cut as everywhere else: "[H] Carlo Ma.:28ms"), text = "64ms" ("~64ms" for an old value, "--" for none yet), pad = the colour's index (LatencyColour).
 #pragma once
 
 #include <cstring>
@@ -55,8 +55,9 @@ inline u32 LatencyName(int node, const u16* units, char* out) {
     return n;
 }
 
-/// "64ms" / "~64ms" / "--" into `out` (at most 12 characters with the terminator). Returns the length.
-inline u32 LatencyText(int rtt_ms, bool stale, char* out) {
+/// "64ms" / "~64ms" / "--" into `out` (at most 12 characters with the terminator); "64ms!" while the value is the last 2 s, clearly worse than the window
+/// (latency::NodeRtt::spike: the connection just got worse - the user's request, 2026-11-13). Returns the length.
+inline u32 LatencyText(int rtt_ms, bool stale, char* out, bool spike = false) {
     u32 n = 0;
     if (rtt_ms < 0) {
         out[n++] = '-';
@@ -82,6 +83,9 @@ inline u32 LatencyText(int rtt_ms, bool stale, char* out) {
     }
     out[n++] = 'm';
     out[n++] = 's';
+    if (spike) {
+        out[n++] = '!';
+    }
     out[n] = '\0';
     return n;
 }
@@ -131,8 +135,9 @@ inline u32 BuildLatencyRows(const latency::NodeRtt nr[8], const char names[9][kN
         if (n == 0) {
             n = LatencyName(o.node, nullptr, l.nick);
         }
-        // The host is marked "[H] " before the name (not part of the nickname), so its name is cut to 5 characters, not 8: "[H] Ana:28ms".
-        n = CutNick(l.nick, n, o.node == 1 ? kNickShown - 3 : kNickShown); // (5 for the host: the mark is 4 characters wide with its space, but the name is what is read)
+        // The host is marked "[H] " before the name (not part of the nickname). Its name is cut like every other - the same 8 characters the chat shows
+        // for his messages - so the name read in the chat is the name read here ("[H] Carlo Ma.:28ms"; it was cut to 5 before, and no longer matched).
+        n = CutNick(l.nick, n);
         if (o.node == 1) {
             std::memmove(l.nick + 4, l.nick, n + 1);
             l.nick[0] = '['; l.nick[1] = 'H'; l.nick[2] = ']'; l.nick[3] = ' ';
@@ -140,7 +145,7 @@ inline u32 BuildLatencyRows(const latency::NodeRtt nr[8], const char names[9][kN
         }
         l.own = static_cast<u8>(o.node - 1); // (the colour of the node: kNodeColour, the same the player's messages have in the chat)
         l.nick_len = static_cast<u8>(n);
-        l.text_len = static_cast<u8>(LatencyText(o.rtt_ms, o.stale, l.text));
+        l.text_len = static_cast<u8>(LatencyText(o.rtt_ms, o.stale, l.text, o.spike));
         l.pad = LatencyColour(o.rtt_ms);
     }
     return count;

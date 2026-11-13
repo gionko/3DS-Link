@@ -71,6 +71,13 @@ constexpr gfx::Rgb kNodeColour[kNodeColours] = {{70, 178, 255}, {74, 218, 128}, 
 constexpr u32 kNickColours = 5;
 constexpr gfx::Rgb kNick[kNickColours] = {{70, 178, 255}, {74, 218, 128}, {255, 198, 88}, {255, 140, 56}, {186, 140, 255}};
 constexpr gfx::Rgb kNoticeBar = {255, 255, 255}; ///< the bar of a notification of the plugin (a line with no nick): no nick's colour
+/// Who writes while this console is in a match without being one of its players (Line::pad = kPadOutside): grey, the latency scale's "no value" - never the
+/// colour of a node (the nicks' hash colours are those of nodes 1, 2, 3, 4 and 6: he would look like a player of the match).
+constexpr gfx::Rgb kOutside = {150, 156, 168};
+/// The bar and the name of a message: the player's node, else grey for one outside the match, else (no match) the hash of the nick.
+constexpr gfx::Rgb NickRgb(u8 pad, u32 hash_colour) {
+    return pad >= 1 && pad <= kNodeColours ? kNodeColour[pad - 1] : pad == kPadOutside ? kOutside : kNick[hash_colour];
+}
 
 /// The latency scale (the colours of the AzaharPing plugin): blue up to 30 ms, green 31-60, yellow 61-100, orange 101-150, red over 150, and a
 /// grey for a player with no value yet. LatencyColour() gives the index.
@@ -433,7 +440,7 @@ inline u32 DrawChatLines(const gfx::Surface& s, const View& v, u32 shown, int co
                 break; // (never, by the static_asserts above: a column past the screen would be written into the game's memory)
             }
             y = top ? y0 + h + kGapY : y0 - kGapY;
-            const gfx::Rgb bar = l.nick_len == 0 ? kNoticeBar : l.pad >= 1 && l.pad <= kNodeColours ? kNodeColour[l.pad - 1] : kNick[NickColour(l.nick, l.nick_len)];
+            const gfx::Rgb bar = l.nick_len == 0 ? kNoticeBar : NickRgb(l.pad, NickColour(l.nick, l.nick_len));
             DrawBlock(s, x0, y0, l, w, gfx::Raw(bar, s.format), text_raw, bg_raw, 0, translucent);
             ++drawn;
         }

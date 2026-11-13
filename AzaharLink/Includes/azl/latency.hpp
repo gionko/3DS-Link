@@ -4,7 +4,7 @@
 // (ctr/uds_hle.cpp, on the game's thread: no lock, no log, no allocation, nothing on the stack). The network thread (Tick) empties the
 // ring and keeps the estimator up to date. It sends nothing and needs no plugin on the other consoles.
 //
-// When it runs: always. The ring (29 KB, on the heap) is created when the console joins a lobby (hosting, connecting, connected or
+// When it runs: always. The ring (128 records, 15 KB, on the heap) is created when the console joins a lobby (hosting, connecting, connected or
 // spectating: Tick(now_ms, in_session)); before that a game thread pays one load and one branch per command. The log (g_debug_level)
 // only decides whether lines are written ("lat: ..."), not whether the estimate is kept: Snapshot() is there for whoever needs the
 // values (the chat, later).
@@ -13,6 +13,8 @@
 //   * Pia (magic 32 AB 98 64, up to 5.10): every packet carries the sender's timer (bytes 8-9, ms) and the last timer it received from
 //     the receiver (bytes 10-11); the time since this console sent that timer is a full round trip with that node. Only 1-3 packets a
 //     second per node carry a usable echo in most games, so every packet is looked at.
+// What is shown and logged for a node: the median of its last 30 s, kept as 60 half-seconds with one value each (120 s for PRUDP, whose
+// samples are rare), so the number does not move while the network does not; the log also has the lowest and the 90th percentile.
 //   * PRUDP v1 (EA D0 01): the unreliable "ping" with a stamp (79 B request / 91 B response), the individual ACKs of PING packets, and
 //     in Final Fantasy Explorers the game clock of the state packets (one-way delay, also between two clients).
 //   * Anything else is counted and its first bytes are logged once, so that a new protocol can be looked at.
@@ -74,14 +76,27 @@ void SetSink(LatencyFile* file, u64 (*console_clock_ms)());
 /// node's number in the "lat: nN ..." lines. Called on the network thread. Only names: no address of any console goes into latency.log.
 void SetNameSource(bool (*name_of)(int node, char* out, u32 cap));
 
+/// This console's own link to the room as 3DS Link already measures it (RoomClient::LinkStats: ENet's round trip, its variance, reliable packets lost
+/// per thousand), handed over with every window of the plugin's statistics. Any thread (one atomic store). With the log on Tick() writes it into
+/// latency.log next to the players' values ("lat: room link 6+-4 ms, loss 5/1000"), so that who reads the file can tell this console's own
+/// connection from the other players'. Nothing is measured or sent for it here.
+void NoteLink(u32 rtt_ms, u32 rtt_var_ms, u32 loss_permille);
+
 struct NodeRtt {
     int node = 0;       ///< UDS node number (1 = the host of the match)
-    int rtt_ms = -1;    ///< round trip, median of the recent samples; -1 = none
-    int min_ms = -1;
-    int last_ms = -1;
+    int rtt_ms = -1;    ///< round trip, what is shown: the median of the window (one value a half-second, see latency.cpp kSlots), or, while the
+                        ///< last 2 s are clearly worse than the window (`spike`), the value of those 2 s; -1 = none
+    int window_ms = -1; ///< the median of the window alone
+    int recent_ms = -1; ///< the value of the last 2 s alone (-1 = no sample in them)
+    bool spike = false; ///< rtt_ms is recent_ms: the last 2 s are at least 1.5 x the window and 30 ms above it (a connection that just got worse)
+    int min_ms = -1;    ///< the lowest value of the window
+    int p90_ms = -1;    ///< its 90th percentile: far above rtt_ms = a connection that jumps
+    int window_s = 30;  ///< how long the window is (30 s)
+    int last_ms = -1;   ///< the newest sample
     int age_ms = -1;    ///< >= 0: packets of the game still arrive from this node
     int samples = 0;
     bool stale = false;     ///< no recent sample: the last known value
+    bool corrected = false; ///< most samples are PRUDP aggregated acknowledgements with the hold time removed, not a direct measure (the log's A)
     int owd_ms = -1;        ///< one-way delay from the game clock (Final Fantasy Explorers), -1 = none
     bool estimated = false; ///< rtt_ms is 2 x owd_ms
 };

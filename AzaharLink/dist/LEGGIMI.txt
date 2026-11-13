@@ -292,15 +292,15 @@ sessioni, anche con l'host Azahar). Si comincia dalla serata TFH (passo 2: le us
 
 1. I FILE DI QUESTA CARTELLA
 ---------------------------------------------------------------------------------------------------------------------------
-  3DSLink.cia             2.601.920 byte   md5 8e22af6f48e4cebd1b97efbb50817d26    3DS Link come app installabile (FBI): Title ID 000400000F83D100, versione 1.1.3,
+  3DSLink.cia             2.602.432 byte   md5 fff0b25f9fc7eec94ccc15ebdada6601    3DS Link come app installabile (FBI): Title ID 000400000F83D100, versione 1.1.3,
                                                                              costruita dallo stesso 3DSLink.elf del .3dsx (DlpLink/tools/build_all.sh). E' il PACCHETTO
                                                                              UNICO: il plugin e' dentro, e l'app lo scrive in SD:/3ds/3DSLink/AzaharLink.3gx da sola. E' l'UNICO
                                                                              file da consegnare per condividere 3DS Link: il figlio per il Download Play (child.cia) NON si
                                                                              consegna, lo compone l'app (SD:/3ds/3DSLink/dlp/child.cia)
-  3DSLink.3dsx            3.722.120 byte   md5 d99ce9b06277c56b15099489a663dbc4    l'app 3DS Link (mostra v1.1.3; la stessa del CIA, per l'Homebrew Launcher; identica a
+  3DSLink.3dsx            3.723.352 byte   md5 cc18755563834e0e32068a423d90c947    l'app 3DS Link (mostra v1.1.3; la stessa del CIA, per l'Homebrew Launcher; identica a
                                                                              ConfigApp/3DSLink.3dsx del repository; porta dentro lo stesso plugin e non vuole nessun altro file;
                                                                              contiene anche il modulo di consegna dei titoli, Titles Delivery, e l'host Download Play, 3DS Link Delivery)
-  AzaharLink.3gx          1.219.679 byte   md5 06a7541972abf13c7b2ca91f891ac0b8    NON e' un file di questa cartella: e' DENTRO i due file sopra (la risorsa che l'app
+  AzaharLink.3gx          1.220.888 byte   md5 09b47a8c57f46419ec3453427f5bc1fa    NON e' un file di questa cartella: e' DENTRO i due file sopra (la risorsa che l'app
                                                                              scrive in SD:/3ds/3DSLink/AzaharLink.3gx: questa dimensione e questo md5 sono quelli del file che deve
                                                                              comparire sulla SD, per controllarlo; intestazione 3gx: versione 1.1.3, memoria condivisa, non privata)
   default.3gx             non c'e' piu': 3DS Link abilita il plugin titolo per titolo e non lo usa (vedi sezione 2)
