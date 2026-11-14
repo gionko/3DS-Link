@@ -32,10 +32,11 @@ done
 for f in "$LIBCTRU"/libctru/source/util/utf/*.c; do
   gcc $CFLAGS32 -include stddef.h $INC -c "$f" -o "$OUT/ctru_utf_$(basename $f .c).o"
 done
-# (dlp_hub.cpp and dlp_lobby_net.cpp: ctr/uds_hle.cpp serves the Download Play of the games in Lobby mode through the hub)
+# (dlp_hub.cpp and dlp_lobby_net.cpp: ctr/uds_hle.cpp serves the Download Play of the games in Lobby mode through the hub;
+#  latency.cpp: it hands every SendTo / PullPacket to the latency log, which does nothing while the log is off)
 CORE="Sources/azl/crypto.cpp Sources/azl/log.cpp Sources/azl/platform.cpp Sources/azl/room_proto.cpp
       Sources/azl/uds_frames.cpp Sources/azl/uds_engine.cpp Sources/azl/room_client.cpp Sources/azl/ndm_hle.cpp
-      Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp"
+      Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/latency.cpp"
 g++ -m32 -std=c++17 -O1 -g -w -pthread $INC \
     Tests/ipc_test/ipc_test.cpp Tests/ipc_test/shim_svc.cpp Sources/ctr/uds_hle.cpp $CORE \
     "$OUT"/ctru_*.o "$OUT"/enet_*.o -o "$OUT/ipc_test"

@@ -110,6 +110,9 @@ CORE="Sources/azl/crypto.cpp Sources/azl/log.cpp Sources/azl/platform.cpp Source
 g++ $CXXFLAGS Tests/test_main.cpp $CORE "$OUT"/enet_*.o -o "$OUT/test_main"
 g++ $CXXFLAGS Tests/ring_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/ring_test"
 g++ $CXXFLAGS Tests/dedupe_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dedupe_test"
+# latency_test: the latency of the other players from the game's own UDS packets (azl/latency.hpp): off at debug 0, Pia, PRUDP v1,
+# an unknown protocol, a burst bigger than the ring (one process per case; the clock is the real one, the delays are sleeps)
+g++ $CXXFLAGS Tests/latency_test.cpp Sources/azl/latency.cpp $CORE "$OUT"/enet_*.o -o "$OUT/latency_test"
 g++ $CXXFLAGS Tests/link_policy_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/link_policy_test"
 # enet_path_test: the ENet client's data path (what a service call reads, when the acknowledgements go, the counters); the link wraps
 # the platform layer's three socket calls so that the test can count them, and ENet's clock so that it can hold it
@@ -292,6 +295,7 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/test_main"
   "$OUT/ring_test"
   "$OUT/dedupe_test" $DEDUPE_TRACES
+  "$OUT/latency_test"
   "$OUT/link_policy_test"
   "$OUT/enet_path_test"
   "$OUT/soc_plan_test"

@@ -487,6 +487,34 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
+// The latency of the other players, on the screen while the keyboard is open
+// ---------------------------------------------------------------------------------------------
+
+constexpr u32 kLatWantedMs = 1500;  ///< the plugin's thread builds the lines while the drawing asked for them this recently
+constexpr u32 kLatPublishMs = 250;  ///< ... and refreshes them this often (4 a second: the values are medians over seconds)
+constexpr u32 kLatStaleMs = 2000;   ///< the drawing shows lines no older than this (a board nobody refreshes goes off the screen)
+
+/// The lines of the latency, in the chat's own ring: the plugin's thread REPLACES the whole picture (one line a player: nick = the name, text =
+/// the value, pad = the colour's index, t_ms = when it was made), the game's thread reads it the way it reads the chat. Made only while the
+/// keyboard is open (Overlay::lat_wanted).
+class LatencyBoard {
+public:
+    /// The plugin's thread: the picture is these `n` lines (0: nothing).
+    void Publish(const Line* rows, u32 n) {
+        ring_.Replace(rows, n);
+    }
+    // >>> game-thread code (Tests/policy_check.sh)
+    const View& Refresh() {
+        return reader_.Refresh(ring_);
+    }
+    // <<< game-thread code
+
+private:
+    ChatRing ring_;
+    ChatReader reader_;
+};
+
+// ---------------------------------------------------------------------------------------------
 // The game's thread: what the OSD callback draws
 // ---------------------------------------------------------------------------------------------
 
@@ -500,6 +528,8 @@ struct Overlay {
     ImageSlot image;
     NoticeClock notices;                  ///< the framework's notifications on screen (OSD::Notify: the bottom-right corner climbs above them)
     NoticeBoard board;                    ///< the plugin's own, drawn in the corner opposite the chat
+    LatencyBoard lat;                     ///< the latency of the other players, drawn in the free corner beside the notifications' (the half of the screen the chat does not use)
+    std::atomic<u32> lat_wanted{0};       ///< the clock (| 1) of the last frame drawn with the keyboard open: the plugin's thread builds `lat` while it is recent
     std::atomic<u32> top_seen{0};         ///< the clock (| 1) of the last top screen the callback could draw on, 0: none (it refused it)
 };
 
@@ -587,6 +617,26 @@ __attribute__((noinline, optimize("no-tree-loop-distribute-patterns"))) inline v
 #endif
 }
 
+/// The latency of the other players, while the keyboard is open (the user writes): in the free corner beside the notifications' (`corner ^ 2`: the same row, in the half of the screen the chat does not use,
+/// so that no message of the chat covers it), starting at the notifications' own height and above the framework's when there are some, and the drawing says
+/// to the plugin's thread that it wants the lines (lat_wanted). `*edge_out` is the edge of its stack, where the chat's own stops. True when it drew.
+__attribute__((noinline)) inline bool DrawLatency(Overlay& o, const gfx::Surface& fb, u32 now_ms, int corner, u32 young, int* edge_out) {
+    o.lat_wanted.store(now_ms | 1u, std::memory_order_relaxed);
+    const View& lv = o.lat.Refresh();
+    if (lv.count == 0 || !Recent(now_ms, lv.lines[lv.count - 1].t_ms, kLatStaleMs)) {
+        return false;
+    }
+    const int lat_corner = corner ^ 2;
+    const bool lat_top = lat_corner == kTopLeft || lat_corner == kTopRight;
+    // It starts at the same height as the plugin's notifications (the top row, or the bottom one): the two stand side by side - a notification is on the opposite side of the screen - and the
+    // space under (or above) them is the chat's. It is drawn BEFORE the notifications, so that where a very wide one meets it the notification, which is there for a moment and matters, wins.
+    const int start = lat_top ? kTopY : (young != 0 ? BottomRightY(young) : kBottomY);
+    if (DrawLatencyLines(fb, lv, lat_corner, start, kNoLimit, edge_out) == 0) {
+        return false;
+    }
+    return true;
+}
+
 /// The top screen: the plugin's notifications in the corner opposite the chat, then the chat's lines, if any are to be shown; the chat's
 /// stack stops where the notifications' begins. Whether this screen could be drawn on is told to the plugin's thread (top_seen: it sends
 /// its notifications to the framework when not). Out of line: the callback's own frame stays small.
@@ -599,9 +649,13 @@ __attribute__((noinline)) inline u32 DrawOverlayTop(Overlay& o, const gfx::Surfa
     const int corner = static_cast<int>(o.corner.load(std::memory_order_relaxed));
     const int across = Opposite(corner);
     // (the framework's notifications at the bottom right: whichever stack is there climbs above them)
-    const u32 young = corner == kBottomRight || across == kBottomRight ? o.notices.Young(now_ms) : 0;
+    const u32 young = corner == kBottomRight || across == kBottomRight || (corner ^ 2) == kBottomRight ? o.notices.Young(now_ms) : 0;
     u32 drew = kDrewNothing;
     int limit = kNoLimit;
+    ChatSink* sink = o.sink.load(std::memory_order_acquire);
+    const bool keyboard = o.keyboard.load(std::memory_order_relaxed) != 0;
+    int lat_edge = kNoLimit;
+    const bool lat_drawn = sink != nullptr && keyboard && DrawLatency(o, fb, now_ms, corner, young, &lat_edge); // (only while the keyboard is open: when the user writes; before the notifications)
     const View& board = o.board.Refresh(); // (the game's thread is the board's one reader)
     const u32 notes = ShownNotices(board, now_ms);
     if (notes != 0 && DrawChatLines(fb, board, notes, across, across == kBottomRight ? young : 0, kNoLimit, &limit) != 0) {
@@ -609,14 +663,18 @@ __attribute__((noinline)) inline u32 DrawOverlayTop(Overlay& o, const gfx::Surfa
     } else {
         limit = kNoLimit;
     }
-    ChatSink* sink = o.sink.load(std::memory_order_acquire);
+    if (lat_drawn) {
+        drew = kDrewLines;
+        // the chat stops where the farthest of the two stacks on that side of the screen - the notifications' and the latency's - begins
+        const bool chat_top = corner == kTopLeft || corner == kTopRight;
+        limit = limit == kNoLimit ? lat_edge : chat_top ? (lat_edge < limit ? lat_edge : limit) : (lat_edge > limit ? lat_edge : limit);
+    }
     if (sink == nullptr) {
         return drew;
     }
     const View& v = sink->reader.Refresh(sink->ring); // (the game's thread is the ring's one reader)
-    const bool keyboard = o.keyboard.load(std::memory_order_relaxed) != 0;
     const u32 shown = ShownLines(v, now_ms, keyboard);
-    if (shown != 0 && DrawChatLines(fb, v, shown, corner, corner == kBottomRight ? young : 0, limit) != 0) {
+    if (shown != 0 && DrawChatLines(fb, v, shown, corner, corner == kBottomRight ? young : 0, limit, nullptr, true) != 0) { // (the chat's lines are translucent, the plugin's notifications above are not)
         drew = kDrewLines;
     }
     return drew;

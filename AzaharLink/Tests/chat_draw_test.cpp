@@ -648,8 +648,25 @@ static std::vector<Rect> Expected(const chat::View& v, u32 shown, int corner, u3
     const bool top = corner == chat::kTopLeft || corner == chat::kTopRight;
     const bool right = corner == chat::kTopRight || corner == chat::kBottomRight;
     int y = top ? 8 : corner == chat::kBottomRight && notices > 0 ? ((227 - 15 * static_cast<int>(notices)) / 4) * 4 : 236;
+    u32 first_shown = v.count - shown;
+    if (top) {
+        // a top stack that does not fit drops its oldest lines: the newest ones that fit, counted back from the newest
+        int room = (limit < 0 ? 240 : limit) - y;
+        u32 fit = 0;
+        while (fit < shown) {
+            const chat::Wrap fw = chat::WrapLine(v.lines[v.count - 1 - fit]);
+            const int need = (fw.lines == 1 ? 12 : fw.lines == 2 ? 24 : 32) + (fit != 0 ? chat::kGapY : 0);
+            if (need > room) {
+                break;
+            }
+            room -= need;
+            ++fit;
+        }
+        first_shown = v.count - fit;
+        shown = fit;
+    }
     for (u32 k = 0; k < shown; ++k) {
-        const chat::Line& l = v.lines[top ? v.count - shown + k : v.count - 1 - k];
+        const chat::Line& l = v.lines[top ? first_shown + k : v.count - 1 - k];
         const chat::Wrap w = chat::WrapLine(l);
         const int h = w.lines == 1 ? 12 : w.lines == 2 ? 24 : 32;
         u32 cols = 0;
@@ -666,13 +683,13 @@ static std::vector<Rect> Expected(const chat::View& v, u32 shown, int corner, u3
             if (r.y + h > (limit < 0 ? 240 : limit)) {
                 break;
             }
-            y += h + 4;
+            y += h + chat::kGapY;
         } else {
             r.y = y - h;
             if (r.y < (limit < 0 ? 0 : limit)) {
                 break;
             }
-            y = r.y - 4;
+            y = r.y - chat::kGapY;
         }
         out.push_back(r);
     }
@@ -711,6 +728,92 @@ static bool BlockIsRight(const Fb& fb, int e, const Rect& r, const chat::Line& l
     return ok;
 }
 
+// Text without a background, with a shadow (the user's decision, 2026-11-11: no black strip behind the chat's lines - the game shows through everywhere - and a black shadow one pixel to
+// the right and one down of every pixel of every letter): the bar is written in full, a glyph pixel is its colour, a shadow pixel is the background's black, and every other pixel of the block is
+// the game's own, as it was (nothing is read: the pixel is simply not written).
+static bool BlockIsRightShadow(const Fb& fb, int e, const Rect& r, const chat::Line& l) {
+    const Rgb nick = l.nick_len == 0 ? chat::kNoticeBar : chat::NickRgb(l.pad, chat::NickColour(l.nick, l.nick_len));
+    const chat::Wrap w = chat::WrapLine(l);
+    const int pad = w.lines == 2 ? 2 : 1;
+    // 0 = not a glyph pixel, 1 = a pixel in the nick's colour, 2 = in the text colour
+    const auto glyph_at = [&](int cx, int cy) -> int {
+        if (cx < 6 || cx >= r.w - 4 || cy < pad || cy >= r.h - pad) {
+            return 0;
+        }
+        const u32 line = static_cast<u32>((cy - pad) / 10), row = static_cast<u32>((cy - pad) % 10);
+        const u32 c = static_cast<u32>((cx - 6) / 6), g = static_cast<u32>((cx - 6) % 6);
+        if (line >= w.lines || c >= w.len[line]) {
+            return 0;
+        }
+        const u32 at = w.start[line] + c;
+        const char ch = w.dots && line + 1 == w.lines && c + 3 >= w.len[line] ? '.' : chat::BlockChar(l, at);
+        if (((gfx::kSpleen6x10[ch - 0x20][g] >> (9 - row)) & 1) == 0) {
+            return 0;
+        }
+        return at < l.nick_len ? 1 : 2;
+    };
+    bool ok = true;
+    for (int x = r.x; x < r.x + r.w; ++x) {
+        for (int y = r.y; y < r.y + r.h; ++y) {
+            const int cx = x - r.x, cy = y - r.y;
+            const unsigned ux = static_cast<unsigned>(x), uy = static_cast<unsigned>(y);
+            const int own = glyph_at(cx, cy);
+            if (cx < 2) {
+                ok = ok && fb.Is(e, ux, uy, nick); // (the bar, written in full)
+            } else if (own != 0) {
+                ok = ok && fb.Is(e, ux, uy, own == 1 ? nick : chat::kText);
+            } else if ([&] { // the shadow: a pixel within kShadowPx to the right and down of a pixel of a letter
+                           for (int dx = 0; dx <= static_cast<int>(chat::kShadowPx); ++dx) {
+                               for (int dy = 0; dy <= static_cast<int>(chat::kShadowPx); ++dy) {
+                                   if ((dx != 0 || dy != 0) && glyph_at(cx - dx, cy - dy) != 0) {
+                                       return true;
+                                   }
+                               }
+                           }
+                           return false;
+                       }()) {
+                ok = ok && fb.Is(e, ux, uy, chat::kBg);
+            } else {
+                ok = ok && !fb.Changed(e, ux, uy); // (the game's pixel, as it was)
+            }
+        }
+    }
+    return ok;
+}
+
+static void TestTranslucent() {
+    const chat::View v = FiveMessages();
+    unsigned long opaque_bytes = 0, shadow_bytes = 0;
+    for (unsigned f = 0; f < gfx::kFormats; ++f) {
+        for (int stereo = 0; stereo < 2; ++stereo) {
+            for (int corner = 0; corner < 4; ++corner) {
+                Fb fb(f, stereo != 0);
+                fb.Paint();
+                ResetStores();
+                const u32 drawn = chat::DrawChatLines(fb.Surface(), v, 5, corner, 0, chat::kNoLimit, nullptr, true);
+                const unsigned long bytes = StoredBytes();
+                const std::vector<Rect> want = Expected(v, 5, corner, 0);
+                CHECK(drawn == want.size() && drawn == 5);
+                CHECK(OnlyInside(fb, want));
+                for (u32 k = 0; k < want.size(); ++k) {
+                    const chat::Line& l = v.lines[corner < 2 ? k : 4 - k];
+                    for (int e = 0; e <= stereo; ++e) {
+                        CHECK(BlockIsRightShadow(fb, e, want[k], l));
+                    }
+                }
+                // the cost: far fewer stores than the opaque block (no background at all: the letters and their shadows, and the bar)
+                Fb fo(f, stereo != 0);
+                fo.Paint();
+                ResetStores();
+                chat::DrawChatLines(fo.Surface(), v, 5, corner, 0);
+                CHECK(bytes < StoredBytes());
+                opaque_bytes += StoredBytes();
+                shadow_bytes += bytes;
+            }
+        }
+    }
+    std::printf("shadow text: %lu bytes stored against %lu for the opaque lines (%lu%%)\n", shadow_bytes, opaque_bytes, shadow_bytes * 100 / opaque_bytes);
+}
 static void TestChatLines() {
     const chat::View v = FiveMessages();
     for (unsigned f = 0; f < gfx::kFormats; ++f) {
@@ -788,11 +891,11 @@ static void TestChatLines() {
         const u32 drawn = chat::DrawChatLines(fb.Surface(), v, 5, chat::kBottomRight, notices);
         CHECK(drawn == want.size());
         CHECK(OnlyInside(fb, want));
-        // (the five blocks are 108 rows with their gaps: up to 7 notifications they fit, with 8 the oldest no longer does)
-        CHECK(notices > 7 || drawn == 5);
-        CHECK(notices != 8 || drawn == 4);
-        if (notices == 8) {
-            WriteBmp(fb, 0, "chat-bottom-right-8-notices-rgb565");
+        // (the five blocks are 88 rows, no gaps between them: up to 9 notifications they fit, with 10 the oldest no longer does)
+        CHECK(notices > 9 || drawn == 5);
+        CHECK(notices != 10 || drawn < 5); // (the oldest goes first)
+        if (notices == 10) {
+            WriteBmp(fb, 0, "chat-bottom-right-10-notices-rgb565");
         }
     }
     // a stack stops where the one in the opposite corner begins (the plugin's notifications): the edge it hands back is the row past it and
@@ -815,18 +918,18 @@ static void TestChatLines() {
             int edge = 0;
             CHECK(chat::DrawChatLines(fb.Surface(), notes, 5, across, 0, chat::kNoLimit, &edge) == 5);
             const bool notes_top = across == chat::kTopLeft || across == chat::kTopRight;
-            CHECK(edge == (notes_top ? 8 + 5 * 16 : 236 - 5 * 16)); // (5 blocks of one line, 12 rows, and their gaps)
+            CHECK(edge == (notes_top ? 8 + 5 * (12 + chat::kGapY) : 236 - 5 * (12 + chat::kGapY))); // (5 blocks of one line, 12 rows, and their gaps)
             const std::vector<Rect> want_notes = Expected(notes, 5, across, 0);
             const std::vector<Rect> want_chat = Expected(tall, 5, corner, 0, edge);
             const u32 drawn = chat::DrawChatLines(fb.Surface(), tall, 5, corner, 0, edge);
-            CHECK(drawn == want_chat.size() && drawn == 4); // (the oldest one goes)
+            CHECK(drawn == want_chat.size() && drawn == 5); // (with no gaps between the blocks all five fit: 160 rows of the 168 the notifications leave)
             std::vector<Rect> all = want_notes;
             all.insert(all.end(), want_chat.begin(), want_chat.end());
             CHECK(OnlyInside(fb, all));
             for (const Rect& n : want_notes) {
                 CHECK(BlockIsRight(fb, 0, n, notes.lines[0]));
                 for (const Rect& c : want_chat) {
-                    const bool apart = n.y + n.h + 4 <= c.y || c.y + c.h + 4 <= n.y;
+                    const bool apart = n.y + n.h + chat::kGapY <= c.y || c.y + c.h + chat::kGapY <= n.y;
                     CHECK(apart); // (never over the chat: a gap of 4 rows at least)
                 }
             }
@@ -927,6 +1030,7 @@ int main(int argc, char** argv) {
     TestRectsAndText();
     TestWrapAndColours();
     TestChatLines();
+    TestTranslucent();
     TestCost();
     FontSheet();
     std::printf("chat_draw_test: %d checks, %d failed%s%s\n", g_checks, g_failures, g_out.empty() ? "" : "; pictures in ", g_out.c_str());

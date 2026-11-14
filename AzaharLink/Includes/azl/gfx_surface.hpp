@@ -270,6 +270,23 @@ inline void RunColumnBoth(u8* l, u8* r, u32 n, u32 ma, u32 mb, const Ink& ink, u
     }
 }
 
+// ---- Text without a background, with a shadow (the user's decision, 2026-11-11: a stripe-dithered "transparent" black did not look right; the game shows through everywhere and the letters
+// get a black shadow one pixel to the right and one down, to read on any scene). Written only, never read, as the opaque black was. ----
+
+/// The pixels of the masks only, one store each (`ink.a` where `ma` has a bit, else `ink.b` where `mb` has one, else `ink.bg` - the shadow - where `ms` has one): the run's other pixels are not
+/// touched. Same run as RunColumnBoth (bit i is the pixel at l + i * bpp, the row i above the run's bottom row), on the left image and, with the 3D, the right one.
+inline void RunColumnFgOnly(u8* l, u8* r, u32 n, u32 ma, u32 mb, u32 ms, const Ink& ink, u32 bpp) {
+    u32 m = (ma | mb | ms) & (n >= 32 ? 0xFFFFFFFFu : (1u << n) - 1u);
+    while (m != 0) {
+        const u32 i = static_cast<u32>(__builtin_ctz(m));
+        m &= m - 1;
+        const u32 v = (ma >> i & 1u) != 0 ? ink.a : (mb >> i & 1u) != 0 ? ink.b : ink.bg;
+        PutPixel(l + i * bpp, v, bpp);
+        if (r != nullptr) {
+            PutPixel(r + i * bpp, v, bpp);
+        }
+    }
+}
 /// The offset of the pixel (x, y) from the start of an image (the caller keeps x < w and y < h). (x * rowsize + (h - 1 - y)) * bpp with
 /// rowsize = stride / bpp is x * stride + (h - 1 - y) * bpp, and no division: the ARM11 has none, and it was a call to the library's.
 inline u32 PixelOffset(const Surface& s, u32 x, u32 y) {

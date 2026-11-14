@@ -2990,6 +2990,16 @@ bool UdsEngine::NodeSnapshot(u16* my_node, u16* node_bitmask) const {
     return true;
 }
 
+bool UdsEngine::NodeMac(u16 node_id, Mac* out) const {
+    Guard lock(this);
+    return NodeMacLocked(node_id, out);
+}
+
+u16 UdsEngine::MyNodeId() const {
+    u16 my_node = 0, mask = 0;
+    return NodeSnapshot(&my_node, &mask) ? my_node : 0;
+}
+
 NetworkStatus UdsEngine::status() const {
     Guard lock(this);
     return static_cast<NetworkStatus>(connection_status_.status);
