@@ -26,6 +26,10 @@ something changed. **Every line begins with the time of day of the console's own
                                                   trip +- its variance, reliable packets lost per thousand. Written when it changes, and every 30 s
 12:20:32.490 lat: protocol Pia,2009,0,0,lock=Pia,ack=0,tk=0,sf=0  protocol seen (Pia / PRUDP v1 / AckTag / Tekken / SSF4 / unknown), the counts (Pia, PRUDP, other), the lock and the packets of the three small layers; for an unknown kind also ",UR,<size>,<first bytes>"
 12:21:07.120 lat: ring dropped 12 packets in all (the network thread paused: they gave no sample)     only if it happens: packets the module could not look at (never a wrong value)
+12:20:33.010 lat: unknown S 108: 6A0068000700...                a game the module does not know: the first packet of each (direction, size), its first 48 bytes in hex, up to
+                                                  16 kinds a lobby - what it takes to find the game's own layer from this file (as Tetris, Tekken and Street Fighter were found)
+12:22:40.300 lat: room link spike: 90 ms, usually 12 (this console's own line)     this console's own link got clearly worse (1.5 x its last ~30 s and 30 ms above): the chat
+12:22:46.310 lat: room link spike over: 13 ms                                      shows "room:90ms!" meanwhile - a player's value that rose with it is this line, not his
 (no CPU line: the module has no counter of its own - 3DS Link's own `stats:` line already measures the CPU of every thread, ours included: the network thread's "queue+tick",
 the game threads' "uds" and "chat osd")
 ```
@@ -140,7 +144,11 @@ and latency.log says when it starts and ends; on the chat's screen the value has
 12:21:06.420 lat: n2 spike over: back to the window's 37 ms
 ```
 
-The window is 30 s for every game (the games with few samples had 120 s until 2026-11-13: too long to follow). How fast the number can move is the game's: a new sample every half-second slot in the Pia games (30-60 echoes a second), one a second in Street Fighter,
+The window is 30 s for every game (the games with few samples had 120 s until 2026-11-13: too long to follow). On the chat's screen a value reads `66ms`, `~66ms` (old), `66ms!` (the last 2 s, a spike) or `66ms+34` when the connection jumps: `+34` is how far the window's
+90th percentile is above its median, written from 20 ms up (a steady connection shows no `+`). While this console's own link to the room is clearly worse than its
+last ~30 s, and a row is free (up to two other players), a row `room:90ms!` says so.
+
+How fast the number can move is the game's: a new sample every half-second slot in the Pia games (30-60 echoes a second), one a second in Street Fighter,
 one every 2 s in Tekken, a few a minute in Tetris. The screen is rebuilt 4 times a second while the keyboard is open.
 
 ## How many packets there are (from our captures, per console, between Azahar instances on one PC)
@@ -172,7 +180,8 @@ what the game sends anyway**.
   has a number at byte 36 and the node that sent it at 38. A reliable data of mine is answered by an ACK from every other node; the round trip is "my data left" ->
   "the ACK of that node arrived", minus the time the other game held it, estimated with the hold of MY OWN ACKs (25 ms until three of them are measured). A message sent
   twice gives no sample (which send does the ACK answer?). Checked on three instances on one PC (the real delay ~33 ms): the pairs' typical errors were -15.6 .. +0.2 ms;
-  few samples (2-3 a minute), so the value is slow to appear and, between two samples more than 30 s apart, is shown as an old one.
+  few samples (2-3 a minute), so the value is slow to appear and, between two samples more than 30 s apart, is shown as an old one. About one packet in ten
+  carries a message shorter than the packet (padding after it): it is read like the others (2026-11-14; before that it was counted as unknown).
 * **Tekken 3D Prime Edition (EUR, "Tekken", flag M).** Header `02 01 | src | dst | 01 00 | length | 8 zero bytes | 11 11 | type`, size = 16 + length. The 281-byte state
   frames (60/s) carry no echo of the other side's counter. Every 2 s each side sends a SHORT packet (30 bytes in a match, 34 in the lobby), type `0xC4` (`0xC0` in the
   lobby), and the other answers at once with `0x94` (`0x90`): that pair is the measure, one sample every 2 s. On the capture against the real console it
@@ -200,12 +209,18 @@ number coming back; the log's `protocol` line (the first bytes of an unknown pac
 
 ## Cost
 
-* **Memory** (arm-none-eabi-size of the object file, the plugin's own flags): **7,760 bytes of bss** (the estimator's tables: 8 nodes x 60 half-seconds, the PRUDP
-  waiting lists) and a ring of 128 x 120 = **15,360 bytes on the heap**, made when the console joins a lobby: **23.1 KB in all**, plus 10.3 KB of code. Final Fantasy Explorers adds
+* **Memory** (arm-none-eabi-size of the object file, the plugin's own flags): **6,616 bytes of bss** (the estimator's tables: 8 nodes x 60 half-seconds of 6 bytes, the
+  waiting lists of PRUDP - 32 a side -, of Tetris - 16 - and of Street Fighter, the three layers' counters) and a ring of 128 x 120 = **15,360 bytes on the heap**, made
+  when the console joins a lobby: **22.0 KB in all**, plus 13.8 KB of code (the three layers, the spike and the per-node cache of 2026-11-14 added 3.5 KB of code and took
+  2 KB of tables away: it was 8,648 bytes of bss with the layers). Final Fantasy Explorers adds
   10,240 bytes on the heap for its game-clock samples, made the first time such a packet is seen; no other game pays for them. It was 46,608 bytes of bss (48 % of the whole
   plugin's 96,972) and a ring of 30,720: 77 KB. What went: a table of the last 1,024 sends (16 KB; the estimate is the same to the millisecond without it, replayed on seven games),
   the clock samples as static storage (23 KB, now on the heap for the one game that uses them and a third of the size), half of the ring (128 records hold half a second of a lobby of 8, so that the log of a full lobby is whole; the network thread empties it
   every few ms; what a long pause loses is counted and written, and gives no sample - never a wrong one).
+* **CPU, what the network thread does (2026-11-14):** a node's value (the sorting of its half-seconds for the median, min and p90, and of its last 2 s) is worked out
+  once a half-second at most, not at every call - the chat asks four times a second and the log once: what was worked out is kept while no sample comes; the one-way
+  median of Final Fantasy Explorers (up to 160 samples a node) is found by partitioning, ~320 steps, instead of an insertion sort, ~6,400. The game-thread hook is
+  unchanged: a multiply-shift for the time, a copy of at most 96 bytes, one atomic. Replayed on eight captures, every value is the same as before.
 * **CPU, measured in Docker on real captures (x86; only the ratios between the parts mean something):** the hook costs ~36 ns a packet, emptying the ring 7-14 ns
   a packet, the estimates and lines ~2-3 us once a second. At ~60 events a second (two players) that is a few microseconds of CPU a second; scaled to the ARM11 at
   268 MHz (a factor of 40-80, an estimate, not a measurement) and adding one clock read per packet, **about 0.03-0.06 % of a core**.

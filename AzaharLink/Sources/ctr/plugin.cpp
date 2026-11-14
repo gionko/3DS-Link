@@ -705,7 +705,8 @@ void PublishChatLatency(UdsEngine& engine, u32 now_ms) {
         }
         has_name[node] = NodeDisplayName(node, names[node]);
     }
-    ChatLatencyPublish(rows, chat::BuildLatencyRows(nr, names, has_name, now_ms, rows));
+    const latency::LinkState ls = latency::LinkNow(); // (this console's own link: a row while it is clearly worse than usual)
+    ChatLatencyPublish(rows, chat::BuildLatencyRows(nr, names, has_name, now_ms, rows, ls.rtt_ms, ls.spike));
 }
 
 /// The file layer of the log on the console: CTRPluginFramework's File.

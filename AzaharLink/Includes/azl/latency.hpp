@@ -82,6 +82,16 @@ void SetNameSource(bool (*name_of)(int node, char* out, u32 cap));
 /// connection from the other players'. Nothing is measured or sent for it here.
 void NoteLink(u32 rtt_ms, u32 rtt_var_ms, u32 loss_permille);
 
+/// This console's own link to the room, as last handed over by NoteLink, against its own recent past (the median of the last 6 windows of the
+/// statistics, about 30 s): `spike` when the latest round trip is at least 1.5 x that and 30 ms above it. The chat shows it then ("room:90ms!"),
+/// so that a player's value that rose together with it reads as this console's line, not his. rtt_ms -1 = nothing handed over yet.
+struct LinkState {
+    int rtt_ms = -1;
+    int base_ms = -1;
+    bool spike = false;
+};
+LinkState LinkNow();
+
 struct NodeRtt {
     int node = 0;       ///< UDS node number (1 = the host of the match)
     int rtt_ms = -1;    ///< round trip, what is shown: the median of the window (one value a half-second, see latency.cpp kSlots), or, while the

@@ -40,6 +40,12 @@ per due secondi: si legge 500 subito); passato il picco torna la finestra; sullo
 (`lat: n2 spike: ...` / `spike over`). Prova: `Tests/latency_test.cpp` modo `spike`. La finestra e' di 30 s per tutti i giochi (quelli con pochi campioni
 avevano 120 s: troppo lunga da seguire).
 
+**Per i tester e per chi legge lo schermo (2026-11-14).** Con `debug=1`, di un gioco sconosciuto `latency.log` scrive il primo pacchetto di ogni (direzione,
+dimensione), 48 byte in esadecimale, al massimo 16 tipi per lobby: con quello si trova lo strato del gioco dal log di un tester, senza catture (cosi' sono stati
+trovati Tetris, Tekken e Street Fighter). Sullo schermo, accanto al valore, `+34` dice quanto balla la connessione (p90 della finestra meno la mediana, solo da
+20 ms in su), e una riga `room:90ms!` compare mentre il collegamento di QUESTA console alla stanza e' chiaramente peggiore del suo solito (i tuoi numeri ENet,
+`NoteLink`): chi vede salire il valore di un giocatore insieme a quella riga sa che e' la propria linea.
+
 Che cosa fa sui thread del gioco: una copia di al massimo 96 byte in un anello di 128 record (`__sync_fetch_and_add`: nessun lock, nessun log, nessuna allocazione,
 niente sullo stack); finché la console non è in una lobby l'anello non esiste e il costo è un caricamento e un salto. Tutto il resto gira sul thread di rete, nel suo tick.
 
@@ -99,12 +105,12 @@ Queste non servono alla misura: sono scelte di aspetto fatte da Mirko provando l
 
 | | Valore | Come è misurato |
 |---|---|---|
-| Memoria statica del modulo | **7.760 byte** di bss (erano 46.608: il 48 % dei 96.972 del plugin) | `arm-none-eabi-size` dell'oggetto, con i flag del Makefile |
+| Memoria statica del modulo | **6.616 byte** di bss (erano 46.608: il 48 % dei 96.972 del plugin; 8.648 prima della pulizia del 14/11) | `arm-none-eabi-size` dell'oggetto, con i flag del Makefile |
 | Anello | **15.360 byte** sull'heap, creati all'ingresso in una lobby (erano 30.720) | 128 record da 120 byte |
-| Totale del modulo | **23,1 KB** (erano 77,3 KB: meno di un terzo) | bss + anello |
+| Totale del modulo | **22,0 KB** (erano 77,3 KB: meno di un terzo) | bss + anello |
 | Memoria statica di tutto il plugin | 58.124 byte di bss (erano 96.972) | `arm-none-eabi-size` di `AzaharLink.elf` |
 | Solo in Final Fantasy Explorers | +10.240 byte sull'heap, alla prima volta che il gioco manda il suo orologio | |
-| Codice | 10,3 KB | idem |
+| Codice | 13,8 KB (con i tre strati di Tetris, Tekken e Street Fighter, i picchi e la cache per nodo) | idem |
 | CPU su New 3DS (MH XX, build dell'11/11 mattina) | aggancio 0,04 ms/s, tick 0,39 ms/s: **0,04 % di un core** | le tue righe `stats:` di un log vero |
 | Thread di rete nello stesso log | ~327 giri/s, pausa più lunga 9 ms | idem |
 

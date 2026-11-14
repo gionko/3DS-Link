@@ -181,9 +181,8 @@ constexpr u8 kMagic[4] = {0x32, 0xAB, 0x98, 0x64};
 constexpr int kSlots = 60;
 constexpr int kSlotSamples = 8;
 constexpr u64 kSlotUs = 500000ULL;
-constexpr u64 kSlowSlotUs = 500000ULL;  // the games with few samples (PRUDP, Tetris, Tekken, Street Fighter) had slots of 2 s - a window of 120 s - and
-                                         // that was too long to follow (the user, 2026-11-13): the same 30 s as the others; a game with samples minutes apart
-                                         // (Tetris) shows its last value as old between them
+// (every game has the same slots: the games with few samples - PRUDP, Tetris, Tekken, Street Fighter - had slots of 2 s, a window of 120 s, until
+// 2026-11-13: too long to follow; a game with samples minutes apart, Tetris, shows its last value as old between them)
 // The window's median is steady by construction: a connection that gets worse for a few seconds would not move it. So the last 2 s are looked at on
 // their own (the slots of the last 2 s, the open one included: 4 of a half-second, or the 2 s one of the slow games) and, when they are clearly worse
 // than the window - at least one and a half times it AND 30 ms above it - THAT value is shown, until they are back near the window (the user's request,
@@ -196,7 +195,8 @@ struct Sent {
     u64 t_us; // 0 = empty
 };
 struct Slot {
-    u32 number;   // which one: time / the slot's length
+    u16 number;   // which one: time / the slot's length, its low 16 bits (whether it is in the window is the difference to now, in 16 bits: a slot
+                  // left untouched for 65536 slots - 9 hours - could count once more for 30 s; nothing else)
     u16 ms;       // the median of its samples
     u8 n;         // samples that came in it (0 = empty; counted up to 255)
     u8 corrected; // how many of them are aggregated acknowledgements with the hold time removed (PRUDP), not a direct measure
@@ -207,7 +207,15 @@ struct NodeStat {
     u32 cur_number = 0;
     u8 cur_n = 0;          // samples that came in it (the first kSlotSamples are kept)
     u8 cur_corrected = 0;
-    bool slow = false;     // PRUDP: see kSlowSlotUs
+    // what Snapshot() last worked out for this node: reused while no sample came and the half-second did not change (the chat asks 4 times a
+    // second, the log once: the sorting is done once a half-second a node at most, not at every call)
+    bool dirty = true;
+    u32 cache_number = 0;
+    u8 c_live = 0;         // 1 = the window has values (c_rtt, c_min, c_p90, c_samples, c_corrected, c_recent, c_spike are them)
+    u8 c_has = 0;          // 1 = a value exists: the window's, or the old one in c_rtt when c_live is 0
+    u8 c_corrected = 0, c_spike = 0;
+    u16 c_rtt = 0, c_window = 0, c_min = 0, c_p90 = 0, c_recent = 0xFFFF;
+    u32 c_samples = 0;
     bool has_last = false;
     u16 last_ms = 0;       // the newest sample
     u64 last_sample_us = 0;
@@ -221,10 +229,6 @@ NodeStat g_nodes[8];       // (node - 1)
 
 inline NodeStat& StatOf(int node) {
     return g_nodes[node - 1];
-}
-
-inline u64 SlotUs(const NodeStat& n) {
-    return n.slow ? kSlowSlotUs : kSlotUs;
 }
 
 // The median of `n` (1..kSlotSamples) values, sorted in place. For an even count the mean of the two in the middle: with two samples "the lower one"
@@ -246,12 +250,43 @@ u16 MedianOf(u16* v, int n) {
     return (n & 1) ? v[n / 2] : static_cast<u16>((static_cast<u32>(v[n / 2 - 1]) + v[n / 2]) / 2u);
 }
 
+// The k-th smallest of n ints (0-based), by partitioning: about 2n steps instead of the n^2/4 of the insertion sort (the one-way delay keeps up to
+// 160 samples a node: 320 steps instead of 6400, five times a second).
+int NthInt(int* a, int n, int k) {
+    int lo = 0;
+    int hi = n - 1;
+    while (lo < hi) {
+        const int pivot = a[(lo + hi) / 2];
+        int i = lo;
+        int j = hi;
+        while (i <= j) {
+            while (a[i] < pivot) ++i;
+            while (a[j] > pivot) --j;
+            if (i <= j) {
+                const int t = a[i];
+                a[i] = a[j];
+                a[j] = t;
+                ++i;
+                --j;
+            }
+        }
+        if (k <= j) {
+            hi = j;
+        } else if (k >= i) {
+            lo = i;
+        } else {
+            break;
+        }
+    }
+    return a[k];
+}
+
 void CloseSlot(NodeStat& n) {
     if (n.cur_n == 0) {
         return;
     }
     Slot& s = n.slot[n.cur_number % kSlots];
-    s.number = n.cur_number;
+    s.number = static_cast<u16>(n.cur_number);
     s.ms = MedianOf(n.cur, n.cur_n < kSlotSamples ? n.cur_n : kSlotSamples);
     s.n = n.cur_n;
     s.corrected = n.cur_corrected;
@@ -268,10 +303,11 @@ void ResetNode(NodeStat& n) {
     n.cur_corrected = 0;
     n.has_last = false;
     n.last_sample_us = 0;
+    n.dirty = true;
 }
 
 void AddSample(NodeStat& n, u64 t_us, u32 rtt_us, bool corrected) {
-    const u32 number = static_cast<u32>(t_us / SlotUs(n));
+    const u32 number = static_cast<u32>(t_us / kSlotUs);
     if (n.cur_n != 0 && number != n.cur_number) {
         CloseSlot(n);
     }
@@ -290,6 +326,7 @@ void AddSample(NodeStat& n, u64 t_us, u32 rtt_us, bool corrected) {
     n.has_last = true;
     n.last_ms = v;
     n.last_sample_us = t_us;
+    n.dirty = true;
 }
 
 inline u16 Be16(const u8* p) {
@@ -323,8 +360,9 @@ struct PrudpPend {
     u8 node;
     u8 used;
 };
-PrudpPend g_p_rx[64];
-PrudpPend g_p_tx[64];
+constexpr int kPend = 32; // reliable data waiting for their acknowledgement: ~5 in flight in Final Fantasy Explorers, 32 is two seconds of them
+PrudpPend g_p_rx[kPend];
+PrudpPend g_p_tx[kPend];
 int g_p_rx_head = 0, g_p_tx_head = 0;
 u32 g_hold_us[16];
 int g_hold_count = 0, g_hold_head = 0;
@@ -351,11 +389,11 @@ int FindPrudp(const Rec& r) {
 
 void PendPut(PrudpPend* a, int* head, u8 node, u16 seq, u64 t) {
     a[*head] = {t, seq, node, 1};
-    *head = (*head + 1) % 64;
+    *head = (*head + 1) % kPend;
 }
 
 u64 PendTakeT(PrudpPend* a, u8 node, u16 seq) {
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < kPend; ++i) {
         if (a[i].used && a[i].node == node && a[i].seq == seq) {
             a[i].used = 0;
             return a[i].t_us;
@@ -463,15 +501,11 @@ void TouchNode(int node, u64 t_us) {
     n.last_rx_us = t_us;
 }
 
-// A sample of the PRUDP path. `corrected`: it is an aggregated acknowledgement with the hold time removed (an assumption about the other game), not a
-// direct measure like the ping echo or the individual ACK: the log marks a value made mostly of those with A instead of M.
+// A sample of the acknowledgement and request/reply paths (PRUDP, Tetris, Tekken, Street Fighter). `corrected`: an acknowledgement with the hold
+// time removed (an assumption about the other game), not a direct measure like the ping echo or the individual ACK: the log marks a value made
+// mostly of those with A instead of M.
 void AddPrudpSample(int node, u64 t_us, u32 rtt_us, bool corrected) {
-    NodeStat& n = StatOf(node);
-    if (!n.slow) {
-        ResetNode(n); // (the slots change length)
-        n.slow = true;
-    }
-    AddSample(n, t_us, rtt_us, corrected);
+    AddSample(StatOf(node), t_us, rtt_us, corrected);
 }
 
 void FeedPrudp(const Rec& r) {
@@ -600,9 +634,11 @@ void FeedPrudp(const Rec& r) {
 // Checked on three instances on one PC (the same bytes seen leaving one and arriving at another give the real delay): see NOTE_LATENCY.md.
 constexpr u32 kAckDefaultHoldUs = 25000; // until three holds of my own are measured: between the 18 and the 34 ms seen
 
+// (the size at 10 is the message's: about one packet in ten carries a DATA shorter than the packet - padding after it, never a second message
+// (checked on a capture, 2026-11-13) - so the message may be shorter than the packet, never longer)
 inline bool IsAckLayer(const Rec& r) {
     return r.len >= 40 && r.data[29] == 'a' && r.data[30] == 'c' && r.data[31] == 'k' && Le32(r.data + 4) == 0 && Le32(r.data + 16) == 1 &&
-           static_cast<u32>(Le16(r.data + 10)) == r.size;
+           static_cast<u32>(Le16(r.data + 10)) >= 40u && static_cast<u32>(Le16(r.data + 10)) <= r.size;
 }
 
 struct AckTx {
@@ -611,7 +647,8 @@ struct AckTx {
     u8 used;
     u8 dup; // sent again: its acknowledgements say nothing about this send
 };
-AckTx g_ack_tx[32];
+constexpr int kAckTx = 16; // my reliable messages waiting for their ACKs: a few a minute
+AckTx g_ack_tx[kAckTx];
 int g_ack_tx_head = 0;
 u16 g_ack_me = 0; // my node, from the sender field of what I send
 
@@ -625,14 +662,14 @@ void FeedAck(const Rec& r) {
             g_ack_me = static_cast<u16>(me);
         }
         if (ty == 0 && msg != 0) { // a reliable message of mine: the acknowledgements will name it
-            for (int i = 0; i < 32; ++i) {
+            for (int i = 0; i < kAckTx; ++i) {
                 if (g_ack_tx[i].used && g_ack_tx[i].seq == msg && r.t_us - g_ack_tx[i].t_us < 5000000ULL) {
                     g_ack_tx[i].dup = 1;
                     return;
                 }
             }
             g_ack_tx[g_ack_tx_head] = {r.t_us, msg, 1, 0};
-            g_ack_tx_head = (g_ack_tx_head + 1) % 32;
+            g_ack_tx_head = (g_ack_tx_head + 1) % kAckTx;
         } else if (ty == 6) { // my acknowledgement of a message of a node: how long my game held it
             const u64 t_rx = PendTakeT(g_p_rx, node <= 255 ? static_cast<u8>(node) : 0, msg);
             if (t_rx != 0 && r.t_us > t_rx && r.t_us - t_rx < 500000ULL) {
@@ -650,7 +687,7 @@ void FeedAck(const Rec& r) {
     if (ty == 0 && msg != 0) { // a reliable message of the node: I will acknowledge it
         PendPut(g_p_rx, &g_p_rx_head, r.node, msg, r.t_us);
     } else if (ty == 6 && g_ack_me != 0 && node == g_ack_me) { // the node acknowledges a message of mine
-        for (int i = 0; i < 32; ++i) {
+        for (int i = 0; i < kAckTx; ++i) {
             const AckTx& s = g_ack_tx[i];
             if (s.used && s.seq == msg) {
                 if (!s.dup && r.t_us > s.t_us && r.t_us - s.t_us < 3000000ULL) {
@@ -795,6 +832,37 @@ void FeedSf4(const Rec& r) {
     }
 }
 
+// A game the module does not know: with the log on, the first packet of each (direction, size) is written to latency.log, its first 48 bytes in hex
+// ("lat: unknown S 108: 6A00..."), up to kUnknownKinds kinds a lobby. That is what it takes to find the game's own layer from a tester's log, as the
+// Tetris, Tekken and Street Fighter ones were found from captures (2026-11-14; before that only the very first unknown packet's 24 bytes were kept).
+constexpr int kUnknownKinds = 16;
+constexpr int kUnknownBytes = 48;
+u16 g_unknown_seen[kUnknownKinds]; // size | 0x8000 for a sent one
+int g_unknown_n = 0;
+void Emit(const char* fmt, ...);
+
+void NoteUnknown(const Rec& r) {
+    if (g_debug_level <= 0 || r.len == 0 || g_unknown_n >= kUnknownKinds) {
+        return;
+    }
+    const u16 key = static_cast<u16>((r.size & 0x7FFFu) | (r.dir == 'S' ? 0x8000u : 0u));
+    for (int i = 0; i < g_unknown_n; ++i) {
+        if (g_unknown_seen[i] == key) {
+            return;
+        }
+    }
+    g_unknown_seen[g_unknown_n++] = key;
+    static const char kHex[] = "0123456789ABCDEF";
+    char hex[kUnknownBytes * 2 + 1];
+    const int n = r.len < kUnknownBytes ? r.len : kUnknownBytes;
+    for (int i = 0; i < n; ++i) {
+        hex[2 * i] = kHex[r.data[i] >> 4];
+        hex[2 * i + 1] = kHex[r.data[i] & 15];
+    }
+    hex[2 * n] = '\0';
+    Emit("lat: unknown %c %u: %s", r.dir, static_cast<unsigned>(r.size), hex);
+}
+
 // Protocol recognition, for the log only (ProtoSummary): counts the packets of each kind and keeps the first bytes of an
 // unrecognised packet, sent and received, so that a new game can be looked at from a log sent by someone else.
 struct ProtoStat {
@@ -828,6 +896,7 @@ void ClassifyProto(const Rec& r) {
             g_proto.smp_size[k] = r.size;
             std::memcpy(g_proto.smp[k], r.data, g_proto.smp_len[k]);
         }
+        NoteUnknown(r);
     }
 }
 
@@ -988,6 +1057,7 @@ struct LogState {
     u32 file_dropped = 0; // the file's own count at its last line
     u32 link = 0;         // g_link at the last "room link" line
     u64 link_ms = 0;
+    u8 link_spike = 0;    // the last line about the link said a spike
 };
 LogState g_log;
 
@@ -995,6 +1065,27 @@ LogState g_log;
 // the plugin with every window of its statistics (NoteLink). One word, written by that thread and read by the network thread:
 // bit 31 = there is a value, 30..19 the round trip (ms, up to 4095), 18..10 its variance (up to 511), 9..0 the loss (0..1000).
 u32 g_link = 0;
+u32 g_link_seq = 0;      // one more at every NoteLink (the same figures twice are two windows)
+u32 g_link_seq_seen = 0; // (the network thread's)
+constexpr int kLinkHist = 6; // windows of the statistics kept (one every ~5 s: about 30 s)
+u16 g_link_hist[kLinkHist];
+int g_link_hist_n = 0, g_link_hist_head = 0;
+
+// (network thread, once a round) a new window of the statistics goes into the link's history
+void TrackLink() {
+    const u32 seq = __atomic_load_n(&g_link_seq, __ATOMIC_RELAXED);
+    if (seq == g_link_seq_seen) {
+        return;
+    }
+    g_link_seq_seen = seq;
+    const u32 link = __atomic_load_n(&g_link, __ATOMIC_RELAXED);
+    if (link == 0) {
+        return;
+    }
+    g_link_hist[g_link_hist_head] = static_cast<u16>((link >> 19) & 0xFFFu);
+    g_link_hist_head = (g_link_hist_head + 1) % kLinkHist;
+    if (g_link_hist_n < kLinkHist) ++g_link_hist_n;
+}
 
 } // namespace
 
@@ -1011,6 +1102,24 @@ void NoteLink(u32 rtt_ms, u32 rtt_var_ms, u32 loss_permille) {
     const u32 word = 0x80000000u | ((rtt_ms > 4095u ? 4095u : rtt_ms) << 19) | ((rtt_var_ms > 511u ? 511u : rtt_var_ms) << 10) |
                      (loss_permille > 1000u ? 1000u : loss_permille);
     __atomic_store_n(&g_link, word, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_link_seq, 1u, __ATOMIC_RELAXED);
+}
+
+LinkState LinkNow() {
+    LinkState s;
+    const u32 link = __atomic_load_n(&g_link, __ATOMIC_RELAXED);
+    if (link == 0) {
+        return s;
+    }
+    s.rtt_ms = static_cast<int>((link >> 19) & 0xFFFu);
+    if (g_link_hist_n < 3) {
+        return s; // (too little past to say what "usual" is)
+    }
+    u16 v[kLinkHist];
+    for (int i = 0; i < g_link_hist_n; ++i) v[i] = g_link_hist[i];
+    s.base_ms = MedianOf(v, g_link_hist_n);
+    s.spike = s.rtt_ms >= s.base_ms + kSpikeMinMs && s.rtt_ms * 2 >= s.base_ms * 3;
+    return s;
 }
 
 void Tick(u64 now_ms, bool in_session) {
@@ -1030,6 +1139,7 @@ void Tick(u64 now_ms, bool in_session) {
         }
         g_log.last_ms = now_ms;
         g_log.proto_ms = now_ms;
+        g_unknown_n = 0; // (a new lobby: its unknown packets are written again)
         g_ring = ring;
         if (g_debug_level > 0 && g_file && g_clock_ms) { // the file says which day it is once, here: its lines only carry the time of day
             char day[24];
@@ -1038,6 +1148,7 @@ void Tick(u64 now_ms, bool in_session) {
         }
     }
     Pump();
+    TrackLink();
     if (g_debug_level <= 0 || now_ms - g_log.last_ms < 1000) {
         return;
     }
@@ -1110,6 +1221,17 @@ void Tick(u64 now_ms, bool in_session) {
         Emit("lat: room link %u+-%u ms, loss %u/1000", static_cast<unsigned>((link >> 19) & 0xFFFu), static_cast<unsigned>((link >> 10) & 0x1FFu),
              static_cast<unsigned>(link & 0x3FFu));
     }
+    {   // this console's own link got clearly worse (or is back): said once each way, like a node's spike
+        const LinkState ls = LinkNow();
+        if ((ls.spike ? 1 : 0) != g_log.link_spike) {
+            g_log.link_spike = ls.spike ? 1 : 0;
+            if (ls.spike) {
+                Emit("lat: room link spike: %d ms, usually %d (this console's own line)", ls.rtt_ms, ls.base_ms);
+            } else {
+                Emit("lat: room link spike over: %d ms", ls.rtt_ms);
+            }
+        }
+    }
     // What was lost on the way to this file: packets the ring could not hold (they gave no sample) and lines the queue could not take.
     if (g_dropped != g_log.dropped) {
         g_log.dropped = g_dropped;
@@ -1136,49 +1258,82 @@ int Snapshot(NodeRtt out[8]) {
         NodeRtt& o = out[node - 1];
         o = NodeRtt();
         o.node = node;
-        const NodeStat& n = StatOf(node);
-        const u64 slot_us = SlotUs(n);
-        const u32 now_number = static_cast<u32>(now / slot_us);
-        o.window_s = static_cast<int>(slot_us * kSlots / 1000000ULL);
-        // the values of the window: one a slot that has samples and is not older than kSlots slots, and the one being filled;
-        // `old`: those and the older ones still kept (what is shown, marked as old, when the window is empty)
-        u16 v[kSlots + 1];
-        u16 old[kSlots + 1];
-        u16 rec[kSlots + 1]; // the slots of the last 2 s (see kRecentUs)
-        int c = 0;
-        int oc = 0;
-        int rc = 0;
-        int samples = 0;
-        int corrected = 0;
-        const u32 recent_slots = static_cast<u32>(kRecentUs / slot_us) > 0 ? static_cast<u32>(kRecentUs / slot_us) : 1u;
-        for (int i = 0; i < kSlots; ++i) {
-            const Slot& s = n.slot[i];
-            if (s.n == 0) {
-                continue;
-            }
-            old[oc++] = s.ms;
-            if (now_number - s.number < static_cast<u32>(kSlots)) {
-                v[c++] = s.ms;
-                samples += s.n;
-                corrected += s.corrected;
-                if (now_number - s.number < recent_slots) {
-                    rec[rc++] = s.ms;
+        NodeStat& n = StatOf(node);
+        const u32 now_number = static_cast<u32>(now / kSlotUs);
+        o.window_s = static_cast<int>(kSlotUs * kSlots / 1000000ULL);
+        if (n.dirty || n.cache_number != now_number) { // (otherwise nothing moved since the last call: what it worked out still holds)
+            n.dirty = false;
+            n.cache_number = now_number;
+            // the values of the window: one a slot that has samples and is not older than kSlots slots, and the one being filled;
+            // `old`: those and the older ones still kept (what is shown, marked as old, when the window is empty)
+            u16 v[kSlots + 1];
+            u16 old[kSlots + 1];
+            u16 rec[kSlots + 1]; // the slots of the last 2 s (see kRecentUs)
+            int c = 0;
+            int oc = 0;
+            int rc = 0;
+            int samples = 0;
+            int corrected = 0;
+            constexpr u32 recent_slots = static_cast<u32>(kRecentUs / kSlotUs) > 0 ? static_cast<u32>(kRecentUs / kSlotUs) : 1u;
+            for (int i = 0; i < kSlots; ++i) {
+                const Slot& s = n.slot[i];
+                if (s.n == 0) {
+                    continue;
+                }
+                old[oc++] = s.ms;
+                const u16 ago = static_cast<u16>(now_number - s.number);
+                if (ago < static_cast<u16>(kSlots)) {
+                    v[c++] = s.ms;
+                    samples += s.n;
+                    corrected += s.corrected;
+                    if (ago < recent_slots) {
+                        rec[rc++] = s.ms;
+                    }
                 }
             }
-        }
-        if (n.cur_n != 0) {
-            u16 w[kSlotSamples];
-            const int kept = n.cur_n < kSlotSamples ? n.cur_n : kSlotSamples;
-            for (int i = 0; i < kept; ++i) w[i] = n.cur[i];
-            const u16 m = MedianOf(w, kept);
-            old[oc++] = m;
-            if (now_number - n.cur_number < static_cast<u32>(kSlots)) {
-                v[c++] = m;
-                samples += n.cur_n;
-                corrected += n.cur_corrected;
-                if (now_number - n.cur_number < recent_slots) {
-                    rec[rc++] = m;
+            if (n.cur_n != 0) {
+                u16 w[kSlotSamples];
+                const int kept = n.cur_n < kSlotSamples ? n.cur_n : kSlotSamples;
+                for (int i = 0; i < kept; ++i) w[i] = n.cur[i];
+                const u16 m = MedianOf(w, kept);
+                old[oc++] = m;
+                if (now_number - n.cur_number < static_cast<u32>(kSlots)) {
+                    v[c++] = m;
+                    samples += n.cur_n;
+                    corrected += n.cur_corrected;
+                    if (now_number - n.cur_number < recent_slots) {
+                        rec[rc++] = m;
+                    }
                 }
+            }
+            n.c_live = 0;
+            n.c_has = 0;
+            n.c_spike = 0;
+            n.c_recent = 0xFFFF;
+            if (c > 0) {
+                Sort(v, c);
+                n.c_live = 1;
+                n.c_has = 1;
+                n.c_window = v[c / 2];
+                n.c_rtt = n.c_window;
+                n.c_min = v[0];
+                n.c_p90 = v[(c * 9) / 10];
+                n.c_samples = static_cast<u32>(samples);
+                n.c_corrected = corrected * 2 > samples ? 1 : 0;
+                if (rc > 0) { // the last 2 s on their own: shown instead of the window while they are clearly worse (kSpikeMinMs)
+                    Sort(rec, rc);
+                    n.c_recent = rec[rc / 2];
+                    if (n.c_recent >= n.c_window + kSpikeMinMs && static_cast<u32>(n.c_recent) * 2u >= static_cast<u32>(n.c_window) * 3u) {
+                        n.c_spike = 1;
+                        n.c_rtt = n.c_recent;
+                    }
+                }
+            } else if (oc > 0) {
+                // No recent sample (FF Explorers: a client sends reliable data only when it joins, afterwards there is nothing to match).
+                // The last known value - the median of what is still kept - is what is shown, marked as old, while the node is still connected.
+                Sort(old, oc);
+                n.c_has = 1;
+                n.c_rtt = old[oc / 2];
             }
         }
         // A line is shown while game packets arrive from the node (even if there are no samples yet: then "name --", as for the
@@ -1188,27 +1343,19 @@ int Snapshot(NodeRtt out[8]) {
             o.age_ms = n.last_sample_us ? static_cast<int>((now - n.last_sample_us) / 1000) : 0;
             o.last_ms = n.has_last ? static_cast<int>(n.last_ms) : -1;
         }
-        if (c > 0) {
-            Sort(v, c);
-            o.rtt_ms = static_cast<int>(v[c / 2]);
-            o.window_ms = o.rtt_ms;
-            o.min_ms = static_cast<int>(v[0]);
-            o.p90_ms = static_cast<int>(v[(c * 9) / 10]);
-            o.samples = samples;
-            o.corrected = corrected * 2 > samples;
-            if (rc > 0) { // the last 2 s on their own: shown instead of the window while they are clearly worse (kSpikeMinMs)
-                Sort(rec, rc);
-                o.recent_ms = static_cast<int>(rec[rc / 2]);
-                if (o.recent_ms >= o.window_ms + kSpikeMinMs && o.recent_ms * 2 >= o.window_ms * 3) {
-                    o.spike = true;
-                    o.rtt_ms = o.recent_ms;
-                }
+        if (n.c_live) {
+            o.rtt_ms = n.c_rtt;
+            o.window_ms = n.c_window;
+            o.min_ms = n.c_min;
+            o.p90_ms = n.c_p90;
+            o.samples = static_cast<int>(n.c_samples);
+            o.corrected = n.c_corrected != 0;
+            if (n.c_recent != 0xFFFF) {
+                o.recent_ms = n.c_recent;
             }
-        } else if (o.age_ms >= 0 && oc > 0) {
-            // No recent sample but the node is still connected (FF Explorers: a client sends reliable data only when it joins,
-            // afterwards there is nothing to match). The last known value - the median of what is still kept - is shown, marked as old.
-            Sort(old, oc);
-            o.rtt_ms = static_cast<int>(old[oc / 2]);
+            o.spike = n.c_spike != 0;
+        } else if (o.age_ms >= 0 && n.c_has) {
+            o.rtt_ms = n.c_rtt;
             o.stale = true;
         }
         // One-way delay (game clock in the state packets): median of the samples of the last 8 s, one sample per new value of
@@ -1223,16 +1370,8 @@ int Snapshot(NodeRtt out[8]) {
                 if (now_ms32 - owd[i].t_ms <= kOwdWindowMs) d[dc++] = owd[i].d_ms;
             }
             if (dc >= kOwdMinSamples) {
-                for (int i = 1; i < dc; ++i) {
-                    const int x = d[i];
-                    int j = i - 1;
-                    while (j >= 0 && d[j] > x) {
-                        d[j + 1] = d[j];
-                        --j;
-                    }
-                    d[j + 1] = x;
-                }
-                o.owd_ms = d[dc / 2] < 0 ? 0 : d[dc / 2];
+                const int m = NthInt(d, dc, dc / 2);
+                o.owd_ms = m < 0 ? 0 : m;
             }
         }
     }

@@ -43,6 +43,14 @@ static std::vector<std::string> g_lines;
         }                                                                                 \
     } while (0)
 
+static int CountLines(const char* prefix) {
+    int n = 0;
+    for (const std::string& l : g_lines) {
+        if (l.find(prefix) != std::string::npos) ++n;
+    }
+    return n;
+}
+
 static void SleepMs(int ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
@@ -78,8 +86,9 @@ static std::vector<u8> PrudpPing(bool reply, u16 stamp, u16 seq) {
 }
 
 // A packet of the "ack" layer (Tetris): see latency.cpp. type 0 DATA, 1 heartbeat, 6 ACK; msg / node at 36 / 38; sender node at 20.
-static std::vector<u8> AckPacket(u8 type, u32 dest, u32 sender, u16 msg, u16 msg_node, std::size_t size = 52) {
+static std::vector<u8> AckPacket(u8 type, u32 dest, u32 sender, u16 msg, u16 msg_node, std::size_t size = 52, std::size_t declared = 0) {
     std::vector<u8> p(size, 0);
+    if (declared != 0) size = declared; // (the size written in the header: a DATA shorter than its packet, padding after it)
     auto put32 = [&](int o, u32 v) { p[o] = static_cast<u8>(v); p[o + 1] = static_cast<u8>(v >> 8); p[o + 2] = static_cast<u8>(v >> 16); p[o + 3] = static_cast<u8>(v >> 24); };
     put32(0, dest);
     p[8] = 0x80;
@@ -327,6 +336,15 @@ static void TestAck() {
         latency::OnRecv(2, 0, back.data(), static_cast<u32>(back.size()));
         latency::Tick(0, true);
     }
+    // a reliable DATA of mine declared 108 bytes in a 160-byte packet (padding after it): acknowledged and counted like the others
+    {
+        std::vector<u8> padded = AckPacket(0, 0xFFFFFFFFu, 1, 50, 1, 160, 108);
+        latency::OnSend(255, 0, padded.data(), static_cast<u32>(padded.size()));
+        SleepMs(60);
+        std::vector<u8> back = AckPacket(6, 1, 2, 50, 1);
+        latency::OnRecv(2, 0, back.data(), static_cast<u32>(back.size()));
+        latency::Tick(1500, true);
+    }
     // a message sent twice: the ACK that follows says nothing (which send does it answer?)
     std::vector<u8> out = AckPacket(0, 0xFFFFFFFFu, 1, 99, 1, 108);
     latency::OnSend(255, 0, out.data(), static_cast<u32>(out.size()));
@@ -339,7 +357,7 @@ static void TestAck() {
     const latency::NodeRtt n2 = Node(2);
     const latency::NodeRtt n3 = Node(3);
     std::printf("ack: node 2 %d ms (%d samples, A %d), node 3 %d ms age %d\n", n2.rtt_ms, n2.samples, n2.corrected ? 1 : 0, n3.rtt_ms, n3.age_ms);
-    CHECK(n2.age_ms >= 0 && n2.samples == 12);          // (the resent message gave no sample)
+    CHECK(n2.age_ms >= 0 && n2.samples == 13);          // (12 + the padded one; the resent message gave no sample)
     CHECK(n2.corrected && n2.window_s == 30);           // (the hold is an estimate: A)
     CHECK(n2.rtt_ms >= 28 && n2.rtt_ms <= 60);          // ~60 ms ACK delay - ~20 ms of my own hold = ~40 ms
     CHECK(n3.age_ms >= 0 && n3.rtt_ms < 0);             // node 3 is listed (it sends) with no value
@@ -364,6 +382,13 @@ static void TestOther() {
     CHECK(std::strstr(buf, "lock=-") != nullptr);
     CHECK(std::strstr(buf, ",UR,60,020101FF") != nullptr); // the first bytes of the unknown packet, once
     CHECK(Node(1).rtt_ms < 0);
+    // the log has one sample a (direction, size): the ten 60-byte packets gave one line of 48 bytes in hex; a 44-byte one of mine, another
+    CHECK(CountLines("lat: unknown R 60: 020101FF5A5A5A5A") == 1);
+    std::vector<u8> q(44, 0x33);
+    latency::OnSend(1, 0, q.data(), static_cast<u32>(q.size()));
+    latency::OnSend(1, 0, q.data(), static_cast<u32>(q.size()));
+    latency::Tick(3000, true);
+    CHECK(CountLines("lat: unknown S 44: 3333") == 1 && CountLines("lat: unknown ") == 2);
 }
 
 static void TestBurst() {
@@ -415,9 +440,22 @@ static void TestWindow() {
     g_lines.clear();
     latency::Tick(6000, true);
     CHECK(!HasLine("lat: room link"));
+    // the link against its own past: three windows of 6-7 ms, then one of 48: a spike ("room:48ms!" on the screen, a line in the log), over when it is back
+    latency::NoteLink(7, 4, 5);
+    latency::Tick(7000, true);
+    latency::NoteLink(6, 3, 5);
+    latency::Tick(7500, true);
+    CHECK(!latency::LinkNow().spike && latency::LinkNow().base_ms == 6);
     latency::NoteLink(48, 30, 120);
     latency::Tick(8000, true);
     CHECK(HasLine("lat: room link 48+-30 ms, loss 120/1000"));
+    const latency::LinkState up = latency::LinkNow();
+    std::printf("window: link %d ms, usually %d, spike %d\n", up.rtt_ms, up.base_ms, up.spike ? 1 : 0);
+    CHECK(up.spike && up.rtt_ms == 48 && up.base_ms == 6);
+    CHECK(HasLine("lat: room link spike: 48 ms, usually 6 (this console's own line)"));
+    latency::NoteLink(7, 4, 5);
+    latency::Tick(9000, true);
+    CHECK(!latency::LinkNow().spike && HasLine("lat: room link spike over: 7 ms"));
 }
 
 // Pia echoes at 40 ms for 3 s, then 500 ms for 2 s (the connection got worse), then 40 ms again: the shown value jumps to ~500 while it lasts and comes

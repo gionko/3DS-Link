@@ -55,9 +55,12 @@ inline u32 LatencyName(int node, const u16* units, char* out) {
     return n;
 }
 
-/// "64ms" / "~64ms" / "--" into `out` (at most 12 characters with the terminator); "64ms!" while the value is the last 2 s, clearly worse than the window
-/// (latency::NodeRtt::spike: the connection just got worse - the user's request, 2026-11-13). Returns the length.
-inline u32 LatencyText(int rtt_ms, bool stale, char* out, bool spike = false) {
+constexpr int kJitterShownMs = 20; ///< "+J" after the value only from this much: below it the connection is steady and the number would be noise
+
+/// "64ms" / "~64ms" / "--" into `out` (at most 16 characters with the terminator); "64ms!" while the value is the last 2 s, clearly worse than the window
+/// (latency::NodeRtt::spike: the connection just got worse - the user's request, 2026-11-13); "64ms+34" when the connection jumps: `jitter` is how far
+/// the window's 90th percentile is above its median, written from kJitterShownMs up (the user's request, 2026-11-14). Returns the length.
+inline u32 LatencyText(int rtt_ms, bool stale, char* out, bool spike = false, int jitter = -1) {
     u32 n = 0;
     if (rtt_ms < 0) {
         out[n++] = '-';
@@ -86,6 +89,21 @@ inline u32 LatencyText(int rtt_ms, bool stale, char* out, bool spike = false) {
     if (spike) {
         out[n++] = '!';
     }
+    if (!stale && jitter >= kJitterShownMs) {
+        if (jitter > 999) {
+            jitter = 999;
+        }
+        out[n++] = '+';
+        d = 0;
+        v = jitter;
+        do {
+            digits[d++] = static_cast<char>('0' + v % 10);
+            v /= 10;
+        } while (v > 0);
+        while (d > 0) {
+            out[n++] = digits[--d];
+        }
+    }
     out[n] = '\0';
     return n;
 }
@@ -93,8 +111,10 @@ inline u32 LatencyText(int rtt_ms, bool stale, char* out, bool spike = false) {
 /// The rows of the board: `nr` as latency::Snapshot gives it (8 nodes, node 1 first), `names[node]` the name to show for each node (plain ASCII, the
 /// room's nickname of that player - the one the chat writes - else its UDS username; `has_name[node]` false: none known: "P<node>"), `now_ms` the
 /// time stamped on the rows. Fills `rows` (kLatShown at most: one line a player up to
-/// kLatShown players, one line of tiles above that), returns how many.
-inline u32 BuildLatencyRows(const latency::NodeRtt nr[8], const char names[9][kNickMax + 1], const bool has_name[9], u32 now_ms, Line* rows) {
+/// kLatShown players, one line of tiles above that), returns how many. `link_rtt_ms` / `link_spike`: this console's own link to the room (latency::LinkNow):
+/// while it is clearly worse than usual, and there is a row free, a row "room:90ms!" says so - a player's value that rose with it is this console's line.
+inline u32 BuildLatencyRows(const latency::NodeRtt nr[8], const char names[9][kNickMax + 1], const bool has_name[9], u32 now_ms, Line* rows,
+                            int link_rtt_ms = -1, bool link_spike = false) {
     u32 present = 0;
     for (int i = 0; i < 8; ++i) {
         present += nr[i].age_ms >= 0 && nr[i].node >= 1 && nr[i].node <= 8 ? 1 : 0;
@@ -145,8 +165,21 @@ inline u32 BuildLatencyRows(const latency::NodeRtt nr[8], const char names[9][kN
         }
         l.own = static_cast<u8>(o.node - 1); // (the colour of the node: kNodeColour, the same the player's messages have in the chat)
         l.nick_len = static_cast<u8>(n);
-        l.text_len = static_cast<u8>(LatencyText(o.rtt_ms, o.stale, l.text, o.spike));
+        // "+J": how far the window's 90th percentile is above its median - not while the last 2 s are shown instead of the window (the "!" says it already)
+        const int jitter = !o.spike && o.p90_ms >= 0 && o.window_ms >= 0 ? o.p90_ms - o.window_ms : -1;
+        l.text_len = static_cast<u8>(LatencyText(o.rtt_ms, o.stale, l.text, o.spike, jitter));
         l.pad = LatencyColour(o.rtt_ms);
+    }
+    if (link_spike && link_rtt_ms >= 0 && count < kLatShown) { // this console's own link, only while it is clearly worse than usual
+        Line& l = rows[count++];
+        l = Line();
+        l.t_ms = now_ms;
+        l.sep = '\0';
+        std::memcpy(l.nick, "room", 5);
+        l.nick_len = 4;
+        l.own = 6; // (white: none of the players)
+        l.text_len = static_cast<u8>(LatencyText(link_rtt_ms, false, l.text, true));
+        l.pad = LatencyColour(link_rtt_ms);
     }
     return count;
 }

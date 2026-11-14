@@ -1304,6 +1304,32 @@ static void TestLatencyRows() {
         CHECK(chat::LatencyText(64, true, t) == 5 && std::strcmp(t, "~64ms") == 0);
         CHECK(chat::LatencyText(480, false, t, true) == 6 && std::strcmp(t, "480ms!") == 0);
         CHECK(chat::LatencyText(-1, false, t, true) == 2 && std::strcmp(t, "--") == 0);
+        // "+J" when the connection jumps (the 90th percentile 20 ms or more above the median), not for a steady one nor an old value
+        CHECK(chat::LatencyText(66, false, t, false, 34) == 7 && std::strcmp(t, "66ms+34") == 0);
+        CHECK(chat::LatencyText(66, false, t, false, 19) == 4 && std::strcmp(t, "66ms") == 0);
+        CHECK(chat::LatencyText(66, true, t, false, 34) == 5 && std::strcmp(t, "~66ms") == 0);
+        CHECK(chat::LatencyText(66, false, t, true, 34) == 8 && std::strcmp(t, "66ms!+34") == 0);
+    }
+    {   // this console's own link to the room: a row "room:90ms!" while it is clearly worse than usual and a row is free; never when three players fill the rows
+        latency::NodeRtt nr[8];
+        char units[9][chat::kNickMax + 1] = {};
+        bool has[9] = {};
+        for (int i = 0; i < 8; ++i) {
+            nr[i].node = i + 1;
+        }
+        nr[0].age_ms = 5;
+        nr[0].rtt_ms = 66;
+        nr[0].window_ms = 66;
+        nr[0].p90_ms = 100; // (the window jumps: "+34")
+        chat::Line rows[chat::kLines];
+        CHECK(chat::BuildLatencyRows(nr, units, has, 1000, rows, 90, true) == 2);
+        CHECK(std::strcmp(rows[0].nick, "[H] P1") == 0 && std::strcmp(rows[0].text, "66ms+34") == 0);
+        CHECK(std::strcmp(rows[1].nick, "room") == 0 && std::strcmp(rows[1].text, "90ms!") == 0 && rows[1].own == 6 && rows[1].pad == chat::LatencyColour(90));
+        CHECK(chat::BuildLatencyRows(nr, units, has, 1000, rows, 90, false) == 1); // (the link is usual: no row)
+        CHECK(chat::BuildLatencyRows(nr, units, has, 1000, rows, -1, true) == 1);  // (nothing handed over yet: no row)
+        nr[1].age_ms = 5; nr[1].rtt_ms = 40; nr[1].window_ms = 40; nr[1].p90_ms = 45;
+        nr[2].age_ms = 5; nr[2].rtt_ms = 50; nr[2].window_ms = 50; nr[2].p90_ms = 55;
+        CHECK(chat::BuildLatencyRows(nr, units, has, 1000, rows, 90, true) == 3 && std::strcmp(rows[2].nick, "P3") == 0); // (three players: no room for the link)
     }
     // the rows: in the order of the nodes, the host marked, a name read from the username, "P<node>" for none or for no plain ASCII
     {
