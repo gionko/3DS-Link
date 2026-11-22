@@ -416,9 +416,10 @@ static void GameHostWithClients(Player& g, Player& h, Player& k) {
     CHECK_EQ(k.e().ConnectToNetwork(info, sizeof(info), 1), 0u);
 }
 
-/// Y7: a game's host says nothing to its clients when a node leaves (the engine's behaviour for games does not change).
+/// Y7: a game's host tells the clients that remain, and only them, when a node leaves (2026-11-15, GB-01 closed by the user's decision D5: before, it
+/// said nothing, and the clients kept the player who had left): one Logoff, to K, the one client that remains.
 static void YGameHostQuiet() {
-    std::printf("y7: a game's host sends no Logoff when a node leaves\n");
+    std::printf("y7: a game's host sends one Logoff to the client that remains when a node leaves\n");
     g_rules.Reset();
     MockRoom room;
     Player g(room, 1, "G"), h(room, 2, "H"), k(room, 3, "K");
@@ -431,7 +432,12 @@ static void YGameHostQuiet() {
     CHECK_EQ(h.e().DisconnectNetwork(), 0u);
     CHECK(WaitFor(3000, [&] { return HostSees(g, 5); }));
     Settle(ps, 600);
-    CHECK_EQ(Logoffs(sent), 0);
+    CHECK_EQ(Logoffs(sent), 1);
+    int to_k = 0;
+    for (const WifiPacket& p : sent.All()) {
+        to_k += IsLogoff(p) && p.destination_address == k.mac() ? 1 : 0;
+    }
+    CHECK_EQ(to_k, 1);
 }
 
 /// Y8: a lobby CLIENT sends nothing when a fellow node leaves the room (only the host tells the others).

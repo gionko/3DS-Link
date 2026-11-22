@@ -60,14 +60,22 @@ public:
     bool Start(const Config& config);
     /// Leaves the room and waits for the thread - at most kStopJoinMs. A network thread that does not leave in that time
     /// (stuck in a service call, or not scheduled) is abandoned: it is told that it belongs to a past session, and
-    /// whatever it does when it wakes up is void (it touches no state of the next one).
+    /// whatever it does when it wakes up is void (it touches no state of the next one). True when the thread ended (or there was none); false
+    /// when it was abandoned: it still holds this client and may run one more round of its callbacks, so neither the client nor what the callbacks
+    /// use may be freed (the final review of 1.1.4: the app's Download Play page freed them).
     static constexpr u32 kStopJoinMs = 2000;
-    void Stop();
+    bool Stop();
     /// Only asks the thread to finish (no waiting). `quick` skips the polite disconnect handshake.
     void RequestStop(bool quick);
     /// RequestStop(true) and wait at most `timeout_ms` for the thread. Returns false if it did not
     /// finish in time (the thread is then abandoned: do not tear down what it uses).
     bool StopWithin(u32 timeout_ms);
+    /// 1.1.4 (route B, spec 8 D-B10): did the last polite leave (Stop) end with the room's answer - ENet's DISCONNECT within its 500 ms, or the
+    /// peer already let go? False from every Start until then, and after a quick stop, a lost link or no answer: the room may then list this
+    /// console for a few seconds. Read after Stop() returned.
+    bool LeaveAcknowledged() const {
+        return leave_ack_.load();
+    }
 
     /// How long the network thread pauses after a socket error: the n-th in a row (1 for the first) waits 2, 4, 8, 16, 32,
     /// 64 and then 128 ms. A link that is gone (the console woke up from sleep with no WiFi yet: ENETDOWN) makes every
@@ -127,6 +135,29 @@ public:
     }
     bool fast_data() const {
         return fast_level_.load() > 0;
+    }
+
+    /// How many of the room's packets that are ready the network thread hands over in ONE round, before it turns to the queue and
+    /// the flush. 1 (the default, every game but the titles of azl/flow_relief.hpp): one, as ever - the service call's. More: the
+    /// ones that are ready behind it too, up to `packets` in the round, with no soc call (enet_host_check_events). Can be changed live.
+    void SetHandOverBurst(u32 packets) {
+        hand_over_burst_.store(packets < 1 ? 1 : packets);
+    }
+    u32 hand_over_burst() const {
+        return hand_over_burst_.load();
+    }
+    /// At ENet's limit of waiting data, a relayed game frame or beacon of the room (EarlyFilter: what a radio may lose) is acknowledged and dropped
+    /// instead of refused (ENetHost::azlCapDrop): a refusal doubles the room's timer of that very frame, and the holes that follow grow until the room
+    /// ends the link (2026-11-14 22:50, Mario Party: Island Tour). `placeholders`: at most this many dropped frames wait at once (beyond that, refused);
+    /// 0 (the default, every game whose row of azl/title_rules.hpp has no cap_drop_max): refused, as ever.
+    void SetCapDrop(u32 placeholders) {
+        cap_drop_max_.store(placeholders);
+    }
+    /// The send budget of a round (2026-11-15): a round hands ENet at most `bytes` of the game's queue (TxQueue::TakeUpTo: the first frame always), the rest
+    /// waits for the next round, which reads the socket first. 0 (the default, every game whose row of azl/title_rules.hpp has no send_budget_bytes): the
+    /// whole queue every round, as ever.
+    void SetSendBudget(u32 bytes) {
+        send_budget_.store(bytes);
     }
 
     /// What ENet knows about the link to the room server, refreshed about once a second.
@@ -193,9 +224,13 @@ private:
     std::atomic<int> error_{static_cast<int>(Error::None)};
     std::atomic<bool> stop_requested_{false};
     std::atomic<int> fast_level_{0};
+    std::atomic<u32> hand_over_burst_{1}; ///< the room's packets handed over per round (SetHandOverBurst)
+    std::atomic<u32> send_budget_{0};     ///< bytes of the game's queue handed to ENet per round (SetSendBudget; 0 = all of it)
+    std::atomic<u32> cap_drop_max_{0};    ///< game frames dropped (acknowledged) at ENet's limit instead of refused, at most this many held (SetCapDrop; 0 = off)
     std::atomic<u32> tx_pending_{0};     ///< 1 while something was pushed into tx_ and not taken: the loop looks at the queue only then
     std::atomic<u32> last_enqueue_ms_{0}; ///< when the game last queued a frame (ms, truncated): the loop polls faster for a while after it
     std::atomic<bool> quick_stop_{false};
+    std::atomic<bool> leave_ack_{false}; ///< LeaveAcknowledged (written by the network thread at the end of a polite leave)
     std::atomic<u32> generation_{0}; ///< bumped by every Start() and by a Stop() that abandons the thread
     std::atomic<int> last_errno_{0};
     u64 start_request_ms_ = 0;
@@ -230,6 +265,14 @@ inline u32 ServiceTimeoutFor(bool queued, u32 now_ms, u32 last_enqueue_ms) {
         return 0;
     }
     return now_ms - last_enqueue_ms < kQuickPollWindowMs ? kQuickPollMs : kServiceTimeoutMs;
+}
+/// Whether queuing a frame of this type starts that window. 2026-11-10: a host's own beacon does not. The window is for the
+/// frames of a burst of the GAME; the beacon is queued by the network thread itself (UdsEngine::Tick) every 102 ms and has no
+/// burst behind it, yet it bought 10 ms of 1 ms polls each time: 38 to 75 rounds a second on a host that stood still, none
+/// on a console that did not host (console 63's logs). The beacon itself is not held back: it is queued, so the next round
+/// does not wait at all, and a frame of the game that comes after it starts the window as before.
+inline bool StartsQuickPoll(WifiPacket::Type type) {
+    return type != WifiPacket::Type::Beacon;
 }
 
 /// The room link's probe, the answer to a silence the link has already left behind. ENet doubles the timer of a packet that gets no

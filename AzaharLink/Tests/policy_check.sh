@@ -8,9 +8,12 @@ FAILED=0
 BUILT=1
 [ -f dist/3DSLink.3dsx ] && [ -f ConfigApp/data/AzaharLink.3gx ] && [ -f ConfigApp/data/child_model.bin ] || BUILT=0
 [ "$BUILT" = 1 ] || echo "NOTE: this tree has not been built: the checks of the build products (dist/, ConfigApp/data/) are skipped"
+# POLICY_FAIL_FAST=1 (set only by Tests/policy_mutants.py on a mutant, never on the unchanged copy): the first failure ends the check, the
+# verdict is the same (fail is never called in a subshell or a pipe here, so it always reaches this exit)
 fail() {
   echo "policy check FAILED: $1"
   FAILED=1
+  [ -z "$POLICY_FAIL_FAST" ] || exit 1
 }
 # $1 = file, $2 = what must be in it (a fixed string), $3 = why
 need() {
@@ -34,6 +37,12 @@ need_order() {
 # $1 = file, $2 = a statement that must open a line after its indentation (a commented-out copy, '// x;', does not count), $3 = why
 need_stmt() {
   tr -d '\r' < "$1" | awk -v s="$2" '{ sub(/^[ \t]+/, ""); if (index($0, s) == 1) found = 1 } END { exit !found }' || fail "$1 no longer has the statement '$2' ($3)"
+}
+# $1 = what the block is, $2 = a block of lines (a piece of a function, taken by the caller), $3 = the number of a line in it (from 1), $4 = the whole line that must be there, $5 = why
+need_nth() {
+  local got
+  got=$(printf '%s\n' "$2" | sed -n "${3}p")
+  [ "$got" = "$4" ] || fail "$1: statement $3 is '$got', not '$4' ($5)"
 }
 
 # The ini defaults: the sleep action is off until the lid test, the receive ring is the 64 KB the soc service grants, and
@@ -75,8 +84,10 @@ RENDERED=$(tr -d '\r' < Includes/azl/ini_values.hpp | sed -n '/^inline std::stri
 # The switches (enabled, tunnel, autoconnect, socket_buffers, chat) are read by the shared ParseBool in both programs: 1/on/true/yes
 # and 0/off/false/no, and a slip is the key's default, never "on". radio_like has three values (0, 1, 2: ini::ParseRadioLike,
 # which takes the words of a switch for 0 and 1) since the performance round of 2026-10-19.
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'ini::ParseBool(value, true)')" = "5" ] || fail "the plugin reads a switch of the ini without ini::ParseBool"
-[ "$(tr -d '\r' < ConfigApp/source/settings.cpp | grep -c 'azl::ini::ParseBool(value, true)')" = "5" ] || fail "the Setup app reads a switch of the ini without ini::ParseBool"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'ini::ParseBool(value, true)')" = "4" ] || fail "the plugin reads a switch of the ini without ini::ParseBool"
+need_line Sources/ctr/plugin.cpp '            config_.chat = ini::ParseBool(value, ini::kChatDefault); // (a slip is the default: off since DPAPP-2j, as the app)' "DPAPP-2j: the plugin reads the chat with the shared default (off), as the app"
+[ "$(tr -d '\r' < ConfigApp/source/settings.cpp | grep -c 'azl::ini::ParseBool(value, true)')" = "4" ] || fail "the Setup app reads a switch of the ini without ini::ParseBool"
+need_line ConfigApp/source/settings.cpp '            cfg.chat = azl::ini::ParseBool(value, azl::ini::kChatDefault);' "DPAPP-2h: the chat's switch read with ini::ParseBool, its default the shared one (off)"
 need Sources/ctr/plugin.cpp "config_.radio_like = ini::ParseRadioLike(value);" "the plugin reads radio_like's three values with the shared parser"
 need ConfigApp/source/settings.cpp "cfg.radio_like = azl::ini::ParseRadioLike(value);" "the Setup app reads radio_like's three values with the shared parser"
 need Includes/azl/ini_values.hpp 'if (Word(value) == "2") {' "radio_like=2 is the third value"
@@ -120,12 +131,17 @@ need_after Sources/main.cpp "    if (g_chat_keys == Key::Select || clash(g_chat_
 need_after Sources/main.cpp "    if (clash(g_chat_keys, g_menu_keys)) {" "        g_menu_keys = ParseKeys(azl::ini::kDefaultMenuKey) | Key::Select;" "a menu chord that still clashes takes its default"
 need_order Sources/main.cpp "    g_menu_keys = ParseKeys(cfg.menu_key) | Key::Select;" "    if (g_chat_keys == Key::Select || clash(g_chat_keys, g_menu_keys)) {" "the clash is looked for with the menu's chord read"
 need_line Tests/log_files_test.cpp '    CHECK(ini::ChordsNested("L+Left+Select", "l+left") && ini::ChordsNested("L+Select", ini::kDefaultChatKey));' "the ini test checks the nested chords"
-# The chat is ON by default (the user's decision, 2026-11-04: it can be switched off in the app and in the in-game menu), and its lines are
+# The chat is OFF by default since 2026-11-19 (the user's choice for the build 2h: In-game chat and In-game menu both off in a new file; it was on
+# since 2026-11-04 - a file that says chat=1 keeps it on, it can be switched on in the app and in the in-game menu), and its lines are
 # at the bottom left of the top screen until the user moves them. The word in the file is one of four; anything else is the default, read
-# by the one shared parser in both programs, and the plugin's Config and the app's Settings take the default from the shared header.
-need Includes/azl/ini_values.hpp "bool chat = true;" "the chat is on in a new file"
-need Includes/ctr/plugin.hpp "bool chat = true;" "the plugin's chat is on when the file does not say otherwise"
-need ConfigApp/source/settings.hpp "bool chat = true;" "the app's row In-game chat is on when the file does not say otherwise"
+# by the one shared parser in both programs; the app's Settings, the shared Fields AND (DPAPP-2j, the user's decision: chat, debug and menu off by
+# default, the plugin too when the file or the key is missing) the plugin's own Config take the default from the shared header (kChatDefault).
+need Includes/azl/ini_values.hpp "inline constexpr bool kChatDefault = false;" "DPAPP-2h: the chat is off in a new file (the user's choice of 2026-11-19)"
+need Includes/azl/ini_values.hpp "bool chat = kChatDefault;" "the shared Fields take the chat's default from the header"
+need Includes/ctr/plugin.hpp "bool chat = ini::kChatDefault;" "DPAPP-2j: the plugin's chat is OFF when the file does not say otherwise (the user's decision)"
+need Includes/ctr/plugin.hpp "std::atomic<bool> chat_on_{ini::kChatDefault};" "DPAPP-2j: ... and so is the switch the other threads read until the file is read"
+! tr -d '\r' < Includes/ctr/plugin.hpp | sed 's://.*$::' | grep -q -E 'bool chat = true|chat_on_\{true\}' || fail "DPAPP-2j: the plugin's chat is on by default again"
+need ConfigApp/source/settings.hpp "bool chat = azl::ini::kChatDefault;" "the app's row In-game chat is off when the file does not say otherwise (DPAPP-2h)"
 need Includes/azl/ini_values.hpp "enum ChatPos : int { kChatPosTopLeft = 0, kChatPosTopRight = 1, kChatPosBottomLeft = 2, kChatPosBottomRight = 3, kChatPosCount = 4 };" "the four corners of chat_pos, in the order the rows cycle"
 need Includes/azl/ini_values.hpp 'constexpr const char* kChatPosWords[kChatPosCount] = {"top-left", "top-right", "bottom-left", "bottom-right"};' "the words of chat_pos in the file, in the order of the corners"
 need Includes/azl/ini_values.hpp "constexpr int kChatPosDefault = kChatPosBottomLeft;" "the chat's lines are at the bottom left by default"
@@ -210,6 +226,18 @@ need_after Sources/ctr/plugin.cpp "    ChatSink* sink = chat_sink_.load(std::mem
 need Sources/ctr/plugin.cpp "    room_->SetChatSink(on ? sink : nullptr);" "the chat off hands the room client no block"
 need Tests/run.sh 'Tests/chat_core_test.cpp -Wl,--wrap=malloc -o "$OUT/chat_core_test"' "the chat's test counts the allocations through the link"
 need Tests/integration.sh "/tmp/azl_tests/chat_room_probe \$R1 24872" "the chat is tested against the real room"
+# (2026-11-15) The integration run builds only the probes it runs, with the lane 'room' of Tests/lane.sh (the policy check first, then run.sh's own
+# g++ lines for those binaries): every binary of $OUT it runs must be in that lane, or it would run a binary of another build, or none
+need_line Tests/integration.sh "      bash Tests/lane.sh room && /tmp/azl_tests/room_integration \$R1 24872 \$R2 24872 &&" "the integration run builds its probes with the lane 'room', then runs them"
+lane_room=" $(bash Tests/lane.sh --list | sed -n 's/^room: //p') "
+for t in $(grep -o '/tmp/azl_tests/[A-Za-z0-9_]*' Tests/integration.sh | sed 's|.*/||' | sort -u); do
+  [[ "$lane_room" == *" $t "* ]] || fail "Tests/integration.sh runs $t, which the lane 'room' of Tests/lane.sh does not build"
+done
+bash Tests/lane.sh --list | grep -q '^in no area' && fail "a test of Tests/run.sh is in no area of Tests/lane.sh: $(bash Tests/lane.sh --list | grep '^in no area' | head -1)"
+# (2026-11-15, registro 1185) The gate's post (azl_post32) is the dispatch to the five posts and nothing else, line for line: an early return put in it
+# (a level check, a shortcut) would skip the post of every call and passed the check before
+GATE_POST=$(tr -d '\r' < Sources/ctr/hook.cpp | awk '$0 == "extern \"C\" Result azl_post32(Result result, u32 stub_ret, u32* ctx) {" { f = 1 } f { print } f && $0 == "}" { exit }' | tr '\n' '|')
+[ "$GATE_POST" = 'extern "C" Result azl_post32(Result result, u32 stub_ret, u32* ctx) {|    (void)stub_ret;|    switch (ctx[3]) {|    case kActPostIpc:|        return PassThroughPost(result, ctx);|    case kActPostGetService:|        return PassThroughGetServicePost(result, ctx);|    case kActPostTraced:|        return PassThroughTracedPost(result, ctx);|    case kActPostApt:|        return PassThroughAptPost(result, ctx);|    case kActPostAptNoted:|        return PassThroughAptNotedPost(result, ctx);|    default:|        return result;|    }|}|' ] || fail "Sources/ctr/hook.cpp: azl_post32 is no longer the dispatch to the five posts, line for line (an early return in it skips the post of every call)"
 # The chat's lines on the top screen (Includes/azl/chat_draw.hpp) and the drawing under them (Includes/azl/gfx_surface.hpp): they run on the
 # game's thread inside the framework's OSD callback, so the two headers are held to the rule of the game-thread code everywhere (no heap,
 # no container, no printf, no big buffer: their regions are counted with the others below), and they draw with their own stores, never with
@@ -681,7 +709,281 @@ need ConfigApp/source/pages_config.cpp "} else if (keys == KEY_X) {" "X alone gi
 # ... and, while the mirror is the game's page, its live parts are copied again at every frame (review of the chat, I12: the call dropped, the
 # indices and ticks of the pad and the touch, the accelerometer and the gyroscope stayed frozen and the "released" were never written again)
 body=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | awk '/^void MirrorFrame\(u32 now_ms\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::')
-printf '%s\n' "$body" | grep -F -A3 -- "    if (g_m.active.load(std::memory_order_acquire) != 0) {" | grep -F -q -- "        hidmirror::RefreshMirror(g_page, real, g_released.Next());" || fail "Sources/ctr/input_mirror.cpp: MirrorFrame no longer refreshes the mirror's live parts (RefreshMirror with the next 'released') at every frame the mirror is mapped"
+printf '%s\n' "$body" | grep -F -A7 -- "    if (g_m.active.load(std::memory_order_acquire) != 0) {" | grep -F -q -- "        hidmirror::RefreshMirror(g_page, real, g_released.Next());" || fail "Sources/ctr/input_mirror.cpp: MirrorFrame no longer refreshes the mirror's live parts (RefreshMirror with the next 'released') at every frame the mirror is mapped"
+
+# ---- the chat's keyboard, review of 2026-11-10 (package B: the wait for the release, the keyboard still shown, the trail) ---------
+# B1. The wait for the release counts from ONE clock, the frame's: the close used to read the clock again, 1-2 ms after the frame's own,
+# and the frame's look then saw "4 billion ms over the cap" (unsigned) and gave the page back at once, the closing key still held (23 closes
+# of 144 on console 63). Both halves are held: the close passes the frame's clock, and the wait compares with the sign on BOTH sides
+# (kMaxWaitMs and kQuietMs are u32: a signed difference against them is an unsigned comparison again).
+need_line Includes/azl/hid_mirror.hpp "        const bool capped = static_cast<s32>(now_ms - start_) >= static_cast<s32>(kMaxWaitMs);" "the cap of the wait for the release is compared with its sign, on both sides"
+need_line Includes/azl/hid_mirror.hpp "        const bool rested = quiet_ && static_cast<s32>(now_ms - quiet_since_) >= static_cast<s32>(kQuietMs);" "the quiet of the wait for the release is compared with its sign, on both sides"
+need_line Sources/ctr/chat_overlay.cpp "        MirrorRelease(g_frame_ms);" "the close starts the wait for the release from the frame's clock"
+n=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -c 'MirrorRelease(')
+[ "$n" = 1 ] || fail "Sources/ctr/chat_overlay.cpp starts the wait for the release $n times (once, from the frame's clock)"
+need_after Sources/ctr/chat_overlay.cpp "    const u32 now_ms = static_cast<u32>(platform::NowMs());" "    g_frame_ms = now_ms;" "the frame's clock is kept for the close, right where it is read"
+n=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -c 'g_frame_ms = ')
+[ "$n" = 2 ] || fail "Sources/ctr/chat_overlay.cpp sets the frame's clock $n times (its definition and ChatFrame's one store)"
+need_line Tests/hid_mirror_test.cpp "    CHECK(!w.Update(false, 1000) && w.waiting()); // (held, 1 ms \"before\" the start: not over the cap)" "the input mirror's test holds a clock older than the wait's start"
+need_line Tests/hid_mirror_test.cpp "    CHECK(!w.Update(true, 999));  // (a clock that steps back between two looks: -1 ms of quiet, not 4 billion)" "the input mirror's test holds a clock that steps back during the quiet"
+# B2. The page is quiet by its 8 pad entries and its 8 touch entries (and the raw touch): the pad's two raw words (0x1C, 0x20) are not
+# looked at any more (with them the 50 ms of quiet never ended a wait on a console: 121 closes of 144 at the 1 s cap). The cap stays 1 s
+# (pinned above). A wait that still ends at its cap says why in the debug log, from the plugin's thread, with those words.
+need_after Includes/azl/hid_mirror.hpp "inline bool PageQuiet(const u8* real) {" "    return Unquiet(real) == 0;" "the page is quiet when none of Unquiet's conditions holds"
+hit=$(tr -d '\r' < Includes/azl/hid_mirror.hpp | awk '/^inline u32 Unquiet\(const u8\* real\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::' | grep -n -E 'kPadRaw|0x1C|0x20' | head -2)
+[ -z "$hit" ] || fail "Includes/azl/hid_mirror.hpp: the look at the real page reads the pad's raw words again (never quiet on a console): $hit"
+n=$(tr -d '\r' < Includes/azl/hid_mirror.hpp | awk '/^inline u32 Unquiet\(const u8\* real\) \{/{f=1} f{print} f&&/^}/{exit}' | grep -c -E 'why \|= kUnquiet(Key|Circle|Touch|RawTouch);')
+[ "$n" = 4 ] || fail "Includes/azl/hid_mirror.hpp: the look at the real page has $n of its 4 conditions (a key, the Circle Pad, a finger in an entry, the raw touch)"
+need_line Sources/ctr/input_mirror.cpp "                if (g_release_wait.Update(unquiet == 0, now_ms)) {" "the wait for the release looks at the page's own conditions"
+need_after Sources/ctr/input_mirror.cpp "                    if (g_release_wait.capped()) {" "                        LogCappedWait(real, unquiet);" "a wait that ended at its cap is said in the debug log"
+need_after Sources/ctr/input_mirror.cpp "void LogCappedWait(const u8* real, u32 last) {" "    if (g_debug_level <= 0) {" "the line of a capped wait is the debug log's only"
+need Sources/ctr/input_mirror.cpp "raw pad 0x%08lx, raw Circle Pad 0x%08lx, raw touch flag 0x%08lx\"," "the line of a capped wait prints the words at 0x1C, 0x20 and 0xC4"
+need Sources/ctr/input_mirror.cpp "static_cast<unsigned long>(hidmirror::Load32(real, hidmirror::kPadRawCircle))," "the line of a capped wait reads the raw Circle Pad"
+need_line Tests/hid_mirror_test.cpp "    CHECK(with(kPadRaw, 0xFFFFFFFFu));" "the input mirror's test holds that the pad's raw state does not keep the page from being quiet"
+need_line Tests/hid_mirror_test.cpp "    CHECK(circle(kPadRawCircle, 2047, -2048));" "the input mirror's test holds that the raw Circle Pad does not keep the page from being quiet"
+# ---- the key still held when the chat's keyboard closes (2026-11-13) --------------------------------------------------------------
+# Console 63, Final Fantasy Explorers with four: B closed the keyboard, B and the Circle Pad were still down at the 1 s cap of the wait
+# for the release, the page went back and the game took that B: the mission left. A wait that ends at its cap with something down no
+# longer gives the page back: the mirror stays, as the REAL page without what is still down (azl/hid_mirror.hpp, HeldMask) - each key
+# until the 8 entries no longer mention it, the Circle Pad centred with its four direction keys until it is at rest (10 s at the most),
+# the touch absent until the pen lifts - and the page goes back when the last mask falls. A key pressed after the cap is the game's at
+# the plugin's next frame. The wait, its 50 ms and its 1 s are what they were (pinned above): a close with everything let go in time
+# never meets any of this.
+HELD_H=Includes/azl/hid_mirror.hpp
+HELD_M=Sources/ctr/input_mirror.cpp
+HELD_T=Tests/hid_mirror_test.cpp
+need $HELD_H "constexpr u32 kCirclePadKeys = 0xF0000000u; " "the Circle Pad's four direction keys (bits 28-31) are masked with it"
+need $HELD_H "constexpr u32 kCircleMaskMaxMs = 10000; " "a Circle Pad that never comes to rest is centred for 10 s, not for ever"
+need_line $HELD_H "        keys_ = s.circle ? s.keys & ~kCirclePadKeys : s.keys; // (the pad's direction keys are its mask's while it is on)" "the masks start with every key the entries mention"
+need_line $HELD_H "            s.keys |= Load32(real, e + kPadHeld) | Load32(real, e + kPadPressed) | Load32(real, e + kPadReleased);" "a key is mentioned by an entry that holds it, pressed it or released it (no release of a key the game never saw pressed)"
+need_line $HELD_H "        keys_ &= s.keys;" "a mask only shrinks: a key leaves it when no entry mentions it any more"
+need_line $HELD_H "        const u32 keep = ~(keys_ | (circle ? kCirclePadKeys : 0u));" "the direction keys are masked for as long as the Circle Pad is"
+n=$(tr -d '\r' < $HELD_H | sed 's://.*$::' | grep -c -F '& keep);')
+[ "$n" = 4 ] || fail "$HELD_H: $n of the 4 words of keys are written without what is masked (the raw word; held, pressed and released of every entry)"
+need_line $HELD_H "        Store32(m, kPadRawCircle, circle ? 0u : Load32(real, kPadRawCircle));" "the masked Circle Pad is centred in the raw word"
+need_line $HELD_H "            Store32(m, e + kPadCircle, circle ? 0u : Load32(real, e + kPadCircle));" "the masked Circle Pad is centred in every entry"
+need_after $HELD_H "        if ((what_ & kMaskTouch) != 0) {" "            std::memset(m + kTouchRaw, 0, touch_bytes);" "the masked touch is absent, raw and entries, positions too"
+need_line $HELD_H "        const u32 touch_bytes = kTouchEnd - kTouchRaw;" "the masked touch is cleared from the raw touch to the end of the entries"
+need_after $HELD_H "            if (!s.circle) {" "                keys_ |= s.keys & kCirclePadKeys;" "a direction key the entries still mention when the pad comes to rest waits for them as any key"
+need_line $HELD_H "            } else if (static_cast<s32>(now_ms - start_) >= static_cast<s32>(kCircleMaskMaxMs)) {" "the 10 s of the Circle Pad's mask are compared with their sign, on both sides"
+need_after $HELD_H "        if (!s.touch) {" "            what_ &= ~kMaskTouch;" "the touch's mask falls when the pen is up in every entry and in the raw touch"
+# (the mirror is never written with the real keys first and masked after: the game may read it between two stores. What Write copies
+# whole from the real page are the three parts that are never masked - or, the touch, not masked now - and the six kinds of word above
+# are stored one by one)
+hmw=$(tr -d '\r' < $HELD_H | awk '/^    void Write\(u8\* m, const u8\* real\) const \{/{f=1} f{print} f&&/^    }/{exit}' | sed 's://.*$::')
+n=$(printf '%s\n' "$hmw" | grep -c -E '^ +live\(')
+[ "$n" = 3 ] || fail "$HELD_H: HeldMask::Write copies $n parts of the real page whole (three: the accelerometer on, the word before the entries, the touch when it is not masked)"
+n=$(printf '%s\n' "$hmw" | grep -c -E 'memcpy\(')
+[ "$n" = 5 ] || fail "$HELD_H: HeldMask::Write has $n copies (five: 'live', the two headers taken and the two written; the pad's entries are never copied whole: the game may read the mirror between two stores)"
+# The two headers - the ticks and the index of the pad's ring and of the touch's - are TAKEN before anything else is read and WRITTEN
+# after everything else (the review, 2026-11-13). The hid module adds a sample every 4.3 ms whenever it likes, and the plugin's thread
+# can lose the CPU anywhere in Write: with the headers read from the real page after the entries, an index that moved in between
+# pointed at an entry of the mirror copied before its sample - the oldest of the ring, shown to the game as the newest until the next
+# frame (a key let go 30 ms ago held again). Proved with a hid module on another thread: 13957 frames of 400000 with the old order, none
+# with this one (Tests/hid_mirror_test.cpp, TestMaskSampleMidWrite).
+need_nth "$HELD_H, HeldMask::Write" "$hmw" 3 "        u8 pad_head[kPadRaw], touch_head[kTouchRaw - kTouchHeader];" "the two headers have their own copy on the stack: 28 and 24 bytes"
+need_nth "$HELD_H, HeldMask::Write" "$hmw" 4 "        std::memcpy(pad_head, real, sizeof(pad_head));" "the pad's header is taken before any entry is read"
+need_nth "$HELD_H, HeldMask::Write" "$hmw" 5 "        std::memcpy(touch_head, real + kTouchHeader, sizeof(touch_head));" "the touch's header is taken before any entry is read"
+need_nth "$HELD_H, HeldMask::Write" "$hmw" 6 '        __asm__ __volatile__("" ::: "memory");' "the compiler may not move the two reads of the headers past the entries"
+hmt=$(printf '%s\n' "$hmw" | tail -3)
+need_nth "$HELD_H, the end of HeldMask::Write" "$hmt" 1 "        std::memcpy(m, pad_head, sizeof(pad_head));" "the pad's header taken at the start is the last but one thing written"
+need_nth "$HELD_H, the end of HeldMask::Write" "$hmt" 2 "        std::memcpy(m + kTouchHeader, touch_head, sizeof(touch_head));" "the touch's header taken at the start is the last thing written"
+need_nth "$HELD_H, the end of HeldMask::Write" "$hmt" 3 "    }" "nothing is written to the mirror after its headers"
+need_line $HELD_T "    TestMaskSampleMidWrite();" "the input mirror's test runs the hid module that adds samples while the mirror is written"
+need_line $HELD_T "    CHECK(stale_pad == 0);   // the pad's index never points at an entry of the mirror older than the frame's start" "a sample in the middle of a frame: the pad's index and its entry"
+need_line $HELD_T "    CHECK(stale_touch == 0); // ... nor the touch's" "a sample in the middle of a frame: the touch's index and its entry"
+need_line $HELD_T "        if (static_cast<s32>(pad_seq - before) < 0) {" "the test compares the entry at the mirror's index with the last whole sample before the frame"
+need_line $HELD_T "            Store32(real, kPadIndex, i);" "the test's hid module moves the pad's index while the frames run"
+# (the review, the same day: a keyboard asked for again with the masks on, never shown, and closed - MirrorRelease with the masks on and no
+# MirrorWant before it - changes nothing of the masks; MirrorRelease itself has no line of them, held by the count of g_held.Clear above)
+need_line $HELD_T "    CHECK(masks_at_unshown && seen_b_ms == 0); // the B of the first close never reaches the game through the close of a keyboard never shown" "a keyboard never shown, closed with the masks on: B stays hidden"
+need_line $HELD_T "    CHECK(backs_at_third == 1 && back1_ms >= 5000 + 3000 + 30 && back1_ms < 5000 + 3000 + 60); // the page back once, when B was let go" "a keyboard never shown, closed with the masks on: the page goes back when B is let go, not at that close's wait"
+need_line $HELD_T "                flow.Release(5000 + ms); // (the keyboard of 1990 ms, never shown: closed with no Want)" "the test closes a keyboard with the masks on and no opening of the mirror"
+mrb=$(tr -d '\r' < $HELD_M | awk '/^void MirrorRelease\(u32 now_ms\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::')
+printf '%s\n' "$mrb" | grep -q -E 'g_held|MaskFrame' && fail "$HELD_M: MirrorRelease touches the masks (a close of a keyboard that was never shown would drop them, or start them again, with the key still down)"
+# The plugin's thread's frame (Sources/ctr/input_mirror.cpp). With the masks on the mirror is written by MaskFrame and by nothing else
+# (the neutral refresh would show the game a release and a new press of every key it holds); the masks start where the capped wait
+# used to give the page back; the way back after the last mask has no wait for the trail (the one ', true)' way back is pinned above).
+mfb=$(tr -d '\r' < $HELD_M | awk '/^void MirrorFrame\(u32 now_ms\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::; s/[[:space:]]*$//')
+blk=$(printf '%s\n' "$mfb" | grep -F -A4 -- "        const u8* real = RealPage();")
+need_nth "$HELD_M, MirrorFrame with the mirror mapped" "$blk" 2 "        if (g_held.on()) {" "the masks are looked at before the neutral refresh"
+need_nth "$HELD_M, MirrorFrame with the mirror mapped" "$blk" 3 "            MaskFrame(real, now_ms);" "with the masks on the frame is MaskFrame's"
+need_nth "$HELD_M, MirrorFrame with the mirror mapped" "$blk" 4 "            return;" "... and nothing else writes the mirror in it"
+need_nth "$HELD_M, MirrorFrame with the mirror mapped" "$blk" 5 "        }" "... and nothing else writes the mirror in it"
+blk=$(printf '%s\n' "$mfb" | grep -F -B5 -- '                    RestoreHere("the keyboard closed", true);')
+need_nth "$HELD_M, MirrorFrame at the wait's end" "$blk" 1 "                    if (unquiet != 0 && g_held.Start(g_page, real, now_ms)) {" "a wait that ends with something down starts the masks"
+need_nth "$HELD_M, MirrorFrame at the wait's end" "$blk" 4 "                        return;" "... and does not give the page back"
+need_nth "$HELD_M, MirrorFrame at the wait's end" "$blk" 5 "                    }" "... and does not give the page back"
+n=$(printf '%s\n' "$mfb" | grep -c -F 'if (g_held.on()) {')
+[ "$n" = 2 ] || fail "$HELD_M: MirrorFrame looks at the masks in $n places (two: the mirror mapped, and the page gone back by another way)"
+need_line $HELD_M "    const bool left = g_held.Frame(g_page, real, now_ms);" "MaskFrame lets go what was let go and writes the mirror, every frame"
+need_after $HELD_M '    if ((!g_retry || static_cast<s32>(now_ms - g_retry_ms) >= 0) && RestoreHere(g_retry ? "once more, after the masks" : "the last mask fell") &&' "        g_held.Clear();" "the page goes back when the last mask fell, and the masks end with the mirror"
+need_line $HELD_M "        g_m.active.load(std::memory_order_acquire) == 0) {" "the masks stay on (empty: the real page's copy) while the mirror could not be taken off"
+mwb=$(tr -d '\r' < $HELD_M | awk '/^void MirrorWant\(\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::; s/[[:space:]]*$//')
+printf '%s\n' "$mwb" | grep -F -x -q -- "            g_released.Start(hidmirror::HeldNow(g_page));" || fail "$HELD_M: the keyboard opened again with the masks on no longer releases the keys the game saw held through the mirror"
+printf '%s\n' "$mwb" | grep -F -A8 -- "    if (g_held.on()) {" | grep -F -x -q -- "        g_held.Clear();" || fail "$HELD_M: the keyboard opened again no longer drops the masks (the game would see the keys while the keyboard is open)"
+need_after $HELD_M '            LogMask("the page went back by another way (HOME, sleep, the menu, the exit): the masks went with it", now_ms);' "            g_held.Clear();" "a page given back by HOME, sleep, the menu or the exit takes the masks with it"
+n=$(tr -d '\r' < $HELD_M | sed 's://.*$::' | grep -c -F 'g_held.Clear();')
+[ "$n" = 3 ] || fail "$HELD_M drops the masks in $n places (three: the page back after the last mask, the keyboard opened again, the page gone back by another way)"
+# (the masks are the plugin's thread's: no game's thread and no event of the framework reads or writes them)
+hit=$(tr -d '\r' < $HELD_M | awk '/^\/\/ >>> game-thread code/{f=1} /^\/\/ <<< game-thread code/{f=0} /^void MirrorProcessEvent\(int event\) \{/{f=1} f' | sed 's://.*$::' | grep -n -E 'g_held|LogMask|MaskFrame' | head -2)
+[ -z "$hit" ] || fail "$HELD_M: the masks are touched off the plugin's thread (a game's thread or the keep-alive): $hit"
+need_after $HELD_M "__attribute__((noinline)) void LogMask(const char* what_happened, u32 now_ms) {" "    if (g_debug_level <= 0) {" "the masks' lines are the debug log's only"
+need $HELD_M 'masked for the game now: keys 0x%08lx%s%s%s | %lu ms after the wait' "the masks' line says what is still masked, and how long after the cap"
+need $HELD_M 'the mirror written %lu times, %lu ms at most "' "the masks' line says how the mirror was kept: the frames, and the longest time between two (what a key waited for the plugin's thread)"
+need_line $HELD_H "            gap_max_ = static_cast<u32>(gap);" "the longest time between two frames of the masks is kept for the log"
+need_line $HELD_T "    CHECK(h.frames() == 4 && h.longest_gap_ms() == 66); // the longest time between two frames: what a key waited for the plugin's thread" "the input mirror's test holds the count of the frames and the longest gap"
+need $HELD_M "still down at the wait's cap: the page stays the mirror's, the real input without it, until it is let go" "the start of the masks is said in the debug log"
+need $HELD_M '"the last mask fell: the game'"'"'s page goes back",' "the fall of the last mask is said in the debug log"
+# The test (Tests/hid_mirror_test.cpp, built and run by Tests/run.sh as before): the masks alone, and the plugin's frame over them
+# against a hid module of 234 Hz - the console's case, the normal path byte for byte as 1.1.4's, the pen, the keyboard opened again,
+# HOME and the exit with the masks on, a pad that never rests, a way back that has to wait.
+need_line $HELD_T "    TestHeldMask();" "the input mirror's test runs the masks"
+need_line $HELD_T "    TestMaskFlow();" "the input mirror's test runs the plugin's frame over the masks"
+for t in TestMaskConsoleCase TestMaskNormalPath TestMaskTouch TestMaskReopen TestMaskClosedUnshown TestMaskHomeAndExit TestMaskLimits; do
+  need_line $HELD_T "    $t();" "the input mirror's test runs $t"
+done
+need_line $HELD_T "    CHECK(seen_b_ms == 0);   // the game never sees the B that closed the keyboard, nor a direction key of the pushed pad, in any entry" "the console's case: B held 3 s past the close never reaches the game"
+need_line $HELD_T "    CHECK(seen_pad_ms == 0); // ... nor the Circle Pad off its centre, until it is let go" "the console's case: the pushed Circle Pad never reaches the game"
+need_line $HELD_T "    CHECK(a_first_ms >= 1500 && a_first_ms < 1500 + 5 + 17 + 1); // a key pressed with the masks on reaches the game at the next frame" "the console's case: a new key goes through at once"
+need_line $HELD_T "    CHECK(flow.backs == 1 && flow.back_ms >= 5000 + 3400 + 30 && flow.back_ms < 5000 + 3400 + 75); // the page back once, when the last mask fell" "the console's case: the page goes back when everything is let go"
+need_line $HELD_T "        CHECK(same);" "the normal path is 1.1.4's, byte for byte and frame for frame"
+need_line $HELD_T "        CHECK(now.said.empty() && !now.held.on()); // no mask was ever on" "the normal path never starts a mask"
+need_line $HELD_T "    CHECK(touch_ms == 0); // the game never sees the pen that was on the keyboard" "the pen held through the close never reaches the game"
+need_line $HELD_T "    CHECK(shown_while_open == 0 && released_a == kKeyA); // the keyboard open again: nothing held, and the A the game saw is released" "the keyboard opened again with the masks on is neutral"
+need_line $HELD_T "            CHECK(!flow.active && !flow.have_page && !flow.held.on() && held_while_open2 == 0); // the game ended: no mirror ever again" "the exit with the masks on leaves nothing"
+need_line $HELD_T "            CHECK(flow.active && !flow.held.on() && held_while_open2 == 0 && released_while_open2 == (kKeyB | kPadDown));" "HOME with the masks on: the next keyboard starts from nothing"
+need_line $HELD_T "        CHECK(pad_ms >= 1200 + 10000 && pad_ms < 1200 + 10000 + 34); // (10 s after the cap, 11 s after the close)" "a Circle Pad that never rests is given up after 10 s"
+need_line $HELD_T "        CHECK(b_ms >= 1700 && b_ms < 1700 + 5 + 17 + 1 && neutral_again == 0); // B pressed again while the page cannot go back: the game's" "a mirror that stays after the last mask is the real page's copy"
+need_line $HELD_T "                        if (masks && unquiet != 0 && held.Start(page, real, now_ms)) {" "the test's frame starts the masks where the plugin's does"
+
+# B3. The keyboard that is open is still on the screen: the game's thread counts the top screens presented with the keyboard open and
+# clears the count at every copy of the keyboard onto the bottom one (two atomics, no clock); at 60 the plugin's thread closes the keyboard,
+# says so, and gives the game its input page back at once. And every opening waits for the bottom screen again (the geometry is 0 at Open).
+need Includes/azl/chat_host.hpp "constexpr u32 kBottomLostTops = 60; " "a keyboard not copied for 60 presents of the top screen is closed"
+# (2026-11-11) ... once the plugin's thread has seen it lost at every look for a second of its own clock: 60 presents are half a second of a
+# game that swaps its top screen twice a frame, and a change of scene of a little over a second closed the keyboard while the user typed
+need Includes/azl/chat_host.hpp "constexpr u32 kBottomLostMs = 1000; " "... after a second of looks that all found it lost"
+need_after Includes/azl/chat_host.hpp "    bool LostFor(u32 now_ms) {" "        if (!Lost()) {" "the clock never makes a keyboard lost: the count of the presents does"
+need_after Includes/azl/chat_host.hpp "        if (!Lost()) {" "            lost_seen_ = false;" "a look that finds the keyboard copied starts the second again"
+need_line Includes/azl/chat_host.hpp "        return now_ms - lost_since_ms_ >= kBottomLostMs && now_tops - lost_tops_ >= kBottomLostMoreTops;" "the keyboard is closed after kBottomLostMs of looks that found it lost, in which the game went on presenting its top screen"
+# (2026-11-11, the second review) the second counts only if the game presented its top screen kBottomLostMoreTops times more since the look that first found the keyboard lost:
+# the plugin's thread looks when the game presents, and a fade of 60 presents followed by a load of 1.1 s that presents nothing closed the keyboard at the first present after it
+need Includes/azl/chat_host.hpp "constexpr u32 kBottomLostMoreTops = kBottomLostTops / 2; " "... thirty presents more: a film goes on presenting, a game that stands still does not"
+need_after Includes/azl/chat_host.hpp "        const u32 now_tops = tops();" "        if (!lost_seen_ || now_tops < lost_tops_) {" "a count lower than at the last look is a copy no look saw: the second and the presents start again"
+need_after Includes/azl/chat_host.hpp "        if (!lost_seen_ || now_tops < lost_tops_) {" "            lost_tops_ = now_tops;" "the presents are counted from the look that first found the keyboard lost"
+need_line Tests/chat_host_test.cpp "    CHECK(!o.bottom_watch.LostFor(t0 + 120000 + 1000 + 1100));" "the chat host's test holds the first present after a load: the keyboard stays open"
+need_after Includes/azl/chat_host.hpp "    void Reset() {" "        lost_seen_ = false;" "a new opening or a new picture starts the second again"
+need_after Includes/azl/chat_host.hpp "    void NoteTop() {" "        tops_.fetch_add(1, std::memory_order_relaxed);" "the game's thread counts a present with one atomic add"
+need_after Includes/azl/chat_host.hpp "    void NoteCopy() {" "        tops_.store(0, std::memory_order_relaxed);" "the game's thread clears the count with one atomic store"
+need_after Includes/azl/chat_host.hpp "    bool Lost() const {" "        return tops() >= kBottomLostTops;" "the keyboard is lost at kBottomLostTops"
+need_after Includes/azl/chat_host.hpp "inline u32 DrawOverlayTop(Overlay& o, const gfx::Surface& fb, u32 now_ms) {" "    if (o.keyboard.load(std::memory_order_relaxed) != 0) {" "the presents of the top screen are counted only with the keyboard open"
+need_after Includes/azl/chat_host.hpp "inline u32 DrawOverlayTop(Overlay& o, const gfx::Surface& fb, u32 now_ms) {" "        o.bottom_watch.NoteTop();" "every present of the top screen is counted, drawn on or not"
+need_after Includes/azl/chat_host.hpp "        CopyImage(*im, fb);" "        o.bottom_watch.NoteCopy();" "the count is cleared by a copy of the keyboard"
+n=$(cat Includes/azl/chat_host.hpp Sources/ctr/chat_overlay.cpp | tr -d '\r' | sed 's://.*$::' | grep -c 'NoteCopy()')
+[ "$n" = 2 ] || fail "the count of the presents without a copy is cleared in $n places (BottomWatch's own NoteCopy and the one call after CopyImage)"
+need_line Includes/azl/chat_host.hpp "__attribute__((noinline)) inline u32 DrawOverlayBottom(Overlay& o, const gfx::Surface& fb) {" "the bottom screen's drawing reads no clock (the watch of the keyboard still shown counts presents)"
+need_order Sources/ctr/chat_overlay.cpp "    g_overlay.bottom_geometry.store(0, std::memory_order_release);" "    g_overlay.keyboard.store(1, std::memory_order_release);" "every opening forgets the bottom screen's geometry before the game's thread is told the keyboard is open"
+need_after Sources/ctr/chat_overlay.cpp "    g_overlay.bottom_geometry.store(0, std::memory_order_release);" "    g_overlay.bottom_watch.Reset();" "every opening starts the count of the presents again"
+need_after Sources/ctr/chat_overlay.cpp "    Redraw(true);" "    g_overlay.bottom_watch.Reset();" "a new picture has its own presents to be copied"
+need_order Sources/ctr/chat_overlay.cpp "    g_overlay.bottom_watch.Reset(); // (the count of the presents without a copy starts with the picture there is to copy)" "    g_overlay.image.Publish(im);" "the count starts before the picture can be copied"
+need_line Sources/ctr/chat_overlay.cpp "    if (g_shown && g_overlay.bottom_watch.LostFor(now_ms)) {" "a keyboard that was shown and is no longer copied is closed (never one still waiting for its first picture)"
+# (2026-11-11) the game's input goes back at once only when nothing is held on the real page: the last picture of a bottom screen no longer
+# presented is the keyboard's, the user goes on touching it, and the page given back with the finger down was a fresh press for the game
+need_after Sources/ctr/chat_overlay.cpp "    if (g_shown && g_overlay.bottom_watch.LostFor(now_ms)) {" "        const bool quiet = MirrorInputQuiet(); // (the REAL page, before the close: no key, no Circle Pad, no finger)" "a lost keyboard looks at what is held before it closes"
+need_after Sources/ctr/chat_overlay.cpp "        const bool quiet = MirrorInputQuiet(); // (the REAL page, before the close: no key, no Circle Pad, no finger)" '        Close(true, "not shown any more", quiet, true);' "a keyboard no longer shown closes with its draft kept, the game's input back at once when nothing is held and at the release otherwise"
+need_after Sources/ctr/input_mirror.cpp "bool MirrorInputQuiet() {" "    return g_m.active.load(std::memory_order_acquire) == 0 || hidmirror::PageQuiet(RealPage());" "what is held is read on the real page, with the look of the wait for the release, and only while there is a mirror to give back"
+need_after Sources/ctr/chat_overlay.cpp '        Close(true, "not shown any more", quiet, true);' '        Notify("Keyboard closed: the game is not showing the bottom screen");' "a keyboard no longer shown says so on the screen"
+need_order Sources/ctr/chat_overlay.cpp '        Close(true, "not shown"); // (the mirror never taken' "    if (g_shown && g_overlay.bottom_watch.LostFor(now_ms)) {" "the picture is looked for before the keyboard is taken for lost"
+need_order Sources/ctr/chat_overlay.cpp "    if (g_shown && g_overlay.bottom_watch.LostFor(now_ms)) {" "    if (!g_shown || !g_pacer.Due(svcGetSystemTick())) {" "a lost keyboard is closed every frame, not only at the keyboard's pace"
+need_line Tests/chat_host_test.cpp "    TestBottomWatch();" "the chat host's test runs the watch of the keyboard still shown"
+need_line Tests/stack_usage.sh 'budget chat_overlay "azl::chat::DrawOverlayTop" 56' "the count of the presents costs the top screen's drawing no stack"
+# B4. The trail (AzaharLink.sleep.log, debug=1) of the keyboard and of the way back of the game's HID page: open, switched, closed,
+# "about to hold the game's threads" BEFORE the hold and "let go" AFTER it. On the plugin's thread the line before the hold is given up to
+# 100 ms to reach the card (bounded, ended by the gate's close and by anything that wants the page back now); a game's thread and the
+# framework's keep-alive only push. With the log off: one load in BackCrumb, no wait.
+need_after Sources/ctr/input_mirror.cpp "__attribute__((noinline)) void BackCrumb(u32 kind, u32 low, u32 ticks) {" "    if (g_debug_level <= 0) {" "the trail's crumbs of the way back cost one load with the log off"
+need_order Sources/ctr/input_mirror.cpp "        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWherePlugin, 0);" "    const Outcome out = RestoreOffGameThread(true, kWherePlugin, &ticks);" "the plugin's thread says 'about to hold' before the hold"
+need_after Sources/ctr/input_mirror.cpp "        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWherePlugin, 0);" "        GiveTrailTime(); // (NOT under the lock)" "the trail is waited for right after its line was pushed"
+need_order Sources/ctr/input_mirror.cpp "        GiveTrailTime(); // (NOT under the lock)" "    const Outcome out = RestoreOffGameThread(true, kWherePlugin, &ticks);" "the trail is waited for before the hold"
+# (2026-11-11) ... and before the mirror's lock is taken, never under it: for the length of the wait (sleeps on the lowest thread of the
+# process) a game's thread at HOME, sleep or power, and the keep-alive at an event, found the lock taken and could not give the page back
+need_order Sources/ctr/input_mirror.cpp "        GiveTrailTime(); // (NOT under the lock)" "    if (g_m.event_waiting.load(std::memory_order_seq_cst) != 0 || !g_m.lock.TryLock()) {" "the trail is waited for before the mirror's lock is taken, not under it"
+need_after Sources/ctr/input_mirror.cpp "    if (g_m.event_waiting.load(std::memory_order_seq_cst) != 0 || !g_m.lock.TryLock()) {" "        if (said) {" "RestoreHere's try of the lock is the one the pins of the wait for the trail stand on"
+need_order Sources/ctr/input_mirror.cpp "        GiveTrailTime(); // (NOT under the lock)" "        if (said) {" "... and it comes after the wait"
+need_after Sources/ctr/input_mirror.cpp "        GiveTrailTime(); // (NOT under the lock)" "        if (g_m.active.load(std::memory_order_acquire) == 0) {" "after the wait the plugin's thread looks whether the page is back already"
+need_after Sources/ctr/input_mirror.cpp "        if (said) {" "            BackCrumb(SleepCrumbs::kChatMirrorBackDone, static_cast<u32>(Outcome::kBusy), 0);" "an 'about to hold' that held nothing is closed in the trail"
+need_after Sources/ctr/input_mirror.cpp "    if (trail && !said) {" "        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWherePlugin, 0); // (under the lock: only for a way back that is made here)" "a way back that does not wait for the trail says 'about to hold' under the lock"
+need_after Sources/ctr/input_mirror.cpp "        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWherePlugin, 0); // (under the lock: only for a way back that is made here)" "    const Outcome out = RestoreOffGameThread(true, kWherePlugin, &ticks);" "... right before the hold"
+need Includes/azl/sleep_crumbs.hpp "            if (out == hidmirror::Outcome::kBusy) {" "the trail has its line for an 'about to hold' that held nothing"
+# (2026-11-11, the second review) the plugin's thread pushes "about to hold" BEFORE the wait it gives the trail, with the game's threads running: its line says that the hold
+# may not have begun (a console that stops in that wait leaves the same last line as one that stops inside the hold); the other threads push right before the hold and say nothing
+need_line Includes/azl/sleep_crumbs.hpp '                    ((value & 0xFF) == kMirrorByPlugin ? kMirrorPluginWaitsText : "") + ")");' "the plugin's thread's 'about to hold' says that a wait may come before the hold, and only that thread's"
+need_line Includes/azl/sleep_crumbs.hpp '        ", and this thread may first wait for it to be on the card: the game'"'"'s threads run in that wait, the hold is not begun";' "... in these words"
+need_line Tests/sleep_crumbs_test.cpp '            CHECK(!Has(lines[i], "may first wait"));' "the trail's test holds that the lines of the other threads say nothing of a wait"
+need_order Sources/ctr/input_mirror.cpp "    const Outcome out = RestoreOffGameThread(true, kWherePlugin, &ticks);" "        BackCrumb(SleepCrumbs::kChatMirrorBackDone, static_cast<u32>(out), ticks);" "the plugin's thread says 'let go' after the let-go"
+need_line Sources/ctr/input_mirror.cpp "    if (trail && trail_wait && g_debug_level > 0 && g_m.event_waiting.load(std::memory_order_seq_cst) == 0) {" "the wait for the trail is asked for, never the rule (and only with the log on, and never with an event waiting)"
+n=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | sed 's://.*$::' | grep -c 'GiveTrailTime()')
+[ "$n" = 2 ] || fail "Sources/ctr/input_mirror.cpp waits for the trail in $n places (its definition and RestoreHere's one call)"
+n=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | sed 's://.*$::' | grep -c -E 'RestoreHere\([^)]*, true\)')
+[ "$n" = 1 ] || fail "Sources/ctr/input_mirror.cpp asks the wait for the trail in $n ways back (one: the keyboard closed by the user, after the release)"
+need_line Sources/ctr/input_mirror.cpp '                    RestoreHere("the keyboard closed", true);' "the way back after the release gives the trail its time"
+need_line Sources/ctr/input_mirror.cpp "    while (!Plugin::TrailOnCard(mark) && !GateClosing() && g_m.event_waiting.load(std::memory_order_seq_cst) == 0 &&" "the wait for the trail ends at the gate's close and when an event waits for the lock"
+need_line Sources/ctr/input_mirror.cpp "           g_m.want_restore.load(std::memory_order_acquire) == 0 && g_m.closing.load(std::memory_order_seq_cst) == g_look_closing &&" "the wait for the trail ends when a game's thread or a closing wants the page back"
+need_line Sources/ctr/input_mirror.cpp "           svcGetSystemTick() < deadline) {" "the wait for the trail is bounded"
+need_after Sources/ctr/input_mirror.cpp "void GiveTrailTime() {" "    const u64 deadline = svcGetSystemTick() + kTrailWaitTicks;" "the wait for the trail has its deadline"
+need_line Sources/ctr/input_mirror.cpp "constexpr u64 kTrailWaitTicks = SYSCLOCK_ARM11 / 10;" "the trail gets 100 ms at most before the hold"
+need_order Sources/ctr/input_mirror.cpp "        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWhereNotification, 0);" "        RestoreLocked(true, true, kWhereNotification, &ticks);" "a game's thread says 'about to hold' before the hold"
+need_order Sources/ctr/input_mirror.cpp "        RestoreLocked(true, true, kWhereNotification, &ticks);" "        BackCrumb(SleepCrumbs::kChatMirrorBackDone, g_m.report_outcome, ticks); // (the outcome RestoreLocked left, under the lock)" "a game's thread says 'let go' after the let-go"
+hit=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | awk '/^[[:space:]]*\/\/ >>> game-thread code/{f=1} f{print} /^[[:space:]]*\/\/ <<< game-thread code/{f=0}' | sed 's://.*$::' | grep -n -E 'GiveTrailTime|TrailOnCard|TrailMark|svcSleepThread\(kTrail' | head -2)
+[ -z "$hit" ] || fail "Sources/ctr/input_mirror.cpp: a game's thread waits for the trail (it only pushes: the wait is the plugin's thread's): $hit"
+body=$(tr -d '\r' < Sources/ctr/input_mirror.cpp | awk '/^void MirrorProcessEvent\(int event\) \{/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::')
+printf '%s\n' "$body" | grep -q -E 'GiveTrailTime|TrailOnCard|TrailMark' && fail "Sources/ctr/input_mirror.cpp: the keep-alive thread waits for the trail at an event (Luma3DS waits for its answer: it only pushes)"
+printf '%s\n' "$body" | grep -F -A1 -- "            BackCrumb(SleepCrumbs::kChatMirrorBackBegins, static_cast<u32>(event), 0);" | grep -F -q -- "            state = LastState(RestoreOffGameThread(!last, static_cast<u32>(event), &ticks), kMirrorLastGivenBack);" || fail "Sources/ctr/input_mirror.cpp: the keep-alive thread no longer says 'about to hold' right before its way back"
+need_after Sources/ctr/plugin.cpp "bool Plugin::TrailOnCard(u32 mark) {" "    if (g_debug_level <= 0 || self.crumb_wake_ == 0) {" "with the log off or no trail there is nothing to wait for"
+need_line Sources/ctr/plugin.cpp "    return static_cast<s32>(self.crumb_written_.load() - mark) >= 0;" "the trail is on the card once its thread wrote what was pushed"
+need Sources/ctr/chat_overlay.cpp "    Plugin::NoteSleepEvent(SleepCrumbs::kChatKeyboardOpen, ++g_openings);" "the keyboard's opening leaves its line in the trail"
+need_order Sources/ctr/chat_overlay.cpp "    Plugin::NoteSleepEvent(SleepCrumbs::kChatKeyboardClosed, " "        MirrorRestoreNow(why, trail_wait);" "the keyboard's close leaves its line in the trail before the way back"
+need_line Sources/ctr/chat_overlay.cpp "void Close(bool keep, const char* why, bool at_once = false, bool trail_wait = false) {" "a close asks the wait for the trail only when told to"
+n=$(tr -d '\r' < Sources/ctr/chat_overlay.cpp | sed 's://.*$::' | grep -c -E 'Close\([^)]*, (true|quiet), true\)')
+[ "$n" = 1 ] || fail "Sources/ctr/chat_overlay.cpp asks the wait for the trail in $n closes (one: the keyboard no longer shown; never HOME, power, sleep, exit, the chat off or the room left)"
+for k in "kChatKeyboardOpen = 34;" "kChatMirrorOn = 35;" "kChatKeyboardClosed = 36;" "kChatMirrorBackBegins = 37;" "kChatMirrorBackDone = 38;"; do
+  need Includes/azl/sleep_crumbs.hpp "    static constexpr u32 $k" "the trail's kinds of the chat's keyboard and input mirror keep their numbers (old logs are read by them)"
+done
+need Includes/azl/sleep_crumbs.hpp "    static constexpr u32 kMaxLines = 400; " "the trail has 400 lines a launch"
+# (2026-11-11) the lines of the chat's keyboard have a limit of their own and are never counted against those 400: 80 openings used the
+# launch's lines up, and the HOME, the swap or the exit at which a console then stopped left no line in the trail
+need Includes/azl/sleep_crumbs.hpp "    static constexpr u32 kMaxChatLines = 240;" "the lines of the chat's keyboard have their own limit a launch (48 openings at 5 lines each)"
+need_line Includes/azl/sleep_crumbs.hpp "        chat_line_ = kind >= kChatKeyboardOpen && kind <= kChatMirrorBackDone; // (their own limit of lines: Add; cleared below)" "the trail knows a line of the chat's keyboard by its kind"
+need_after Includes/azl/sleep_crumbs.hpp "        if (chat_line_) {" "            if (chat_lines_ >= kMaxChatLines) {" "the lines of the chat's keyboard stop at their own limit"
+need Includes/azl/sleep_crumbs.hpp "            line += ++lines_ == kMaxLines ? \"the limit of lines for one launch is reached: nothing more is written\" : text;" "a line that is not the chat's counts against the launch's limit, and only such a line"
+n=$(tr -d '\r' < Includes/azl/sleep_crumbs.hpp | sed 's://.*$::' | grep -c '++lines_')
+[ "$n" = 1 ] || fail "Includes/azl/sleep_crumbs.hpp counts the launch's lines in $n places (one: the branch of Add that is not the chat's)"
+need_after Includes/azl/sleep_crumbs.hpp "        default:" "        chat_line_ = false;" "the mark of a chat's line does not outlive its event"
+need_line Tests/sleep_crumbs_test.cpp "    TestChatMirror();" "the trail's test runs the lines of the chat's keyboard and input mirror"
+need_line Tests/stack_usage.sh 'budget input_mirror "azl::ctr::{anonymous}::BackCrumb" 32' "the trail's crumb of a way back stays small on a game's thread"
+# B5. The strings of the room's information are kept up to a limit each and skipped past it, at the decoding (the plugin and the app share
+# it); the game's name NOT under 255 (the plugin cuts its own title at 80 on a letter's edge and sends it back to the room); the three
+# fields nobody reads are skipped. The in-game menu cuts a text at 256 bytes before it measures it.
+need Includes/azl/room_proto.hpp "constexpr std::size_t kKeepRoomName = 128; " "the room's name is kept up to 128 bytes"
+need Includes/azl/room_proto.hpp "constexpr std::size_t kKeepGameName = 255; " "a game's name is kept up to 255 bytes, never less (SanitizeTitle cuts it at 80 on a letter's edge)"
+need Includes/azl/room_proto.hpp "constexpr std::size_t kKeepNickname = 32; " "a nickname is kept up to 32 bytes"
+need_line Includes/azl/room_proto.hpp "            std::size_t n = len < keep ? len : keep;" "a string of the room is kept up to its limit"
+need_after Includes/azl/room_proto.hpp "    std::string String(std::size_t keep) {" "        if (len > 0 && Check(len)) {" "a string whose length is past the packet is a bad packet, whatever is kept of it"
+n=$(tr -d '\r' < Sources/azl/room_proto.cpp | awk '/^bool DecodeRoomInformation\(/{f=1} f{print} f&&/^}/{exit}' | sed 's://.*$::' | grep -c -E 'String\(\)')
+[ "$n" = 0 ] || fail "Sources/azl/room_proto.cpp: DecodeRoomInformation keeps $n strings of the room without a limit"
+for l in "    out->name = r.String(kKeepRoomName);" "        m.nickname = r.String(kKeepNickname);" "        m.game_name = r.String(kKeepGameName);"; do
+  need_line Sources/azl/room_proto.cpp "$l" "the room's information is decoded with its limits"
+done
+n=$(tr -d '\r' < Sources/azl/room_proto.cpp | sed 's://.*$::' | grep -c -F 'r.String(0);')
+[ "$n" = 3 ] || fail "Sources/azl/room_proto.cpp skips $n fields of a member (three: the username, the display name and the avatar URL, which nobody reads)"
+need_line Sources/game_menu.cpp "constexpr std::size_t kFitMaxBytes = 256;" "the in-game menu cuts a text at 256 bytes before it measures it"
+need_after Sources/game_menu.cpp "    const bool too_long = s.size() > kFitMaxBytes;" "    if (!too_long && TextW(s) <= max_w) {" "a text over the limit is never measured whole"
+need Tests/test_main.cpp "        CHECK(full.name == std::string(room::kKeepRoomName, 'R'));" "test_main holds the limits of the room's strings on a full room"
+# (2026-11-11, the second review: that line is in the test TWICE - the avatar that says 7 bytes and has 6, and the one that says 2 GB - and a plain search was content with one)
+[ "$(tr -d '\r' < Tests/test_main.cpp | grep -c -F -x -- '        CHECK(!room::DecodeRoomInformation(lying.data(), lying.size(), &ok_info));')" = "2" ] || fail "Tests/test_main.cpp no longer holds a skipped field whose length is past the packet in its two cases (a few bytes too many, and 2 GB)"
+need_after Tests/test_main.cpp "        lying[before_avatar + 3] = 7; // (the avatar says 7 bytes and has 6)" "        CHECK(!room::DecodeRoomInformation(lying.data(), lying.size(), &ok_info));" "test_main holds a skipped field a few bytes past the packet"
+need_after Tests/test_main.cpp "        lying[before_avatar] = 0x7F; // (... or 2 GB)" "        CHECK(!room::DecodeRoomInformation(lying.data(), lying.size(), &ok_info));" "test_main holds a skipped field of 2 GB"
 
 # ---- the zombie probe (ctr/zombie_probe.hpp/.cpp): the MHXX-after-chat leak of a TERMINATED-but-not-finalized process -------------
 # Every console-reading entry point of the probe early-returns unless the capture is on (g_debug_level>0) AND Luma3DS's custom svcs are
@@ -839,7 +1141,8 @@ need ConfigApp/source/games.hpp 'constexpr const char* kPluginFileName = "Azahar
 # which the plugin has to find without the app)
 [ "$(grep -n '= "sdmc:/3ds' ConfigApp/source/paths.hpp | wc -l)" = "3" ] || fail "paths.hpp names a place under sdmc:/3ds that it should not (only the default folder, the plugin's folder and its ini)"
 need ConfigApp/source/paths.hpp 'kPluginDataDir = "sdmc:/3ds/3DSLink";' "the plugin's folder is the one place of the app's that is fixed"
-if grep -rn -E '"[^"]*(TitleShare|Enable game|Game delivery|enable game)[^"]*"' ConfigApp/source ConfigApp/titleshare_host ConfigApp/titleshare/source ConfigApp/titleshare/common --include=*.c --include=*.h --include=*.cpp --include=*.hpp | grep -v 'kCatalogCache = '; then
+# ("Enable games", the row of the page Download Play that the user named on 2026-11-18, is not the old name: "Enable game" not followed by an s is)
+if grep -rn -E '"[^"]*(TitleShare|Game delivery|enable game)[^"]*"|"[^"]*Enable game([^s"][^"]*)?"' ConfigApp/source ConfigApp/titleshare_host ConfigApp/titleshare/source ConfigApp/titleshare/common --include=*.c --include=*.h --include=*.cpp --include=*.hpp | grep -v 'kCatalogCache = '; then
   fail "a text of the app or of the delivery module says TitleShare (or Enable game / Game delivery): the user knows no such app"
 fi
 need ConfigApp/source/pages_main.cpp 'enable.label = "Enable Titles for Azahar Emulator Net";' "the page that enables titles is called 'Enable Titles for Azahar Emulator Net'"
@@ -850,7 +1153,7 @@ need ConfigApp/source/ui.cpp "if (luma_too_old && cfg.enabled) {" "with a Luma3D
 need ConfigApp/source/pages_main.cpp "power.dim = lock != setup::SwitchLock::None;" "the 3DS Link switch is locked with a Luma3DS that is too old (and with a plugin that is not on the card)"
 need ConfigApp/source/pages_main.cpp "room.dim = g.luma_too_old;" "the room row is faint with a Luma3DS that is too old"
 need ConfigApp/source/pages_main.cpp "enable.dim = g.luma_too_old;" "the row of the titles for the Azahar emulator is faint with a Luma3DS that is too old"
-[ "$(grep -c 'ShowToast("This Luma is not supported"' ConfigApp/source/pages_main.cpp)" = "3" ] || fail "ConfigApp/source/pages_main.cpp: A on a shut row (the switch, the room, the titles) must say, short, that this Luma is not supported (three places)"
+[ "$(grep -c 'ShowToast("This Luma is not supported"' ConfigApp/source/pages_main.cpp)" = "4" ] || fail "ConfigApp/source/pages_main.cpp: A on a shut row (the switch, the room, the titles, Download Play of route B) must say, short, that this Luma is not supported (four places)"
 need ConfigApp/source/pages_main.cpp 'message = "This Luma is not supported";' "the card of the main page says it short (the long sentence was too small to read)"
 need ConfigApp/source/pages_main.cpp 'return ""; // (nothing between the buttons: the keys are the usual ones)' "the main page has no hint between its two buttons"
 # the copies of the plugin in the games' folders are looked at once a start (an update of the app must not leave a game on the old plugin)
@@ -868,7 +1171,7 @@ need ConfigApp/source/games.cpp 'return std::string(kPluginsDir) + "/" + TidText
 need ConfigApp/source/games.cpp "if (ReadSlot(tid).slot == Slot::Other) {" "a game whose folder holds another plugin is never touched"
 need ConfigApp/source/games.cpp "rmdir(GamePluginDir(tid).c_str());" "disabling removes the folder too, but rmdir only takes an empty one"
 need ConfigApp/source/games.cpp 'const std::string part = std::string(dst) + ".part";' "a copy is made as .part and put in place only when complete: never half a plugin"
-[ "$(grep -c 'std::remove(' ConfigApp/source/games.cpp)" = "8" ] || fail "games.cpp removes a file in a place it did not (the only files the app deletes are a game's plugin copy and its .part, the .part of a failed copy, and the cache of the games when it is replaced)"
+[ "$(grep -c 'std::remove(' ConfigApp/source/games.cpp)" = "11" ] || fail "games.cpp removes a file in a place it did not (the only files the app deletes are a game's plugin copy and its .part, the .part of a failed copy, the copy set aside (.old, DPAPP-2h-sec), and the cache of the games when it is replaced)"
 need ConfigApp/source/titles.cpp "setup::CurrentPaths().games_cache.c_str()" "the app's own cache of the titles (name and icon) is the one in the data folder"
 need ConfigApp/source/titles.cpp "setup::ReadSmdhKeyed(keys, tid, buffer.data(), buffer.size()) == 0" "when the system refuses a game's icon file (a 3dsx on the consoles of TitleShare's logs) the icon is read with the user's keys"
 need ConfigApp/source/titles.cpp "if (system_works < 0 && have_keys) {" "the system is not asked again once it refused and the keys are there (as TitleShare's catalog does)"
@@ -1128,7 +1431,7 @@ need ConfigApp/source/ui.cpp "return setup::CopyWorker::Get().PendingCount() == 
 need ConfigApp/source/ui.cpp "AskLeaveDuringPluginPass(); // (the pass over the games is not over: say so, and let the user choose)" "START during the pass over the games asks before it leaves"
 need ConfigApp/source/ui.cpp "setup::CopyWorker::Get().CancelRefreshes();" "leaving in the middle of the pass drops the looks that wait (the one that runs is finished)"
 need ConfigApp/source/copyworker.cpp "int CopyWorker::CancelRefreshes() {" "the worker can drop the quiet looks that wait"
-need ConfigApp/source/ui.cpp "plugin_pass_total = submitted;" "the pass knows how many folders it looks at (the main page says how many are done)"
+need_line ConfigApp/source/ui.cpp "    plugin_pass_total = submitted;" "the pass knows how many folders it looks at (the main page says how many are done)"
 need ConfigApp/source/ui.cpp "aptSetHomeAllowed(home_holds == 0);" "HOME is given back only when the last page that switched it off lets go"
 need ConfigApp/source/main.cpp "g.HoldHome();" "HOME is off while the plugin is being copied into the folders of the titles"
 need ConfigApp/source/pages_enable.cpp 'Fmt("%d / %d ON", on, static_cast<int>(entries_.size()))' "the bar of the page of the titles says how many are ON"
@@ -1297,15 +1600,15 @@ need Sources/azl/log_files.cpp "if (debug_file_ || g_debug_level <= 0 || !DebugR
 need Sources/azl/log_files.cpp "if (crumb_file_ || g_debug_level <= 0) {" "the trail of a sleep (AzaharLink.sleep.log) is never opened with the log off"
 # (the capture, the main log, and the trail's file: opened and, for the trail, reopened after the old one is removed)
 [ "$(grep -c 'OpenAppend(' Sources/azl/log_files.cpp)" = "4" ] || fail "Sources/azl/log_files.cpp opens a file in a place that is not behind the level check"
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -o 'File::Open(' | wc -l)" = "12" ] || fail "Sources/ctr/plugin.cpp opens a file besides the log layer, the exit guard's own file (AppendLumaLine, on the plugin's thread), the ini read, the ini write, the memory record (read and write), the startup-occupancy warning (CheckStartupOccupancy, the one debug-0 write), the line of the link to Luma3DS's plugin loader (CheckPluginLoaderLink, debug-independent too), the three read-only openings of the comparison of this game's plugin with 3DS Link's (ReadPluginHead, PluginFilesAreEqual), and the read-only one of the in-game menu's lists (ReadDataFile)"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -o 'File::Open(' | wc -l)" = "13" ] || fail "Sources/ctr/plugin.cpp opens a file besides the log layer, the exit guard's own file (AppendLumaLine, on the plugin's thread), the ini read, the ini write, the memory record (read and write), the startup-occupancy warning (CheckStartupOccupancy, the one debug-0 write), the line of the link to Luma3DS's plugin loader (CheckPluginLoaderLink, debug-independent too), the three read-only openings of the comparison of this game's plugin with 3DS Link's (ReadPluginHead, PluginFilesAreEqual), the read-only one of the in-game menu's lists (ReadDataFile) and the read-only one of a prepared child's block (ServeDownloadPlayClient, 1.1.4 G1: the Download Play application only, the plugin's thread)"
 need_after Sources/ctr/plugin.cpp "void Plugin::CompareMemoryWithLastLaunch() {" "if (g_debug_level <= 0) {" "the memory record is read and written with the log on only (debug=0 leaves the card alone)"
 need Sources/ctr/plugin.cpp "mem against the last launch of this title:" "two launches of a title are compared (2026-10-20: the proof that an exit leaves nothing)"
 need Sources/ctr/plugin.cpp "    CompareMemoryWithLastLaunch();" "... at the start, after the memory line"
 need Sources/ctr/plugin.cpp "    constexpr int kRecords = 16;" "... with a record for each of the last 16 titles (a launch of the same title right after the last one is rare)"
-need Sources/ctr/plugin.cpp "void Plugin::CheckLinkSilence(const Stats& s) {" "with the log on, a notice when the room's datagrams stop for 150 ms or more (the WiFi link: 2026-10-20, one console 17-23 a minute, the other 0-2)"
-need Sources/ctr/plugin.cpp "    CheckLinkSilence(s);" "... checked every statistics window"
-need Sources/ctr/plugin.cpp "    if (s.rx_datagrams >= 100 && silent >= 2) {" "... in a window with traffic and at least two silences"
-need_after Sources/ctr/plugin.cpp "void Plugin::CheckLinkSilence(const Stats& s) {" "if (g_debug_level <= 0) {" "... and only with the log on"
+need Sources/ctr/plugin.cpp "void Plugin::CheckLinkSilence(const Stats& s, u64 window_ms) {" "with the log on, a notice when the room's datagrams stop for 150 ms or more (the WiFi link: 2026-10-20, one console 17-23 a minute, the other 0-2; 2m-diag: the real window)"
+need Sources/ctr/plugin.cpp "    CheckLinkSilence(s, dt);" "... checked every statistics window, with its real length (2m-diag D2)"
+need Sources/ctr/plugin.cpp "    if (LinkSilenceWorthANotice(s.rx_datagrams, silent, window_ms, kStatsIntervalMs)) {" "... in a window with traffic and at least two silences (2m-diag D2: traffic in datagrams per second of the real window; 2m-rev: against the nominal 5 s)"
+need_after Sources/ctr/plugin.cpp "void Plugin::CheckLinkSilence(const Stats& s, u64 window_ms) {" "if (g_debug_level <= 0) {" "... and only with the log on"
 need Sources/ctr/plugin.cpp "if (config_.debug > 0) {" "the capture ring is allocated only when debug is on"
 need Sources/ctr/plugin.cpp "config_.debug = g_debug_level;" "the menu label and the toggle follow what the log really does"
 need Sources/ctr/plugin.cpp ': DebugRingReady() ? "AzaharLink.log and AzaharLink.debug.log"' "the line that says the capture is written is only true when the ring exists"
@@ -1388,7 +1691,12 @@ need Sources/azl/room_client.cpp "if (!keep_running || !Live(generation)) {" "an
 if grep -n 'SetState(State::Joined)' Sources/azl/room_client.cpp; then
   fail "the network thread of Sources/azl/room_client.cpp sets Joined without checking that its session is still the client's (set_state())"
 fi
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'log_files_->Flush()')" = "2" ] || fail "Sources/ctr/plugin.cpp calls log_files_->Flush() from more than the log writer's two places (the room state callback must not wait for the SD card)"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'log_files_->Flush()')" = "3" ] || fail "Sources/ctr/plugin.cpp calls log_files_->Flush() from more or fewer than the log writer's three places (its service, the HOME button's request, its last lines when it leaves: the room state callback must not wait for the SD card)"
+# ... the third being the writer's own last flush (2026-11-10): when the writer sat in a long write at the end of the launch, Shutdown's FlushWithin gave up and put the
+# main log's last lines back in the queue, and nobody wrote them
+need_line Sources/ctr/plugin.cpp "                    log_files_->Flush();" "the writer writes the main log's waiting lines when it leaves its loop"
+need_after Sources/ctr/plugin.cpp "                if (g_debug_level > 0) { // (log off: no queue and no file, nothing is touched)" "                    log_files_->Flush();" "... with the log on only"
+need_after Sources/ctr/plugin.cpp "                if (g_debug_level > 0) { // (log off: no queue and no file, nothing is touched)" "                    const SwapGateScope gate(kGateWriter);" "... and inside the gate of the plugin's threads, as every pass of the writer"
 # - the foreign-lobby filter: a host always refuses, a client only counts until the switch is turned (nothing of the plugin's own code
 #   turns it; 1.1.3, decision Q8 of PROGETTO-DLP-VERO-1.1.3.md taken in the night session of 2026-11-09 and written in REGISTRO-MODIFICHE-ERRORI.md:
 #   the adapter of the real Download Play turns it on for a probe and a session of a RealDlp game only, and its Release turns it off on every
@@ -1421,6 +1729,33 @@ fi
 need Sources/azl/log.cpp "constexpr u32 kDietFullCalls = 3;" "the diet writes the first three calls of a kind in a second whole"
 need Sources/azl/log.cpp "constexpr u32 kDietWindowMs = 1000;" "... and counts the rest of that second in one line"
 need Sources/azl/log.cpp "if ((result != 0 || !DietLocked(handle, header, arg, now)) &&" "a call with a result other than 0 is never counted"
+# - the diet of the capture (1.1.4, 2026-11-13; four players of Final Fantasy Explorers: the ring full for 43 minutes, the card at 16 KB/s, two heavy records of
+#   three lost, three quarters of the text the bytes of the game's frames): a game's data frame leaves its first 32 bytes, a frame of the Download Play's network
+#   is whole, a polled UDS command that succeeds is ONE whole line a second and kind and then a count, from a table that is not the IPC lines'; the whole
+#   capture is a study build's (make EXTRA_CFLAGS=-DAZL_CAPTURE_WHOLE, by hand), never the delivered plugin's, and no value of the ini
+need Includes/azl/stats.hpp "constexpr u32 kDebugFrameHead = 32;" "a game's data frame keeps its first 32 bytes in the capture"
+need Sources/azl/log.cpp "const u32 keep = (dir & kDirWhole) != 0 || g_debug_whole ? kDebugMaxPayload : kDebugFrameHead;" "a data frame is cut to its head unless it is the Download Play's (or the build is a study build)"
+need Sources/azl/log.cpp "rec.stored = static_cast<u16>(payload ? std::min<u32>(size, keep) : 0);" "... and what goes into the ring is the head, not the frame"
+need Sources/azl/uds_engine.cpp "DebugSecure(kDirRx, packet, secure_data, lobby_inbox_ || dlp_net_);" "a frame a bind takes is whole in the capture only on the Download Play's network"
+need Sources/azl/uds_engine.cpp "dlp_frame = lobby_inbox_ || dlp_net_; // (the Download Play's network: its frames are whole in the capture)" "... and so is a frame that SendTo sends"
+need Sources/azl/uds_engine.cpp "DebugFrame(static_cast<u8>(kDirTx | (dlp_frame ? kDirWhole : 0)), own_node_id, dest_node_id, data_channel, data, data_size);" "a game's own frame is cut in the capture"
+need Sources/azl/log.cpp "    if (!CommandDietLocked(rec, head, request, reply) && AdmitLocked(lane, sizeof(DebugRecord) + rec.stored, rec.ms)) {" "a polled UDS command is under the diet: counted, it makes no record"
+need Sources/azl/log.cpp "    return DietLocked(key, header, arg, rec.ms, nullptr, g_dbg_cmd_diet, kCmdDietSlotBits, kCmdDietProbe, kCmdDietFullCalls);" "... in a table of its own (the IPC lines of the hook keep theirs)"
+need Tests/stack_usage.sh 'budget log "azl::{anonymous}::CommandDietLocked" 40' "the diet of the polled commands runs on the game's UDS thread: its frame has a budget"
+need Sources/azl/log.cpp "    u8* block = new (std::nothrow) u8[kDebugRingBytes + kCmdDietSlots * sizeof(DietSlot)];" "the table of the polled commands is the end of the ring's block: with the log off the capture has no memory, as before"
+need_line Sources/azl/log.cpp "DietSlot* g_dbg_cmd_diet = nullptr;" "... and not an array of the plugin's own data"
+need Sources/azl/log.cpp "constexpr u32 kCmdDietFullCalls = 1;" "one whole line a second and kind of a polled command, then the count"
+need Sources/azl/log.cpp "    if (rec.pad != kLaneHeavy || g_debug_whole) {" "a command of the control lane is never counted"
+need Sources/azl/log.cpp "        if (head.tag != kCmdUds || head.reply_words == 0 || reply[0] != 0) {" "a command that failed is never counted"
+need Sources/azl/log.cpp "            header = kDietUdsSend | (request[5] << kDietUdsSendFlagsShift) | (request[0] << kDietUdsSendFirstShift) | 0x17;" "the kind of a SendTo holds its first word and its flags: no other line of the capture has them, and games differ in them (a count must not stand for calls that differ in a word nothing else shows)"
+need_line Sources/azl/log.cpp "            request[5] <= 0xFFu) {" "... and a SendTo whose words have bits above their fields is counted only with the same words, every one"
+need Sources/azl/log.cpp "            PushAggregateLocked(slot, now, with_pending, kAggCommand);" "the writer closes the counts of the polled commands with those of the IPC lines"
+[ "$(grep -r 'g_debug_whole = ' Sources Includes | wc -l)" = "2" ] || fail "g_debug_whole is set somewhere besides its definition (Sources/azl/log.cpp: false unless AZL_CAPTURE_WHOLE): the delivered plugin never writes the whole capture"
+need_after Sources/azl/log.cpp "#else" "volatile bool g_debug_whole = false;" "the capture of the delivered plugin is under the diet"
+! grep -q 'AZL_CAPTURE_WHOLE' Makefile ConfigApp/Makefile ../DlpLink/tools/build_all.sh || fail "the delivered build names AZL_CAPTURE_WHOLE (the whole capture is a study build's: make EXTRA_CFLAGS=-DAZL_CAPTURE_WHOLE, by hand, to one console)"
+need_line Tests/capture_test.cpp "    TestFrameDiet();" "the diet of the frames is tested"
+need_line Tests/test_main.cpp "    TestCaptureDietOnTheWire();" "... through the engine too: a game's network cut, the Download Play's whole"
+need_line Tests/capture_test.cpp "    TestCommandDiet();" "... and the diet of the polled commands"
 need Sources/azl/uds_engine.cpp "DebugSecureHeader(kDirEcho, packet, secure_data);" "the echo of our own frame is a header-only record"
 need Sources/azl/uds_engine.cpp "DebugSecureHeader(kDirOther, packet, secure_data);" "a frame for another node is a header-only record"
 need Sources/azl/uds_engine.cpp "DebugFrame(kDirEcho, src_node, dest_node, data_channel, nullptr, frame_size);" "the prefilter writes the same header-only echo record"
@@ -1428,15 +1763,31 @@ need Sources/azl/uds_engine.cpp "DebugFrame(kDirOther, src_node, dest_node, data
 if grep -n 'DebugSecure(kDirOther\|DebugSecure(kDirEcho' Sources/azl/uds_engine.cpp; then
   fail "the bytes of a frame that is not for this node are in the capture again (half of its volume)"
 fi
-need Sources/azl/log_files.cpp "constexpr std::size_t kPassBytes = 256 * 1024;" "a pass of the capture's writer puts at most 256 KB of text on the card"
-need Sources/azl/log_files.cpp "constexpr u64 kPassMs = 200;" "... and takes at most 200 ms"
-need Sources/azl/log_files.cpp "if (more && !final && (written + out.size() >= kPassBytes || platform::NowMs() - begin_ms > kPassMs)) {" "both bounds end a pass that is not the last"
+# - a pass of the capture's writer that is not the last is ONE write (2026-11-10; until then 256 KB / 200 ms, which on a slow card was two writes of 64 KB and a
+#   flush, 9 s: the console has one file-system service and a file read of the game waits behind the call in hand - Kirby Battle Royale read one block per pass and
+#   the session fell); the main log's waiting lines go to the card before each write of the capture
+need_after Sources/azl/log_files.cpp "        if (!final) {" "            cut = DebugBytesQueued() != 0; // one write a pass: the rest of the ring on the next, after the card has rested" "a pass of the capture that is not the last stops after ONE write"
+need_after Sources/azl/log_files.cpp "            cut = DebugBytesQueued() != 0; // one write a pass: the rest of the ring on the next, after the card has rested" "            break;" "... and leaves the loop there"
+[ "$(grep -c 'WriteDebug(out);' Sources/azl/log_files.cpp)" = "1" ] || fail "Sources/azl/log_files.cpp: a pass of the capture writes from more or fewer than one place (one write a pass that is not the last)"
+need_after Sources/azl/log_files.cpp "        Flush();" "        WriteDebug(out);" "the main log's waiting lines are written before each write of the capture"
+need Sources/azl/log_files.cpp "__atomic_store_n(&capture_backlog_, cut ? 1u : 0u, __ATOMIC_RELAXED);" "a pass that left records in the ring makes the next one due"
+need Sources/azl/log_files.cpp "const bool due = __atomic_load_n(&capture_backlog_, __ATOMIC_RELAXED) != 0 || CaptureDue(now_ms, ring_used, early);" "... without waiting for the capture's interval"
 need Sources/azl/log_files.cpp "DebugFlushAggregates(final);" "the writer closes the counts of the diet before it drains"
 # - the writer is light on the card (2026-10-20, the user: "a volte si inchioda il gioco"): the capture goes to the card in writes of 64 KB
 #   (16 KB until then) and is flushed ONCE a pass (every write was flushed until then: a flush costs the card as much as a small write), the
 #   main log at every write (its last lines are what a post-mortem needs); the console's file layer flushes only in Flush(); a writer whose
 #   pass was cut short rests as long as the card was busy (20..250 ms) before the next pass; the hex of a frame is formatted in one go
-need Sources/azl/log_files.cpp "constexpr std::size_t kWriteBytes = 64 * 1024;" "the capture goes to the card in writes of 64 KB"
+#   (2026-11-10, console 63, Kirby Battle Royale with the log on: the card was the writer's 97% of the time. The write is 64 KB while the card answers and 8 KB after a
+#   call of the capture - a write or a flush - that took over 250 ms, until 8 calls in a row were fast; the rest after a pass is as long as the pass kept the card,
+#   20 ms..5 s, no longer 250 ms at the most, and it is the pass that sets it: LogFiles "capture_not_before")
+need Includes/azl/capture_pace.hpp "constexpr u32 kSliceLargeBytes = 64 * 1024;" "the capture goes to the card in writes of 64 KB while the card answers"
+need Includes/azl/capture_pace.hpp "constexpr u32 kSliceSmallBytes = 8 * 1024;" "... and of 8 KB after a slow call (a read of the game waits for the call in hand)"
+need Includes/azl/capture_pace.hpp "constexpr u32 kSlowCallMs = 250;" "a call of the capture is slow over 250 ms"
+need Includes/azl/capture_pace.hpp "constexpr u32 kFastCallsToGrow = 8;" "the slice is 64 KB again after 8 fast calls in a row"
+need Includes/azl/capture_pace.hpp "        if (ms > kSlowCallMs) {" "a slow call makes the slice small"
+need Includes/azl/capture_pace.hpp "        } else if (small && ++fast_in_a_row >= kFastCallsToGrow) {" "... and only a run of fast ones makes it large again"
+need Sources/azl/log_files.cpp "const std::size_t slice_bytes = small_slice ? pace::kSliceSmallBytes : slice_.Bytes();" "a write of the capture is the slice's size (the forced one is small whatever the card did)"
+need Sources/azl/log_files.cpp "        slice_.NoteCall(ms);" "every write and flush of the capture tells the size of the next slice"
 [ "$(grep -c 'files_->Flush(debug_file_);' Sources/azl/log_files.cpp)" = "1" ] || fail "Sources/azl/log_files.cpp: the capture is flushed in more or fewer than one place (once a pass, at the end of DrainDebug)"
 grep -A4 "    if (written != 0) {" Sources/azl/log_files.cpp | grep -q "files_->Flush(debug_file_);" || fail "Sources/azl/log_files.cpp: the capture is not flushed at the end of the pass (when something was written)"
 need Sources/azl/log_files.cpp "files_->Flush(log_file_); // (every time: the main log is small, and its last lines are what a post-mortem needs)" "the main log is flushed at every write"
@@ -1445,8 +1796,134 @@ need Sources/azl/log_files.cpp "files_->Flush(crumb_file_); // (at once: the tra
 if grep -n 'f->Flush()' Sources/ctr/plugin.cpp; then
   fail "Sources/ctr/plugin.cpp: the console's file layer flushes at every write again (every 16 KB of the capture flushed the card until 2026-10-20)"
 fi
-need Sources/ctr/plugin.cpp "const u32 wait_ms = backlog ? rest_ms : g_debug_level > 0 ? 250 : 1000;" "a writer whose pass was cut short rests before the next pass ..."
-need Sources/ctr/plugin.cpp "rest_ms = card_ms < 20 ? 20 : card_ms > 250 ? 250 : card_ms;" "... for as long as the card was busy, 20 ms at least, 250 at most"
+need Sources/ctr/plugin.cpp "const u32 wait_ms = g_debug_level > 0 ? log_files_->WriterWaitMs(platform::NowMs()) : 1000;" "the writer wakes every second with the log off, and as LogFiles says with it on (250 ms, sooner when the capture waits for the card)"
+need Includes/azl/capture_pace.hpp "constexpr u32 kWakeMs = 250;" "the writer wakes every 250 ms with the log on (the main log does not wait for the capture's rest)"
+need Includes/azl/capture_pace.hpp "constexpr u32 kRestMinMs = 20;" "after a pass the capture stays off the card 20 ms at least ..."
+need Includes/azl/capture_pace.hpp "constexpr u32 kRestMaxMs = 5000;" "... and 5 s at most (250 ms until 2026-11-10: a pass of 9 s made nothing of it)"
+need Includes/azl/capture_pace.hpp "return card_ms < kRestMinMs ? kRestMinMs : card_ms > kRestMaxMs ? kRestMaxMs : static_cast<u32>(card_ms);" "... for as long as the pass kept the card"
+need Sources/azl/log_files.cpp "const u32 rest_ms = pace::RestAfterPass(azl_ticks_to_ms(card_wait_ticks() - card_before));" "the rest is taken from the card time of the pass itself"
+need Sources/azl/log_files.cpp "__atomic_store_n(&capture_not_before_ms_, platform::NowMs() + rest_ms, __ATOMIC_RELAXED);" "... and the capture is not back on the card before it is over"
+need Sources/azl/log_files.cpp "const bool rested = early || now_ms >= __atomic_load_n(&capture_not_before_ms_, __ATOMIC_RELAXED);" "a pass waits for the card's rest (the HOME button's does not)"
+need Sources/azl/log_files.cpp "return left < pace::kRestMinMs ? pace::kRestMinMs : left > pace::kWakeMs ? pace::kWakeMs : static_cast<u32>(left);" "the writer's wake is never later than 250 ms, whatever the capture waits for"
+# - the game's file reads come first (2026-11-10): the svc hook counts FSFILE_Read begun and ended with the log on only - two atomic adds, no line, no call, nothing on
+#   the game's stack - and the writer keeps the capture off the card while a read is under way or one ended since its last look, for 10 s of looks in a row at the
+#   most (then ONE small slice); a read whose end is never counted (the post skipped by an Old 3DS's swap) is put right after 3 s
+# (2026-11-11: not the reads alone - EVERY call of the game to the file system, an open, a write, a close, a size, a directory, an archive. Tekken 3D Prime Edition on a
+# console, 1.1.3 with the log on: fs:USER OpenFileDirectly came back after 26.4 s with the writer in the card, the game sent nothing for 17 s and the session fell; the
+# call left waiting was an open, which the count of FSFILE_Read did not see. The rule is a pure header, Includes/azl/game_card_calls.hpp - the command id's high byte is
+# 0x08 - run on the PC by Tests/game_card_calls_test.cpp; the hook asks it in its pre and in its post, the same question of the same header, and nowhere else)
+# (2026-11-12, review: the count of every call would not have seen THAT open in time either - it began 5.9 s after the game's last file call, with the writer already in
+# the card; what the count covers, and what to read in the log's card line at the test on a console, is in the header's own comment)
+need_line Includes/azl/game_card_calls.hpp "constexpr u32 kFsCommandFamily = 0x08;" "the family of the file system's commands is the high byte 0x08 of the command id (fs:USER, FSFILE, FSDIR)"
+need_line Includes/azl/game_card_calls.hpp "__attribute__((always_inline)) constexpr bool IsFileSystemCall(u32 header) {" "the rule is folded into the hook's two functions: no call on the game's thread (the 464-byte thread of Tri Force Heroes runs them)"
+need_after Includes/azl/game_card_calls.hpp "__attribute__((always_inline)) constexpr bool IsFileSystemCall(u32 header) {" "    return (header >> 24) == kFsCommandFamily;" "a call of the game is a file call when its command id's high byte is the family's: every fs command, not FSFILE_Read alone"
+[ "$(tr -d '\r' < Includes/azl/game_card_calls.hpp | sed 's://.*$::' | grep -c 'return ')" = "1" ] || fail "Includes/azl/game_card_calls.hpp: the rule of the file calls is no longer its one return (a shift and a compare)"
+if tr -d '\r' < Includes/azl/game_card_calls.hpp | grep -n '#include' | grep -v '#include "azl/common.hpp"'; then
+  fail "Includes/azl/game_card_calls.hpp includes more than azl/common.hpp (it is a pure header: the PC test builds it alone, and nothing of libctru may come with it)"
+fi
+need Sources/ctr/hook.cpp '#include "azl/game_card_calls.hpp"' "the hook takes the rule of the file calls from the pure header"
+need_after Sources/ctr/hook.cpp "    ctx[2] = cmd[1];" "    if (IsFileSystemCall(header)) {" "the pre asks the rule of the header it just kept for the post (log on: the branch after the level check)"
+need_after Sources/ctr/hook.cpp "    const u32 arg = ctx[2];" "    if (IsFileSystemCall(header)) {" "... and the post asks the same rule of that header (ctx[1]), first of all"
+need_after Sources/ctr/hook.cpp "    const Handle handle = ctx[0];" "    const u32 header = ctx[1];" "the header the post asks about is the one the pre kept"
+[ "$(tr -d '\r' < Sources/ctr/hook.cpp | sed 's://.*$::' | grep -c 'IsFileSystemCall(')" = "2" ] || fail "Sources/ctr/hook.cpp asks the rule of the file calls in more or fewer than its two places (the pre and the post of the pass-through: a call counted as begun must be counted as ended by the same rule)"
+[ "$(tr -d '\r' < Sources/ctr/hook.cpp | grep -c '^    if (IsFileSystemCall(header)) {$')" = "2" ] || fail "Sources/ctr/hook.cpp: the two questions of the file calls are no longer the same line, 'if (IsFileSystemCall(header)) {', in the pre and in the post"
+if tr -d '\r' < Sources/ctr/hook.cpp | sed 's://.*$::' | grep -n 'kFsFileRead\|0x080200C2'; then
+  fail "Sources/ctr/hook.cpp counts by the header of FSFILE_Read again (the reads alone: the open of Tekken 3D that waited 26 s behind the writer is not seen)"
+fi
+need_after Sources/ctr/hook.cpp "    if (IsFileSystemCall(header)) {" "        __atomic_fetch_add(&g_game_reads_begun, 1u, __ATOMIC_RELAXED);" "what the pre does for a file call is the one atomic add"
+need_after Sources/ctr/hook.cpp "    if (IsFileSystemCall(header)) {" "        __atomic_fetch_add(&g_game_reads_done, 1u, __ATOMIC_RELAXED);" "... and so the post"
+need_after Sources/ctr/hook.cpp "    ctx[2] = cmd[1];" "        __atomic_fetch_add(&g_game_reads_begun, 1u, __ATOMIC_RELAXED);" "a file call of the game is counted as it begins (log on: the branch after the level check)"
+need_after Sources/ctr/hook.cpp "    const u32 arg = ctx[2];" "        __atomic_fetch_add(&g_game_reads_done, 1u, __ATOMIC_RELAXED);" "... and as it ends, before anything else of the post"
+# (2026-11-12, review: the pins above look for their text within three lines, as a part of a line - a condition put AROUND the add, 'if (cmd[1] != 0) {' or
+# 'if (R_SUCCEEDED(rc)) {', left every one of them satisfied: the add was still there, four spaces further in. An open has 0 in its first word and may fail: the first
+# would have made the count blind to the opens again, the second left every refused open "under way" for good. So: the three lines in a row, twice, and nothing else -
+# the question, the ONE add at the question's own depth, the closing brace; the pre's first, the post's second)
+[ "$(tr -d '\r' < Sources/ctr/hook.cpp | awk -v q='    if (IsFileSystemCall(header)) {' -v b1='        __atomic_fetch_add(&g_game_reads_begun, 1u, __ATOMIC_RELAXED); // (' -v d1='        __atomic_fetch_add(&g_game_reads_done, 1u, __ATOMIC_RELAXED); // (' '$0 == q { if ((getline a) > 0 && (getline c) > 0 && c == "    }") got = got (index(a, b1) == 1 ? "begun " : index(a, d1) == 1 ? "done " : "other ") } END { print got }')" = "begun done " ] || fail "Sources/ctr/hook.cpp: the count of a file call is no longer three lines in a row, in the pre and in the post - 'if (IsFileSystemCall(header)) {', the one atomic add at that depth, '}' (a condition around the add makes the count miss calls: an open has 0 in its first word, and a call the kernel refuses must end too)"
+# (2026-11-12, review C2: "the end of a call is counted even when the log was switched off while the call was in the kernel" was true and held by nothing. A post that began
+# with 'if (g_debug_level <= 0) return rc;' passed every pin above - the question was still within three lines of the post's values - and the chain test, where the level never
+# changes inside a call; on a console the call under way when the log goes off would stay "under way": `begun` one ahead, 3 s of skipped passes and one "realigned" when the
+# log comes back. So: from the post's first line to its add, nothing returns and nothing looks at the level)
+POST_HEAD=$(tr -d '\r' < Sources/ctr/hook.cpp | awk '$0 == "__attribute__((noinline)) Result PassThroughPost(Result rc, const u32* ctx) {" { f = 1 } f { print } f && (index($0, "__atomic_fetch_add(&g_game_reads_done, 1u, __ATOMIC_RELAXED);") || $0 == "}") { exit }' | sed 's://.*$::')
+printf '%s\n' "$POST_HEAD" | tail -1 | grep -F -q -- '        __atomic_fetch_add(&g_game_reads_done, 1u, __ATOMIC_RELAXED);' || fail "Sources/ctr/hook.cpp: PassThroughPost no longer reaches the count of the end of a file call (the pin of what stands before that count has nothing to read)"
+if printf '%s\n' "$POST_HEAD" | grep -n -E 'return|goto|g_debug_level'; then
+  fail "Sources/ctr/hook.cpp: PassThroughPost returns or looks at the log's level before it counts the end of a file call (the start was counted: a log switched off while the call was in the kernel must not leave the call under way)"
+fi
+need_order Sources/ctr/hook.cpp "        return PreReply(handle, kActSvc);" "    if (IsFileSystemCall(header)) {" "with the log off the hook's pass-through returns before it asks whether the call is a file call (nothing more on the common path)"
+need_stmt Tests/game_card_calls_test.cpp 'TestTheCallsOfTheLogs();' "the test of the rule runs the fs headers of a console's captures and the calls to the other services"
+need_stmt Tests/game_card_calls_test.cpp 'TestTheWholeCommandSpace();' "... every command id"
+need_stmt Tests/game_card_calls_test.cpp 'TestAnOpenKeepsTheCaptureOffTheCard();' "... and the hook's two lines around the writer's watch: an open under way keeps the capture off the card"
+need Tests/game_card_calls_test.cpp '{0x08030204, "FSUSER_OpenFileDirectly (28): the call of Tekken 3D that came back after 26.4 s"},' "the call of Tekken 3D is among the headers the test holds to the rule"
+need Tests/game_card_calls_test.cpp '{0x00080082, "gsp::Gpu FlushDataCache: the 0x08 is the LOW byte of the command id"},' "a gsp command with 0x08 in its id's low byte is among the ones that must not count"
+need Tests/game_card_calls_test.cpp "const bool file_system = command >= 0x0800 && command <= 0x08FF;" "the test says the family by its own words, not by the rule's"
+[ "$(tr -d '\r' < Tests/log_files_test.cpp | grep -c '^            if (IsFileSystemCall(header)) {$')" = "2" ] || fail "Tests/log_files_test.cpp: the writer's test no longer plays the hook's two lines, the start and the end of a call, with the rule itself (an open, a write, a close under way make the capture step aside)"
+# ... and the compiled hook itself, in the ARM emulator on the 464-byte thread (Tests/chain_sim/chain_sim.py, run by Tests/stack_usage.sh on the built plugin): every fs
+# command counted as begun before the svc and as ended after it with the log on, no other call counted, neither word ever written with the log off, no deeper than a plain call
+need_line Tests/chain_sim/chain_sim.py "        scenario_file_calls(elf, level)" "the whole-chain test runs the count of the game's file calls in the compiled hook, at both log levels"
+need Tests/chain_sim/chain_sim.py "FILE_CALLS = (0x08030204, 0x080200C2, 0x080201C2, 0x08030102, 0x08080000, 0x08040000, 0x080C00C2, 0x080E0080, 0x080D0144, 0x08080202," "... with the open of Tekken 3D, a read, a write, a close and the other fs commands of the captures"
+need Tests/chain_sim/chain_sim.py "OTHER_CALLS = (0x000C0000, 0x00080082, 0x001F0000, 0x000B0000, 0x00010082, 0x000B0040, 0x001400C0, 0x00140084, 0x04010082, 0x10010080)" "... and calls to gsp, dsp, srv, cfg:u, APT, nwm::UDS and soc:U that must move neither word"
+# (2026-11-12, review: a pre that counted the start only when the request's first word was not 0 passed this scenario - every call had 0x1000 there - and an open of a
+# console has 0; and the end of a call the kernel refuses is counted because of ONE call of the scenario, the last, which had no pin)
+need_line Tests/chain_sim/chain_sim.py "        sim.set_request([header, 0 if i % 2 == 0 else 0x1000])" "... with 0 in the first word of one call out of two, as the opens of a console have (the open of Tekken 3D, the first call, among them)"
+need_line Tests/chain_sim/chain_sim.py "    calls = FILE_CALLS + OTHER_CALLS + (0x08030204,)" "... and one more open at the end ..."
+need Tests/chain_sim/chain_sim.py "        failing = i == len(calls) - 1 " "... which the kernel refuses ..."
+need_line Tests/chain_sim/chain_sim.py "        result[0] = 0xD8E007F7 if failing else 0" "... with an error for its result: a call that fails is counted as ended all the same"
+need Tests/chain_sim/chain_sim.py "check(writes == [], 'file calls at debug 0: neither word is ever written (%d stores)' % len(writes))" "the chain test watches every store into the two words: none with the log off"
+need Tests/chain_sim/chain_sim.py "check(at_svc[-1] == (before[0] + 1, before[1])," "... a file call is counted as begun, and not as ended, while it is in the kernel"
+need Tests/chain_sim/chain_sim.py "check(after == (before[0] + 1, before[1] + 1), 'file calls at debug 1: 0x%08x is counted as ended after the svc" "... and as ended once it is back"
+need Tests/chain_sim/chain_sim.py "check(at_svc[-1] == before and after == before," "... and a call that is not of the file system, or any call with the log off, moves neither word"
+need Tests/chain_sim/chain_sim.py "record('pass-through, the game\\'s file calls (counted at debug 1)', level, worst, BUDGET_PURE, 'pure')" "... within the budget of the plain pass-through"
+need Tests/chain_sim/chain_sim.py "    check(written <= PURE_WRITTEN[level]," "... and writing no deeper on the game's stack than srv:ReceiveNotification does"
+need Tests/log_files_test.cpp "const u32 file_calls[] = {0x08030204, 0x080201C2, 0x08030102, 0x08080000, 0x08040000, 0x080C00C2, 0x080D0144, 0x08080202, 0x08010042};" "... with opens, a write, a close, a size, archives and a directory, none of them a read"
+need Sources/azl/log_files.cpp "%lu skipped for the game's file calls\"" "the card line says 'file calls': the count is of every call to the file system, not of the reads"
+need Sources/azl/log_files.cpp "\" (%lu calls, %lu realigned), rest %lu ms" "... and so the count beside it"
+[ "$(grep -c 'g_game_reads_begun\|g_game_reads_done' Sources/ctr/hook.cpp)" = "4" ] || fail "Sources/ctr/hook.cpp touches the counts of the game's file reads in more than their two definitions and their two atomic adds (nothing else may run on the game's thread for them)"
+need_order Sources/ctr/hook.cpp "        return PreReply(handle, kActSvc);" "        __atomic_fetch_add(&g_game_reads_begun, 1u, __ATOMIC_RELAXED);" "with the log off the hook's pass-through returns before it counts a read"
+[ "$(grep -c '        return PreReply(handle, kActSvc);' Sources/ctr/hook.cpp)" = "1" ] || fail "Sources/ctr/hook.cpp: the pass-through's return with the log off is no longer the one line the pin of the read counts stands on"
+need_after Sources/ctr/hook.cpp "    if (g_debug_level <= 0) {" "        return PreReply(handle, kActSvc);" "... which is the return of the level check"
+need Sources/ctr/plugin.cpp "log_files_->SetGameReads(&g_game_reads_begun, &g_game_reads_done, &GatePostsSkipped);" "the writer is given the hook's two counts, and the gate's count of the posts it skipped"
+need Sources/azl/log_files.cpp "reads = read_watch_.Look(begun, done, now_ms, wanted && !early, skipped);" "the writer looks at the game's reads every time it asks for the capture's turn (with the gate's skipped posts)"
+# (2026-11-11, second review: the gate's count is read BEFORE the two counts of the reads - read after them, a read that began and lost its end between the loads showed its
+# skipped post beside counts that did not hold it yet, and a look that found nothing under way wrote the post off; Tests/log_files_test.cpp makes the race happen in the load)
+need_line Sources/azl/log_files.cpp "        const u32 skipped = posts_skipped_ ? posts_skipped_() : 0u;" "what the watch is told of the skipped posts is the gate's count (none where there is no gate)"
+need_order Sources/azl/log_files.cpp "const u32 skipped = posts_skipped_ ? posts_skipped_() : 0u;" "const u32 done = __atomic_load_n(reads_done_, __ATOMIC_RELAXED);" "the gate's skipped posts are read before the counts of the reads"
+[ "$(tr -d '\r' < Sources/azl/log_files.cpp | sed 's://.*$::' | grep -c 'posts_skipped_()')" = "1" ] || fail "Sources/azl/log_files.cpp: the gate's count of skipped posts is no longer read in one place, before the counts of the reads"
+need_line Tests/log_files_test.cpp "    for (const bool before_the_load : {true, false}) {" "the test makes a read lose its end on both sides of the load of the skipped posts"
+need Sources/ctr/hook.cpp "    return g_gate != nullptr ? __atomic_load_n(&g_gate->post_skipped, __ATOMIC_RELAXED) : 0;" "the skipped posts the watch is told are the gate's own word"
+need_order Sources/azl/log_files.cpp "const u32 done = __atomic_load_n(reads_done_, __ATOMIC_RELAXED);" "const u32 begun = __atomic_load_n(reads_begun_, __ATOMIC_RELAXED);" "the ended count is read before the begun one (a read between the two loads shows as under way, never as -1)"
+need Sources/azl/log_files.cpp "    if (reads == pace::GameReadWatch::kSkip) {" "the capture steps aside for a read of the game"
+need Sources/azl/log_files.cpp "        return CaptureTurn::kSmallPass;" "... and after 10 s of it writes one small slice"
+need Includes/azl/capture_pace.hpp "constexpr u32 kSkipForceMs = 10000;" "the capture steps aside for 10 s in a row at the most"
+need Includes/azl/capture_pace.hpp "constexpr u32 kReadStuckMs = 3000;" "a read under way for 3 s without an end is an end that was never counted"
+need Includes/azl/capture_pace.hpp "        if (!reading && !ended_since) {" "the card is the capture's only when no read is under way and none ended since the last look"
+need Includes/azl/capture_pace.hpp "        if (now_ms - skip_since_ms >= kSkipForceMs) {" "the forced slice comes after kSkipForceMs of skips in a row"
+need Includes/azl/capture_pace.hpp "            if (now_ms - still_since_ms >= kReadStuckMs) {" "the count of the reads under way is put right after kReadStuckMs of neither count moving"
+# (2026-11-11: reads on end are not a lost end. The fewest-open rule needs a post the gate really skipped, or five minutes.)
+need Includes/azl/capture_pace.hpp "            } else if (now_ms - open_since_ms >= (posts_skipped != quiet_skipped ? kReadStuckMs : kReadLostMs)) {" "reads under way at every look are a lost end after 3 s only when the gate skipped a post, after kReadLostMs otherwise"
+need Includes/azl/capture_pace.hpp "constexpr u32 kReadLostMs = 300000;" "with no skipped post, reads on end are taken for a lost end only after five minutes"
+need Includes/azl/capture_pace.hpp "            quiet_skipped = posts_skipped; // (the count is right here: a post skipped before now lost no end of a read)" "a skipped post seen while no read is under way is no proof of a lost end later"
+need Includes/azl/capture_pace.hpp "                quiet_skipped = posts_skipped; // (the skipped post is accounted for: the next one is another)" "a skipped post puts the count right once"
+# (2026-11-11, second review: the pieces of that rule that no test and no pin held, and its two corrections - the fewest-open rule never takes more ends for lost than posts
+# were skipped, and the time between two looks far apart is no time "at every look"; Tests/log_files_test.cpp, TestCapturePace, runs every one of them)
+need_after Includes/azl/capture_pace.hpp "        if (!looked) {" "            quiet_skipped = posts_skipped; // (what was skipped before the first look is before the counts)" "the posts skipped before the first look are no proof of a lost end"
+need_line Includes/azl/capture_pace.hpp "            if (!open_run || posts_skipped != last_skipped) {" "a post skipped just now starts the fewest-open count again (the 3 s run from the look that sees it)"
+need_after Includes/azl/capture_pace.hpp "                lost = open_min;" "                const u32 skipped = posts_skipped - quiet_skipped;" "the fewest seen open is held against the posts skipped since the count was right"
+need_after Includes/azl/capture_pace.hpp "                const u32 skipped = posts_skipped - quiet_skipped;" "                if (skipped != 0 && lost - lost_posts > skipped) {" "... never more lost ends than skipped posts (with none skipped, the last resort, there is no such bound)"
+need_after Includes/azl/capture_pace.hpp "                if (skipped != 0 && lost - lost_posts > skipped) {" "                    lost = lost_posts + skipped;" "... the count goes that far and no further"
+need Includes/azl/capture_pace.hpp "constexpr u32 kLookGapMs = 1000;" "two looks more than a second apart: the time between them is no time 'at every look'"
+need_line Includes/azl/capture_pace.hpp "        } else if (open_run && now_ms > last_look_ms && now_ms - last_look_ms > kLookGapMs) {" "a gap between two looks is found by the clock of the looks"
+need_after Includes/azl/capture_pace.hpp "        } else if (open_run && now_ms > last_look_ms && now_ms - last_look_ms > kLookGapMs) {" "            open_since_ms += now_ms - last_look_ms;" "... and taken off the time of the fewest-open rule"
+need_line Includes/azl/capture_pace.hpp "        last_look_ms = now_ms;" "every look is the one the next gap is measured from"
+need Sources/ctr/plugin.cpp "log_files_->DrainDebug(false, turn == LogFiles::CaptureTurn::kSmallPass);" "the writer makes the pass LogFiles asked for (small when forced)"
+# (2026-11-11) a pass that began before the gate of the swap closed does not make the swap wait longer than it did before 2026-11-10: no
+# sleep while it formats and no flush of the main log once the gate closes; and what the ring dropped is said by every pass that is not the last
+need Sources/azl/log_files.cpp "const auto gate_closing = [this, final]() { return !final && stop_capture_ && __atomic_load_n(stop_capture_, __ATOMIC_ACQUIRE) != 0; };" "a pass under way knows when the gate of the swap closes (never the last pass)"
+need Sources/azl/log_files.cpp "            if (!final && platform::NowTicks() - paused_at > yield_ticks && !gate_closing()) {" "a pass gives the core up while it formats, but not with the gate of the swap closing"
+need_after Sources/azl/log_files.cpp "        if (!gate_closing()) {" "            Flush();" "the main log goes first in a pass, but not with the gate of the swap closing"
+need_after Sources/azl/log_files.cpp "        if (!more || !final) {" "            const u32 dropped = DebugTakeDropped();" "the records the ring dropped are said by every pass that is not the last (and by the last when the ring is empty)"
+need_line Tests/log_files_test.cpp "    TestCaptureStopsAtTheGate();" "the capture and the gate of the swap are tested (closed before a pass, during its write, while it formats)"
+need_line Tests/log_files_test.cpp "    TestCapturePace();" "the pace of the capture is tested (the rest, the slice, the game's reads)"
+need_line Tests/log_files_test.cpp "    TestCaptureLeavesTheCardToTheGame();" "... and on a slow card, through LogFiles"
+need_line Tests/log_files_test.cpp "    TestMainLogGoesFirst();" "the order of the main log and the capture on the card is tested"
 need Sources/azl/log.cpp "out->resize(at + 2 * static_cast<std::size_t>(n) + 1);" "the hex of a frame is formatted in one go, not a char at a time"
 # - the session of 2026-10-20 with Friend-A (Tekken, DOA, SSF4, NSMB2 over the internet, the log on): the writer runs ABOVE the game's
 #   threads (0x2E: a thread that holds a lock the game's threads take must not be preemptable by them), a scan leaves out the networks of
@@ -1456,7 +1933,13 @@ need Sources/ctr/plugin.cpp "constexpr int kLogWriterPriority = 0x2E;" "the writ
 need Sources/ctr/plugin.cpp "            0, kLogWriterPriority)) {" "... and that is the priority its thread is started with"
 need Includes/azl/uds_engine.hpp "bool scan_filter_enforced_ = true;" "a scan leaves out the networks of another game (2026-10-20: NSMB2 listed and joined the emulator's Tekken lobby)"
 need Sources/ctr/plugin.cpp "AzaharLink debug: SD card busy %lu%%, capture lost %lu%% (the log slows the game)" "with the log on the screen says when the log slows the game"
-need Sources/ctr/plugin.cpp "    CheckDebugLoad(s);" "... checked every statistics window"
+need Sources/ctr/plugin.cpp "    CheckDebugLoad(s, dt);" "... checked every statistics window, with the window's real length"
+# ... and the share of the card is taken over that length, never over a fixed 5 s (2026-11-10: the writer closes the window and it is the thread that sits in the
+# card, so the window lasted up to 43 s and the notice said "SD card busy 868%"), 100 at the most, and a window of no length divides nothing
+need Sources/ctr/plugin.cpp "const u32 card_pct = pace::CardBusyPercent(azl_ticks_to_ms(s.t_writer_wait), window_ms);" "the notice's share of the card is over the real length of the window"
+need_after Includes/azl/capture_pace.hpp "inline u32 CardBusyPercent(u64 card_ms, u64 window_ms) {" "    if (window_ms == 0) {" "a window of no length is no division"
+need Includes/azl/capture_pace.hpp "    const u64 pct = card_ms * 100 / window_ms;" "the share is the card's time over the window's"
+need Includes/azl/capture_pace.hpp "    return pct > 100 ? 100u : static_cast<u32>(pct);" "... and never more than 100"
 need Sources/ctr/plugin.cpp "    if (card_pct >= 50 || lost_pct >= 30) {" "... when the card was ours half the time, or the ring dropped almost a third"
 # - no thread above the log writer ever waits for a lock of the log (2026-10-20, Tekken stuck at the publisher's screen with the log on: the
 #   writer has the lowest priority, a LightLock has no priority inheritance, and a game that spins never lets the writer back on the core):
@@ -1514,7 +1997,7 @@ need Sources/azl/log_files.cpp "if (deadline != 0 && platform::NowMs() >= deadli
 need Sources/azl/log_files.cpp "shutdown: the capture was cut at the end: " "the main log says how much of the capture was not written"
 # - a count line of the diet that finds the control lane full takes its calls into the lost count
 need Sources/azl/log.cpp "g_dbg_totals.lost_full[kLaneControl] += count - 1;" "a count line that is lost loses the calls it stood for, and the LOST marker says so"
-need Sources/ctr/plugin.cpp "backlog = log_files_->DrainDebug(false);" "a pass cut at its bound is followed soon by the next, not after the usual pause"
+need Sources/azl/log_files.cpp "    if (waiting == 1 || __atomic_load_n(&capture_backlog_, __ATOMIC_RELAXED) != 0) {" "a pass that left records is followed by the next as soon as the card has rested, not after the usual pause"
 # - Log() and DebugEvent() write the plugin's conversions themselves (the HLE proper calls them on the game's UDS thread, where newlib's
 #   vsnprintf chain needed 1.4 KB), a raw record carries a command's words to the writer, and the request copy of the capture is as long as
 #   the words the header declares
@@ -1537,6 +2020,61 @@ need Sources/enet/enet_3ds.c 'azl_c_soc_call (2, svcGetSystemTick () - startTick
 need Sources/enet/enet_3ds.c 'azl_c_soc_call (recvLength > 0 ? 0 : 1, now - startTick);' "every receive is timed"
 need Sources/azl/log.cpp "platform::NoteNetWait(ticks);" "a soc call is a wait of the network loop: it comes off the section it fell in"
 need Sources/azl/log.cpp "if (!platform::IsNetThread()) {" "the soc statistics are those of the network thread"
+# (2026-11-11: two functions begin with that question now, the timing of a soc call and the count of a send: each is asked for by its name,
+# or the one would stand in for the other)
+need_after Sources/azl/log.cpp "void StatsSocCall(int kind, u64 ticks) {" "    if (!platform::IsNetThread()) {" "the timing of the soc calls is the network thread's own"
+need_after Sources/azl/log.cpp "void StatsSocSend(u32 bytes, int outcome) {" "    if (!platform::IsNetThread()) {" "the count of the sends is the network thread's own"
+# The datagrams handed to the room socket (2026-11-11, Fantasy Life: a client's broadcast frames above ENet's fragment length never reached the
+# room, and a send the socket refuses is "0 bytes sent" for ENet, in silence). enet_socket_send tells the counters what the socket did with EVERY
+# datagram, each answer under its own number (azl/stats.hpp: 0 taken whole, 1 refused, 2 failed, 3 short), and leaves the socket's errno behind
+# (ENet reads it after the call). The end of the function is held statement by statement, from the gate's leave to the closing brace: the answer
+# is read from the errno that was kept (not from one a hook may have changed), every branch counts before it returns, and what it returns is
+# what it returned before the count was there (0 for a refusal, -1 for a failure, the bytes otherwise). Tests/soc_send_test.cpp runs the same
+# lines on a PC with the socket answered by the test; this is for a copy of the function that is edited without it.
+# (the function, less its blank lines and the lines of a comment, from the statement after the gate's leave)
+SEND_TAIL=$(tr -d '\r' < Sources/enet/enet_3ds.c | awk '/^enet_socket_send \(ENetSocket socket,/{f=1} f{print} f&&/^}/{exit}' |
+            awk '{ if (!c && $0 ~ /^[ \t]*\/\*/) { c = 1 } if (c) { if ($0 ~ /\*\//) c = 0; next } if ($0 ~ /^[ \t]*$/) next; print }' |
+            awk 'f{print} $0 == "    azl_c_soc_leave ();"{f=1}')
+ST="Sources/enet/enet_3ds.c, the end of enet_socket_send"
+need_nth "$ST" "$SEND_TAIL" 1 '    savedErrno = errno;' "the socket's errno is kept as soon as the call is over"
+need_nth "$ST" "$SEND_TAIL" 2 '    azl_c_soc_call (2, svcGetSystemTick () - startTick);' "the send is timed"
+need_nth "$ST" "$SEND_TAIL" 3 '    errno = savedErrno;' "the errno is put back after the timing"
+need_nth "$ST" "$SEND_TAIL" 4 '    if (sentLength == -1)' "an error of the socket ..."
+need_nth "$ST" "$SEND_TAIL" 5 '    {' "..."
+need_nth "$ST" "$SEND_TAIL" 6 '       if (savedErrno == EWOULDBLOCK)' "... is a refusal when the errno that was kept says so"
+need_nth "$ST" "$SEND_TAIL" 7 '       {' "..."
+need_nth "$ST" "$SEND_TAIL" 8 '          azl_c_soc_send ((unsigned) total, 1);' "a refused datagram is counted as refused (1), with the bytes of the whole datagram"
+need_nth "$ST" "$SEND_TAIL" 9 '          errno = savedErrno;' "the errno is put back after the count of a refusal"
+need_nth "$ST" "$SEND_TAIL" 10 '          return 0;' "a refusal is '0 bytes sent' for ENet, as before the count"
+need_nth "$ST" "$SEND_TAIL" 11 '       }' "..."
+need_nth "$ST" "$SEND_TAIL" 12 '       azl_c_soc_send ((unsigned) total, 2);' "any other error is counted as a failure (2)"
+need_nth "$ST" "$SEND_TAIL" 13 '       errno = savedErrno;' "the errno is put back after the count of a failure (ENet's caller reads it)"
+need_nth "$ST" "$SEND_TAIL" 14 '       return -1;' "a failure is -1 for ENet, as before the count"
+need_nth "$ST" "$SEND_TAIL" 15 '    }' "..."
+need_nth "$ST" "$SEND_TAIL" 16 '    azl_c_soc_send ((unsigned) total, sentLength < 0 ? 2 : (size_t) sentLength < total ? 3 : 0);' "any other negative answer is a failure (2: libctru gives the kernel's raw result, not -1, when the request to the soc service fails), fewer bytes than the datagram held a short send (3), all of them a datagram taken whole (0)"
+need_nth "$ST" "$SEND_TAIL" 17 '    errno = savedErrno;' "the errno is put back after the count of a datagram that was taken"
+need_nth "$ST" "$SEND_TAIL" 18 '    return sentLength;' "ENet is told the bytes the socket took"
+need_nth "$ST" "$SEND_TAIL" 19 '}' "the function ends there"
+[ "$(printf '%s\n' "$SEND_TAIL" | grep -c '')" = "19" ] || fail "$ST: it is no longer the 19 statements held here (a statement was added or lost)"
+[ "$(tr -d '\r' < Sources/enet/enet_3ds.c | grep -c 'azl_c_soc_send (')" = "4" ] || fail "Sources/enet/enet_3ds.c: azl_c_soc_send is no longer its declaration and the three calls of enet_socket_send (one answer of the socket, one count)"
+need_line Sources/enet/enet_3ds.c 'void azl_c_soc_send (unsigned bytes, int outcome); /* outcomes: 0 taken whole, 1 refused (EWOULDBLOCK), 2 failed, 3 short (azl/stats.hpp) */' "the layer's hook for the count of the sends"
+need_line Includes/azl/stats.hpp 'enum SocSendOutcome : int { kSocSendTaken = 0, kSocSendRefused = 1, kSocSendFailed = 2, kSocSendShort = 3 };' "the numbers enet_3ds.c writes (a C file: it cannot read the enum) are the enum's"
+need_after Sources/azl/log.cpp 'extern "C" void azl_c_soc_send(unsigned bytes, int outcome) {' '    azl::StatsSocSend(bytes, outcome);' "the layer's hook is the count of the statistics"
+# ... and the test that runs those lines on a PC is built with the plugin's OWN layer (not the PC's unix.c: it would pass nothing through the count), with the socket
+# calls and the two hooks wrapped, and is run by the suite; the family of Tests/enet3ds builds it too and the integration run runs that one
+need Tests/run.sh 'gcc $CFLAGS -ITests/enet3ds/shim -c Sources/enet/enet_3ds.c -o "$OUT/plat_3ds.o"' "the test of the send count is built against the plugin's own ENet platform layer"
+need Tests/run.sh 'g++ $CXXFLAGS Tests/soc_send_test.cpp Sources/azl/log.cpp Sources/azl/platform.cpp "$OUT/plat_3ds.o" -Wl,--wrap=sendto -Wl,--wrap=send -Wl,--wrap=azl_c_soc_send -Wl,--wrap=azl_c_soc_call -o "$OUT/soc_send_test"' "the test of the send count links the plugin's layer and counters, with the socket calls and the two hooks wrapped"
+need_line Tests/run.sh '  "$OUT/soc_send_test"' "... and the suite runs it"
+need Tests/enet3ds/build.sh 'Tests/soc_send_test.cpp Sources/azl/log.cpp Sources/azl/platform.cpp "$OUT/enet_3ds.o" -Wl,--wrap=sendto -Wl,--wrap=send -Wl,--wrap=azl_c_soc_send -Wl,--wrap=azl_c_soc_call -o "$OUT/soc_send_test_3ds"' "the tests against the plugin's layer build the test of the send count too"
+need Tests/integration.sh '/tmp/azl_e3ds/enet_path_test_3ds && /tmp/azl_e3ds/soc_send_test_3ds &&' "... and the integration run runs it with them"
+for t in TestTakenWhole TestRefused TestFailed TestRawKernelResult TestShort TestOneWindow TestNotTheNetworkThread TestOverTheGatherBuffer TestConnectedSocket; do
+  need_line Tests/soc_send_test.cpp "    $t();" "the test of the send count runs $t"
+done
+# (2026-11-11, the second review: libctru answers the kernel's raw result, negative and never -1, when the request to the soc service fails; the test answers such values)
+need_line Tests/soc_send_test.cpp '        CHECK(raw < -1);' "the raw results the test of the send count answers are negative and never -1"
+need_after Tests/soc_send_test.cpp '    case Answer::Raw:' '        return g_raw_result;' "... and they are what the wrapped socket call returns"
+[ "$(tr -d '\r' < Tests/soc_send_test.cpp | grep -c '^    errno = kHookErrno;$')" = "2" ] || fail "Tests/soc_send_test.cpp: the two wrapped hooks no longer leave another errno behind (an errno the layer did not put back would not be seen)"
+need_line Tests/soc_send_test.cpp '    platform::MarkNetThread(); // this thread is the network thread (RoomClient::Run marks itself the same way)' "the test's sends are the network thread's (the others are counted nowhere)"
 need Includes/azl/platform.hpp "NoteNetWait(waited);" "the network thread's wait for the engine's lock comes off its sections too"
 need Sources/azl/room_client.cpp "cut(g_stats.t_net_service, service_end - round_start);" "ENet's own code: the service call less the soc calls in it"
 need Sources/azl/room_client.cpp "cut(g_stats.t_net_events, events_end - service_end);" "the frames and the engine: less the engine-lock waits"
@@ -1549,7 +2087,17 @@ need Sources/ctr/plugin.cpp "StatsAdd64(g_stats.t_writer_wait, waited_ticks);" "
 # figures are CPU and waiting now, the words are the same
 need Sources/ctr/plugin.cpp "| plugin total %lu.%lu (CPU) = " "the CPU line starts with 'plugin total N' (parse_main.py and the other scripts of the PROVA analyses)"
 need Sources/ctr/plugin.cpp "poll %lu.%lu (waiting)," "... and gives the idle poll as 'poll N (waiting)'"
-[ "$(grep -c 'CardTimer card(&card_wait_ticks_);' Sources/azl/log_files.cpp)" = "3" ] || fail "Sources/azl/log_files.cpp: the main log's flush, the capture's write and the capture's flush must both time their time in the file layer"
+# (2026-11-10: every call is timed on its own - the write and the flush apart, the capture and the main log apart - with its count, its sum, its longest and its bytes,
+# and the writer says them in a line of its own, "stats: card:", after the capture's: until then nobody could say whether the seconds of a pass were in the write or in the flush)
+[ "$(grep -c 'CardCall card(this, kCard' Sources/azl/log_files.cpp)" = "6" ] || fail "Sources/azl/log_files.cpp: the main log's write and flush, the capture's write and flush and the two rotations must each time their call into the file layer"
+need_after Sources/azl/log_files.cpp "        CardCall card(this, kCardMainWrite, text.size());" "        files_->Write(log_file_, text.data(), text.size());" "the main log's write is timed"
+need_after Sources/azl/log_files.cpp "        CardCall card(this, kCardMainFlush, 0);" "        files_->Flush(log_file_);" "the main log's flush is timed apart"
+need_after Sources/azl/log_files.cpp "        CardCall card(this, kCardCaptureWrite, text.size());" "        files_->Write(debug_file_, text.data(), text.size());" "the capture's write is timed"
+need_after Sources/azl/log_files.cpp "            CardCall card(this, kCardCaptureFlush, 0);" "            files_->Flush(debug_file_);" "the capture's flush is timed apart"
+need Sources/azl/log_files.cpp "    __atomic_fetch_add(&card_wait_ticks_, ticks, __ATOMIC_RELAXED);" "every timed call is in the writer's wait for the card"
+need Sources/azl/log_files.cpp '"stats: card: capture %lu writes %lu B %lu ms (longest %lu ms for %lu B), %lu flushes %lu ms (longest %lu ms)"' "the line of the calls to the card begins 'stats: card:' (a line of its own: the lines the scripts read keep their shape)"
+need_after Sources/ctr/plugin.cpp "    LogFiles::FormatCardLine(log_files_->TakeCardWindow(), card, sizeof(card));" "    log_files_->Append(card);" "the writer writes the line of the calls to the card with the capture's statistics"
+need_line Tests/log_files_test.cpp "    TestCardWindow();" "the counts of the calls to the card are tested"
 need Sources/ctr/uds_hle.cpp "StatsAdd64(g_stats.ipc_sum_ticks, ticks);" "the game threads' time in the commands is a 64-bit sum"
 need Sources/main.cpp "azl::StatsAdd64(azl::g_stats.t_cb, svcGetSystemTick() - start);" "the frame callback's time is a 64-bit sum"
 need Sources/main.cpp "            start += svcGetSystemTick() - menu_from;" "the time the in-game menu was open is not the frame callback's"
@@ -1715,6 +2263,7 @@ game_thread_file Includes/azl/printf_lite.hpp 1
 game_thread_file Includes/azl/apt_sleep.hpp 2
 game_thread_file Includes/azl/traced_sessions.hpp 1
 game_thread_file Includes/azl/link_policy.hpp 1
+game_thread_file Includes/azl/game_card_calls.hpp 1
 game_thread_file Includes/azl/sleep_crumbs.hpp 1
 game_thread_file Sources/azl/ndm_hle.cpp 1
 game_thread_file Includes/azl/chat_core.hpp 2
@@ -1722,8 +2271,9 @@ game_thread_file Includes/azl/chat_core.hpp 2
 game_thread_file Includes/azl/gfx_surface.hpp 1
 game_thread_file Includes/azl/chat_draw.hpp 1
 # ... and the chat over the running game: the hook's count of the notifications, the handshake of the keyboard's picture and the callback's
-# drawing (Includes/azl/chat_host.hpp), and the callback itself (Sources/ctr/chat_overlay.cpp)
-game_thread_file Includes/azl/chat_host.hpp 4
+# drawing (Includes/azl/chat_host.hpp; 5 regions since 2026-11-10: the watch of the keyboard still shown, BottomWatch, counts on the game's
+# thread too), and the callback itself (Sources/ctr/chat_overlay.cpp)
+game_thread_file Includes/azl/chat_host.hpp 5
 game_thread_file Sources/ctr/chat_overlay.cpp 1
 # ... and the input mirror's way back, which the hook runs on the game's thread that got a notification (Sources/ctr/input_mirror.cpp,
 # MirrorRestoreFromGame and the kernel's calls under it; Includes/azl/hid_mirror.hpp, the Switcher)
@@ -1764,7 +2314,7 @@ need_line Tests/stack_usage.sh 'budget hook "azl::ctr::PassThroughPre" 32' "the 
 # Test hygiene. A test that no script runs is a gate that is not there: every test source is built AND run by the script
 # that owns it (the host tests by Tests/run.sh, the 32-bit ones, which drive UdsHle, by Tests/ipc_test/build.sh and then
 # Tests/hle_tests.sh and Tests/integration.sh), and a new *_test.cpp that is in none of them fails here
-for t in test_main ring_test dedupe_test link_policy_test soc_plan_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_real_engine_test dlp_real_net_test dlp_real_client_test dlp_real_hub_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test chat_core_test chat_core_test_tsan chat_draw_test osk_test chat_host_test chat_host_test_tsan hid_mirror_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test update_test logrot_test log_module_test ncch_icon_test hook_swap_test hook_swap_test_tsan gate_plan_test kernel_books_test gsp_wrapper_test traced_sessions_test traced_sessions_test_tsan heap_plan_test; do
+for t in test_main ring_test dedupe_test link_policy_test uds_eight_test soc_plan_test soc_send_test screen_text_test log_files_test line_test sleep_crumbs_test capture_test dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_real_engine_test dlp_real_net_test dlp_real_client_test dlp_real_hub_test dlp_cap_guard_test dlp_eight_test dlp_eight_hub_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test chat_core_test chat_core_test_tsan chat_draw_test osk_test chat_host_test chat_host_test_tsan hid_mirror_test settings_test games_test paths_test plugin_install_test eta_test dlp_text_test dlp_prepare_test guide_test about_test update_test logrot_test log_module_test ncch_icon_test hook_swap_test hook_swap_test_tsan gate_plan_test kernel_books_test gsp_wrapper_test traced_sessions_test traced_sessions_test_tsan heap_plan_test game_card_calls_test dlp_children_test dlp_clnt_test dlp_guest_test dlp_guest_store_test dlp_guest_run_test; do
   tr -d '\r' < Tests/run.sh | grep -q -E "^  (timeout 1200 )?\"\\\$OUT/$t\"( |\$)" || fail "Tests/run.sh does not run the unit test $t (a line of its own that calls \"\$OUT/$t\")"
   need Tests/run.sh "-o \"\$OUT/$t\"" "the unit test $t is built by Tests/run.sh"
 done
@@ -1811,6 +2361,229 @@ need Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c Conf
 need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_wire_test"' "the suite runs the codec's test"
 need Tests/dlp_real_wire_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the codec's test stops at the first undefined behaviour"
 need Tests/dlp_real_wire_test.cpp '#include "dlp_real_luigi_golden.inc"' "the codec is tested against the golden bytes of the capture 1c"
+# >>> stage H2: the title in the announcement of the real Download Play (made by a table: analysis, h2, genera_pin.py)
+# 2026-11-14, stage H2: the TITLE in the announcement of the real Download Play (Includes/azl/dlp_title_block.hpp; the builder of the frames in
+# azl/dlp_real_wire.*, the adapter azl/dlp_real_net.*, the read in Sources/ctr/plugin.cpp; Tests/dlp_title_block_test.cpp). A console hosting Mario Party: Island Tour was
+# listed by an Azahar's Download Play application with a black icon and no name: the announcement carried zeros where a real host puts the child's names, icon and sizes.
+# What must not change by accident: WHICH games get it (every region of that game and no other: Luigi's Mansion and Mario Kart 7 keep the frames their captures hold), that
+# a game without a block sends the frames of before byte for byte, that the block is read on the plugin's own thread, from the running title, read-only, and that
+# a failed read gives the game nothing to see, and that the readers bound everything they take from a file.
+TBH=Includes/azl/dlp_title_block.hpp; TBWH=Includes/azl/dlp_real_wire.hpp; TBWC=Sources/azl/dlp_real_wire.cpp; TBNH=Includes/azl/dlp_real_net.hpp; TBNC=Sources/azl/dlp_real_net.cpp
+TBP=Sources/ctr/plugin.cpp; TBT=Tests/dlp_title_block_test.cpp
+# - the games: the five title ids of Mario Party: Island Tour (3DS Link's catalogue, the family ATS), one row each, and nothing else in the list
+# (2026-11-15, the user's rule) every game whose host has the real Download Play announces its title: the application's id, no list
+need_line $TBH "    return static_cast<u32>(title_id >> 32) == 0x00040000u && static_cast<u32>(title_id) != 0;" "the title is announced by every application that hosts the real Download Play (no list), never by a child or an update"
+need_line $TBT '                CHECK(dlp_real::AnnouncesTitle(id));' "L: every id of the real Download Play in the table (the Download Play column of azl/title_rules.hpp) announces"
+need $TBT "CHECK(!dlp_real::AnnouncesTitle(id | 0x0000000100000000ull));" "L: a child never announces"
+hit=$(tr -d '\r' < $TBH | sed 's://.*$::' | grep -n -i -E '1D1A00|1D1900|1D1800|1D4F00|0030700|0030800|0030600|0030A00|008B400' | head -2)
+[ -z "$hit" ] || fail "$TBH names a title id of Luigi's Mansion or of Mario Kart 7 (their announcement is zeros, as their captures' tests hold it): $hit"
+need_line $TBH 'static_assert(sizeof(TitleBlock) == 5004, "the title of an announcement: 5,000 bytes of the wire and the child'"'"'s id");' "the block a hosting game keeps is 5 KB: a growth is a decision"
+# - the header is pure: it reads what it is given and keeps nothing (the file calls are the plugin's, in one function)
+hit=$(tr -d '\r' < $TBH | sed 's://.*$::' | grep -n -E '\bLog\(|DebugEvent\(|printf|\bnew\b|malloc|std::vector|std::string|FSUSER_|FSFILE_|File::|svc[A-Z]|^[[:space:]]*static[[:space:]]+[A-Za-z_:<>0-9]+[[:space:]]+[A-Za-z_0-9]+[[:space:]]*(\[|=|;)' | head -3)
+[ -z "$hit" ] || fail "$TBH logs, allocates, keeps static storage or calls the system (it is pure: the plugin reads the files, in GiveAnnouncementItsTitle): $hit"
+# - the SMDH: refused unless it is whole, BEFORE anything of the block is written; the units turned to the wire's order; the big icon; the language
+need_line $TBH '    if (size < kSmdhBytes || std::memcmp(smdh, "SMDH", 4) != 0) {' "what is not a whole SMDH is refused"
+need_after $TBH '    if (size < kSmdhBytes || std::memcmp(smdh, "SMDH", 4) != 0) {' '        return false;' "... with nothing of the block written"
+need_order $TBH '    if (size < kSmdhBytes || std::memcmp(smdh, "SMDH", 4) != 0) {' '    std::memset(out->title_short, 0, sizeof(out->title_short));' "the block is written only after the SMDH was accepted"
+need_line $TBH '        out[i] = in[i + 1];' "a unit of the file (little-endian) goes on the wire big-endian"
+need_line $TBH '        out[i + 1] = in[i];' "... both its bytes"
+need_line $TBH 'constexpr std::size_t kSmdhBigIconAt = 0x24C0;    // 0x1200 bytes' "the icon announced is the BIG one of the SMDH (48 x 48)"
+need_line $TBH '    SwapUnits(out->icon, smdh + kSmdhBigIconAt, kTitleIconBytes);' "... the whole of it"
+need_line $TBH '    if (language < kSmdhTitles && named(language)) {' "the names are those of the console's language, when the game has them"
+need_line $TBH '    if (named(1)) {' "... English otherwise"
+need_line $TBH '        SwapUnits(out->title_short, title, kTitleShortBytes);' "the short name is the entry's first 0x80 bytes"
+need_line $TBH '        SwapUnits(out->title_long, title + kTitleShortBytes, kTitleLongBytes);' "... and the long one the 0x100 after it (never the publisher)"
+# - the child's package: every offset and size of the image is checked before it is used, the directory is walked a bounded number of times
+need_line $TBH 'constexpr unsigned kPackageFiles = 8;      // files of the root directory looked at (a child container has one per child)' "the files of the root directory looked at are bounded"
+need_line $TBH '    for (unsigned n = 0; n < kPackageFiles && !found && at != 0xFFFFFFFFu; ++n) {' "... by the loop itself"
+need_line $TBH '        if (at > file_meta_len || file_meta_len - at < 0x20) {' "an entry is read only inside the file table"
+need_line $TBH '    if (LoadLE32(b) != 0x28 || dir_meta_len < 0x18 || file_meta_len < 0x20) {' "what is not a RomFS header is refused"
+need_line $TBH '        if (master > 0x100000 || block_log2 < 9 || block_log2 > 16) {' "the IVFC container's numbers are bounded before the shift"
+need_line $TBH '        found = whole && LoadLE32(b + 0x1C) == 2 * kCiaNameUnits;' "the file is the one whose name has the length of <title id>.cia ..."
+need_line $TBH '            found = unit == static_cast<u8>(want[i]) || (unit >= '"'"'A'"'"' && unit <= '"'"'F'"'"' && unit + 0x20 == static_cast<u8>(want[i]));' "... and is that name"
+need_line $TBH '    if (data_size > 0xFFFFFFFFull || data_size < kCiaHeaderBytes || data_at > 0xFFFFFFFFFFull) {' "a file that cannot be a CIA is refused before its header is read"
+need_line $TBH '    if (LoadLE32(b) != kCiaHeaderBytes || content > 0xFFFFFFFFull) {' "what is not a CIA header is refused"
+need_line $TBH '    if (meta < kCiaMetaSmdhAt + kSmdhBytes || meta_at + meta != data_size) {' "the CIA's parts must add up to the file, with a meta block that holds an SMDH"
+need_line $TBH '    const u64 meta_at = pad(kCiaHeaderBytes) + pad(LoadLE32(b + 0x08)) + pad(LoadLE32(b + 0x0C)) + pad(LoadLE32(b + 0x10)) + pad(content);' "every part of the CIA ends at a multiple of 64 bytes, the content too: the meta block starts there (as Azahar computes it)"
+need_line $TBH '    const auto pad = [](u64 size) { return (size + 63) & ~63ull; };' "... of 64, not of another number"
+need_line $TBH '    out->transfer_size = static_cast<u32>(meta_at);' "transfer_size is where the meta block starts (Azahar's GetMetadataOffset)"
+need_line $TBH '    out->required_size = static_cast<u32>(data_size);' "required_size is the CIA's length"
+need_line $TBH '    out->smdh_at = cia_at + meta_at + kCiaMetaSmdhAt;' "the SMDH is 0x400 into the meta block"
+# - (revision) the name of the first file of the container, kept for the log of a missing package: bounded, printable, never what the caller had there
+need_line $TBH '    out->first_name[0] = '"'"'\0'"'"';' "a container with no file gives no name to the log"
+need_line $TBH '            const u32 units = !whole ? 0 : out->first_name_bytes / 2 < kCiaNameUnits ? out->first_name_bytes / 2 : kCiaNameUnits;' "the name for the log is at most twenty units, and only what was read"
+need_line $TBH '                out->first_name[i] = unit >= 0x20 && unit < 0x7F ? static_cast<char>(unit) : '"'"'?'"'"';' "... and printable text, whatever the image holds"
+need_line $TBH '            out->first_name[units] = '"'"'\0'"'"';' "... ended"
+# - the frames: the builder of every game is the text it was (its md5: the frames of Luigi's Mansion and Mario Kart 7 come out of it), and the one with a title
+#   calls it, changes nothing without a title, and seals again after the title went in - statement by statement
+r=$(tr -d '\r' < $TBWC | awk -v a='std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4]) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }')
+[ "$(printf '%s\n' "$r" | md5sum | cut -d' ' -f1)" = "96ea63fe5c163ddc78a29b7ef1f2b8dd" ] || fail "$TBWC: the builder of the announcement of every game (no title) is no longer the text it was: the frames of Luigi's Mansion and Mario Kart 7 come out of it"
+need_line $TBWH 'std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4]);' "the builder without a title is still there, for every caller that had it"
+need_line $TBWH 'std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4], const TitleBlock* title);' "the builder with a title is another function"
+TB_FRAME=$(tr -d '\r' < $TBWC | awk -v a='std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4], const TitleBlock* title) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }')
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 1 'std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4], const TitleBlock* title) {' "the builder with a title"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 2 '    const std::size_t len = AnnounceFrame(buf, index, child_tid, max_nodes, seed);  // (the frame of every game, sealed)' "it starts from the frame of every game"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 3 '    if (title == nullptr || index >= kIconFrames) {' "no title, or frame 4: ..."
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 4 '        return len;  // (no title, frame 4 which carries none, or no frame at all: what it was)' "... that frame, untouched"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 5 '    }' "the announcement with a title, statement 5"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 6 '    if (index == 0) {' "frame 0: ..."
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 7 '        StoreBE32(buf + kTransferSizeAt, title->transfer_size);' "... the two sizes, big-endian"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 8 '        StoreBE32(buf + kRequiredSizeAt, title->required_size);' "the announcement with a title, statement 8"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 9 '        std::memcpy(buf + kTitleShortAt, title->title_short, kTitleShortBytes);' "... the short name"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 10 '        std::memcpy(buf + kTitleLongAt, title->title_long, kTitleLongBytes);' "... the long name"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 11 '        std::memcpy(buf + kIconAt0, title->icon, kIconBytes0);' "... the first part of the icon"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 12 '    } else {' "frames 1..3: ..."
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 13 '        std::memcpy(buf + kHeaderBytes, title->icon + kIconBytes0 + (index - 1) * kIconBytesN, kIconBytesN);' "... the rest of the icon, in order"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 14 '    }' "the announcement with a title, statement 14"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 15 '    Seal(seed, buf, len);  // (again: the checksum is of the whole frame)' "the checksum is made again over the title"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 16 '    return len;' "the announcement with a title, statement 16"
+need_nth "$TBWC, the announcement with a title" "$TB_FRAME" 17 '}' "and nothing else"
+need_line $TBWC 'constexpr std::size_t kTransferSizeAt = 0x38, kRequiredSizeAt = 0x3C, kTitleShortAt = 0x40, kTitleLongAt = 0xC0, kIconAt0 = 0x1C0;' "where the title is in frame 0 (the capture; Azahar's DLPBroadcastPacket1)"
+need_line $TBWC 'constexpr unsigned kIconFrames = 4;                                  // frames 0..3 carry the title; frame 4 does not' "four frames carry the title"
+# - the adapter: the title is looked at when a group STARTS (no group half with it), only for the child it is the title of; given through one
+#   atomic pointer that starts empty; and nobody gives one but the plugin, in one place
+need_line $TBNC '        group_titled_ = given != nullptr && given->child_tid_low == static_cast<u32>(child_tid_);' "a group carries the title only when it is the title of the child announced"
+need_after $TBNC '        group_now_ = false;' '        const dlp_real::TitleBlock* const given = title_.load(std::memory_order_acquire);' "the title is looked at where a group starts"
+need_line $TBNC '    const dlp_real::TitleBlock* const title = group_titled_ ? title_.load(std::memory_order_acquire) : nullptr;' "a frame of a group that started without the title has none"
+need_line $TBNC '    const std::size_t len = dlp_real::AnnounceFrame(buf_, frame_, child_tid_, max_nodes_, dlp_real::kTxSeed, title);' "the adapter builds its frames with the title or with none"
+need_line $TBNH '    std::atomic<const dlp_real::TitleBlock*> title_{nullptr};  // the child'"'"'s title for the announcement, or none (SetTitleBlock)' "an adapter starts with no title (Luigi's Mansion and Mario Kart 7 stay so), behind an atomic pointer"
+need_line $TBNH '    bool group_titled_ = false;  // the group under way carries the title (decided at its frame 0: no group is half with it)' "the group under way remembers whether it carries the title"
+need_line $TBNH '        title_.store(title, std::memory_order_release);' "the title is published whole, with one store"
+[ "$(cat Sources/azl/*.cpp Sources/ctr/*.cpp Sources/*.cpp Includes/azl/*.hpp Includes/ctr/*.hpp | tr -d '\r' | sed 's://.*$::' | grep -c 'title_\.store(')" = "1" ] || fail "the title of an announcement is stored in more than one place (SetTitleBlock, once)"
+hit=$(grep -rn 'SetTitleBlock(' Sources Includes --include=*.cpp --include=*.hpp --include=*.h --include=*.c | tr -d '\r' | grep -v -E '^Includes/azl/dlp_real_net\.hpp:[0-9]+:    void SetTitleBlock\(const dlp_real::TitleBlock\* title\) \{$' | grep -v -E '^Sources/ctr/plugin\.cpp:[0-9]+:    real->SetTitleBlock\(block\);  // ')
+[ -z "$hit" ] || fail "something besides GiveAnnouncementItsTitle of the plugin gives an adapter a title: $hit"
+# - the plugin: ONLY a game of the list that has its hub of the real Download Play reads anything, once, in LateInit (the plugin's own thread, after the
+#   language is known, before the room exists as a thread); the function reads and never writes, tells the game and the screen nothing, keeps the block only when
+#   something was read, and gives it to the adapter once
+need_line $TBP '#include "azl/dlp_title_block.hpp"' "the plugin reads the title through the pure header"
+need_line $TBP '    if (dlp_real_ && dlp_hub_ && dlp_real::AnnouncesTitle(game_id_)) {' "the title is read only for a game of the list that has its hub"
+need_after $TBP '    if (dlp_real_ && dlp_hub_ && dlp_real::AnnouncesTitle(game_id_)) {' '        GiveAnnouncementItsTitle(dlp_real_.get(), game_id_, language_);' "... by the one function that reads it"
+[ "$(tr -d '\r' < $TBP | grep -F -x -A2 '    ResolveIdentity();' | tr '\n' '|')" = "    ResolveIdentity();|    ResolveGameName();|    if (dlp_real_ && dlp_hub_ && dlp_real::AnnouncesTitle(game_id_)) {|" ] || fail "$TBP: the title of the announcement is no longer read in LateInit right after the console's language and the game's name (the plugin's own thread, before the room's thread exists)"
+[ "$(tr -d '\r' < $TBP | sed 's://.*$::' | grep -c 'GiveAnnouncementItsTitle(')" = "2" ] || fail "$TBP: GiveAnnouncementItsTitle is defined once and called once (LateInit)"
+[ "$(tr -d '\r' < $TBP | sed 's://.*$::' | grep -c 'AnnouncesTitle(')" = "1" ] || fail "$TBP: which games announce their title is asked in one place (LateInit)"
+need_order $TBP 'void GiveAnnouncementItsTitle(RealDlpNet* real, u64 game_id, u8 language) {' '// >>> game-thread code (Tests/policy_check.sh)' "the function that reads the title is not game-thread code"
+need_line $TBP '__attribute__((noinline)) void GiveAnnouncementItsTitle(RealDlpNet* real, u64 game_id, u8 language) {' "the function that reads the title is out of line: LateInit, which every game runs, keeps its frame"
+TB_GIVE=$(tr -d '\r' < $TBP | awk -v a='void GiveAnnouncementItsTitle(RealDlpNet* real, u64 game_id, u8 language) {' '!on && index($0, a) { on = 1 } on { print } on && $0 == "}" { exit }' | sed 's://.*$::')
+[ -n "$TB_GIVE" ] || fail "$TBP: GiveAnnouncementItsTitle is not there"
+hit=$(printf '%s\n' "$TB_GIVE" | grep -n -E 'FS_OPEN_WRITE|FS_OPEN_CREATE|FSUSER_(Delete|Create|Rename)|FSFILE_(Write|SetSize)|File::|PostNotification|startup_issue_|active_|svcGetThreadList|\bgoto\b|\b(for|while)[[:space:]]*\(.*;;' | head -3)
+[ -z "$hit" ] || fail "$TBP: GiveAnnouncementItsTitle writes a file, tells the screen or the game something, or loops without a bound (it only reads, and a failure changes nothing): $hit"
+[ "$(printf '%s\n' "$TB_GIVE" | grep -c 'FS_OPEN_READ, 0);')" = "2" ] || fail "$TBP: GiveAnnouncementItsTitle opens two files, the child's package and the game's own icon, both to read"
+[ "$(printf '%s\n' "$TB_GIVE" | grep -c 'real->SetTitleBlock(block);')" = "1" ] || fail "$TBP: GiveAnnouncementItsTitle gives the adapter the block in one place"
+[ "$(printf '%s\n' "$TB_GIVE" | grep -c -x '        delete block;')" = "2" ] || fail "$TBP: GiveAnnouncementItsTitle frees the block on both paths that give nothing (no memory, nothing read)"
+[ "$(printf '%s\n' "$TB_GIVE" | grep -c 'delete\[\] smdh;')" = "2" ] || fail "$TBP: GiveAnnouncementItsTitle gives the 14 KB of the SMDH back on every path"
+[ "$(printf '%s\n' "$TB_GIVE" | grep -c -x '    fsExit();')" = "1" ] || fail "$TBP: GiveAnnouncementItsTitle closes the file system session it opened"
+need_line $TBP 'constexpr u32 kDlpChildContent = 2;' "the child's package is in the content 2 of the running title"
+need_line $TBP '        u32 file_path[5] = {0 /* NCCH data */, kDlpChildContent, 0 /* its RomFS */, 0, 0};' "... in its RomFS"
+need_line $TBP '        u32 archive_path[4] = {static_cast<u32>(game_id), static_cast<u32>(game_id >> 32), static_cast<u32>(medias[i]), 0};' "... of the title that is running, whatever its region (no table)"
+need_line $TBP '    block->child_tid_low = static_cast<u32>(game_id) & 0xFFFFFF00u;  // (the child 0: the announcement of another child gets none of this)' "the block is the title of the child 0 of the running title"
+need_line $TBP '        why = dlp_real::FindChildPackage(&ReadFileAt, &handle, block->child_tid_low, &package);' "the package is found by the bounded reader"
+need_line $TBP '    return R_SUCCEEDED(FSFILE_Read(*static_cast<Handle*>(ctx), &read, offset, out, size)) && read == size;' "a read that gives less than asked is a failure"
+need_line $TBP '            if (R_SUCCEEDED(icon_rc) && dlp_real::TitleFromSmdh(block, smdh, read, language)) {' "the game's own icon counts only as much as was read of it"
+need_line $TBP '    if (names_from == nullptr) {' "the game's own icon is read only where the package gave no names"
+need_line $TBP '    if (names_from == nullptr && sized_on < 0) {' "nothing read: ..."
+need_after $TBP '    if (names_from == nullptr && sized_on < 0) {' '        delete block;' "... nothing kept, nothing given"
+need_line $TBP '    real->SetTitleBlock(block);  // (from here the adapter'"'"'s: never freed, never changed - as the adapter and the hub themselves)' "the block is given once, whole"
+need_order $TBP '    fsExit();' '    real->SetTitleBlock(block);  // (from here' "the block is given only after every read is over"
+need_line $TBP '    Log("dlp: the announcement carries the game'"'"'s name and icon from %s (language %lu, the names of entry %lu) and %s; %lu ms, %lu bytes kept",' "with the log on, one line says where the name and the icon came from, the language and the entry used, the sizes, the time and the memory"
+need_line $TBP '        Log("dlp: the announcement stays without the game'"'"'s name and icon (zeros, as before): the game'"'"'s own icon was not read (0x%08lx)"' "... or that there is none, and why"
+#   (revision) a package that was not read has a line of its own with the answer of EACH media - a game started from the SD card must not have the
+#   refusal of the SD card lost under the one of the game card - with what the file that opened looks like and what the first file of the container is called
+need_line $TBP '    Result open_rc[2] = {0, 0};  // (one for each media: the refusal of the first one is not lost under the second one'"'"'s)' "the answer of each media is kept"
+need_line $TBP '        open_rc[i] = FSUSER_OpenFileDirectly(&handle, ARCHIVE_SAVEDATA_AND_CONTENT, archive, file, FS_OPEN_READ, 0);' "... each in its own place"
+need_line $TBP '        if (R_FAILED(open_rc[i])) {' "... and the answer of THAT media decides whether the other one is tried"
+need_line $TBP '        Log("dlp: the child'"'"'s package was not read: %s; open 0x%08lx on media %d, %s on media %d; what opened is 0x%08lx bytes and starts"' "a package that was not read: why, and what each media answered"
+need_line $TBP '            !opened ? "it did not open" : dlp_real::PackageWhyText(why), static_cast<unsigned long>(open_rc[0]),' "... the answer of the first media"
+need_line $TBP '            std::snprintf(second, sizeof(second), "0x%08lx", static_cast<unsigned long>(open_rc[1]));' "... and of the second one, where it was asked"
+need_line $TBP '        char second[12] = "not tried";' "... or that it was not asked"
+need_line $TBP '        if (tried > 1) {' "the second answer is said only when the second media was asked"
+need_line $TBP '        tried = i + 1;' "the media asked are counted"
+need_line $TBP '            package.first_name, static_cast<unsigned long>(package.first_name_bytes));' "... and the name of the first file of the container"
+[ "$(printf '%s\n' "$TB_GIVE" | grep -c -x '                names_entry = dlp_real::SmdhTitleEntry(smdh, language);')" = "2" ] || fail "$TBP: GiveAnnouncementItsTitle says which entry of the SMDH the names are of for both sources (the package and the own icon of the game)"
+# - the suite builds the test (after the plugin's table is cut out and the library's file is built) and runs it under a timeout; the test stops at the first
+#   undefined behaviour, is held to the three captures, runs every part, and every part must make its checks
+need_line Tests/run.sh 'g++ $CXXFLAGS -I"$OUT" Tests/dlp_title_block_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_title_block_test"' "the suite builds the test of the title in the announcement"
+need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/dlp_title_block_test.cpp Sources/azl/dlp_hub.cpp' "the library's dlph_wire.o is built before the test that links it"
+need_order Tests/run.sh 'python3 Tests/plugin_dlp_extract.py Sources/ctr/plugin.cpp "$OUT/plugin_dlp_slice.inc"' 'Tests/dlp_title_block_test.cpp Sources/azl/dlp_hub.cpp' "the plugin's table is cut out before the test that reads it"
+need_line Tests/run.sh '  timeout 1200 "$OUT/dlp_title_block_test"' "the suite runs the test of the title under a timeout: a hang is a failure"
+need $TBT 'return "halt_on_error=1:print_stacktrace=1";' "the test of the title stops at the first undefined behaviour"
+need_line $TBT '#include "dlp_real_luigi_golden.inc"' "the test is held to the capture of Luigi's Mansion"
+need_line $TBT '#include "dlp_real_mk7_golden.inc"' "the test is held to the capture of Mario Kart 7"
+need_line $TBT '#include "dlp_real_island_golden.inc"' "the test is held to the capture of Mario Party: Island Tour"
+need_line $TBT '#include "plugin_dlp_slice.inc"' "the test reads the plugin's own table of games"
+need_line $TBT '    S_Smdh();' "the test runs its part S"
+need_line $TBT '    F_Frames();' "the test runs its part F"
+need_line $TBT '    P_Package();' "the test runs its part P"
+need_line $TBT '    N_Wire();' "the test runs its part N"
+need_line $TBT '    L_List();' "the test runs its part L"
+need_line $TBT '    Ran("S", c, kLeastSmdh);' "S: the part made its checks"
+need_line $TBT '    Ran("F", c, kLeastFrames);' "F: the part made its checks"
+need_line $TBT '    Ran("P", c, kLeastPackage);' "P: the part made its checks"
+need_line $TBT '    Ran("N", c, kLeastWire);' "N: the part made its checks"
+need_line $TBT '    Ran("L", c, kLeastList);' "L: the part made its checks"
+need_line $TBT '    CHECK(made >= least);' "a part of the test that made fewer checks than its least is a failure"
+need_line $TBT 'static constexpr int kLeastSmdh = 40000;' "S makes at least 40000 checks"
+need_line $TBT 'static constexpr int kLeastFrames = 2000;' "F makes at least 2000"
+need_line $TBT 'static constexpr int kLeastPackage = 20000;' "P makes at least 20000"
+need_line $TBT 'static constexpr int kLeastWire = 40;' "N makes at least 40"
+need_line $TBT 'static constexpr int kLeastList = 40;' "L makes at least 40"
+# - what the test holds (each line is one of its claims; taken away, the claim is not made any more)
+need_line $TBT '            CHECK(Swapped(b.title_short, e, 128));' "S: the short name is the language's, every unit turned"
+need_line $TBT '            CHECK(Swapped(b.title_long, e + 0x80, 256));' "S: the long name too"
+need_line $TBT '                CHECK_EQ(b.icon[i], smdh[0x24C0 + i + 1]);  // (one by one: where a wrong byte is)' "S: the icon is the big one, byte by byte"
+need_line $TBT '            CHECK_EQ(b.child_tid_low, 0xA5A5A5A5u);' "S: the child's id is not touched by the SMDH"
+need_line $TBT '            CHECK_EQ(b.transfer_size, 0xA5A5A5A5u);' "S: nor the sizes"
+need_line $TBT '            CHECK(!publisher);' "S: the publisher is never in the names"
+need_line $TBT '            CHECK_EQ(dlp_real::SmdhTitleEntry(eur.data(), lang), 1u);' "S: a language the game has no name in gets the English one"
+need_line $TBT '        CHECK_EQ(dlp_real::SmdhTitleEntry(none.data(), 4), dlp_real::kSmdhTitles);' "S: an SMDH with no name at all"
+need_line $TBT '        CHECK(std::memcmp(&b, &before, sizeof(b)) == 0);' "S: what is not a whole SMDH leaves the block as it was"
+need_line $TBT '        const std::size_t n = dlp_real::AnnounceFrame(buf, i, kIslandChild, kIslandPlayers, kDlpRealIslandSeed, &block);' "F: the frames with a title are built with the capture's seed"
+need_line $TBT '            CHECK_EQ(buf[k], 0xA5u);  // nothing past the frame' "F: nothing is written past the frame"
+need_line $TBT '        CHECK_EQ(LoadBE32(buf + 8), dlp_real::Checksum(kDlpRealIslandSeed, buf, n));  // sealed AFTER the title went in' "F: the checksum is of the frame with its title"
+need_line $TBT '            if ((k >= 8 && k < 12) || (k >= r0 && k < r1)) {' "F: every byte but the checksum and the ranges the capture's file does not carry ..."
+need_line $TBT '            CHECK_EQ(buf[k], g.bytes[k]);' "F: ... is the capture's"
+need_line $TBT '            CHECK(std::memcmp(buf + 0x40, block.title_short, 128) == 0);' "F: frame 0 carries the short name at +0x40"
+need_line $TBT '            CHECK(std::memcmp(buf + 0xC0, block.title_long, 256) == 0);' "F: the long name at +0xC0"
+need_line $TBT '            CHECK(std::memcmp(buf + 0x1C0, block.icon, 312) == 0);' "F: the first part of the icon at +0x1C0"
+need_line $TBT '            CHECK_EQ(LoadBE32(buf + 0x38), kDlpRealIslandTransferSize);' "F: the capture's transfer_size"
+need_line $TBT '            CHECK_EQ(LoadBE32(buf + 0x3C), kDlpRealIslandRequiredSize);' "F: the capture's required_size"
+need_line $TBT '            CHECK(std::memcmp(buf + 0x10, block.icon + 312 + (i - 1) * 1432, 1432) == 0);' "F: frames 1..3 carry the rest of the icon, in order"
+need_line $TBT '            CHECK(std::memcmp(buf, g.bytes, n) == 0);  // frame 4: the capture'"'"'s, checksum included' "F: frame 4 is the capture's whole"
+need_line $TBT '    CHECK_EQ(carried, dlp_real::kTitleShortBytes + dlp_real::kTitleLongBytes + dlp_real::kTitleIconBytes);' "F: the ranges the capture does not carry are exactly the block's names and icon"
+need_line $TBT '    CheckAzaharReads(read, smdh, 4);' "F: Azahar's client reads the SMDH's names and icon out of the five frames"
+need_line $TBT '    CHECK_EQ(read.size, kDlpRealIslandTransferSize);' "F: ... and the size"
+need_line $TBT '    const Game games[] = {{kLuigiChild, 2, kDlpRealLuigiSeed}, {kLuigiChild, 2, dlp_real::kTxSeed}, {kMk7Child, 8, kDlpRealMk7Seed},' "F: without a title, Luigi's Mansion and Mario Kart 7 ..."
+need_line $TBT '            CHECK(std::memcmp(a, b, sizeof(a)) == 0);' "F: ... get the frames of before, byte for byte"
+need_line $TBT '        CHECK_EQ(p.transfer_size, kDlpRealIslandTransferSize);' "P: a package with the real child's header numbers gives the capture's transfer_size"
+need_line $TBT '        CHECK_EQ(p.required_size, kDlpRealIslandRequiredSize);' "P: ... and its required_size"
+need_line $TBT '        CHECK_EQ(im.reads, 4u);  // the header, the root directory, the file'"'"'s entry, the CIA'"'"'s header' "P: four small reads find the package"
+need_line $TBT '        CHECK(got == smdh);' "P: the SMDH is where it says"
+need_line $TBT '        CHECK(Find(im, kIslandLow | 1, &p) == PackageWhy::NoFile);' "P: another child is not this file"
+need_line $TBT '            CHECK(Find(im, kIslandLow, &p) == PackageWhy::NoFile);  // (a ninth file is not looked at)' "P: the directory is walked a bounded number of times"
+need_line $TBT '    CHECK_EQ(dlp_real::kPackageFiles, 8u);  // (the files below are counted against this: eight are looked at, a ninth is not)' "P: ... eight"
+need_line $TBT '        CHECK_EQ(a.reads, 2u + dlp_real::kPackageFiles);' "P: a directory that loops ends"
+need_line $TBT '        for (u32 round = 0; round < 20000; ++round) {' "P: 20,000 damaged images"
+need_line $TBT '            CHECK(im.reads <= 4u + dlp_real::kPackageFiles + 2u);' "P: ... each read little"
+need_line $TBT '                CHECK(!im.outside);' "P: ... and never outside what it was given"
+need_line $TBT '            all = all && IsFrame(sent[k], k, kIslandChild, nullptr);' "N: no title given, the announcement of before"
+need_line $TBT '            all = all && IsFrame(sent[k], k, kIslandChild, &block);' "N: a title given, every frame of every group carries it"
+need_line $TBT '        CHECK_EQ(most_per_pump, 1u);' "N: still one frame per Pump"
+need_line $TBT '            all = all && IsFrame(sent[k], k, child, nullptr);' "N: the title of another child, none of it"
+need_line $TBT '        CHECK(before);  // (the group under way: all five without)' "N: a group that began without the title ends without"
+need_line $TBT '        CHECK(after);   // (every later group: all five with)' "N: the next groups carry it"
+need_line $TBT '        CHECK(titled);' "N: a lobby of the child 0 carries the title ..."
+need_line $TBT '        CHECK(second);  // (the lobby of the child 1: all without)' "N: ... and the lobby the same host opens next for the child 1 does not"
+need_line $TBT '        CHECK(dlp_real::AnnouncesTitle(id));' "L: every region of Mario Party: Island Tour"
+need_line $TBT '    CHECK(azl::ctr::DlpModeOf(0x00040000000F8200ull) == DlpGameMode::RealDlp);' "L: the game seen on a console has its row"
+need_line $TBT '    for (u64 content : {0x3001ull, 0x303Full, 0x3040ull, 0x1EE2FC1ull}) {' "P: contents that are not a multiple of 64 bytes"
+need_line $TBT '        CHECK_EQ(p.transfer_size % 64, 0u);  // (the meta block never starts inside the content'"'"'s padding)' "P: ... the meta block at a multiple of 64"
+need_line $TBT '        CHECK_EQ(p.transfer_size, 0x2040u + 0xA00u + 0x380u + 0xB40u + ((content + 63) & ~63ull));' "P: ... the next one, by numbers written in the test"
+need_line $TBT '        CHECK(std::string(p.first_name) == kName);' "P: a missing package: the name of the file that is there"
+need_line $TBT '        CHECK_EQ(p.first_name[0], '"'"'\0'"'"');' "P: a container with no file: no name, not what the caller had there"
+need_line $TBT '        CHECK(std::string(p.first_name) == "00040001000f8200.ci");  // (only the units the entry says are its name)' "P: a shorter name is given as long as it is"
+need_line $TBT '        CHECK(std::string(p.first_name) == kName);  // (twenty units, whatever the entry says)' "P: a name that says it is longer is cut at twenty units"
+need_line $TBT '        CHECK(std::string(p.first_name) == "000?0?01000f8200.cia");  // (what goes to the log is printable)' "P: what is not printable text is not given to the log"
+need_line $TBT '            CHECK(printable);' "P: 20,000 damaged images, the name for the log always ended and printable"
+# <<< stage H2
 # 1.1.3, phase F2: the engine's half of the real Download Play (design E1/D13, D11, D12, D16; Tests/dlp_real_engine_test.cpp).
 # - the beacons of the real Download Play (its wlancommid, NO application data, any id8 / network id / attributes) are lobbies only under
 #   SetLobbyBeaconKind(RealDlp): an engine starts with the dialect's kind, whose rule stays the text it was
@@ -1941,7 +2714,7 @@ need Sources/azl/dlp_real_net.cpp '            session_flags_ = static_cast<u8>(
 need Sources/azl/dlp_real_net.cpp '                session_flags_ = static_cast<u8>(session_flags_ | kSawFinal | kOweGo);' "the host's FIRST final is the lobby's GO with its passphrase"
 [ "$(grep -c '| kOweGo);' Sources/azl/dlp_real_net.cpp)" = "1" ] || fail "Sources/azl/dlp_real_net.cpp: the lobby's GO is owed in one place (the first final)"
 # - the suite builds and runs its test, which stops at the first undefined behaviour and runs every scenario
-need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test"' "the suite builds the searcher's test of the real Download Play"
+need Tests/run.sh 'Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test"' "the suite builds the searcher's test of the real Download Play"
 need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_client_test"' "the suite runs the searcher's test of the real Download Play"
 need Tests/dlp_real_client_test.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the searcher's test of the real Download Play stops at the first undefined behaviour"
 need Tests/dlp_real_client_test.cpp '#include "azahar_dlp_host.hpp"' "the searcher is tested against the model of Azahar's host"
@@ -1953,15 +2726,17 @@ need Tests/dlp_real_client_test.cpp 'return after == std::vector<u32>({5, 6, 9})
 # Tests/dlp_real_hub_test.cpp the hub with the adapter in both directions and in both modes). What must not change by accident: that only a RealDlp row gets
 # the adapter (and the Lobby rows exactly what they had), that the hub keeps no member for it and pumps / asks it only when it is not its own adapter,
 # that MakeDlpHub is untouched, that nothing but the plugin's two files and the adapter's own name it.
-# - D1, D2: the mode, and the four Luigi's Mansion rows in it (the other rows are pinned with the table of phase 3)
-need Includes/azl/dlp_hub.hpp 'enum class DlpGameMode : u8 { None = 0, ProbeOnly = 1, Lobby = 2, RealDlp = 3 };' "the modes of the table: RealDlp is a new value, the old ones keep theirs"
-for t in 0x00040000001D1A00ull 0x00040000001D1900ull 0x00040000001D1800ull 0x00040000001D4F00ull; do
-  need Sources/ctr/plugin.cpp "{$t, DlpGameMode::RealDlp}," "Luigi's Mansion ($t) speaks the real Download Play (1.1.3; back to Lobby with this row if O5 fails)"
-done
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'DlpGameMode::RealDlp}')" = "4" ] || fail "Sources/ctr/plugin.cpp: the RealDlp rows are the four Luigi's Mansion ones and no other (a new one comes with its own Azahar - Azahar oracle, design F7)"
+# - D1, D2: the mode (azl/dlp_mode.hpp since 1.1.4, L4: one enum) and the games in it. Since L4 the rows are the Download Play column of azl/title_rules.hpp, one row a
+#   game with the ids of all its regions: what each of the thirty ids answers is held id by id by AZL_DLP_AS_BEFORE in Tests/plugin_dlp_test.cpp (at compile time) and the
+#   column against those lines by the block of L4 at the end of this file. The games of the real Download Play are three: Luigi's Mansion, Mario Kart 7, Mario Party: Island Tour
+need Includes/azl/dlp_mode.hpp 'enum class DlpGameMode : u8 { None = 0, ProbeOnly = 1, Lobby = 2, RealDlp = 3, SystemClient = 4 };' "the modes of the table: RealDlp and SystemClient (1.1.4, G1: the Download Play application, never a row) are new values at the end, the old ones keep theirs"
+[ "$(grep -r -l 'enum class DlpGameMode' Sources Includes | tr '\n' ' ')" = "Includes/azl/dlp_mode.hpp " ] || fail "DlpGameMode is declared outside Includes/azl/dlp_mode.hpp: the modes are one enum"
+need_line Includes/azl/dlp_types.hpp '#include "azl/dlp_mode.hpp"  // (DlpGameMode, the modes of the Download Play column of azl/title_rules.hpp)' "the lobby's types bring the modes with them (the hub and the plugin see the same enum)"
+need_line Includes/azl/title_rules.hpp '#include "azl/dlp_mode.hpp"' "the table of the titles names the modes, and nothing else of the lobby (every unit of the engine reads it through azl/flow_relief.hpp)"
+[ "$(tr -d '\r' < Includes/azl/title_rules.hpp | grep -c -E '\{DlpGameMode::RealDlp, (true|false), [0-9]+\}\},$')" = "4" ] || fail "Includes/azl/title_rules.hpp: the games of the real Download Play are Luigi's Mansion, Mario Kart 7, Mario Party: Island Tour and the rows of D6 that moved with their capture (Tests/dlp_real_lobby_games_test.cpp: Kirby Planet Robobot), every region of each in its row, and no other (a new GAME comes with its own Azahar - Azahar capture, design F7)"
 # - D3, D5: the branch of EarlyInit after the Lobby one (whose line is pinned above), the adapter made there and only there, kept by the plugin before the hub
 need_line Sources/ctr/plugin.cpp '    } else if (DlpModeOf(game_id_) == DlpGameMode::RealDlp && active_) {' "the real Download Play's hub exists only for a RealDlp game, only when the plugin is active, right after the Lobby branch"
-[ "$(grep -r -c 'new (std::nothrow) RealDlpNet(engine_.get())' Sources Includes | awk -F: '{ n += $2 } END { print n + 0 }')" = "1" ] || fail "the adapter of the real Download Play is made in one place (the RealDlp branch of EarlyInit)"
+[ "$(grep -r -c 'new (std::nothrow) RealDlpNet(engine_.get())' Sources Includes | awk -F: '{ n += $2 } END { print n + 0 }')" = "2" ] || fail "the adapter of the real Download Play is made in two places (the RealDlp branch of EarlyInit, and the SystemClient branch of 1.1.4 G1 - the Download Play application's searcher)"
 need_after Sources/ctr/plugin.cpp '        dlp_real_.reset(new (std::nothrow) RealDlpNet(engine_.get()));' '            dlp_hub_ = MakeRealDlpHub(engine_.get(), &kernel_, game_id_, console_mac_, dlp_real_.get());' "the hub of a RealDlp game runs on the adapter just made, and only if it was made"
 need_after Sources/ctr/plugin.cpp '        dlp_real_.reset(new (std::nothrow) RealDlpNet(engine_.get()));' '        if (dlp_real_) {' "no hub without the adapter (MakeRealDlpHub gives it its identity)"
 need_order Includes/ctr/plugin.hpp 'std::unique_ptr<RealDlpNet> dlp_real_;' 'std::unique_ptr<DlpHub> dlp_hub_;' "the adapter is declared before the hub that points to it"
@@ -1969,13 +2744,16 @@ need_order Includes/ctr/plugin.hpp 'std::unique_ptr<RealDlpNet> dlp_real_;' 'std
 need Sources/ctr/plugin.cpp 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));' "MakeRealDlpHub gives the hub the adapter as the lobby's network"
 need_order Sources/ctr/plugin.cpp 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver));' 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));' "MakeRealDlpHub comes right after MakeDlpHub (the extractor cuts both)"
 need Sources/ctr/plugin.cpp '    real->SetIdentity(probe);' "the probes take the lobby's own identity (F4's open point: it was zero)"
-need Tests/plugin_dlp_extract.py "marker = 'return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));" "the extractor cuts the plugin's text to the end of MakeRealDlpHub"
+need Tests/plugin_dlp_extract.py "marker = '// <<< end of the Download Play wiring (Tests/plugin_dlp_extract.py)" "the extractor cuts the plugin's text to the placeholder after MakeClntHub (1.1.4, G1), which comes after MakeRealDlpHub"
+need_line Sources/ctr/plugin.cpp '// <<< end of the Download Play wiring (Tests/plugin_dlp_extract.py)' "... the placeholder is there, once, after MakeClntHub"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c -F '// <<< end of the Download Play wiring')" = "1" ] || fail "Sources/ctr/plugin.cpp: the placeholder that ends the extractor's slice is there once"
+need_order Sources/ctr/plugin.cpp 'std::unique_ptr<DlpHub> MakeClntHub(' '// <<< end of the Download Play wiring (Tests/plugin_dlp_extract.py)' "the slice holds MakeClntHub"
 need Tests/plugin_dlp_extract.py "wiring_start = text.index('    if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {" "the extractor also cuts the decision of EarlyInit, from the Lobby line"
 need Tests/plugin_dlp_test.cpp '#include "plugin_dlp_wiring.inc"' "the plugin test runs the decision of EarlyInit itself"
 need_stmt Tests/plugin_dlp_test.cpp 'azl::ctr::WiringTest();' "the plugin test runs the decision for every row, other games and an inactive plugin"
 need_stmt Tests/plugin_dlp_test.cpp 'azl::ctr::RealHubTest();' "the plugin test checks MakeRealDlpHub's configuration"
-need Tests/plugin_dlp_test.cpp 'CHECK_EQ(lobby_hubs, 7u);' "the seven Lobby rows get the hub of the dialect, on the hub's own adapter"
-need Tests/plugin_dlp_test.cpp 'CHECK_EQ(real_hubs, 4u);' "the four RealDlp rows get the adapter of the real Download Play"
+need Tests/plugin_dlp_test.cpp 'CHECK_EQ(lobby_hubs, 10u);' "the Lobby rows (the D6 rows not moved: Tests/dlp_real_lobby_games_test.cpp) get the hub of the dialect, on the hub's own adapter"
+need Tests/plugin_dlp_test.cpp 'CHECK_EQ(real_hubs, 16u);' "the RealDlp rows (Luigi's Mansion 4, Mario Kart 7 5, Mario Party: Island Tour 5, the D6 rows moved with their capture) get the adapter of the real Download Play"
 need Tests/run.sh 'g++ $CXXFLAGS -I"$OUT" Tests/plugin_dlp_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/plugin_dlp_test"' "the plugin test links the adapter of the real Download Play (the wiring makes one)"
 need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/plugin_dlp_test.cpp Sources/azl/dlp_hub.cpp' "the library's dlph_wire.o is built before the plugin test that links it"
 # - D6-D10: the hub's backend: no member, the lobby keeps the pointer; pumped first and asked whether it holds the engine only when it is not the hub's own adapter
@@ -1994,17 +2772,18 @@ need Includes/azl/dlp_real_net.hpp '    void Pump() override;' "the adapter's Pu
 need Includes/azl/dlp_real_net.hpp '    bool Holds() const override {' "the adapter's Holds is the hub's (LobbyNet::Holds)"
 # - who names the adapter: its own two files, the plugin's two (the member and the branch: an exception to the rule of the hub's header, decided in
 #   the design 7.4 point 13) and the tests; the app knows nothing of it
-hit=$(grep -r -n -E 'azl/dlp_real_net\.hpp"' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v -E '^(Sources/azl/dlp_real_net\.cpp|Includes/ctr/plugin\.hpp):' | head -3)
-[ -z "$hit" ] || fail "something other than plugin.hpp and the adapter itself includes azl/dlp_real_net.hpp: $hit"
-hit=$(grep -r -n -E 'RealDlpNet' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v -E '^(Sources/azl/dlp_real_net\.cpp|Includes/azl/dlp_real_net\.hpp|Includes/ctr/plugin\.hpp|Sources/ctr/plugin\.cpp):' | head -3)
-[ -z "$hit" ] || fail "something other than the plugin and the adapter itself names RealDlpNet: $hit"
+#   (1.1.4, route B: and the app's Download Play page, ConfigApp/source/dlp_join.hpp/.cpp - its Core is the plugin's searcher, spec 8 D-B1.3; no other file of the app)
+hit=$(grep -r -n -E 'azl/dlp_real_net\.hpp"' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v -E '^(Sources/azl/dlp_real_net\.cpp|Includes/ctr/plugin\.hpp|ConfigApp/source/dlp_join\.hpp):' | head -3)
+[ -z "$hit" ] || fail "something other than plugin.hpp, the app's dlp_join.hpp and the adapter itself includes azl/dlp_real_net.hpp: $hit"
+hit=$(grep -r -n -E 'RealDlpNet' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v -E '^(Sources/azl/dlp_real_net\.cpp|Includes/azl/dlp_real_net\.hpp|Includes/ctr/plugin\.hpp|Sources/ctr/plugin\.cpp|ConfigApp/source/dlp_join\.(hpp|cpp)):' | head -3)
+[ -z "$hit" ] || fail "something other than the plugin, the app's Download Play page (dlp_join) and the adapter itself names RealDlpNet: $hit"
 # - the stack and the size (design 7.4 points 3, 4, 12): the adapter's size on ARM32, the frames of its two units and of what a game thread runs of it,
 #   the give-back of a RealDlp game on the game's nwm::UDS thread in the chain test
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(RealDlpNet) <= 2048,' "the adapter of the real Download Play is at most 2 KB on ARM32: a growth is a decision"
-need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpHub) <= 408,' "the hub keeps its 408 bytes with a backend (no member for it)"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpHub) <= 536,' "the hub keeps its 536 bytes with a backend (no member for it; 408 while the lobby's tables held four players)"
 need Tests/dlp_net_stack_check.sh 'FRAME_REAL=288 ' "no function of the real Download Play's adapter and codec has a frame over 288 bytes on ARM32"
 need Tests/dlp_net_stack_check.sh 'FRAME_REAL_GAME=80 ' "what a game thread runs of that adapter has a frame of 80 bytes at most"
-need Tests/dlp_net_stack_check.sh "REAL_GAME_FUNCTIONS='NowMs|NowTicks|Holds|HostClose|Disconnect|ScanClose|Release|ClearHost|ClearClient'" "the functions of the adapter a game thread runs (the hub's RunHere, the clock)"
+need Tests/dlp_net_stack_check.sh "REAL_GAME_FUNCTIONS='NowMs|NowTicks|Holds|HostClose|Disconnect|ScanClose|Release|ClearHost|ClearClient|ChildrenAwaited|ClntBook'" "the functions of the adapter a game thread runs (the hub's RunHere, the clock; 1.1.4: the book of dlp:CLNT, which the Download Play application's thread asks for, and H5's ChildrenAwaited, written once with it - contract K6)"
 need Tests/dlp_net_stack_check.sh '-c Sources/azl/dlp_real_net.cpp -o "$W/real_net.o"' "the check compiles the adapter of the real Download Play strictly"
 need Tests/dlp_net_stack_check.sh '-c Sources/azl/dlp_real_wire.cpp -o "$W/real_wire.o"' "... and its codec"
 need Tests/dlp_net_stack_check.sh 'for o in real_net real_wire; do' "the two units of the real Download Play keep no static storage"
@@ -2023,10 +2802,20 @@ need Tests/dlp_real_hub_test.cpp 'TCHECK(lobby[i] == real[i]);' "R3: what the ga
 need Tests/dlp_real_hub_test.cpp 'TCHECK(has("searcher Bob: statuses 5 6 9"));' "R3: the searcher's statuses after the join are 5, 6, 9 (NETCODE point 1)"
 need_line Tests/dlp_real_hub_test.cpp '    for (u32 clients : {1u, 3u}) {' "R3 runs with 1 and 3 clients"
 need_line Tests/dlp_real_hub_test.cpp '    for (const bool alive : {true, false}) {' "R8 runs with the network thread alive and gone"
+# 2026-11-11 (the collaudo of the plugin review, analysis/revisione-plugin-2026-11-10/collaudo): the two races that made this test fall whenever the network
+# threads woke late (a machine busy with other work: 4 runs of 4 with 0..12 ms more between two rounds, none after). A creator accepts a client only after its
+# GetConnectingClients lists it (the lobby's table is the network thread's: AcceptClient on the game's thread does not poll), and no searcher of R3 finalises
+# before every searcher has read its roster (a dialect searcher's roster is the engine's members at the poll that takes the GO)
+need Tests/dlp_real_hub_test.cpp '        return WaitFor(ms, [&] { return ClientsTotal() == total; });' "Lists() waits for the creator's GetConnectingClients"
+[ "$(tr -d '\r' < Tests/dlp_real_hub_test.cpp | awk '/ga\.SvAccept\(2\)/ { n++; if (prev !~ /^ +TCHECK\(ga\.Lists\(1\)\);$/) bad++ } { prev = $0 } END { print n + 0 ":" bad + 0 }')" = "3:0" ] || fail "Tests/dlp_real_hub_test.cpp: a creator of R8 / R10 accepts node 2 without first seeing it in GetConnectingClients (TCHECK(ga.Lists(1)); on the line above each of the three accepts)"
+need_order Tests/dlp_real_hub_test.cpp '    r = g.FkNodes(4);' '    rosters_read.fetch_add(1);' "R3: a searcher counts itself after it has read its roster"
+need_after Tests/dlp_real_hub_test.cpp '    rosters_read.fetch_add(1);' '    TCHECK(WaitFor(5000, [&] { return rosters_read.load() >= clients; }));' "R3: ... waits for every searcher's roster ..."
+need_after Tests/dlp_real_hub_test.cpp '    TCHECK(WaitFor(5000, [&] { return rosters_read.load() >= clients; }));' '    r = g.FkFinalize();' "R3: ... and only then finalises"
+need Tests/dlp_real_hub_test.cpp 'Searcher(*room.n[i], *room.n[0], i, clients, t, in_session, rosters_read);' "R3: one count of the rosters read for all the searchers of a run"
 # 1.1.3, review of F0-F5 (analysis/notte-2026-11-09/CORREZIONI.md): what the three reviews found and the fixes keep.
 # - protocol 1: in the real Download Play's network the Logoff of an admission reaches its members only (Azahar's nwm adopts ANY Logoff while it is
 #   Connecting): a spectator's to the spectator alone, a client's to every member; every other network broadcasts as before
-need_after Sources/azl/uds_engine.cpp '        if (!dlp_net_) {' '            SendEapolLogoffLocked(kBroadcastMac, node.network_node_id);' "outside the real Download Play the Logoff of an admission is broadcast as since 1.0"
+need_after Sources/azl/uds_engine.cpp '        if (!dlp_net_ && !admission_to_members_) {' '            SendEapolLogoffLocked(kBroadcastMac, node.network_node_id);' "outside the real Download Play the Logoff of an admission is broadcast as since 1.0, unless the title asked for its members one by one (Mario Kart 7)"
 need_line Sources/azl/uds_engine.cpp '            SendEapolLogoffLocked(packet.transmitter_address, node.network_node_id);' "a spectator's admission goes to the spectator alone"
 need_line Sources/azl/uds_engine.cpp '                    SendEapolLogoffLocked(member.first, node.network_node_id);' "a client's admission goes to every member of the network, never to the room"
 [ "$(tr -d '\r' < Sources/azl/uds_engine.cpp | grep -c 'SendEapolLogoffLocked(kBroadcastMac,')" = "1" ] || fail "Sources/azl/uds_engine.cpp: a Logoff is broadcast in more or fewer than one place (a game's admission)"
@@ -2134,7 +2923,7 @@ need ConfigApp/source/ui.cpp "setup::RemoveParkFiles(paths.park_dir);" "the bloc
 need ConfigApp/source/paths.cpp 'if (name.size() > 4 && name.compare(name.size() - 4, 4, ".blk") == 0) {' "only the block files go from park/"
 need ConfigApp/source/ui.cpp "if (plugin_copies_checked || !plugin_ready) {" "the quiet look at the copies of the plugin starts at once: it does not wait for the scan of the titles (whoever installed an update waits for it)"
 need ConfigApp/source/ui.cpp "const std::string stamp = setup::PluginContentStamp(setup::EmbeddedPluginData(), setup::EmbeddedPluginSize());" "the stamp of the copies is made from the BYTES of the plugin (the card gives every file the date 0; two builds can have the same size)"
-need ConfigApp/source/ui.cpp "plugin_pass_open = submitted > 0;" "a pass of quiet looks is open while there are folders to look at (the main page tells how it goes)"
+need ConfigApp/source/ui.cpp "plugin_pass_open = submitted > 0; // (the main page tells how it goes and when it is over)" "a pass of quiet looks is open while there are folders to look at (the main page tells how it goes)"
 need ConfigApp/source/plugin_install.cpp '"%llu:h%016llx"' "the stamp of a plugin is its size and the hash of its bytes"
 need ConfigApp/source/pages_main.cpp 'Updating the plugin in your games: %d of %d folders done. Please wait.' "the main page says how many folders are done while the copies of the plugin are looked at"
 need ConfigApp/source/pages_main.cpp 'The plugin is up to date in all your games.' "... and that it is over when nothing had to be made again"
@@ -2168,12 +2957,75 @@ need Sources/azl/uds_engine.cpp "        NotePullLatency(static_cast<u32>(platfo
 need Includes/azl/room_client.hpp "inline u32 ServiceTimeoutFor(bool queued, u32 now_ms, u32 last_enqueue_ms) {" "the wait in the socket follows the game's frames"
 need Includes/azl/room_client.hpp "constexpr u32 kQuickPollMs = 1;" "1 ms after the game sent"
 need Includes/azl/room_client.hpp "constexpr u32 kQuickPollWindowMs = 10;" "... for 10 ms"
+# 2026-11-10 (RL-4): ... started by a frame that is queued, not by the host's own beacon (38 to 75 quick rounds a second on a host that stood still)
+need_line Includes/azl/room_client.hpp "    return type != WifiPacket::Type::Beacon;" "the host's own beacon does not start the quick poll window"
+need_line Sources/azl/room_client.cpp "        if (StartsQuickPoll(packet.type)) { // (not the host's own beacon: nothing of the game follows it)" "... and the room client asks before it stamps the frame"
+need_after Sources/azl/room_client.cpp "        if (StartsQuickPoll(packet.type)) { // (not the host's own beacon: nothing of the game follows it)" "            last_enqueue_ms_.store(static_cast<u32>(now), std::memory_order_relaxed);" "... the one stamp of the window is under that question"
+[ "$(tr -d '\r' < Sources/azl/room_client.cpp | grep -c 'last_enqueue_ms_.store(')" = "1" ] || fail "Sources/azl/room_client.cpp stamps last_enqueue_ms_ in more than one place (a beacon would start the quick poll window again)"
+need_after Sources/azl/room_client.cpp "    if (tx_.Push(std::move(item), now, &drops)) {" "        tx_pending_.store(1, std::memory_order_release);" "a frame that is queued, the beacon too, is sent by the next round without a wait"
+need_after Sources/azl/room_client.cpp "        tx_pending_.store(1, std::memory_order_release);" "        if (StartsQuickPoll(packet.type)) { // (not the host's own beacon: nothing of the game follows it)" "... whatever its type: the question is asked after the queue was marked"
+# 2026-11-10 (LAT-7 / UDS-BEACON, RL-4, UDS-2): the host's beacon is made again only when its inputs changed (the key is the inputs themselves, not a flag raised in places)
+need_line Sources/azl/uds_engine.cpp "    BeaconFrameLocked(&packet.data);" "the host's beacon comes from the copy of the last one"
+# (2026-11-11) the line that says so ("beacons as host", the last clause of "stats: soc calls") fits its buffer with every clause in it
+need_after Sources/ctr/plugin.cpp "void Plugin::LogStatsWire(const Stats& s) {" "    char text[2304];" "the wire statistics line has room for all its clauses (about 2200 characters at the most)"
+# (2026-11-11, Fantasy Life) the count of the datagrams handed to the socket is a line of its own, "stats: socket sends:", after that one. Code of the console only
+# (plugin.cpp is not built on a PC): the end of the function is held statement by statement. The wire line is written FIRST and once; the new line is there only when
+# it has something to say (a refusal, a failure, a short send or a big datagram taken whole: the scripts that read "stats: soc calls" see no new line in a window that
+# has none of them); it starts the buffer again (n = 0: without it the text would go after the wire line's, and the wire line would be written twice); its numbers are
+# in the order of its words. (Its name does not begin "stats: soc calls", which is what the scripts of the analyses look for.)
+WIRE_TAIL=$(tr -d '\r' < Sources/ctr/plugin.cpp | awk '/^void Plugin::LogStatsWire\(const Stats& s\) \{/{f=1} f{print} f&&/^}/{exit}' |
+            grep -v '^[[:space:]]*//' | grep -v '^[[:space:]]*$' | awk '$0 == "    log_files_->Append(text);"{f=1} f{print}')
+WT="Sources/ctr/plugin.cpp, the end of Plugin::LogStatsWire"
+need_nth "$WT" "$WIRE_TAIL" 1 '    log_files_->Append(text);' "the wire line is written before its buffer is used again"
+need_nth "$WT" "$WIRE_TAIL" 2 '    if (s.soc_send_refused || s.soc_send_failed || s.soc_send_short || s.soc_send_big) {' "the line of the sends is written only when it has something to say"
+need_nth "$WT" "$WIRE_TAIL" 3 '        n = 0;' "the line of the sends starts the buffer again"
+need_nth "$WT" "$WIRE_TAIL" 4 '        Append(text, sizeof(text), &n,' "..."
+need_nth "$WT" "$WIRE_TAIL" 5 '               "stats: socket sends: refused %lu (%lu of %lu bytes or more), failed %lu, short %lu | datagrams of %lu bytes"' "the text of the line of the sends ..."
+need_nth "$WT" "$WIRE_TAIL" 6 '               " or more taken whole %lu, largest datagram %lu B",' "... to its end"
+need_nth "$WT" "$WIRE_TAIL" 7 '               static_cast<unsigned long>(s.soc_send_refused), static_cast<unsigned long>(s.soc_send_refused_big),' "refused, and the big ones of them ..."
+need_nth "$WT" "$WIRE_TAIL" 8 '               static_cast<unsigned long>(kSocSendBig), static_cast<unsigned long>(s.soc_send_failed),' "... the size that makes a datagram big (the constant the count uses), failed ..."
+need_nth "$WT" "$WIRE_TAIL" 9 '               static_cast<unsigned long>(s.soc_send_short), static_cast<unsigned long>(kSocSendBig),' "... short, the same size ..."
+need_nth "$WT" "$WIRE_TAIL" 10 '               static_cast<unsigned long>(s.soc_send_big), static_cast<unsigned long>(s.soc_send_max_bytes));' "... the big ones taken whole and the largest datagram"
+need_nth "$WT" "$WIRE_TAIL" 11 '        log_files_->Append(text);' "the line of the sends is written"
+need_nth "$WT" "$WIRE_TAIL" 12 '    }' "..."
+need_nth "$WT" "$WIRE_TAIL" 13 '}' "the function ends there"
+[ "$(printf '%s\n' "$WIRE_TAIL" | grep -c '')" = "13" ] || fail "$WT: after the wire line is written it is no longer the 13 statements held here (a statement was added or lost, or the wire line is written twice)"
+[ "$(tr -d '\r' < Sources/azl/uds_engine.cpp | grep -c 'GenerateBeaconFrame(network_info_, node_info_)')" = "2" ] || fail "Sources/azl/uds_engine.cpp makes the host's beacon outside BeaconFrameLocked (or no longer from network_info_ and node_info_ alone)"
+need_line Sources/azl/uds_engine.cpp "    if (cache && cache->nodes.size() == node_info_.size() &&" "the copy is good while the node table has the size it was made from ..."
+need_line Sources/azl/uds_engine.cpp "        std::memcmp(&cache->network, &network_info_, sizeof(NetworkInfo)) == 0) {" "... the NetworkInfo is byte for byte the same ..."
+need_line Sources/azl/uds_engine.cpp "            same = a.friend_code_seed == b.friend_code_seed && a.network_node_id == b.network_node_id &&" "... and every node has the seed, the id ..."
+need_line Sources/azl/uds_engine.cpp "                   std::memcmp(a.username, b.username, sizeof(a.username)) == 0;" "... and the name it had"
+need_line Sources/azl/uds_engine.cpp "    std::memcpy(&cache->network, &network_info_, sizeof(NetworkInfo));" "the key that is kept is the NetworkInfo the beacon was made from ..."
+need_line Sources/azl/uds_engine.cpp "    cache->nodes = node_info_;" "... and its node table"
+need_line Sources/azl/uds_engine.cpp "    cache->frame = GenerateBeaconFrame(network_info_, node_info_);" "... and the copy is the beacon of exactly those"
+need_line Sources/azl/uds_engine.cpp "        beacon_cache_.reset(new (std::nothrow) BeaconCache());" "no memory for the copy is not an abort: the beacon is made every time, as before"
+# (2026-11-11) ... and that branch ends there: nothing is written through the copy that is not there (Tests/beacon_cache_test.cpp runs it)
+need_after Sources/azl/uds_engine.cpp "        *out = GenerateBeaconFrame(network_info_, node_info_); // (no memory for the copy: as it was, every time)" "        return;" "with no memory for the copy the beacon is handed out and nothing else is touched"
+need_order Sources/azl/uds_engine.cpp "        *out = GenerateBeaconFrame(network_info_, node_info_); // (no memory for the copy: as it was, every time)" "    std::memcpy(&cache->network, &network_info_, sizeof(NetworkInfo));" "the key of the copy is written only after the check that there is a copy"
+need_line Tests/beacon_cache_test.cpp "    TestNoMemoryForTheCopy();" "the beacon cache's test runs the case of no memory for the copy"
+need Tests/beacon_cache_test.cpp "void* operator new(std::size_t size, const std::nothrow_t&) noexcept {" "... with an operator new(nothrow) that fails at its word"
+need_line Sources/azl/uds_engine.cpp "    beacon_cache_.reset(); // (a client or an idle console has no use for it)" "the copy lives only as long as the hosted network"
+need Tests/run.sh 'g++ $CXXFLAGS -DAZL_HAS_BEACON_CACHE -Wl,--wrap=_ZN3azl4Sha1EPKhmPh Tests/beacon_cache_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/beacon_cache_test"' "the suite builds the beacon cache's test, with the SHA-1 counted at the link"
+need_line Tests/run.sh '  "$OUT/beacon_cache_test"' "... and runs it"
 need Sources/azl/room_client.cpp "        if (tx_pending_.load(std::memory_order_acquire) != 0) { // (the game's thread sets it under the lock: nothing pushed, no lock)" "the queue is looked at through an atomic, not the lock, every round"
 need Sources/ctr/uds_hle.cpp "            svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);" "the first call of a command says the thread and its priority"
 need Sources/azl/log.cpp "    c.plugin10 = c.net10 + c.uds10 + c.frame10 + c.chat10;" "the writer's wall time is not in the CPU total"
 need Includes/enet/enet.h "   enet_uint32          azlDeliverOutOfOrder;" "ENet can hand a reliable packet over ahead of a hole"
 need Sources/enet/peer.c "          placeholder -> azlDispatched = 1;" "... leaving a placeholder for the sequence accounting"
 need_after Sources/enet/peer.c "          if (incomingCommand -> azlDispatched)" "enet_free (incomingCommand);" "... that is freed, never delivered, when its turn comes"
+# (2026-11-15, E1) the unreliable commands that waited for the reliable sequence are handed over when it advances, as upstream ENet (the test of the
+# list's begin after the in-order run was unlinked was always false since 2026-10-25): Tests/enet_cap_test.cpp TestUnreliableBehindAHole
+need_line Sources/enet/peer.c "    if (advanced && ! enet_list_empty (& channel -> incomingUnreliableCommands))" "the unreliable dispatch follows a reliable sequence that advanced"
+need_line Sources/enet/peer.c "       advanced = 1;" "... and the in-order run is what says it advanced"
+need_line Tests/enet_cap_test.cpp "    TestUnreliableBehindAHole();" "the suite runs the scene of the unreliable command behind a hole"
+# (2026-11-15, N1) what the socket's ring held after the thread was away, counted up to the empty socket, with the copies the room sent again (counts only, every title)
+need_line Sources/enet/protocol.c "         ++ host -> azlCounters.awayEpisodes; /* (a new one: the socket was found empty since the last) */" "a new episode of the thread away is counted"
+need_line Sources/enet/protocol.c "          host -> azlAwayBytes += (enet_uint32) receivedLength;" "the bytes read after the thread was away are counted"
+need_line Sources/enet/protocol.c "          if (++ host -> azlAwayDatagrams > host -> azlCounters.awayDatagramsMax)" "... and the datagrams"
+need_line Includes/enet/enet.h "      if ((host) -> azlAwayBacklog && ++ (host) -> azlAwayDups > (host) -> azlCounters.awayDupMax) \\" "a copy sent again by the room is counted in the episode"
+[ "$(tr -d '\r' < Sources/enet/peer.c | grep -c 'ENET_AZL_NOTE_DUP (peer -> host);')" = "3" ] || fail "Sources/enet/peer.c: the three places that see a copy of the room count it with ENET_AZL_NOTE_DUP"
+need Includes/azl/flow_relief.hpp "\" | away: %lu times, most read after one %lu datagrams %lu KB, %lu of them sent again, the game's queue held %lu rounds for it\"," "the line of the losses says what the ring held after the thread was away"
+need_line Tests/enet_cap_test.cpp "    TestAwayCounters();" "the suite runs the scene of the counters of the thread away"
 need Sources/enet/protocol.c "return 0; /* AzaharLink: the packet of this fragment was handed over already (a late copy of one of its fragments) */" "a late fragment of a packet handed over already is ignored"
 need Sources/azl/room_client.cpp "        client->azlDeliverOutOfOrder = fast_level_.load() >= 2 ? 1u : 0u; // (the room's reliable stream handed over as it arrives)" "the room's stream is handed over as it arrives only at radio_like=2"
 need Includes/azl/room_client.hpp "    } else if (level >= 2 && peer_numbers) {" "unicast game data goes unreliable and twice only at radio_like=2, and only to a console that numbers its frames"
@@ -2380,27 +3232,21 @@ need ConfigApp/source/dlp_prepare_logic.hpp 'double aes = 0.7;' "the speed of th
 need ConfigApp/source/paths.hpp 'constexpr const char* kDlpMarkerFileName = "child.preparing";' "the marker of a run in progress is dlp/child.preparing"
 need ConfigApp/source/paths.hpp 'constexpr const char* kDlpAppCiaFileName = "3dslink.cia";' "the app's own CIA is dlp/3dslink.cia: where the installer of the child leaves it"
 need ConfigApp/source/paths.hpp 'constexpr const char* kDlpChildFileName = "child.cia";' "the package that is handed out is dlp/child.cia"
-# The emergency switch (Settings > Download Play delivery, 3DSLink.cfg: the app's own file, never the plugin's ini): on by default, an unreadable value is on, it is written every time (a hand edit
-# flips a digit), and with it off the entry is faint, the page does not open and nothing of the feature runs. The same entry is shut, as Titles Delivery's Send Titles is, without boot9.bin.
-need ConfigApp/source/appcfg.hpp 'bool dlp_delivery = true;' "the feature is on by default"
-need ConfigApp/source/appcfg.cpp 'cfg.dlp_delivery = azl::ini::ParseBool(value, true);' "the switch is read with the plugin's words, and a slip means on"
-need ConfigApp/source/appcfg.cpp $'out += std::string("dlp_delivery=") + (cfg.dlp_delivery ? "1" : "0") + "\\n";' "the switch is written every time, so that a hand edit only flips a digit"
-need ConfigApp/source/pages_config.cpp 'dlp_switch.on = g.app_cfg.dlp_delivery;' "the row of Settings shows the switch"
-need ConfigApp/source/pages_config.cpp 'g.app_cfg.dlp_delivery = on;' "the row of Settings flips the switch"
-need_after ConfigApp/source/pages_config.cpp 'g.app_cfg.dlp_delivery = on;' 'g.SaveAppConfig();' "the delivery switch is saved when it is flipped"
+# 3DS Link Delivery is shut, as Titles Delivery's Send Titles is, without boot9.bin, and by NOTHING else: the emergency switch (Settings > Download Play delivery, dlp_delivery in
+# 3DSLink.cfg) is gone (1.1.4, spec 9, the user's decision of 2026-11-17). An old file with the line is read as any file with a line the app does not know (paths_test holds it).
+[ "$(cat ConfigApp/source/*.cpp ConfigApp/source/*.hpp | sed 's://.*$::' | grep -c -E 'dlp_delivery|kSwitchLabel|kSwitchNote|SwitchToast|SwitchedOff|Gate::Off|switch_on')" = 0 ] || fail "the emergency switch of 3DS Link Delivery is back somewhere in ConfigApp/source (dlp_delivery, its row, its texts, Gate::Off or Failure::SwitchedOff): spec 9 took it away, boot9.bin alone shuts the entry"
+! grep -q -F 'dlp_delivery' ConfigApp/source/appcfg.cpp || fail "ConfigApp/source/appcfg.cpp reads or writes dlp_delivery again (a line of an older file is ignored, and the app writes none)"
+need_line Tests/settings_test/paths_test.cpp '    TestDlpDeliveryLineIgnored();' "the test that an old dlp_delivery line is ignored runs"
 need_after ConfigApp/source/pages_config.cpp 'g.app_cfg.update_check = on;' 'g.SaveAppConfig();' "the update-check switch is saved when it is flipped"
-need ConfigApp/source/pages_config.cpp 'dlp_switch.label = dlp::kSwitchLabel;' "the row is called as the text says"
-need ConfigApp/source/dlp_text.hpp 'constexpr const char* kSwitchLabel = "Download Play delivery";' "the row of the switch is called Download Play delivery (as the notes and the documents call it)"
-need ConfigApp/source/dlp_text.hpp '"OFF: the whole feature is shut. Its entry is faint and nothing of it runs or is read or written.' "the note of the switch says what off means"
 need ConfigApp/source/dlp_text.hpp 'return boot9_found ? Gate::Open : Gate::NoBoot9;' "the entry needs boot9.bin as Titles Delivery's Send Titles does"
-need_after ConfigApp/source/dlp_text.hpp 'inline Gate GateOf(bool switch_on, bool boot9_found) {' 'if (!switch_on) {' "the switch comes first: switched off, nothing else about the entry is looked at"
-need ConfigApp/source/dlp_text.hpp 'return g == Gate::Off ? "switched off" : (g == Gate::NoBoot9 ? "needs boot9.bin" : "");' "the shut entry says why at the right of its row, as Send Titles says \"needs boot9.bin\""
-need ConfigApp/source/dlp_text.hpp 'return g == Gate::Off ? "Switched off: Settings > Download Play delivery." : "boot9.bin is missing: press Y to see how to get it.";' "A on the shut entry answers with a line that says why and where"
+need_after ConfigApp/source/dlp_text.hpp 'inline Gate GateOf(bool boot9_found) {' 'return boot9_found ? Gate::Open : Gate::NoBoot9;' "boot9.bin decides the entry, and nothing else"
+need_line ConfigApp/source/dlp_text.hpp 'enum class Gate { Open, NoBoot9 };' "the entry is open or shut for the lack of boot9.bin: there is no third state"
+need ConfigApp/source/dlp_text.hpp 'return g == Gate::NoBoot9 ? "needs boot9.bin" : "";' "the shut entry says why at the right of its row, as Send Titles says \"needs boot9.bin\""
+need ConfigApp/source/dlp_text.hpp 'return "boot9.bin is missing: press Y to see how to get it."; // (the one way the entry is shut)' "A on the shut entry answers with a line that says why and where"
 need ConfigApp/source/dlp_text.hpp $'return "Sharing 3DS Link needs boot9.bin, the key file of this console. 3DS Link itself works without it.\\n\\nPress Y to see, step by step, how to get it.";' "the note says that sharing needs boot9.bin, that 3DS Link works without it, and the key of the guide (two lines, a blank one and the Y line: all it has room for on the main page, where the emulator's wider font shows four lines of the note)"
 need ConfigApp/source/dlp_text.hpp 'The first time it builds the package, and says how long.";' "the note of the open entry is honest about the first time and still short enough to be shown whole (the main page's note has four lines: two, a blank one and one)"
 need ConfigApp/source/dlp_text.hpp 'constexpr const char* kGuideHint = "Y guide";' "the hint of the guide's key"
 need ConfigApp/source/dlp_text.hpp 'text = "Sharing 3DS Link needs boot9.bin, the key file of this console. 3DS Link works without it: it is only needed to share. "' "the page without boot9.bin says what the file is for and that 3DS Link works without it"
-need ConfigApp/source/dlp_text.hpp 'text = "It is switched off in Settings (Download Play delivery). Switch it on there to use it.";' "the page with the switch off says where to switch it on"
 need ConfigApp/source/dlp_text.hpp 'constexpr const char* kPrepareKeepAwake = "B stops it. Nothing is left half done. HOME and sleep are off until it ends.";' "the work's screen says how to stop it and that nothing is left half done"
 need ConfigApp/source/dlp_text.hpp 'std::string s = "One time only: 3DS Link builds the package that other consoles download.";' "the work's screen says that it is one time only and what it builds (and, next, how long)"
 need ConfigApp/source/dlp_text.hpp 'constexpr const char* kCancelPrepareQuestion = "Nothing is left half done, and the work starts again the next time you open this page.";' "the question before a stop says that nothing is left half done"
@@ -2417,14 +3263,14 @@ need ConfigApp/source/pages_dlp.cpp 'Fail(dlp::Failure::Prepare, dlp::PrepareFai
 need ConfigApp/source/pages_dlp.cpp 'if (dlp::FileIsToBlame(app_file_) || refused) {' "when there is no way to the installed copy, a file in the dlp folder that cannot be used is named first (not \"the key is missing\" alone)"
 need ConfigApp/source/pages_dlp.cpp 'Fail(dlp::Failure::BadAppFile, dlp::BadAppFileText(g.paths.dlp_app_cia, found, setup::kVersion));' "...with its path, what is wrong with it, its version when known, and the two ways out"
 need ConfigApp/source/dlp_prepare_logic.hpp 'return app_file != Verdict::Missing && app_file != Verdict::Good;' "a file that is there and is no good is to blame; one that is not there is the plain case"
-need ConfigApp/source/pages_main.cpp 'return dlp::GateOf(g.app_cfg.dlp_delivery, g.boot9.found);' "the main page decides from the switch and from boot9.bin as the app found it"
+need ConfigApp/source/pages_main.cpp 'return dlp::GateOf(g.boot9.found);' "the main page decides from boot9.bin as the app found it"
 need ConfigApp/source/pages_main.cpp 'dlp.dim = gate != dlp::Gate::Open;' "a shut entry is faint"
 need ConfigApp/source/pages_main.cpp 'if (gate != dlp::Gate::Open) {' "A on a shut entry only says why: the page is not pushed"
 need ConfigApp/source/pages_main.cpp 'g.RefreshBoot9(); // (the card is looked at now: a boot9.bin put there since the last look counts)' "the card is looked at when A is pressed"
 need ConfigApp/source/pages_main.cpp 'return row != nullptr && row->id == kDlpDelivery && EntryGate() == dlp::Gate::NoBoot9;' "the guide's key is offered on the entry that is shut for the lack of boot9.bin, and only there"
 need ConfigApp/source/pages_main.cpp 'if ((in.down & KEY_Y) && GuideKeyOffered()) {' "Y opens the guide on that entry"
-need ConfigApp/source/pages_dlp.cpp 'if (!g.app_cfg.dlp_delivery) {' "the page looks at the switch again before it does anything (a second lock)"
 need ConfigApp/source/pages_dlp.cpp 'if (!g.boot9.found) {' "the page looks at boot9.bin again before it does anything (a second lock)"
+need_after ConfigApp/source/pages_dlp.cpp '        step_ = Step::Room;' '        if (!g.boot9.found) {' "the first thing Begin looks at is boot9.bin (the switch of Settings that came first is gone): without it nothing of the feature runs"
 [ "$(grep -rn "NewDlpHostPage()" ConfigApp/source | grep -v "ConfigApp/source/pages_main.cpp\|ConfigApp/source/pages_dlp.cpp\|ConfigApp/source/delivery.hpp" | wc -l)" = "0" ] || fail "the page of 3DS Link Delivery is opened from a place other than the main page's entry (which is shut by the switch and by boot9.bin)"
 [ "$(grep -rn -E "dlpc_(compose|stage_work)\(" ConfigApp/source | grep -v "^ConfigApp/source/dlp_prepare" | wc -l)" = "0" ] || fail "the composer is called from a file other than the work of the package (dlp_prepare.cpp, dlp_prepare_logic.hpp)"
 # The guide "How to get boot9.bin" (ConfigApp/guide, shared by the app and the installer child): its keys (L/R and the D-pad's up and down move, B closes: the steps are a vertical list), the seven pictures, the folders it
@@ -2669,13 +3515,14 @@ fi
 # dist/ are the numbers of the files (the loops above). A document may name dist/dlp only to say it is gone.
 need README.md $'**3DS Link è UN CIA solo, e il figlio per il Download Play lo fa l\'app' "the README says that 3DS Link is one CIA and the app makes the child"
 need README.md 'Nessuno spazio fra *Titles Delivery* e *3DS Link Delivery*' "the README says there is no gap between the two entries"
-need README.md 'Un interruttore di emergenza, *Settings > Download Play delivery*, spegne tutta la funzione' "the README names the emergency switch"
+need README.md "Dalla 1.1.4 non c'è più l'interruttore di emergenza *Settings > Download Play delivery*: la voce dipende solo da \`boot9.bin\`." "the README says that the emergency switch is gone and that boot9.bin alone shuts the entry"
 need README.md $'il modello del figlio di riferimento (fatto con l\'app vera nel RomFS) è lo stesso modello di quello fatto senza l\'app' "the README says how the cycle of the build is broken"
 need dist/LEGGIMI.txt $'3DS Link e\' UN CIA SOLO, e il figlio per il Download Play lo fa l\'app' "the short guide says that 3DS Link is one CIA and the app makes the child"
 need dist/LEGGIMI.txt $'dist/dlp/child.cia NON c\'e\' piu\' e non va copiato da nessuna parte' "the short guide says there is no child to copy"
 need dist/LEGGIMI.txt $'Fra "Titles Delivery" e "3DS Link Delivery" nella pagina principale non c\'e\' spazio' "the short guide says there is no gap between the two entries"
 need PROVE_HARDWARE.md $'**Il CIA unico di 3DS Link, il compositore del figlio, la guida per `boot9.bin` e l\'icona' "the plan of the tests says what the one CIA, the composer and the guide need"
 need PROVE_HARDWARE.md '**3DS Link è UN CIA solo: il figlio Download Play non è un file di `dist/`**' "the plan of the tests says the child is not a file of dist/"
+need CHECKLIST_DA_VERIFICARE.md '| O18 | **Niente più interruttore di emergenza** (dalla 1.1.4, spec 9' "the row O18 of the checklist says that the emergency switch is gone (the review of spec 9: it still asked to try it)"
 for r in O15 O16 O17 O18 O19 O20; do
   grep -q "^| $r |" CHECKLIST_DA_VERIFICARE.md || fail "CHECKLIST_DA_VERIFICARE.md has no row $r (the console rows of the one CIA: the package, the sources, the time, the switch, the guide, the size over the air)"
 done
@@ -2747,7 +3594,33 @@ need Includes/azl/log_files.hpp "u32 capture_every_ms = 2000;" "the capture is w
 need Includes/azl/log_files.hpp "u32 capture_ring_high = 160 * 1024;" "... or at once when the ring holds 160 KB"
 need Sources/azl/log_files.cpp "return early || last == 0 || ring_used >= limits_.capture_ring_high || now_ms - last >= limits_.capture_every_ms;" "a pass is due on request, the first time, when the ring is high, or when the interval is over"
 need Sources/azl/log_files.cpp "    NoteCapturePass(platform::NowMs());" "a pass of the capture notes when it began"
-need Sources/ctr/plugin.cpp "if (backlog || log_files_->CaptureDue(platform::NowMs(), DebugRingUsedBytes(), capture_early)) {" "the writer only passes when the capture is due (or the last pass was cut short)"
+need Sources/ctr/plugin.cpp "const LogFiles::CaptureTurn turn = log_files_->NextCaptureTurn(platform::NowMs(), DebugRingUsedBytes(), capture_early);" "the writer asks LogFiles what the capture does at this wake (due, the card's rest, the game's reads)"
+need Sources/ctr/plugin.cpp "                        if (turn != LogFiles::CaptureTurn::kWait) {" "... and only passes when it says so"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'log_files_->DrainDebug(')" = "1" ] || fail "Sources/ctr/plugin.cpp: a pass of the capture is made from more or fewer than the one place behind NextCaptureTurn"
+# The beacons that say nothing new are counted by the WRITER, not written again (2026-11-10: 55% of the bytes of the capture on the user's console were beacons equal to the
+# one before of the same transmitter); the whole beacon when it changes, once a minute and as the first of every file; the producers store every beacon as before
+need Sources/azl/log_files.cpp "            if (!beacons_ || beacons_->Keep(rec, buf, start_ms, &out)) {" "a pass of the capture asks the table of the beacons before it writes a record"
+need_after Sources/azl/log_files.cpp "            if (!beacons_ || beacons_->Keep(rec, buf, start_ms, &out)) {" "                DebugFormat(rec, buf, start_ms, &out);" "... and writes what the table does not count, as before"
+need Sources/azl/log_files.cpp "            beacons_->Summaries(start_ms, &out); // (before the write: a rotation after it finds nothing counted and not said)" "the counts are said at the end of every block"
+need_after Sources/azl/log_files.cpp "    if (debug_file_) {" "        __atomic_store_n(&beacon_reset_, 1u, __ATOMIC_RELAXED);" "a new capture file starts the table again (the first beacon of every file is whole)"
+need Sources/azl/log_files.cpp "            beacons_->Reset(); // (a new file: its first beacons are whole)" "... at the next block of the pass"
+need Includes/azl/beacon_fold.hpp "static constexpr u32 kWholeEveryMs = 60000;" "the whole beacon once a minute"
+need Includes/azl/beacon_fold.hpp "static constexpr u32 kSlots = 8;" "the table of the beacons has eight places"
+need Sources/azl/log.cpp "        std::memcmp(slot->body, payload + 6, body_len) == 0 && rec.ms - slot->whole_ms < kWholeEveryMs) {" "a beacon is counted only when its bytes are the last ones written and less than a minute went by"
+need Sources/azl/log.cpp "            return true; // (more transmitters than places: this one is written whole every time, as before)" "a transmitter without a place is written whole"
+need Sources/azl/log.cpp "        if (rec.dir == kLaneHeavy) { // (a hole in the lane the beacons are in: some of them may be among the lost)" "a LOST marker of the heavy lane makes the next interval a gap that is not known"
+[ "$(awk '/^void DebugBeacon\(/,/^}/' Sources/azl/log.cpp | grep -c 'BeaconFold\|slots_\|Keep(')" = "0" ] || fail "Sources/azl/log.cpp: the producer's DebugBeacon knows of the writer's table (the count is the writer's alone: nothing more on the threads that store a beacon)"
+need_line Tests/log_files_test.cpp "    TestBeaconsAreCounted();" "the capture file with the counted beacons is tested"
+need_line Tests/capture_test.cpp "    TestBeaconFold();" "... and the table itself, record by record"
+# The writer gives the core up while it formats a block (2026-11-10: at 0x2E it is above the network thread and the game's, and 64 KB of text were 26 ms of CPU in one go);
+# never in the last pass of a launch
+need Includes/azl/log_files.hpp "u32 capture_yield_ms = 2;" "a pass gives the core up when 2 ms have gone by since it last did"
+need_after Sources/azl/log_files.cpp "            if (!final && platform::NowTicks() - paused_at > yield_ticks && !gate_closing()) {" "                platform::SleepMs(1);" "a pass that is not the last gives the core up while formatting"
+need_line Tests/log_files_test.cpp "    TestWriterGivesTheCoreUp();" "... tested: a pass does, the last pass never"
+# ... and the milliseconds given up are neither the writer's CPU nor its wait for the card: kept apart, and taken off the pass before the two are told apart
+need Sources/azl/log_files.cpp "                yielded += paused_at - pause_from;" "the time a pass gave the core up is kept"
+need Sources/azl/log_files.cpp "    __atomic_fetch_add(&yielded_ticks_, yielded, __ATOMIC_RELAXED);" "... and handed over to the writer's accounting"
+need Sources/ctr/plugin.cpp "const u64 pass_ticks = wall_ticks > yielded_ticks ? wall_ticks - yielded_ticks : 0;" "the milliseconds a pass gave the core up are not charged as the writer's CPU"
 need Tests/log_files_test.cpp "    TestCaptureCadence();" "the test of the capture's cadence runs"
 # Kirby Triple Deluxe and Kirby Planet Robobot died at start (a data abort inside CTRPluginFramework's startup search, before the plugin ran a line): Process::GetTextSize() goes through a
 # guard that cuts the size of THAT search to what is left of the code (text_search_guard.cpp; the PC test and the check of the call in the built .elf), and the log says when it did.
@@ -2757,6 +3630,38 @@ need Sources/ctr/text_search_guard.cpp 'constexpr u32 kAddR6R6Imm4 = 0xe2866004;
 need Sources/ctr/text_search_guard.cpp 'if (return_address[0] != kMovR7R0 || return_address[1] != kAddR6R6Imm4) {' "every other caller of GetTextSize() gets the real value"
 need_line Sources/ctr/text_search_guard_entry.s '    b    azl_text_size_guard' "the stub of the guard hands over to the C++ function by a plain branch (lr is left alone)"
 need Sources/ctr/hook.cpp 'if (TextSearchTrims() != 0) {' "the log says when the startup search was cut to the game's code"
+# The Download Play application (0004001000022100) aborted at start with the plugin in its folder (2026-11-13): the framework's GSP::Initialize tests "size of the code - 9" against the
+# ADDRESS 0x100000 before it looks for the SDK wrapper, and under 1 MB it answers -1 without a search. The guard answers THAT call (known by the five words at its return address) with
+# 0x100009, for that ONE application (asked to the kernel by the guard itself) and only when the test would fail; the size of the search comes from another call and stays the real one.
+# Since 2026-11-14 the application is its six regional titles (the list of Includes/ctr/text_search_guard.hpp, pinned row by row in the last block of this file): the guard's own file names no title.
+need Sources/ctr/text_search_guard.cpp 'constexpr u32 kLdrdR2R3Sp12 = 0xe1cd20dc;' "the guard knows the GSP test by the words at its return address (ldrd r2, [sp, #12] ...)"
+need Sources/ctr/text_search_guard.cpp 'constexpr u32 kSubR3R3R2 = 0xe0433002;' "... (... sub r3, r3, r2 ...)"
+need Sources/ctr/text_search_guard.cpp 'constexpr u32 kSubR0R0R3Asr2 = 0xe0400143;' "... (... sub r0, r0, r3, asr #2 ...)"
+need Sources/ctr/text_search_guard.cpp 'constexpr u32 kCmpR0R4 = 0xe1500004;' "... (... cmp r0, r4: the size against an address ...)"
+need Sources/ctr/text_search_guard.cpp 'constexpr u32 kBcc = 0x3a000000;' "... (... bcc: the branch to the -1)"
+need Sources/ctr/text_search_guard.cpp 'return_address[3] == kCmpR0R4 && (return_address[4] & kBccMask) == kBcc;' "the call is known by all five words, not by the first ones alone"
+need Includes/ctr/text_search_guard.hpp 'constexpr u64 kDownloadPlayTitles[] = {' "the GSP test is answered for the Download Play application: the list of its regional titles"
+[ "$(grep -c 'constexpr u64 ' Sources/ctr/text_search_guard.cpp)" = "0" ] || fail "Sources/ctr/text_search_guard.cpp: the GSP test is answered for ONE application, the titles of the list in its header (a title written in the guard's own file is a second list; every title under 1 MB is the user's decision, not a line added here)"
+need Sources/ctr/text_search_guard.cpp 'return svcGetProcessInfo(&title, kOwnProcess, kTitleIdInfo) == 0 && azl::ctr::IsDownloadPlayTitle(static_cast<u64>(title));' "the guard asks the kernel for its own title (no order with EarlyInit), a call that fails is not the title, and the title is one of the list"
+need Sources/ctr/text_search_guard.cpp 'if (size - kSdkPatternWords >= kTextBase || !IsDownloadPlay()) {' "a code that passes the framework's test by itself, and every other title, gets the real size"
+need Sources/ctr/text_search_guard.cpp 'return kTextBase + kSdkPatternWords;' "the answer passes the first test and fails for a later match (with a bigger one the framework would search from the start again and never leave the loop)"
+need_order Sources/ctr/text_search_guard.cpp 'if (size - kSdkPatternWords >= kTextBase || !IsDownloadPlay()) {' 'return kTextBase + kSdkPatternWords;' "the answer comes after the two conditions"
+need_order Sources/ctr/text_search_guard.cpp 'if (IsGspSdkTest(return_address)) {' 'if (return_address[0] != kMovR7R0 || return_address[1] != kAddR6R6Imm4) {' "the GSP test is looked at first, and what is not that call goes on to the cut of KeepThreadMain's search as before"
+need Tests/text_search_guard_test.cpp 'CHECK_EQ(azl_text_size_guard(0, gsp), 0x00100009); // the Download Play application gets through' "the PC test holds the answer for the title"
+need Tests/text_search_guard_test.cpp 'CHECK_EQ(azl_text_size_guard(0, gsp), kDlplayCode); // another title is left alone' "... that another title gets the real size"
+need Tests/text_search_guard_test.cpp 'CHECK_EQ(azl_text_size_guard(0, near_miss), kDlplayCode); // another call is left alone' "... that another call gets the real size"
+need Tests/text_search_guard_test.cpp 'CHECK_EQ(azl_text_size_guard(0, gsp), size); // a big code is left alone' "... and that a code of 1 MB + 9 bytes or more gets the real size"
+need Tests/text_search_guard_test.cpp 'CHECK_EQ(g_title_asked, asked);' "... without the kernel being asked"
+need Tests/text_search_guard_elf_check.sh 'W0=$(word kLdrdR2R3Sp12); W1=$(word kSubR3R3R2); W2=$(word kSubR0R0R3Asr2); W3=$(word kCmpR0R4); W4=$(word kBcc | cut -c1-2)' "the check of the built .elf takes the five words from the guard's own source"
+need Tests/text_search_guard_elf_check.sh 'step == 4 { if ($2 == w3 && $0 ~ /cmp[ \t]+r0, r4/) step = 5; else again(); next }' "... wants cmp r0, r4 after them"
+need Tests/text_search_guard_elf_check.sh 'step == 5 { if (substr($2, 1, 2) == w4 && $0 ~ /(bcc|blo)[ \t]/) { words++; step = 6 } else again(); next }' "... and the bcc (blo)"
+need Tests/text_search_guard_elf_check.sh 'step == 7 { if ($2 != w0) { second++; if (pattern) inpattern++; tail = 3 } again(); next }' "... and the size of the search from another call, which the guard does not answer"
+need Tests/text_search_guard_elf_check.sh 'if [ "$gsp_words" != 1 ] || [ "$gsp_second" != 1 ] || [ "$gsp_pattern" != 1 ]; then' "... exactly once, or the check fails"
+need Tests/text_search_guard_elf_check.sh '$0 ~ /mov[ \t]+r4, #1048576([ \t]|$)/ { base = 1 }' "... and r4 = 0x100000 before the loop (the address the answer 0x100009 is made for)"
+need Tests/text_search_guard_elf_check.sh 'tail > 0 { tail = ($0 ~ /mov[ \t]+r0, #1048576([ \t]|$)/) ? -1 : tail - 1 }' "... and the second call followed by mov r0, #0x100000 (the search starts at the beginning of the code)"
+need Tests/text_search_guard_elf_check.sh 'tail == -1 { if (base && $0 ~ search) searched++; tail = 0 }' "... and by the call to Utils::Search right after it"
+need Tests/text_search_guard_elf_check.sh 'if [ "$gsp_search" != 1 ]; then' "... exactly once, or the check fails"
+need_order Tests/text_search_guard_elf_check.sh 'if [ "$gsp_search" != 1 ]; then' 'echo "text search guard: OK"' "... before it says OK"
 # A game whose GSP wrapper has its svc behind a stub (LEGO Batman 2) makes the framework abort at start unless the plugin writes the svc in place of the bl BEFORE the framework searches (GSP::Initialize runs after PatchProcess); the framework's own sites are found after that
 need Sources/ctr/hook.cpp 'FindStubbedGspWrappers(ReadGameWord, nullptr, first, first + text_size, stubbed, 4);' "the GSP wrapper behind a stub is looked for in the game's .text"
 need Sources/ctr/hook.cpp 'CTRPluginFramework::Process::Patch(stubbed[i], kSvcSendSyncRequest)' "the bl of the GSP wrapper becomes the svc itself"
@@ -2779,37 +3684,37 @@ need Tests/text_search_guard_elf_check.sh 'text search guard: OK' "the check of 
 # "wireless off" because the console stays on its access point for the tunnel. For the titles in the list the plugin answers that probe itself (azl/dlp_fkcl_hle.hpp); for every other
 # title dlp:FKCL is the real service.
 need Sources/ctr/plugin.cpp 'hle_->SetDlpProbeFake(AsksDlpOnlyForTheWireless(game_id_));' "the fake dlp:FKCL is switched on per title, from the list"
-need Sources/ctr/plugin.cpp '0x00040000001C2100ull' "Kirby Battle Royale is in the list of the titles whose dlp:FKCL is answered by the plugin"
 # Phase 3: the table of games is {title id, mode}. Kirby Triple Deluxe and Planet Robobot are NOT in the probe's list (their wireless mode needs the Download Play client -
 # GetChannels, scan, join - and the probe answers 'invalid state' to it, so the game shows an error screen, 0xE0A0AC01, seen 2026-10-28): they are Lobby games, whose
-# Download Play the room carries (azl/dlp_hub.hpp). Every title id of these games is on a line with its mode, and Battle Royale keeps the probe.
-need Sources/ctr/plugin.cpp '{0x000400000010C000ull, DlpGameMode::Lobby}' "Kirby Triple Deluxe is a Lobby game: the room carries its Download Play lobby"
-need Sources/ctr/plugin.cpp '{0x000400000010BF00ull, DlpGameMode::Lobby}' "Kirby Triple Deluxe, the other region's id, is a Lobby game"
-need Sources/ctr/plugin.cpp '{0x0004000000183600ull, DlpGameMode::Lobby}' "Kirby Planet Robobot is a Lobby game"
+# Download Play the room carries (azl/dlp_hub.hpp), and Battle Royale keeps the probe. Since 1.1.4 (L4) the mode, the seed and the ceiling of every title id of these games are
+# the Download Play column of its row in azl/title_rules.hpp, held id by id by AZL_DLP_AS_BEFORE (Tests/plugin_dlp_test.cpp) and against it by the block of L4 at the end.
 # Mario Tennis Open: its local multiplayer scene starts the Download Play CLIENT at once (Initialize with no name, GetMyStatus every 5 ms, GetChannels, StartScan, StartFakeSession) and the host side runs
 # the SERVER (StartAccepting, GetConnectingClients): it is NOT a game of the probe (Battle Royale asks Initialize/Finalize only), it is a Lobby game, in all the regions whose id is known.
-need Sources/ctr/plugin.cpp '{0x000400000007C800ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Europe is a Lobby game: the room carries its Download Play lobby"
-need Sources/ctr/plugin.cpp '{0x000400000007C700ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, USA is a Lobby game: the room carries its Download Play lobby"
-need Sources/ctr/plugin.cpp '{0x0004000000064D00ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Japan is a Lobby game: the room carries its Download Play lobby"
-need Sources/ctr/plugin.cpp '{0x00040000000B9100ull, DlpGameMode::Lobby, true}' "Mario Tennis Open, Taiwan is a Lobby game: the room carries its Download Play lobby"
-need Sources/ctr/plugin.cpp '{0x00040000001D1A00ull, DlpGameMode::RealDlp}' "Luigi's Mansion 2018 (Europe, seen: dlp:SRVR / dlp:FKCL InitializeWithName) is a RealDlp game (1.1.3: the real Download Play on the wire)"
-need Sources/ctr/plugin.cpp '{0x00040000001C2100ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale answers the wireless check only (the probe)"
-need Sources/ctr/plugin.cpp '{0x00040000001C2000ull, DlpGameMode::ProbeOnly}' "Kirby Battle Royale, the other region's id, answers the wireless check only"
-hit=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -i -E '0x000400000010C000|0x000400000010BF00|0x0004000000183600|0x00040000001C2100|0x00040000001C2000|0x000400000007C800|0x000400000007C700|0x0004000000064D00|0x00040000000B9100' | grep -v 'DlpGameMode::' | head -3)
-[ -z "$hit" ] || fail "a title id of Triple Deluxe, Planet Robobot, Mario Tennis Open or Battle Royale is in Sources/ctr/plugin.cpp outside the table of games (a mode must stay next to it): $hit"
-need Sources/ctr/plugin.cpp 'constexpr DlpGame kDlpGames[] = {' "the table of games of the Download Play wiring"
+# Mario Kart 7 (2026-11-11, seen on two consoles with 1.1.3: dlp:FKCL InitializeWithName -> 0xC940AC04 and nothing after it), in the five ids of its full editions (the two kiosk
+# demos and 8B500, an id of the catalogue's family that is not identified, are out), with the console's seed (what a real console gives; the capture of eight Azahar shows it is not
+# needed). A Lobby game until 2026-11-13, when a console and an Azahar did not see each other in it (the dialect against the real Download Play). Since then a RealDlp game, with
+# its own Azahar - Azahar capture as the contract (eight emulators, analysis/mk7-azahar-2026-11-13; Tests/dlp_real_mk7_golden.inc). Seen on a console with 1.1.4: its creator asks
+# dlp:SRVR for 7 clients: the five rows carry the ceiling of EIGHT players, the fourth value of the row; every other row closes after its mode or its seed flag and so has the
+# default of four (the pins above and below hold those rows with their closing brace: a ceiling written on one of them fails there).
+need Tests/plugin_dlp_test.cpp 'CHECK_EQ(seeded, 10u);' "the console's seed is on ten rows and no other: Mario Tennis Open (5, Korea's since 2026-11-14) and Mario Kart 7 (5)"
+need_after Tests/plugin_dlp_test.cpp '    static const u64 others[] = {0, ' '0x0004000000081500ull, 0x0004000000081600ull, 0x000400000008B500ull};' "the plugin test names, among the games that keep the real services, the ids of Mario Kart 7's family that stay out of the table: the two kiosk demos and the one that is not identified (8B500 was held out only by being one bit from Taiwan's)"
+hit=$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -n -i -E '0x000400000010C000|0x000400000010BF00|0x000400000010BE00|0x0004000000120F00|0x0004000000123200|0x0004000000183600|0x000400000017C600|0x00040000001C2100|0x00040000001C2000|0x00040000001A8B00|0x00040000001C2200|0x000400000007C800|0x000400000007C700|0x0004000000064D00|0x00040000000B9100|0x00040000000B8800|0x0004000000030700|0x0004000000030800|0x0004000000030600|0x0004000000030A00|0x000400000008B400|0x00040000001D1A00|0x00040000001D1900|0x00040000001D1800|0x00040000001D4F00|0x00040000000F8200|0x00040000000F8100|0x00040000000DD400|0x0004000000119300|0x0004000000119B00' | head -3)
+[ -z "$hit" ] || fail "a title id of a game of the Download Play column is in Sources/ctr/plugin.cpp (1.1.4, L4: the column of every game is its row of azl/title_rules.hpp, and the plugin names no game): $hit"
+need_line Includes/azl/title_rules.hpp '    Dlp dlp = kNoDlp;  ///< the Download Play column (kNoDlp: none)' "the table of the Download Play wiring is a column of the table of the titles (a row that does not say it: the real services)"
 need Sources/ctr/plugin.cpp 'return DlpModeOf(title_id) == DlpGameMode::ProbeOnly;' "the probe is for the ProbeOnly games and nobody else"
 need Sources/ctr/plugin.cpp 'if (DlpModeOf(game_id_) == DlpGameMode::Lobby && active_) {' "the hub exists only for a Lobby game, and only when the plugin is active"
 need Sources/ctr/plugin.cpp 'new (std::nothrow) DlpHub(engine, kernel, config, resolver)' "the hub is the one allocation of the lobby and a refusal leaves the real services"
-[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c -F 'hle_->SetDlpHub(dlp_hub_.get());')" = "2" ] || fail "Sources/ctr/plugin.cpp: the HLE is given the hub in both branches of EarlyInit, Lobby and RealDlp (the line twice)"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c -F 'hle_->SetDlpHub(dlp_hub_.get());')" = "3" ] || fail "Sources/ctr/plugin.cpp: the HLE is given the hub in the three branches of EarlyInit, Lobby, RealDlp and SystemClient (1.1.4, G1) (the line three times)"
 need_order Sources/ctr/plugin.cpp 'hle_->SetDlpHub(dlp_hub_.get());' 'hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' "the hub is set before the hooks are installed (a game's first call finds it)"
 need_after Sources/ctr/plugin.cpp 'engine_->Tick(now_ms);' 'dlp_hub_->Tick();' "the hub serves after the engine's own Tick, on the network thread"
 need_order Sources/ctr/plugin.cpp 'dlp_hub_->Stop();' 'room_->StopWithin(kNetStopTimeoutMs)' "the hub is stopped before the room: no request waits for a network thread that is going away"
 need Sources/ctr/plugin.cpp 'dlp_hub_->SetPlayerName(name);' "the console's profile name is the name the lobby shows (the games send Initialize with no name)"
 # Mario Tennis Open matches the players of the Download Play lobby with the nodes of its own network by the friend code seed (2026-11-01, found with the debugger on a stalled
-# game): the lobby announces the console's OWN seed (config block 0x00090000, 8 bytes: what the game gives nwm::UDS), for these four titles only.
+# game): the lobby announces the console's OWN seed (config block 0x00090000, 8 bytes: what the game gives nwm::UDS), for these four titles - and, since 2026-11-11,
+# for the five of Mario Kart 7, which does not match them (in the capture of eight Azahar the seeds of the two networks differ and they raced): it gets what a real console gives.
+# No other row has the flag.
 need Sources/ctr/plugin.cpp 'bool LobbySeedIsConsoles(u64 title_id) {' "the table says which games get the console's own friend code seed in the lobby"
-need Sources/ctr/plugin.cpp 'return game.console_seed;' "... and it is the table's flag"
+need_line Sources/ctr/plugin.cpp '    return title_rules::DlpOf(title_id).console_seed;' "... and it is the flag of the game's Download Play column"
 need Sources/ctr/plugin.cpp 'CFGU_GetConfigInfoBlk2(sizeof(console_seed), 0x00090000, &console_seed)' "the console's friend code seed is config block 0x00090000, 8 bytes (what the game reads itself)"
 need Sources/ctr/plugin.cpp 'dlp_hub_->SetFriendSeed(console_seed);' "the lobby announces that seed (not the hash of the MAC) for the games with the flag"
 need Includes/azl/dlp_lobby.hpp 'id_.seed = seed;' "the lobby's seed can be set (SetFriendSeed)"
@@ -2824,7 +3729,7 @@ need Sources/ctr/plugin.cpp 'if (address < kLow || address >= kHigh || size > kH
 need Sources/ctr/uds_hle.cpp '} else if ((dlp_hub_ != nullptr || dlp_probe_fake_) && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:FKCL", 8) == 0) {' "dlp:FKCL is intercepted only for a Lobby game (the hub) or when the title asked for the probe (otherwise the real service answers)"
 need Sources/ctr/uds_hle.cpp '} else if (dlp_hub_ != nullptr && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:SRVR", 8) == 0) {' "dlp:SRVR is intercepted only for a Lobby game (the probe leaves it to the real service, as Battle Royale always had)"
 # The front-end of the hub's services (DESIGN-FASE3 sez. 4.1).
-need Includes/ctr/uds_hle.hpp 'enum Kind : u8 { kKindUds = 1, kKindNdm = 2, kKindDlp = 3, kKindDlpSrvr = 4 };' "the session kinds: nwm::UDS, ndm:u, dlp:FKCL and dlp:SRVR"
+need Includes/ctr/uds_hle.hpp 'enum Kind : u8 { kKindUds = 1, kKindNdm = 2, kKindDlp = 3, kKindDlpSrvr = 4, kKindDlpClnt = 5 };' "the session kinds: nwm::UDS, ndm:u, dlp:FKCL, dlp:SRVR and (1.1.4, G1) dlp:CLNT, the last one at the end"
 need Sources/ctr/uds_hle.cpp 'constexpr u32 kDlpJoinCapMs = 8000;' "the join wait of StartFakeSession gives up after 8 s (the lobby's own timeout is 3 s: the network thread is gone if this one runs out)"
 need Sources/ctr/uds_hle.cpp 'constexpr s64 kDlpJoinSleepNs = 10 * 1000 * 1000;' "the join wait polls every 10 ms"
 need Sources/ctr/uds_hle.cpp 'while (!hub.PollPending(cmd)) {' "the join wait asks the hub, outside every lock"
@@ -2926,7 +3831,7 @@ need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::RequestInFlight" 24' "..
 need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::AlwaysSucceeds" 8' "the table of the commands that cannot fail"
 need Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::EndsRole" 8' "the table of the ones that end a role"
 need Tests/dlp_net_stack_check.sh 'FRAME_HUB=40 ' "no function of the hub has a frame over 40 bytes on ARM32 (the code a game thread runs to serve a dlp command)"
-need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpHub) <= 408,' "the hub is 408 bytes on ARM32: a growth is a decision"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpHub) <= 536,' "the hub is 536 bytes on ARM32 (the 408 of before and the 128 of the tables of eight players, 2026-11-13): a growth is a decision"
 # The debug trace of the hub's commands (Phase 4, DESIGN-FASE3 sez. 6): the log of the console test is the only record of what the game asked.
 need Sources/ctr/uds_hle.cpp 'constexpr u32 kDlpTraceWords = 6;' "the trace shows 6 words of a request and of a reply"
 need Sources/ctr/uds_hle.cpp 'constexpr u32 kDlpTraceEveryMs = 2000;' "a reply the command already gave is counted, not written again, for 2 s"
@@ -2936,44 +3841,145 @@ need Sources/ctr/uds_hle.cpp ' more like it since the last line' "the trace says
 need Sources/ctr/uds_hle.cpp 'DlpTraceRequest(srvr, cmd); // (debug only; before the reply replaces the request words)' "the request is taken before the reply replaces its words"
 need_after Sources/ctr/uds_hle.cpp 'DlpTraceReply(srvr, id, cmd); // (debug only)' 'NoteCommand(DlpServiceName(srvr), id, cmd[1]);' "the trace line comes before NoteCommand, which stays the LAST call of RunDlpHub (a tail call: RunDlp's frame is gone when its Log() runs)"
 need Sources/ctr/uds_hle.cpp 'if (g_debug_level <= 0 || id >= kDlpTraceIds) {' "the trace does nothing without the debug level (the test is inside the function: outside it the compiler kept g_debug_level in a register across RunDlp, 8 bytes more at every level)"
-need Sources/ctr/uds_hle.cpp '.Str(": the Download Play lobby is carried by the room (thread ").Dec(thread_id).Str(", priority 0x")' "the first command of each dlp service says which thread made it and its priority (the hub's threads wait for each other's locks; the network thread is at 0x2F)"
+need Sources/ctr/uds_hle.cpp '.Str(": Download Play is served by the plugin over the room (thread ").Dec(thread_id).Str(", priority 0x")' "the first command of each dlp service says which thread made it and its priority (the hub's threads wait for each other's locks; the network thread is at 0x2F)"
 need Tests/ipc_test/dlp_lobby_hle_test.cpp '    L15();' "the trace is tested in the 32-bit front-end test (L15, in fresh processes)"
 need Tests/ipc_test/dlp_lobby_hle_test.cpp 'std::strcmp(argv[1], "--l15") == 0' "... in its five-six parts"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '    for (const char* part : {"off", "td", "flood", "alt", "refused", "probe", "race"}) {' "L15 runs its part (race): two threads of a game on one service"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '        return L15Race();' "... the part is wired"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '        g.SvPass(nine);  // (its request is kept while the Finalize still waits; the Game'"'"'s journal is off: no vector is shared)' "L15 (race): the SendPassphrase of the second thread"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '    TCHECK_EQ(carried, 0u);' "L15 (race): no line carries a word of the passphrase"
 need Tests/chain_sim/chain_sim.py 'def scenario_hub_trace_dedupe(elf, level):' "the chain test runs the trace's window of replies on the compiled ARM code at both log levels"
 need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::UdsHle::RunDlp" 32' "RunDlp keeps its 32 bytes (the trace is called from RunDlpHub without growing its frame)"
 need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::{anonymous}::NoteDlpFirst" 48' "the first-command line has its frame (48)"
 need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::{anonymous}::DlpTraceRequest" 24' "the trace's request capture"
 need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::{anonymous}::DlpTraceReply" 72' "the trace's line"
+# 1.1.4 (TRACE): the trace's line of dlp:FKCL / dlp:SRVR writes zeros where a request or a reply carries a host's MAC, a passphrase or a node's
+# friend code seed (the layouts of azl/dlp_ipc.hpp; dlp:CLNT does the same in ClntTraceRequest / ClntTraceReply): the masks, the table line by line,
+# and the two loops of the line read through it. Only the line: the window's signature still hashes the real words and the games get the same replies
+# (dlp_cap_guard_test, the FKCL / SRVR tests). L15 of the 32-bit test holds every line of the Triple Deluxe sequence to the game's journal with these words zero.
+TRH=$(tr -d '\r' < Sources/ctr/uds_hle.cpp | sed -n '/^constexpr u32 DlpTraceHidden(bool srvr, u32 id) {$/,/^}$/p')
+[ "$(printf '%s\n' "$TRH" | wc -l)" = "19" ] || fail "Sources/ctr/uds_hle.cpp: DlpTraceHidden (the words the trace of dlp:FKCL / dlp:SRVR blanks) is not the 19 lines of its table"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 1 'constexpr u32 DlpTraceHidden(bool srvr, u32 id) {' "one function says which words of dlp:FKCL / dlp:SRVR the line blanks"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 2 '    if (srvr) {' "dlp:SRVR first"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 3 '        return id == DlpService::kSvSendPassphrase ? kTracePass123 : (id == DlpService::kSvGetClientInfo ? kTraceSeedReply : 0u);' "SRVR SendPassphrase: the nine bytes of its request; SRVR GetClientInfo: the seed of its reply"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 4 '    }' "... and nothing else of dlp:SRVR"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 5 '    switch (id) {' "dlp:FKCL by id"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 6 '    case DlpService::kFkStartScan:' "FKCL StartScan ..."
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 7 '        return kTraceMacFilter45;' "... its MAC filter, words 4-5"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 8 '    case DlpService::kFkGetServerInfo:' "FKCL GetServerInfo ..."
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 9 '    case DlpService::kFkGetTitleInfo:' "FKCL GetTitleInfo ..."
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 10 '    case DlpService::kFkDeleteScanInfo:' "FKCL DeleteScanInfo ..."
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 11 '    case DlpService::kFkStartFakeSession:' "FKCL StartFakeSession ..."
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 12 '        return kTraceMac12;' "... a host's MAC in words 1-2"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 13 '    case DlpService::kFkGetNodeInfo:' "FKCL GetNodeInfo ..."
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 14 '        return kTraceSeedReply;' "... the seed of its reply"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 15 '    case DlpService::kFkGetPassphrase:' "FKCL GetPassphrase ..."
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 16 '        return kTracePassReply;' "... the nine bytes of its reply"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 17 '    }' "the end of the ids"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 18 '    return 0u;' "every other id shows its words"
+need_nth "Sources/ctr/uds_hle.cpp, DlpTraceHidden" "$TRH" 19 '}' "and nothing after it"
+need_line Sources/ctr/uds_hle.cpp 'constexpr u32 kTraceMac12 = 0x03u;         // request [1][2]: a host'"'"'s MAC' "the mask of a MAC in words 1-2 of a request"
+need_line Sources/ctr/uds_hle.cpp 'constexpr u32 kTraceMacFilter45 = 0x18u;   // request [4][5]: StartScan'"'"'s MAC filter' "the mask of StartScan's MAC filter, words 4-5"
+need_line Sources/ctr/uds_hle.cpp 'constexpr u32 kTracePass123 = 0x07u;       // request [1..3]: SendPassphrase'"'"'s nine bytes' "the mask of the passphrase in words 1-3 of a request"
+need_line Sources/ctr/uds_hle.cpp 'constexpr u32 kTraceSeedReply = 0x0600u;   // reply [2][3]: +0 of a DLPNodeInfo, the node'"'"'s friend code seed' "the mask of a seed in words 2-3 of a reply (bit 8 + n for word n + 1)"
+need_line Sources/ctr/uds_hle.cpp 'constexpr u32 kTracePassReply = 0x0E00u;   // reply [2..4]: GetPassphrase'"'"'s nine bytes' "the mask of the passphrase in words 2-4 of a reply"
+need_line Sources/ctr/uds_hle.cpp '    const u32 hidden = DlpTraceHidden(srvr, id); // (the line only: never a MAC, a passphrase or a seed)' "the line of a command asks the table for its own service and id"
+need_line Sources/ctr/uds_hle.cpp '        line.Str(" ").Hex(((hidden >> i) & 1u) != 0 ? 0u : g_dlp_trace_req[s][1 + i], 8);' "the request's words are written through the mask (bit i: word i + 1)"
+need_line Sources/ctr/uds_hle.cpp '        line.Str(" ").Hex(((hidden >> (8 + i)) & 1u) != 0 ? 0u : cmd[1 + i], 8);' "the reply's words are written through the mask (bit 8 + i: word i + 1)"
+[ "$(tr -d '\r' < Sources/ctr/uds_hle.cpp | grep -c -F 'DlpTraceHidden(')" = "3" ] || fail "Sources/ctr/uds_hle.cpp: DlpTraceHidden is defined once and called twice (the request kept by DlpTraceRequest, the line of DlpTraceReply)"
+# (the final review of 1.1.4: the slot is the service's and the line of a reply prints what it holds then - another thread's request of the same
+# service among them - so the request is blanked as it is kept, by its own id; L15 (race) of the 32-bit test holds a SendPassphrase of a second thread
+# out of the line of a Finalize that waited)
+need_line Sources/ctr/uds_hle.cpp '    const u32 hidden = DlpTraceHidden(srvr, cmd[0] >> 16);' "the request is blanked as it is kept, by the request's own id"
+need_line Sources/ctr/uds_hle.cpp '        g_dlp_trace_req[s][1 + i] = i < words && ((hidden >> i) & 1u) == 0 ? cmd[1 + i] : 0;' "the slot keeps the request's words blanked where the table hides them (a MAC, the passphrase never in the trace's memory)"
+need_order Sources/ctr/uds_hle.cpp '    const u32 hidden = DlpTraceHidden(srvr, cmd[0] >> 16);' '    const u32 hidden = DlpTraceHidden(srvr, id); // (the line only' "... in DlpTraceRequest, before the line"
+[ "$(tr -d '\r' < Sources/ctr/uds_hle.cpp | grep -c -F 'g_dlp_trace_req[s][1 + i]')" = "2" ] || fail "Sources/ctr/uds_hle.cpp: the request words of the trace are stored once (DlpTraceRequest) and written once, through the mask (DlpTraceReply)"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '        return id == 0x08 && i <= 2;' "L15: SRVR SendPassphrase hides words 1-3 of its request (written out in the test, not read from the code)"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '    if (id == 0x07 || id == 0x08 || id == 0x0A || id == 0x0B) {' "L15: FKCL GetServerInfo, GetTitleInfo, DeleteScanInfo and StartFakeSession hide ..."
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '    return id == 0x05 && (i == 3 || i == 4);' "L15: FKCL StartScan hides its MAC filter"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '        return id == 0x0C && k <= 1;' "L15: SRVR GetClientInfo hides the seed of its reply"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '    return (id == 0x0E && k <= 1) || (id == 0x0F && k <= 2);' "L15: FKCL GetNodeInfo hides the seed, GetPassphrase the nine bytes of its reply"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '                TCHECK_EQ(L.req[i], hide ? 0u : c.req[i]);' "L15: every request word of every line is the game's, or zero where it is hidden"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '                TCHECK_EQ(L.rep[i], hide ? 0u : c.rep[i]);' "L15: every reply word of every line is the game's, or zero where it is hidden"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '    TCHECK(g_trace_hidden_nonzero >= 8);  // (the books of CheckTraceAgainstJournal above: MAC 2 x 2, the passphrase sent and got, seeds - hidden, not zero)' "L15 (td): words that were not zero were hidden"
+need_line Tests/ipc_test/dlp_lobby_hle_test.cpp '        TCHECK(seed_seen);  // (a seed there to hide: the books of CheckTraceAgainstJournal compared every line with it)' "L15 (td): GetNodeInfo and GetClientInfo had a seed to hide"
+# 1.1.4 (TRACE: what G1 left): the four ANSWERS of the system's Download Play application (A2 the AuthAck, A4 to StartDistribution without content, A6
+# to the Finish, A9 to the notice), as two Azahar emulators exchanged them on 2026-11-13, held against what dlp:CLNT served by the plugin sends to a model of
+# Azahar's host that sends the same capture's packets (RC8 of Tests/dlp_real_client_test.cpp, 1-G1.md 4.4). The golden data are cut out of the recording by
+# Tests/make_dlp_real_clnt_goldens.py: generated, never edited; no passphrase (the script replaces it and refuses four bytes of it left), no name and no
+# address of a node. And the rows of dlp:CLNT in the table of Tests/dlp_chain_report.py (1-G1.md 4.6), held to CLNT_CEILING at both levels.
+CG=Tests/dlp_real_clnt_golden.inc
+CS=Tests/make_dlp_real_clnt_goldens.py
+CT=Tests/dlp_real_client_test.cpp
+[ -f $CS ] || fail "$CS is gone (the script that cuts the answers of the Download Play application out of the recording of two Azahar)"
+head -1 $CG | grep -q "^// Generated by Tests/make_dlp_real_clnt_goldens.py from the recording of 2026-11-13" || fail "$CG is not marked as generated by $CS"
+[ "$(tr -d '\r' < $CG | md5sum | cut -d' ' -f1)" = "d7dd15dd38b6ff815a1e745a9637083c" ] || fail "$CG is not the file $CS wrote from the recording of two Azahar: the golden data are not edited by hand"
+need_line $CG 'static const std::uint8_t kDlpRealClntSeed[4] = {0xb8, 0xf4, 0x6b, 0xff};' "the seed of the capture's checksums"
+need_line $CG 'static const unsigned kDlpRealClntPassReplaced = 0;  // the passphrase of the session found in these packets and replaced by the stand-in' "none of the four answers carries the passphrase"
+need_line $CG 'static const DlpRealGolden kDlpRealClntAnswers[4] = {' "the four answers"
+need_line $CG 'static const std::uint8_t kDlpRealClntAsked[4][3] = {{0x00, 0x00, 0x00}, {0x00, 0x19, 0x79}, {0x01, 0x19, 0x79}, {0x02, 0x19, 0x79}};' "what the capture's host put in the packets they answer, as numbers"
+need_line $CS 'STAND_IN = b'"'"'1234567v'"'"'           # what replaces the passphrase wherever a written packet would carry it' "the script has a stand-in for the passphrase"
+need_line $CS '            g = sealed(seed, g[:k] + STAND_IN + g[k + len(STAND_IN):])' "... puts it in the place of the passphrase, with the checksum made again"
+need_line $CS '    refuse(any(w in p[3] for w in windows(passphrase) for p in packets), '"'"'four bytes of the passphrase of the recording in a packet'"'"')' "... and refuses four bytes of the passphrase left in a packet"
+need_line $CS '    refuse(any(mac in p[3] or mac[::-1] in p[3] for mac in macs for p in packets), '"'"'an address of a node of the recording in a packet'"'"')' "the script refuses an address of a node in a packet"
+need_line $CS '    refuse(any(n.encode(enc) in p[3] for n in nicks for enc in ('"'"'utf-8'"'"', '"'"'utf-16-be'"'"', '"'"'utf-16-le'"'"') for p in packets), '"'"'a name of a node of the recording in a packet'"'"')' "... and a name of a node"
+need_line $CS '    bad = [w.decode('"'"'latin-1'"'"').lower() for w in windows(passphrase)] + [w.hex() for w in windows(passphrase)]' "... and in the text the passphrase, as characters or as hex"
+need_line $CS '    refuse(any(x in low for x in bad), '"'"'the passphrase, an address or a name of a node of the recording in the text'"'"')' "... and refuses a text that has any of them"
+need_line $CS '    refuse(not all(nicks) or any(len(mac) != 6 for mac in macs) or macs[0] == macs[1], '"'"'the two nodes of the recording are not read'"'"')' "... and stops when it did not read the two nodes"
+need_line $CT '#include "dlp_real_clnt_golden.inc"    // (1.1.4, RC8: the four answers of the capture'"'"'s Download Play application, Tests/make_dlp_real_clnt_goldens.py)' "the client test includes the answers of the capture"
+need_line $CT '    RC8_AnswersAsCaptured();' "the client test runs RC8"
+need_line $CT '    AzaharDlpHost h(room, 1, "Gionko", kIslandChild, 3, 31, kAzaharDlpIslandWire);' "RC8: the model of Azahar's host sends the packets of the same capture"
+need_line $CT '        CHECK(g.size == t.size && std::memcmp(g.bytes, t.bytes, g.size) == 0);' "RC8: the two scripts cut the same bytes out of the one capture"
+need_line $CT '        CHECK(zero == o.p);  // ours is sealed with the seed 00 00 00 00' "RC8: ours is sealed with the seed 0"
+need_line $CT '            CHECK(p[0x0E] == my_id[0] && p[0x0F] == my_id[1]);  // ours echoes the id of the host'"'"'s packet: the model'"'"'s is ours' "RC8: what ours puts where the host's values go is the host's"
+need_line $CT '            std::memcpy(p.data() + 0x0D, g.bytes + 0x0D, 3);  // the capture'"'"'s host: kDlpRealClntAsked' "RC8: only the host's sequence and id are taken from the capture"
+need_line $CT '            CHECK(p[0x16] == 0 && p[0x17] == 0 && p[0x18] == 0 && p[0x19] == 0);  // (ours: zero where Azahar'"'"'s client leaves its stack)' "RC8: ... and the four bytes Azahar's client never sets, zero in ours"
+need_line $CT '        CHECK(same);' "RC8: every answer of ours is the capture's, byte for byte"
+need_line $CT '        CHECK(seen[k] >= 1);' "RC8: each of the four was sent"
+need_line $CT '    CHECK_EQ(my_id[0], 0x01u);  // the id the capture'"'"'s application gives too' "RC8: the id the application gives itself is the capture's"
+need_after $CT '            std::printf("   a packet of ours that the capture'"'"'s application does not send: %s\n", HexOf(o.p.data(), o.p.size()).c_str());' '            CHECK(false);' "RC8: a packet of ours the capture does not have is a failure"
+need_line Tests/dlp_chain_report.py 'CLNT_CEILING = 520                # ... dlp:CLNT at both levels (1-G1.md 4.6: the Download Play application'"'"'s threads, not a game'"'"'s)' "the chain report knows the ceiling of dlp:CLNT (read from chain_sim with --repo)"
+need_line Tests/dlp_chain_report.py '        self.build_clnt_rows()' "the chain report has the rows of dlp:CLNT"
+need_line Tests/dlp_chain_report.py '            cut = self.any_of(to_clnt, to_serve, clnt_only, self.to('"'"'post'"'"'), no_poll, *others)' "... an inline row cuts only what the kind Clnt does not run"
+need_line Tests/dlp_chain_report.py '            R.append(Row(case_label(gr), '"'"'dlp'"'"', '"'"'rundlp'"'"', cut, '"'"'clnt'"'"', True, cond, '"'"'inline'"'"'))' "... one inline row per case of the switch of dlp:CLNT, gated"
+need_line Tests/dlp_chain_report.py '        R.append(Row('"'"'CLNT StartSession: the wait for the join (WaitForClntJoin > PollPending)'"'"', '"'"'dlp'"'"', '"'"'rundlp'"'"',' "... the join of StartSession"
+need_line Tests/dlp_chain_report.py '    if not m or '"'"'return !In(id, kPosted);'"'"' not in text or '"'"'return clnt::IsInline(id);'"'"' not in hub:' "... split by kPosted only while the hub asks clnt::IsInline"
+need_line Tests/dlp_chain_report.py '        m = re.search(r'"'"'^CLNT_CEILING = (\d+)'"'"', text, re.M)' "... with the ceiling of Tests/chain_sim/chain_sim.py"
+[ "$(tr -d '\r' < Tests/dlp_chain_report.py | grep -c -F ''"'"'clnt'"'"', True,')" = "5" ] || fail "Tests/dlp_chain_report.py: every row of dlp:CLNT (inline, posted, the two of the join, the lines) is gated against the ceiling of dlp:CLNT"
 need Includes/azl/dlp_fkcl_hle.hpp 'static constexpr u32 kResInvalidState = 0xE0A0AC01;' "a command beyond the wireless check gets the service's own 'invalid state'"
 need Tests/dlp_fkcl_test.cpp 'TestOffByDefault();' "the test that dlp:FKCL is the real service by default runs"
 
 # ---- the fake Download Play lobby, Phase 1 (Includes/azl/dlp_types.hpp, dlp_lobby.hpp, dlp_ipc.hpp; analysis/dlp-lobby-fake-2026-10-28/DESIGN-FASE1.md) ----
 # Three pure headers, tested on the PC only: nothing in the plugin includes them yet (Phase 3 does, and lifts that pin). What must not change by accident: the ceiling of
-# the user (THERE IS NEVER A FIFTH PLAYER, and every table is sized on the constants), the memory (no heap, objects of a fixed size, a few hundred bytes), the stack (the
+# the user (2026-10-28: there is never a fifth player; 2026-11-13: a game that plays in eight is played in eight - the TABLES hold eight and are sized on the constants, every
+# title has a ceiling of its own, four unless its row says more: the block "eight players" at the end of this file), the memory (no heap, objects of a fixed size, a few hundred bytes), the stack (the
 # code runs on the game thread that made the IPC call, some of which have 464 bytes below it), the numbers the games read (the results of the module, the channel mask, the
 # records, the times), the wire format between two plugins, and the answer of the probe mode that Battle Royale is served by (DlpFkclHle, which stays as it is).
-# - the ceiling of the user (2026-10-28): THERE IS NEVER A FIFTH PLAYER, a host and 3 clients and no more
-need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxPlayers = 4;' "the fake lobby holds a host and 3 clients and never a fifth player"
-need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxClients = 3;' "a host has 3 clients at most"
-need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxGroups = 4;' "a searcher keeps 4 lobbies at most: a room of 4 players holds no more hosts"
-need Includes/azl/dlp_types.hpp 'static_assert(kMaxPlayers == 4,' "the ceiling is an assertion too: raising it takes two edits, and the second says why not"
+# - the capacity of the tables (2026-11-13: a host and 7 clients; it was "never a fifth player", a host and 3 clients, from 2026-10-28 to 1.1.4)
+need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxPlayers = 8;' "the tables of the fake lobby hold a host and 7 clients (the ceiling of a title is its own: four unless its row says more)"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxClients = 7;' "a host has 7 clients at most"
+need Includes/azl/dlp_types.hpp 'constexpr u32 kMaxGroups = 4;' "a searcher keeps 4 lobbies at most: as many as the engine remembers"
+need Includes/azl/dlp_types.hpp 'static_assert(kMaxPlayers == 8,' "the capacity is an assertion too: raising it takes two edits, and the second says what was measured for eight"
 need Includes/azl/dlp_types.hpp 'static_assert(kMaxClients + 1 == kMaxPlayers,' "host + clients = players"
 need Includes/azl/dlp_types.hpp 'static_assert(kMaxGroups <= kMaxPlayers,' "no more lobbies than players"
-# - every table of the modules is sized on those constants and says so in an assertion (a table of 8 places is the first step to a fifth player)
+# - every table of the modules is sized on those constants and says so in an assertion (a table written with a number of its own is the first step to a ninth player)
 need Includes/azl/dlp_lobby.hpp 'Group g[kMaxGroups];' "the scan table holds kMaxGroups lobbies"
 need Includes/azl/dlp_lobby.hpp 'NodeEntry roster[kMaxPlayers];' "the roster of a session holds kMaxPlayers players"
 need Includes/azl/dlp_lobby.hpp 'Track t[kMaxClients];' "the creator tracks kMaxClients clients"
 need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(ScanTable::g) / sizeof(Group) == kMaxGroups,' "the scan table is checked against kMaxGroups"
 need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(SessionTable::roster) / sizeof(NodeEntry) == kMaxPlayers,' "the roster is checked against kMaxPlayers"
 need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(HostTable::t) / sizeof(Track) == kMaxClients,' "the creator table is checked against kMaxClients"
-need Includes/azl/dlp_ipc.hpp 'u16 ids[kMaxPlayers];' "GetConnectingNodes writes 4 node ids at most, whatever the game asks"
+need Includes/azl/dlp_ipc.hpp 'u8 ids[kMaxPlayers];' "GetConnectingNodes writes kMaxPlayers node ids at most, whatever the game asks, and keeps them as BYTES in its frame (as u16 the frame is 56 bytes, over the 48 of a game thread: measured 2026-11-13)"
 need Includes/azl/dlp_ipc.hpp 'static_assert(sizeof(ids) / sizeof(ids[0]) == kMaxPlayers,' "the ids of GetConnectingNodes are checked against kMaxPlayers"
-need Includes/azl/dlp_ipc.hpp 'u16 ids[kMaxClients];' "GetConnectingClients writes 3 client ids at most, whatever the game asks"
+need Includes/azl/dlp_ipc.hpp 'u8 ids[kMaxClients];' "GetConnectingClients writes kMaxClients client ids at most, whatever the game asks, and keeps them as bytes in its frame"
+! grep -q 'u16 ids\[' Includes/azl/dlp_ipc.hpp || fail "Includes/azl/dlp_ipc.hpp keeps the ids of a handler as u16 again: with eight players that frame is 56 bytes, over the 48 a game thread may pay (Tests/dlp_stack_check.sh)"
+need Includes/azl/dlp_lobby.hpp 'u32 ClientConnectingNodes(u8* ids, u32 capacity, u32* total) const {' "the lobby gives the node ids as bytes (the caller's frame holds eight of them in 8 bytes)"
+need Includes/azl/dlp_lobby.hpp 'u32 ServerConnectingClients(u8* ids, u32 capacity, u32* total) const {' "the lobby gives the client ids as bytes"
 need Includes/azl/dlp_ipc.hpp 'static_assert(sizeof(ids) / sizeof(ids[0]) == kMaxClients,' "the ids of GetConnectingClients are checked against kMaxClients"
 need Includes/azl/dlp_types.hpp 'static_assert(sizeof(HeardGroup) <= 40,' "a lobby heard is a local of a game thread: 36 bytes, and not more than 40"
-# - the memory: a few hundred bytes next to a game that needs all of its own (272 measured), and no record of the game (5032 and 664 bytes) kept
-need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(DlpLobby) <= 320,' "the whole lobby is at most 320 bytes: no heap, and one table of ONE of three shapes"
-need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(Tables) <= 168,' "the tables are one union whose biggest shape is 168 bytes"
+# - the memory: a few hundred bytes next to a game that needs all of its own (400 measured with the tables of eight players, 272 with those of four), and no record of the game (5032 and 664 bytes) kept
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(DlpLobby) <= 400,' "the whole lobby is at most 400 bytes: no heap, and one table of ONE of three shapes"
+need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(Tables) <= 296,' "the tables are one union whose biggest shape is 296 bytes (the session: the host's entry and eight players)"
 need Includes/azl/dlp_lobby.hpp 'static_assert(sizeof(Group) == 40,' "a lobby heard is 40 bytes with no u64: the same on ARM32 and on the PC"
 need Includes/azl/dlp_ipc.hpp 'static_assert(sizeof(DlpService) <= 64,' "the IPC front-end is a handful of words: no buffer, no record of the game"
 # - the results of the module that the games read (module 43, Download Play); success is 0 and there is no placeholder -1
@@ -3044,8 +4050,9 @@ DLPFKCL_SHA=3f5019d169ad65249ab61d922f6991cbc393bba2b81feaffd1a614b07281b784
 SUM=$(tr -d '\r' < Includes/azl/dlp_fkcl_hle.hpp | sha256sum | cut -d' ' -f1)
 [ "$SUM" = "$DLPFKCL_SHA" ] || fail "Includes/azl/dlp_fkcl_hle.hpp is not the file of Phase 1 (sha256 $SUM): it is the answer of Battle Royale's probe and the oracle that DlpService in ProbeOnly mode is tested against; it stays as it is"
 # - the plugin and the app include none of the three headers (Phase 1 is PC only; Phase 3 changes the plugin and lifts this pin)
-hit=$(grep -r -n -E 'dlp_(types|lobby|ipc)\.hpp' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v '^Includes/azl/dlp_' | head -3)
-[ -z "$hit" ] || fail "the plugin or the app includes a header of the fake Download Play lobby other than the hub's (Phase 3: the plugin reaches the lobby only through azl/dlp_hub.hpp): $hit"
+#   (1.1.4, route B: the app's Download Play page, ConfigApp/source/dlp_join*.hpp/.cpp, runs the lobby of any game itself - spec 8 D-B1.3; no other file of the app)
+hit=$(grep -r -n -E 'dlp_(types|lobby|ipc)\.hpp' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v '^Includes/azl/dlp_' | grep -v -E '^ConfigApp/source/dlp_join(_logic)?\.(hpp|cpp):' | head -3)
+[ -z "$hit" ] || fail "the plugin or the app includes a header of the fake Download Play lobby other than the hub's (Phase 3: the plugin reaches the lobby only through azl/dlp_hub.hpp; route B: the app's dlp_join only): $hit"
 # - Phase 3: the plugin reaches the lobby through the hub alone. Only Includes/ctr/plugin.hpp (the member) and Sources/ctr/uds_hle.cpp (the HLE) include azl/dlp_hub.hpp, nothing includes the
 #   adapter's header (the hub owns the adapter), and the app (ConfigApp) knows nothing of it.
 hit=$(grep -r -n -E 'azl/dlp_hub\.hpp"' Sources Includes ConfigApp/source --include=*.cpp --include=*.c --include=*.hpp --include=*.h | grep -v '^Sources/azl/dlp_hub.cpp' | grep -v '^Includes/ctr/plugin.hpp' | grep -v '^Sources/ctr/uds_hle.cpp' | head -3)
@@ -3081,7 +4088,7 @@ need Tests/dlp_stack_check.sh 'read -r _text data bss _rest < <("$ARM_SIZE" "$W/
 need_after Tests/dlp_stack_check.sh '"$W/probe_$pass.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the fake lobby keeps no static storage: data and bss of the probe are 0 (a static buffer would hide from sizeof and from the frames)"
 need_after Tests/dlp_stack_check.sh '"$W/probe_H.o" | awk' 'if [ "$data" != 0 ] || [ "$bss" != 0 ]; then' "the hub's header keeps no static storage: data and bss of the probe with the hub are 0"
 # A test of the lobby that hangs (a loop that waits for something a regression no longer does) must fail the suite after 20 minutes, not stop it for good.
-for t in dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_real_engine_test dlp_real_hub_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test; do
+for t in dlp_lobby_test dlp_ipc_test dlp_lobby_sim_test dlp_adv_lobby_test dlp_adv_ipc_test dlp_net_test dlp_net_adv_test dlp_net_churn_test dlp_net_extra_test dlp_real_engine_test dlp_real_hub_test dlp_cap_guard_test dlp_eight_test dlp_eight_hub_test dlp_real_mk7_test dlp_hub_test dlp_hub_test_tsan plugin_dlp_test; do
   need_line Tests/run.sh "  timeout 1200 \"\$OUT/$t\"" "the suite runs $t under a timeout: a hang is a failure, not a stop"
 done
 ARM_ARCH=$(tr -d '\r' < Makefile | sed -n 's/^ARCH[[:space:]]*:=[[:space:]]*//p')
@@ -3092,9 +4099,9 @@ need Makefile '-fno-rtti -fno-exceptions -std=gnu++17' "the plugin is built with
 # - the probe: the sizes on ARM32 as assertions, and a wrapper for every public function of the two classes
 need_line Tests/dlp_stack_probe.cpp '#if !defined(__arm__)' "the probe measures the plugin's target and refuses another compiler"
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(void*) == 4,' "the probe knows it is ARM32"
-need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpLobby) <= 272,' "the whole lobby is 272 bytes on ARM32: a growth is a decision"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpLobby) <= 400,' "the whole lobby is 400 bytes on ARM32 (272 with the tables of four players): a growth is a decision"
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpService) <= 40,' "the IPC front-end is 40 bytes on ARM32: a growth is a decision"
-need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpLobby::Tables) == 168,' "the tables are one union of 168 bytes on ARM32"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpLobby::Tables) == 296,' "the tables are one union of 296 bytes on ARM32"
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(Group) == 40,' "a lobby heard is 40 bytes on ARM32"
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(NodeEntry) == 32,' "a player as the network reports it is 32 bytes on ARM32"
 need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(HeardGroup) <= 40,' "a lobby heard on the stack of a game thread is at most 40 bytes on ARM32"
@@ -3118,7 +4125,7 @@ dlp_wrappers Includes/azl/dlp_ipc.hpp DlpService
 need Includes/azl/dlp_lobby.hpp 'DLP_NOINLINE bool Announce(u8 accepting, u32 channel) {' "the announcement is built in a frame of its own: the creator's commands stay small"
 need Includes/azl/dlp_lobby.hpp 'DLP_NOINLINE void PollScan() {' "the lobby heard (36 bytes) lives in a frame of its own: the only one over 48"
 [ "$(grep -c '^    DLP_NOINLINE ' Includes/azl/dlp_lobby.hpp)" = "13" ] || fail "Includes/azl/dlp_lobby.hpp has not 13 functions marked DLP_NOINLINE (each keeps a frame out of its callers; a change is a decision: tell Tests/dlp_stack_check.sh and this line)"
-[ "$(grep -c '^    DLPIPC_NOINLINE ' Includes/azl/dlp_ipc.hpp)" = "28" ] || fail "Includes/azl/dlp_ipc.hpp has not 28 functions marked DLPIPC_NOINLINE (each handler keeps its frame out of Dispatch; a change is a decision: tell Tests/dlp_stack_check.sh and this line)"
+[ "$(grep -c '^    DLPIPC_NOINLINE ' Includes/azl/dlp_ipc.hpp)" = "44" ] || fail "Includes/azl/dlp_ipc.hpp has not 44 functions marked DLPIPC_NOINLINE (each handler keeps its frame out of Dispatch - 28 of dlp:FKCL / dlp:SRVR, 16 of dlp:CLNT since 1.1.4 G1; a change is a decision: tell Tests/dlp_stack_check.sh and this line)"
 # - no array over 64 bytes with a number in its size in the code of the three headers (the stack check sees every size, the scan sees a number as it is written): char[N] is
 #   already refused above; here also u8, u16, u32, u64, Mac and the records of the lobby. A table sized by a constant (Group g[kMaxGroups]) is a member and is held by its assertion.
 dlp_big_arrays() { # $1 = a header of the lobby
@@ -3158,11 +4165,16 @@ need Includes/azl/uds_engine.hpp 'static constexpr u8 kLobbyId8 = 0x55;' "...and
 need Sources/azl/dlp_lobby_net.cpp 'engine_->BeginHostingLobby(UdsEngine::kLobbyWlanCommId, UdsEngine::kLobbyId8, channel,' "the creator hosts the lobby under the Download Play's ids"
 need Sources/azl/uds_engine.cpp 'LoadBE32(tags.network + 4) != kLobbyWlanCommId || tags.network[8] != kLobbyId8) {' "the engine files only the beacons of the Download Play's ids as lobbies"
 need Sources/azl/uds_engine.cpp 'if (!GetBeaconApplicationData(tags, &data, &size) || size == 0 || tags.network_size <= kMaxAt ||' "a beacon with no application data, or a tag too short for the node counts, is no lobby"
-# - the sizes the engine keeps for it: 8 messages of 16 bytes, 4 lobbies of 32 bytes of announcement (a room of 4 players holds 4 hosts at most)
+# - the sizes the engine keeps for it: 8 messages of 16 bytes, 4 lobbies of 32 bytes of announcement. Neither grew with the tables of eight players (2026-11-13): the ring was
+#   measured frame by frame with seven clients (Tests/dlp_eight_test.cpp: 7 messages wait at most, nothing is pushed out, also with the creator stalled; with the seven clients stalled
+#   what is pushed out is asked again 200 ms later and nobody is thrown out), and the lobbies heard are hosts, not players
 need Includes/azl/uds_engine.hpp 'static constexpr u8 kLobbyChannel = 0xD1;' "the lobby's messages travel on a data channel of their own"
 need Includes/azl/uds_engine.hpp 'static constexpr u32 kLobbyMessageMax = 16;' "a lobby message is 16 bytes at most (the largest, GO, is 11)"
-need Includes/azl/uds_engine.hpp 'static constexpr u32 kLobbyInbox = 8;' "the ring of the lobby's messages holds 8: 144 bytes"
-need Includes/azl/uds_engine.hpp 'static constexpr u32 kHeardLobbies = 4;' "the engine remembers 4 lobbies: a room of 4 players holds at most 4 hosts"
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kLobbyInbox = 16;' "the ring of the lobby's messages holds 16: 288 bytes (8 until 2026-11-15, D5: with seven clients a stalled host lost START's acks)"
+# (2026-11-15, D5) the creator judges the grace of START only in a poll that did not come after a stall: the acks that waited are read first
+need_line Includes/azl/dlp_lobby.hpp "            if (Elapsed(now, t0_) >= kStartGraceMs && (flags2_ & kF2Stalled) == 0) {" "the grace of START is not judged in the poll right after a stall"
+need_line Includes/azl/dlp_lobby.hpp "            stalled = d >= 0 && static_cast<u32>(d) >= kResendMs;" "a stall is a poll kResendMs or more after the previous one"
+need Includes/azl/uds_engine.hpp 'static constexpr u32 kHeardLobbies = 4;' "the engine remembers 4 lobbies (hosts, not players: as many as a searcher lists)"
 need Includes/azl/uds_engine.hpp 'static constexpr u32 kHeardDataMax = 32;' "an announcement is 29 bytes: the engine copies 32 of a beacon's application data"
 need Includes/azl/dlp_lobby_net.hpp 'static_assert(kMaxGroups <= UdsEngine::kHeardLobbies,' "the engine remembers as many lobbies as the searcher keeps"
 need Includes/azl/dlp_lobby_net.hpp 'static_assert(kAnnounceSize <= UdsEngine::kHeardDataMax,' "an announcement fits in what the engine copies out of a beacon"
@@ -3190,8 +4202,8 @@ need Sources/azl/dlp_lobby_net.cpp 'if (engine_->InitializeForLobby(me.seed, me.
 need Sources/azl/dlp_lobby_net.cpp 'return !engine_->initialized() && engine_->PrepareLobby();' "a scan is possible unless a game has the service, and it asks the engine to keep the lobbies it hears"
 need Sources/azl/dlp_lobby_net.cpp '    engine_->Shutdown();' "the lobby gives the service back whole (a game's Initialize after ours must not inherit our node, name or seed)"
 need Sources/azl/dlp_lobby_net.cpp 'engine_->UpdateNetworkAttribute(kBlockClients, a.accepting != 0 ? 0 : 1);' "a creator that stops accepting closes the admission in the engine, not only in its announcement"
-need Sources/azl/dlp_lobby_net.cpp 'if (to_node < 1 || to_node > kMaxPlayers || size == 0 || size > kMaxMessage) {' "a message goes to one node of 1..4, 1..16 bytes"
-need Sources/azl/dlp_lobby_net.cpp 'for (u32 id = 1; id <= 16 && count < kMaxPlayers; ++id) {' "the lobby is told about 4 nodes at most, whatever the engine says"
+need Sources/azl/dlp_lobby_net.cpp 'if (to_node < 1 || to_node > kMaxPlayers || size == 0 || size > kMaxMessage) {' "a message goes to one node of 1..kMaxPlayers (the tables' eight), 1..16 bytes"
+need Sources/azl/dlp_lobby_net.cpp 'for (u32 id = 1; id <= 16 && count < kMaxPlayers; ++id) {' "the lobby is told about kMaxPlayers nodes at most, whatever the engine says (and reads the first of its title's ceiling)"
 need Sources/azl/dlp_lobby_net.cpp 'out->signal = 3;' "a lobby is always heard at full strength (as Azahar says)"
 [ "$(grep -c 'SetLobbyInbox' Sources/azl/dlp_lobby_net.cpp)" = "0" ] || fail "Sources/azl/dlp_lobby_net.cpp switches the inbox itself: the engine does it with the network (BeginHostingLobby, ConnectBeginLobby, Shutdown), in the same breath, so that no frame of the handshake meets it off"
 [ "$(grep -c 'lobby_inbox_ = true;' Sources/azl/uds_engine.cpp)" = "2" ] || fail "Sources/azl/uds_engine.cpp: the lobby's inbox is switched on in two places by the network that begins (the creator's BeginHostingLobby, the searcher's ConnectBeginLobby)"
@@ -3205,10 +4217,10 @@ need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_net_test.cpp Sources/azl/dlp_lobby_ne
 need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_room_probe"' "the probe of the lobby over a real room is built (with the monotonic clock of the other room tests)"
 need Tests/integration.sh '/tmp/azl_tests/dlp_room_probe $R1 24872' "the integration run plays the lobby over the real room server"
 # 1.1.3, design 7.5: the real Download Play over the real room (I1-I3), built by the suite and played by the integration run
-need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_real_room_probe"' "the probe of the real Download Play over a real room is built (with the monotonic clock of the other room tests)"
+need Tests/run.sh 'g++ $CXXFLAGS -I"$OUT" -ITests/settings_test/shim -IConfigApp/source Tests/dlp_real_room_probe.cpp Tests/mono_clock.cpp ConfigApp/source/dlp_join.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" "$OUT"/ts_sha256.o $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_real_room_probe"' "the probe of the real Download Play over a real room is built (with the monotonic clock of the other room tests; since route B with the app's Core and the plugin's slice)"
 need Tests/integration.sh '/tmp/azl_tests/dlp_real_room_probe $R1 24872' "the integration run plays the real Download Play over the real room server (I1-I3)"
 need Tests/dlp_real_room_probe.cpp 'return "halt_on_error=1:print_stacktrace=1";' "the probe of the real Download Play stops at the first undefined behaviour"
-for s in TestI1 TestI2 TestI3; do
+for s in TestI1 TestI2 TestI3 TestI4 TestI5; do
   need_line Tests/dlp_real_room_probe.cpp "    $s(host, port);" "the scenario $s of the real Download Play over the real room runs in main()"
 done
 [ "$(grep -c 'CHECK(false);' Tests/dlp_real_room_probe.cpp)" = "2" ] || fail "Tests/dlp_real_room_probe.cpp: a room that cannot be joined is a failure (TwoIn for I1 and I3, and I2's own; a probe that returns green without checking anything proves nothing)"
@@ -3218,14 +4230,30 @@ need_line Tests/dlp_real_room_probe.cpp '    CHECK(mem_most <= mem_after2 + 64 *
 need_line Tests/dlp_net_stack_check.sh 'ARM_FLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Os -mword-relocations -fomit-frame-pointer -ffunction-sections -fno-strict-aliasing -Wall -Wno-psabi -fno-rtti -fno-exceptions -std=gnu++17 -D__3DS__ -DAZL_USE_CTRPF"' "the adapter and the engine are compiled with the flags of the Makefile and the plugin's 3DS defines"
 # - what the review of 2026-10-29 asked for: a client of a lobby drops the frames of another lobby, its roster follows the departures, the engine keeps lobby state only when a lobby is used
 need Sources/azl/uds_engine.cpp 'PurgeLobbyMessagesLocked(node.node_id);' "a node that leaves takes its unread lobby messages with it"
-[ "$(grep -c 'RefreshClientsLocked();' Sources/azl/uds_engine.cpp)" = "1" ] || fail "Sources/azl/uds_engine.cpp: a departure is told to the clients that remain in one place (RemoveNodeLocked, while a lobby is up)"
+# (2026-11-13, design D17: also in the network of the real Download Play, for the departure of a CLIENT - Mario Kart 7 has up to seven; a spectator comes and goes at every probe.
+#  With one client, Luigi's Mansion, nobody remains to tell: Tests/dlp_real_mk7_test.cpp holds that not one frame leaves there.)
+# (2026-11-15, GB-01, the user's decision D5) ... and in the game's own network, after every departure of a client (not in the real Download Play's network: D17)
+[ "$(grep -c 'RefreshClientsLocked();' Sources/azl/uds_engine.cpp)" = "3" ] || fail "Sources/azl/uds_engine.cpp: a departure is told to the clients that remain in three places, all in RemoveNodeLocked (while a lobby is up; in the real Download Play's network while it admits; in the game's own network)"
+need_line Sources/azl/uds_engine.cpp "    } else if (!dlp_net_ && !node.spec && connection_status_.status == static_cast<u32>(NetworkStatus::ConnectedAsHost) && cause != kRemovedLink &&" "GB-01: the game's own network tells the clients that remain about a departure (not when the room's link is gone)"
+need_line Sources/azl/uds_engine.cpp "               !quiet_removals_ && tells_departures_) {" "... nor when the host ejects everybody (a client that authenticates again IS told about)"
+need_line Sources/azl/uds_engine.cpp "        if (!associated_) {" "a Connecting client takes no Logoff before the host's AssociationResponse, in every network (GB-01's departure Logoff names its own slot)"
+need_line Sources/enet/protocol.c "         host -> azlAwayBacklog = 0; /* (AzaharLink, 2026-11-15: the socket is empty - found by a poll, not only by a receive - so nothing waits from the absence) */" "a poll that finds the socket empty ends the ring's backlog"
+need_line Sources/azl/room_client.cpp "        client->azlAwayBacklog = 0;" "the connect loop's polls are no absence"
+[ "$(tr -d '\r' < Sources/enet/protocol.c | grep -c 'ENET_AZL_NOTE_DUP (host);')" = "3" ] || fail "Sources/enet/protocol.c: the three places where a fragment is a copy sent again count it"
+need_line Includes/azl/uds_engine.hpp "    bool tells_departures_ = true; // (2026-11-15, GB-01) false only in the tests' model of an AZAHAR host (SetHostTellsDepartures)" "a host tells the departures by default"
+[ -z "$(grep -r -n 'SetHostTellsDepartures(' Sources | head -1)" ] || fail "the plugin turns off the telling of departures (SetHostTellsDepartures is for the tests' model of an Azahar host only)"
+need_line Sources/azl/uds_engine.cpp "        quiet_removals_ = true; // (nobody remains to be told: GB-01 in RemoveNodeLocked)" "an EjectClient of everybody tells nobody about each removal"
+need_line Sources/azl/uds_engine.cpp "        quiet_removals_ = false;" "... and the quiet ends with its loop"
+need_line Includes/azl/uds_engine.hpp "    static constexpr u32 kLeftTable = 15; // (2026-11-15, D5: the clients of a network of 16; it was 4, and six guests of a network of 8 that said goodbye twice lost the guard)" "the table of who left holds the clients of a network of 16"
+need_line Sources/azl/uds_engine.cpp '    } else if (dlp_net_ && !node.spec && !AdmissionBlocked() && connection_status_.status == static_cast<u32>(NetworkStatus::ConnectedAsHost)) {' "in the real Download Play's network the host tells the clients that remain of a CLIENT that left, while it still admits clients (never of a spectator, never in a game's own network, never from StartDistribution on: at the final seven departures made 21 Logoffs)"
+tr -d '\r' < Sources/azl/uds_engine.cpp | awk '/^    } else if \(dlp_net_ && !node.spec && / { on = 1 } on && /^        RefreshClientsLocked\(\);$/ { ok = 1 } on && /^    return true;$/ { exit } END { exit !ok }' || fail "Sources/azl/uds_engine.cpp: the branch of the real Download Play's network in RemoveNodeLocked no longer tells the clients that remain"
 need Sources/azl/uds_engine.cpp 'if (slot.used && static_cast<u32>(stamp - slot.rx_ms) > kBeaconKeepMs) {' "a lobby silent for longer than the engine keeps a beacon is forgotten (unsigned age: no ghost after 24.8 days)"
 need Sources/azl/uds_engine.cpp 'return; // (no lobby is in use: a game' "a game that uses no lobby does not parse a beacon for one"
 need Sources/azl/uds_engine.cpp 'lobby_.reset(new (std::nothrow) LobbyState());' "what a lobby keeps is allocated the first time one is used, and a failure to allocate is an answer, not an abort"
 need Includes/azl/uds_engine.hpp 'static_assert(sizeof(HeardLobbySlot) == 48,' "a lobby heard is 48 bytes"
 need Sources/azl/uds_engine.cpp '    DebugSecure(kDirRx, packet, secure_data); // (the capture of a lobby' "a lobby frame that is taken is in the debug capture, as the ones that go out are"
 [ "$(grep -c 'const bool took = !held_;' Sources/azl/dlp_lobby_net.cpp)" = "2" ] || fail "Sources/azl/dlp_lobby_net.cpp: HostOpen and ConnectBegin end the lobby on a failure only when it was this call that took the engine"
-need Sources/azl/dlp_lobby_net.cpp 'if (a.max_nodes > kMaxPlayers) {' "a lobby of more than 4 players is never announced"
+need Sources/azl/dlp_lobby_net.cpp 'if (a.max_nodes > kMaxPlayers) {' "a lobby of more players than the tables hold is never announced"
 [ "$(grep -c 'slot.lobby.host == packet.transmitter_address' Sources/azl/uds_engine.cpp)" = "1" ] || fail "Sources/azl/uds_engine.cpp: a lobby whose host beacons other ids is forgotten in one place (NoteLobbyBeaconLocked)"
 need Tests/dlp_net_adv_test.cpp "    XGameOwnsEngine();" "the scenario XGameOwnsEngine runs in main()"
 need Tests/dlp_net_adv_test.cpp "    XFailures();" "the scenario XFailures runs in main()"
@@ -3263,7 +4291,7 @@ for s in YHeardTable YFreshEngine YRing YStaleRing YGameChannel YRefresh YGameHo
 done
 need Tests/run.sh '-Wl,--wrap=_ZN3azl8platform5NowMsEv -Wl,--wrap=malloc -o "$OUT/dlp_net_extra_test"' "the extra test is linked with the two wraps it needs (the clock and malloc): without them Y15 and Y16 fail on their own check"
 # The two engine rules the churn fuzz found (the departure's Logoff is no admission for a console that has not been answered; a lobby has no guard for a second goodbye).
-need Sources/azl/uds_engine.cpp "        if (lobby_inbox_ && !associated_) {" "a lobby client that is Connecting takes no Logoff before its host has answered the Authentication (the departure refresh is not its admission)"
+need Sources/azl/uds_engine.cpp "        if (!associated_) {" "a client that is Connecting takes no Logoff before its host has answered the Authentication (the departure refresh is not its admission): in every network since 2026-11-15"
 need Sources/azl/uds_engine.cpp "(!lobby_inbox_ && LeftRecentlyLocked(packet.transmitter_address, now))" "a lobby host arms no guard against a late second goodbye (its peers say it once, and the guard would keep the node of a console that left twice)"
 need Sources/azl/dlp_lobby_net.cpp "    if (a.accepting == 0) {" "a lobby opened closed is closed (BeginHostingLobby leaves the admission open)"
 [ "$(grep -c 'CHECK(false)' Tests/dlp_room_probe.cpp)" = "4" ] || fail "Tests/dlp_room_probe.cpp: a room that cannot be joined is a failure in each of the four scenarios (a probe that returns green without checking anything proves nothing)"
@@ -3412,6 +4440,12 @@ need Sources/ctr/plugin.cpp '    SetSwapDeadlineRaised(rosalina_wait_raised_); /
 need Sources/ctr/plugin.cpp '    if (!swap_console_ && loader_linked) {' "the alias of Luma's word is looked for on a New 3DS linked to the loader only"
 need Sources/ctr/plugin.cpp '            if (!swap_console_ && luma_alias_ && hook_stats_.gate_ready) {' "the exit guard is installed on a New 3DS with the gate and the alias only (never on an Old 3DS: the guard is in the block the swap takes away)"
 need Sources/ctr/plugin.cpp 'constexpr const char* kLumaLogPath = "/3ds/3DSLink/AzaharLink.luma.log";' "the guard's line goes to a file of its own (the writer appends to the main log)"
+# The Download Play application (stage G0): one line in that file at its start, written by EarlyInit before the framework's GSP::Initialize, for THAT application only, in each of its
+# regional titles (2026-11-14: the list of the guard, IsDownloadPlayTitle; what the card holds if the
+# framework aborts inside it again: the size of the code and the svc left to the framework).
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c 'kDownloadPlayEurTitle')" = "0" ] || fail "Sources/ctr/plugin.cpp: the start line has a title of its own again (it reads the guard's list: the titles the guard answers and the titles that write the line are the same)"
+need Sources/ctr/plugin.cpp 'if (IsDownloadPlayTitle(CTRPluginFramework::Process::GetTitleID())) {' "the start line is for the Download Play application, every region of it, and no other title writes it"
+need Sources/ctr/plugin.cpp '"[%s] start: the Download Play application, 0x%lx bytes of code, %lu svc 0x32 left to the framework\n", stamp,' "the start line says the size of the code and the framework's sites"
 need Sources/ctr/plugin.cpp '                                                reinterpret_cast<u32>(g_exit_guard_stack) + sizeof(g_exit_guard_stack));' "the guard runs on the plugin's own stack, not the exiting thread's"
 need Sources/ctr/hook.cpp '    if (svcGetSystemInfo(&emulator, 0x20000, 0) == 0) {' "no alias, and so no guard, on an emulator"
 need Sources/ctr/hook.cpp '        const u32 bytes = PageCount(g_site_count + (reserve_exit_tramp ? kExitTrampStubs : 0), blob.bytes) * kGatePageBytes; // (+ the exit guard'"'"'s trampoline, InstallExitGuard: a New 3DS only)' "the gate's page keeps room for the exit guard's trampoline, on a New 3DS only"
@@ -3426,7 +4460,12 @@ need Sources/ctr/plugin.cpp '                sink->OnPresence(c.nickname.data(),
 need_order Sources/ctr/plugin.cpp 'void Plugin::OnRoomInfo(const room::RoomInfo& info) {' '    NoteRoomMembers(info);' "the presence lines are pushed on the network thread (the room's list of members), the chat ring's one writer"
 # The guest in the game's sockets (Fantasy Life, REGISTRO phase S): only on 0xC8A0700B; never ShutdownSockets nor socInit as a guest
 need Sources/ctr/soc.cpp '    if (rc == kSocAlreadyInitialized && g_guest_allowed && EnterGuest()) {' "the plugin becomes a guest only when the game initialised its sockets first, and only for a title of the list"
-need Includes/azl/soc_plan.hpp '    0x0004000000113100ull, // Fantasy Life, Europe (seen: InitializeSockets at 1.9 s, Friend-A 2026-11-08)' "Fantasy Life shares the game's sockets"
+need Includes/azl/title_rules.hpp '    {"Fantasy Life", {0x00113100u, 0x00113200u, 0x0006D200u}, {0, 1, 0, false, 0, false, false, true}},' "Fantasy Life shares the game's sockets, its three regions"
+# (2026-11-15, L3) the start-up rules are read by the APPLICATION's id only: a Download Play child starts as it ever did
+need_line Includes/azl/title_rules.hpp "    return static_cast<u32>(title_id >> 32) == kTitleHighApplication ? RulesFor(title_id) : kNoRules;" "the start-up rules are the application's alone"
+need_line Includes/azl/core_plan.hpp "    return title_rules::AppRulesFor(title_id).worker_off_core1;" "the core rule is read through the application's rules"
+need_line Includes/azl/soc_plan.hpp "    return title_rules::AppRulesFor(title_id).soc_guest;" "the socket guest is read through the application's rules"
+need_line Includes/azl/soc_plan.hpp "    return title_rules::AppRulesFor(title_id).late_soc_block;" "the late block is read through the application's rules"
 need_order Sources/ctr/soc.cpp '    if (g_guest) {' '    const Result rc = socExit();' "a guest leaves before socExit (its ShutdownSockets would end the game's sockets)"
 need Sources/ctr/soc.cpp '    d.name = "soc";' "the guest's device is named soc (libctru's sendto and the others check the name)"
 need Sources/ctr/soc.cpp '    azl_enet_rcvbuf_bytes = azl_rcvbuf_limit(azl_enet_rcvbuf_bytes, kGuestPoolBytes);' "a guest's receive ring fits the game's smallest pool"
@@ -3719,7 +4758,8 @@ need Sources/ctr/plugin.cpp 'CloseSwapGate(kSwapGateTimeoutMs);' "SWAP_ENTER clo
 need Sources/ctr/plugin.cpp 'OpenSwapGate();' "SWAP_EXIT opens it"
 need Sources/ctr/plugin.cpp 'OpenSwapGate(); // (a thread stopped at the gate could never be joined)' "the shutdown opens it"
 need Sources/ctr/plugin.cpp 'InitSwapGate(); // (before the threads that use it)' "the gate is set up on an Old 3DS before the threads start"
-need Sources/ctr/plugin.cpp 'const SwapGateScope gate(kGateWriter);' "a pass of the log's writer is inside the gate"
+# (2026-11-11: with its context. Since 2026-11-10 the statement is in the file twice - the loop and the writer's last flush, pinned with the flush - and a plain search was satisfied by the second alone.)
+need_after Sources/ctr/plugin.cpp "                    const SwapGateScope gate(kGateWriter);" "                    const u64 woke = platform::NowTicks();" "a pass of the log's writer is inside the gate (the scope is taken in the loop, right after the wait)"
 need Sources/ctr/plugin.cpp 'const SwapGateScope gate(kGateTrail);' "the lines of the sleep's trail are inside the gate"
 need Sources/ctr/swap_gate.cpp 'if (CTRPluginFramework::System::IsNew3DS()) {' "the gate stays off on a New 3DS"
 need Sources/ctr/swap_gate.cpp 'svcWaitSynchronization(g_gate_open, -1);' "a stopped thread waits with no end, until SWAP_EXIT"
@@ -3729,7 +4769,9 @@ need Sources/ctr/plugin.cpp 'extern "C" void __wrap_PLGLDR__Reply(s32 event) {' 
 need_order Sources/ctr/plugin.cpp '    __real_PLGLDR__Reply(event);' 'azl::ctr::Plugin::Get().OnSwapBack();' "the gate opens only after the framework's reply returned: before it the block is not mapped"
 need_after Sources/ctr/plugin.cpp 'void Plugin::OnSwapBack() {' '    OpenGate();' "the block is back: the gate opens"
 need Makefile '-Wl,--wrap=svcCreateThread -Wl,--wrap=_ZN18CTRPluginFramework9Scheduler10InitializeEv' "the framework's syscore worker is held off core 1 on an Old 3DS: a thread that has not begun escapes the stop at the swap"
-need Sources/ctr/thread_core.cpp 'g_moving = svcGetSystemInfo(&is_new, 0x10001, 0) != 0;' "only on an Old 3DS, by the very test of Luma's swap"
+need Sources/ctr/thread_core.cpp 'const bool old_console = svcGetSystemInfo(&is_new, 0x10001, 0) != 0;' "an Old 3DS is told by the very test of Luma's swap"
+need Sources/ctr/thread_core.cpp 'g_listed = !old_console && azl::ctr::coreplan::LeavesCore1ToTheGame(CTRPluginFramework::Process::GetTitleID());' "on a New 3DS only a title of azl/core_plan.hpp has its worker moved (Ridge Racer 3D, Pac-Man & Galaga Dimensions, Ocarina of Time 3D: ErrDisp 0xE0A01839)"
+need Sources/ctr/thread_core.cpp 'g_moving = old_console || g_listed;' "the worker moves on an Old 3DS, or for a listed title: no other game on a New 3DS is touched"
 need Sources/ctr/plugin.cpp 'constexpr u32 kSwapGateTimeoutMs = 6100;' "the wait of the gate stays within what Luma waits for the answer (10 s: the mirror's 1 s, the trail's 40 ms and the hooks' 1.5 s before it, 8.64 s in all)"
 # The table of the game's real sessions the hook follows (1.1.2): around the swap some of the game's closes are not seen, and after 12 HOMEs the APT:A sessions were no longer
 # followed (issue 5, Pokemon Alpha Sapphire, Old 3DS): no HOME seen, the game woke up in freed memory. The logic is held by Tests/traced_sessions_test.cpp (and
@@ -3881,6 +4923,3712 @@ need_line $HA '    setup::WriteTextFile(path, heap_plan::KeepLast(old, std::stri
 need ConfigApp/source/heap_plan.hpp 'constexpr std::size_t kLogMaxLines = 50;' "the heap log keeps the last 50 starts"
 need ConfigApp/source/main.cpp '        heap_alloc::WriteStartLog(g.paths.datadir);' "every start but the first adds its line"
 need ConfigApp/source/pages_startup.cpp '        heap_alloc::WriteStartLog(g.paths.datadir);' "the first start adds its line once it may write"
+
+# ---- The guard of the titles of four players (2026-11-13: Tests/dlp_cap_guard_test.cpp, written BEFORE the lobby holds eight players; what it holds and what it
+# cannot hold is analysis/lobby-otto-2026-11-13/guardia/RAPPORTO.md). It is the fixed point of that change: built with the hub, the two adapters and the codec of the
+# real Download Play, run under a timeout, every part of it called, every LobbyConfig of it zeroed, and its literals - the bytes and the SHA-1 of the code of that
+# day - as they were written: a literal that has to change is changed here as well, in the open, never in the test alone to make it pass.
+G=Tests/dlp_cap_guard_test.cpp
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_cap_guard_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_cap_guard_test"' "the suite builds the guard of the titles of four players with the hub, the two adapters and the codec of the real Download Play"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_cap_guard_test"' "the suite runs the guard of the titles of four players, under a timeout"
+need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/dlp_cap_guard_test.cpp Sources/azl/dlp_hub.cpp' "the library's dlph_wire.o is built before the guard that links it"
+need $G 'return "halt_on_error=1:print_stacktrace=1";' "the guard stops at the first undefined behaviour"
+need_line $G '        std::memset(&c, 0, sizeof(c));  // (zeroed: whatever a later version adds to it must mean "four players" at zero)' "the guard builds every LobbyConfig zeroed: a field added to it must mean four players at zero"
+for part in TestAnnouncement TestSearcherLists S1_FourAndAFifth S2_ManualAcceptance S3_LobbyOfTwo S4_NodeFive D1_Codec D2_RealHost D3_RealSearcher E1_BeaconBytes E2_FourOnTheEngine E3_BeaconsOfOtherSizes; do
+  need_line $G "    $part();" "the guard runs its part $part"
+done
+need_line $G '    Hold("S1-wire", w.wire, "c20b58e3721418134b9f6843ade467c45db733b3", 33);' "the guard holds the lines of the session of that day (host + 3 clients, a fifth console, START, GO: what the lobby asks of the network)"
+need_line $G '    Hold("S1-ipc", w.ipc, "2b9943a7ef6c068ecb3428fd1054ff0a6193446f", 217);' "the guard holds the lines of the session of that day (host + 3 clients, a fifth console, START, GO: every answer to the game)"
+need_line $G '    Hold("S2-wire", w.wire, "bdcf83257d921bd62e8edd680758e28ae7f82cfe", 40);' "the guard holds the lines of the session of that day (manual acceptance and the ejections: what the lobby asks of the network)"
+need_line $G '    Hold("S2-ipc", w.ipc, "ca3f2e2ca4d0ba9ad3be6e74d34443b09eba415d", 151);' "the guard holds the lines of the session of that day (manual acceptance and the ejections: every answer to the game)"
+need_line $G '    Hold("S3-wire", w.wire, "b078835547e144e34e49368e13158393fbcab4e1", 18);' "the guard holds the lines of the session of that day (a lobby of two: what the lobby asks of the network)"
+need_line $G '    Hold("S3-ipc", w.ipc, "f12f0c101f7a99882e0b3de6edd21e21e6dcc36d", 57);' "the guard holds the lines of the session of that day (a lobby of two: every answer to the game)"
+need_line $G '    Hold("S4-wire", w.wire, "53470490b4692970af20673986400b962a9d8263", 13);' "the guard holds the lines of the session of that day (a node 5 from a faulty engine: what the lobby asks of the network)"
+need_line $G '    Hold("S4-ipc", w.ipc, "a0441cdcfd81f2f018cf8a37f842ff4827256330", 39);' "the guard holds the lines of the session of that day (a node 5 from a faulty engine: every answer to the game)"
+need_line $G '              "c0 members=246 read_node=852 receive=252 scan_read=0 connect_poll=0 my_node=246\n"' "the guard holds how often the host's lobby read its network in S1"
+need_line $G '              "c0 members=173 read_node=370 receive=173 scan_read=0 connect_poll=0 my_node=173\n"' "the guard holds how often the host's lobby read its network in S2"
+need_line $G '              "c0 members=186 read_node=230 receive=188 scan_read=0 connect_poll=0 my_node=186\n"' "the guard holds how often the host's lobby read its network in S3"
+need_line $G '              "c0 members=81 read_node=90 receive=83 scan_read=0 connect_poll=0 my_node=81\n"' "the guard holds how often the host's lobby read its network in S4"
+need_line $G '    {"TD 3 clients", kTdLow, 3, 0, nullptr, 4, {0x44, 0x4C, 0x01, 0x01, 0x00, 0xC0, 0x10, 0x00, 0x04, ANN_NAME_3DSLINK}},' "the guard holds the 29 bytes of what Kirby Triple Deluxe asks (3 clients): 4 nodes"
+need_line $G '    {"TD 7 clients", kTdLow, 7, 0, nullptr, 4, {0x44, 0x4C, 0x01, 0x01, 0x00, 0xC0, 0x10, 0x00, 0x04, ANN_NAME_3DSLINK}},' "the guard holds the 29 bytes of 7 clients asked of a title of four: 4 nodes, not 8"
+[ "$(tr -d '\r' < $G | grep -c '^    {"[A-Za-z]')" = "18" ] || fail "$G no longer holds its 18 announcements (the rows of kAnnWant are counted: one is gone, or one was added without its pin)"
+
+# ---- Eight players (2026-11-13, the user: "a game that plays in eight is played in eight"; analysis/lobby-otto-2026-11-13/impl/RAPPORTO.md) ----
+# Two numbers where there was one. The CAPACITY of the lobby's tables is host + 7 clients (the pins of Phase 1 above hold kMaxPlayers = 8 and every table sized on it). The CEILING of
+# a title is its own: the third value of its Download Play column in azl/title_rules.hpp (1.1.4, L4), FOUR for a column that does not say it, eight for Mario Kart 7 and for no other (AZL_DLP_AS_BEFORE
+# and the block of L4 hold every id). It reaches the lobby in LobbyConfig::max_players, where 0 - a configuration that was zeroed and never told - is four, decided in
+# ONE place (TitlePlayers), and the lobby applies it in five: the clients a game may ask for (so the announcement and the "max N nodes" of the network the room carries), the lobbies
+# a searcher lists, the entry of a session that was not in the table, the members read from the engine, and the creator's slots with the ejection of an id above them. A title of
+# four must be, on the wire and in every answer, what it was when the tables held four: Tests/dlp_cap_guard_test.cpp (written before the change, and not edited since: its checksum
+# is held here) and the evening of Tests/dlp_eight_test.cpp, whose lines the code of before wrote.
+T=Includes/azl/dlp_types.hpp
+L=Includes/azl/dlp_lobby.hpp
+need $T 'constexpr u32 kTitlePlayers = 4;' "a title whose configuration says nothing has four players: every game of the table but Mario Kart 7"
+need $T 'static_assert(kTitlePlayers >= 2 && kTitlePlayers <= kMaxPlayers,' "the ceiling of a title fits in the tables"
+need_line $T '    return said == 0 ? kTitlePlayers : (said < 2 ? 2 : (said > kMaxPlayers ? kMaxPlayers : said));' "the ONE place that decides what a configuration means: 0 is four, 1 is two, more than the tables hold is eight"
+need $T 'static_assert(TitlePlayers(0) == 4,' "a zeroed configuration is a title of four: an assertion, not only a test"
+[ "$(grep -c 'kTitlePlayers' $L)" = "0" ] || fail "$L names kTitlePlayers: the lobby takes its ceiling from TitlePlayers(cfg.max_players) and from nowhere else"
+need $L '    u8 max_players;   // the ceiling of the title, host included: 0 = four' "the ceiling of the title is a byte of LobbyConfig, at its end (the structure did not grow: 40 bytes), and 0 is four"
+need_line $L '        flags2_ = static_cast<u8>(TitlePlayers(cfg.max_players) << kF2CapShift);' "the lobby keeps the ceiling TitlePlayers() gave for its configuration (in the high half of a byte it had: sizeof did not grow for it)"
+need $L 'static constexpr u8 kF2CapShift = 4; ' "the ceiling is the high half of flags2_"
+need $L 'static_assert((kMaxPlayers << kF2CapShift) <= 0xFF && (kF2FinalRoster | kF2External | kF2OnNet | kF2Stalled) < (1u << kF2CapShift),' "the ceiling and the three flags fit in one byte without touching"
+need_line $L '        return static_cast<u32>(flags2_ >> kF2CapShift);' "Ceiling() reads the ceiling the constructor stored"
+[ "$(grep -c 'flags2_ = ' $L)" = "5" ] || fail "$L writes flags2_ in another place: the ceiling of the title lives in its high half, and of its five plain assignments one is the declaration (= 0) and the others are the constructor, SetF2 and the two clears of kF2FinalRoster, which keep the other bits (the compound writes are counted below)"
+[ "$(grep -c 'flags2_ = static_cast<u8>(flags2_ & ~kF2FinalRoster);' $L)" = "2" ] || fail "$L: the two clears of the searcher's bit keep every other bit of flags2_ (the hub's mode, the ceiling of the title)"
+need_line $L '        flags2_ = static_cast<u8>(on ? (flags2_ | bit) : (flags2_ & ~bit));' "SetF2 keeps every other bit of flags2_"
+# - the five places where the ceiling is applied (and no kMaxPlayers / kMaxClients in their place)
+need_line $L '        const u32 most = CeilingClients();  // (1..3 for a title of four players, 1..7 for one of eight)' "the clients a game may ask for are cut to the ceiling of its TITLE, not to the capacity of the tables"
+need_line $L '        max_clients_ = static_cast<u8>(max_clients < 1 ? 1 : (max_clients > most ? most : max_clients));' "... 1 at least, the title's at most: the announcement and the hosted network follow (max_clients_ + 1)"
+need_line $L '        if (a.max_nodes < 2 || a.max_nodes > Ceiling() || hg.total_nodes < 1 || hg.total_nodes > a.max_nodes) {' "a searcher never lists a lobby of more nodes than the ceiling of its title (a title of four: never one of five)"
+need_line $L '            g->max_nodes = static_cast<u8>(Ceiling());' "the entry of a session that was not in the table says the title's ceiling"
+need_line $L '        return n > Ceiling() ? Ceiling() : n;' "the lobby reads the first members up to its title's ceiling, whatever the engine lists after them"
+need_after $L 'DLP_NOINLINE void TrackClients(const u8* nodes, u32 n, u32 now) {' 'for (u32 s = 0; s < CeilingClients(); ++s) {' "the creator's slots are the title's (nodes 2..its ceiling): the slots past them stay free"
+need_line $L '            if (nodes[i] > Ceiling() && Elapsed(now, aux_ms_) >= kResendMs) {' "an id above the ceiling of the title is ejected with the one shared timer, as an id above 4 always was"
+[ "$(grep -c 'Ceiling()' $L)" = "8" ] || fail "$L: the ceiling of the title is read in other places than the eight lines of 2026-11-13 (its two accessors, max_players(), the five places where it is applied and the comment of one): a new use, or one that went back to the capacity of the tables, is a decision"
+[ "$(grep -c 'for (u32 s = 0; s < kMaxClients; ++s) {' $L)" = "4" ] || fail "$L: four loops walk every slot of the creator's table (the list of the clients, EjectState, the two of SendPhase); TrackClients walks the title's slots only"
+! grep -q 'max_clients > kMaxClients' $L || fail "$L cuts the clients a game asks for to the capacity of the tables again: Kirby would announce what its game asks, up to eight"
+! grep -q 'a.max_nodes > kMaxPlayers' $L || fail "$L: a searcher lists every lobby the tables could hold again: a title of four would list a lobby of eight"
+need_line $L '    u32 max_players() const {' "the ceiling of the title can be read (the tests of the wiring read it)"
+# - the adapter of the real Download Play (2026-11-13, Mario Kart 7): its table of dialogues holds host + 7 clients, the lobby's own tables; what ONE game uses of it is the ceiling
+#   of its title, players_, which the plugin gives it as it gives the lobby (four for an adapter nobody told: Luigi's Mansion keeps its refusal of a network of more than four and
+#   its three dialogues). Every bound on a node and every loop over the dialogues is the title's, but the one that clears the whole table
+need Includes/azl/dlp_real_net.hpp 'static constexpr u32 kRealPlayers = kMaxPlayers;' "the table of the real Download Play holds what the lobby's tables hold: eight players"
+need Includes/azl/dlp_real_net.hpp 'static constexpr u32 kRealClients = kRealPlayers - 1;' "... host + 7 clients"
+need Includes/azl/dlp_real_net.hpp 'static_assert(kRealPlayers == 8 && kRealClients == kMaxClients,' "... held by an assertion"
+need_line Includes/azl/dlp_real_net.hpp '    Peer peers_[kRealClients] = {};' "the adapter's table of dialogues has a place for every client of the table"
+need_line Includes/azl/dlp_real_net.hpp '    u8 players_ = kTitlePlayers;  // the ceiling of the title, host included: 2..kRealPlayers (SetPlayers; four if nobody said)' "an adapter nobody told is a title of four players (Luigi's Mansion as before)"
+need_line Includes/azl/dlp_real_net.hpp '        players_ = static_cast<u8>(TitlePlayers(said));' "the ceiling the adapter is told goes through the one place that decides it: 0 is four, never more than the tables"
+need_line Includes/azl/dlp_real_net.hpp '        return node >= 2 && node <= players_ ? peers_[node - 2].st : 0;' "no dialogue is read for a node above the ceiling of the title"
+need_line Sources/azl/dlp_real_net.cpp '    if (a.max_nodes < 2 || a.max_nodes > players_) {' "the real Download Play never hosts more nodes than the ceiling of the title (four for Luigi's Mansion)"
+need_line Sources/azl/dlp_real_net.cpp '    if (hosting_ && node >= kFirstClientNode && node <= players_) {' "Kick keeps a dialogue only for a node of the title"
+need_line Sources/azl/dlp_real_net.cpp '    for (u32 id = 1; id <= 16 && count < players_; ++id) {' "Members lists at most the players of the title"
+need_line Sources/azl/dlp_real_net.cpp '    if (!hosting_ || to_node < kFirstClientNode || to_node > players_ || size < 2) {' "Send takes a client of the title"
+need_line Sources/azl/dlp_real_net.cpp '        if (p.kind == dlp_real::Kind::None || src < kFirstClientNode || src > players_) {' "a packet is taken from a client of the title"
+need_after Sources/azl/dlp_real_net.cpp 'void RealDlpNet::ClearHost() {' '    for (u32 s = 0; s < kRealClients; ++s) {  // (the whole table, whatever the title uses of it)' "ClearHost clears the whole table of dialogues"
+need_after Sources/azl/dlp_real_net.cpp 'void RealDlpNet::ForgetGone(u16 mask) {' '    for (u32 s = 0; s < kRealClients && s + 1 < players_; ++s) {' "ForgetGone walks the dialogues of the title"
+need_after Sources/azl/dlp_real_net.cpp '    TakePackets(now);' '    for (u32 s = 0; s < kRealClients && s + 1 < players_; ++s) {' "the Pump steps the dialogues of the title: seven for Mario Kart 7, three for a title of four"
+need_after Sources/azl/dlp_real_net.cpp '    if (!hosting_ || capacity < 2) {' '    for (u32 s = 0; s < kRealClients && s + 1 < players_; ++s) {' "Receive hands the acks of the dialogues of the title"
+[ "$(grep -c 'kMaxClients' Sources/azl/dlp_real_net.cpp)" = "0" ] || fail "Sources/azl/dlp_real_net.cpp sizes a loop on the lobby's kMaxClients: its table has kRealClients places and its title players_"
+[ "$(grep -c 'kMaxPlayers' Sources/azl/dlp_real_net.cpp)" = "1" ] || fail "Sources/azl/dlp_real_net.cpp names the lobby's kMaxPlayers outside the array of Members() (the interface's): its own bound is the title's players_"
+[ "$(grep -c 's < kRealClients; ++s' Sources/azl/dlp_real_net.cpp)" = "1" ] || fail "Sources/azl/dlp_real_net.cpp: only ClearHost walks the whole table (kRealClients)"
+[ "$(grep -c 'kRealClients' Sources/azl/dlp_real_net.cpp)" = "4" ] || fail "Sources/azl/dlp_real_net.cpp: the size of the table (kRealClients) is named by ClearHost and by the three loops over the dialogues of the title, and nowhere else"
+[ "$(grep -c 'kRealPlayers' Sources/azl/dlp_real_net.cpp)" = "0" ] || fail "Sources/azl/dlp_real_net.cpp bounds a node by the capacity of the table (kRealPlayers): a title of four would get the dialogues and the network of eight"
+[ "$(grep -c 's + 1 < players_' Sources/azl/dlp_real_net.cpp)" = "3" ] || fail "Sources/azl/dlp_real_net.cpp: three loops walk the dialogues of the title (ForgetGone, Receive, PumpHost)"
+[ "$(grep -c 'players_' Sources/azl/dlp_real_net.cpp)" = "8" ] || fail "Sources/azl/dlp_real_net.cpp: the ceiling of the title is read in eight places (HostOpen, Kick, ForgetGone, Members, Send, Receive, PumpHost, TakePackets)"
+[ "$(grep -r -c 'SetPlayers(' Sources | awk -F: '{ n += $2 } END { print n + 0 }')" = "2" ] || fail "the adapter of the real Download Play is told its ceiling in two places (MakeRealDlpHub, the row's; MakeClntHub, the tables' eight - 1.1.4 G1)"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | sed -n '/^std::unique_ptr<DlpHub> MakeRealDlpHub(/,/^}/p' | grep -c -x '    real->SetPlayers(config.max_players);')" = "1" ] || fail "Sources/ctr/plugin.cpp: MakeRealDlpHub gives the adapter the ceiling it gives the lobby (the row's: eight for Mario Kart 7)"
+# - the plugin: the row's fourth value, its default, and the two hubs that take it to the lobby (twins: each has its mutant)
+P=Sources/ctr/plugin.cpp
+# (1.1.4, L4: the ceiling is the third value of the game's Download Play column in azl/title_rules.hpp; the ceiling of every id is held by AZL_DLP_AS_BEFORE, the block of L4)
+need_line Includes/azl/title_rules.hpp 'inline constexpr Dlp kNoDlp = {DlpGameMode::None, false, kDlpTitlePlayers};' "a game with no Download Play column has the ceiling of four"
+need_line Includes/azl/title_rules.hpp '        if (dlp.max_players != kDlpTitlePlayers && dlp.mode != DlpGameMode::RealDlp) {' "only a row of the real Download Play carries a ceiling of its own (the compiler holds it: RowsAreSound) ..."
+need_line Includes/azl/title_rules.hpp '            return false; // (a ceiling of its own: the real Download Play only)' "... and refuses any other"
+need_line Includes/azl/title_rules.hpp '        if (dlp.max_players < 2 || dlp.max_players > kDlpPlayersMax) {' "a ceiling is one the lobby's tables can hold"
+need_line Includes/azl/title_rules.hpp 'inline constexpr u8 kDlpTitlePlayers = 4;' "the ceiling of a column that does not say it is four ..."
+need_line Includes/azl/title_rules.hpp 'inline constexpr u8 kDlpPlayersMax = 8;' "... and eight at the most"
+need_line Sources/ctr/plugin.cpp 'static_assert(title_rules::kDlpTitlePlayers == kTitlePlayers && title_rules::kDlpPlayersMax == kMaxPlayers,' "... held to the lobby's kTitlePlayers and kMaxPlayers by the compiler"
+need_after $P 'u8 LobbyPlayersOf(u64 title_id) {' 'return title_rules::DlpOf(title_id).max_players;' "the ceiling of a game is its row's"
+[ "$(tr -d '\r' < $P | grep -c -x '    config.max_players = LobbyPlayersOf(game_tid);')" = "2" ] || fail "$P: both hubs give the lobby the ceiling of the game's row, MakeDlpHub and MakeRealDlpHub (the line twice)"
+[ "$(tr -d '\r' < $P | sed -n '/^std::unique_ptr<DlpHub> MakeRealDlpHub(/,/^}/p' | grep -c -x '    config.max_players = LobbyPlayersOf(game_tid);')" = "1" ] || fail "$P: MakeRealDlpHub gives the lobby the ceiling of the game's row"
+[ "$(tr -d '\r' < $P | sed -n '/^std::unique_ptr<DlpHub> MakeDlpHub(/,/^}/p' | grep -c -x '    config.max_players = LobbyPlayersOf(game_tid);')" = "1" ] || fail "$P: MakeDlpHub gives the lobby the ceiling of the game's row"
+D=Tests/plugin_dlp_test.cpp
+need_line $D '        CHECK_EQ(kDlpGames[i].max_players, want[i].max_players);' "the plugin test holds the ceiling of every row against its own table"
+[ "$(grep -c -E 'DlpGameMode::(ProbeOnly|Lobby|RealDlp), (true|false), 4\},' $D)" = "25" ] || fail "$D: twenty-five rows of its table say four players (Kirby Battle Royale 4, Triple Deluxe 5, Planet Robobot 2, Mario Tennis Open 5, Luigi's Mansion 4, Mario Party: Island Tour 5)"
+[ "$(grep -c -E 'DlpGameMode::RealDlp, true, 8\},     // Mario Kart 7' $D)" = "5" ] || fail "$D: five rows of its table say eight players, Mario Kart 7's"
+need_line $D '    CHECK_EQ(eight_rows, 5u);' "... and counts them"
+need_line $D '        CHECK_EQ(game.max_players, is_mk7 ? 8u : 4u);' "... against the five ids written by hand"
+need_line $D '            CHECK_EQ(hub.lobby_.max_players(), ceiling);' "the plugin's own decision is run for every row: the hub's lobby has the ceiling of the row"
+need_line $D '                CHECK_EQ(hub.lobby_.max_clients_, asked < 1 ? 1u : (asked > ceiling - 1 ? ceiling - 1 : asked));' "... and cuts the clients a game asks for to it"
+need_line $D '    CHECK_EQ(eight_hubs, 5u);  // Mario Kart 7 and nobody else plays in eight' "... for five hubs and no more"
+need_line $D '    CHECK_EQ(hub->lobby_.max_players(), 4u);  // Luigi'"'"'s Mansion: four, as its row' "the hub of Luigi's Mansion has the ceiling of four"
+need_line $D '    CHECK_EQ(real.players(), 4u);             // ... and the adapter is told the same four (its table holds RealDlpNet::kRealPlayers, eight)' "... and so has its adapter"
+need_line $D '            CHECK_EQ(real8.players(), 8u);' "MakeRealDlpHub gives the adapter of Mario Kart 7 the eight of its row"
+need_line $D '            CHECK_EQ(hub8->lobby_.max_players(), 8u);' "... and its lobby"
+need_line $D '                CHECK_EQ(p.dlp_real_->players(), ceiling);  // the adapter has the ceiling of the row, as the lobby: 4 for Luigi'"'"'s Mansion, 8 for Mario Kart 7' "the plugin's own decision is run for every row: the adapter of a RealDlp game has the ceiling of its row"
+need_line $D '    CHECK_EQ(real, 16u);' "the plugin test counts the RealDlp rows"
+need_line $D '    CHECK_EQ(real_luigi, 4u);' "... four of Luigi's Mansion"
+need_line $D '    CHECK_EQ(real_mk7, 5u);' "... five of Mario Kart 7"
+need_line $D '            CHECK_EQ(game.console_seed, is_mk7 || is_d6_seeded);' "... of which only Mario Kart 7's have the console's seed, and the D6 rows of d6_seeded"
+need_line $D '            CHECK(game.mode == DlpGameMode::RealDlp);  // (Mario Kart 7 since 2026-11-13: the real Download Play, whose adapter holds host + 7 clients)' "the rows of eight players are RealDlp rows"
+# - the test of eight: built with the two adapters, run under a timeout, every part of it called, and the lines of before as that code wrote them
+E=Tests/dlp_eight_test.cpp
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_eight_test.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_eight_test"' "the suite builds the test of eight players with the two adapters"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_eight_test"' "the suite runs the test of eight players, under a timeout"
+need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/dlp_eight_test.cpp Sources/azl/dlp_lobby_net.cpp' "the library's dlph_wire.o is built before the test that links it"
+need $E 'return "halt_on_error=1:print_stacktrace=1";' "the test of eight stops at the first undefined behaviour"
+for part in TestCeiling TestAskedClients TestSearcher TestTitleOfFour TestEightOnTheAir TestEightCountsItself TestEightLosesOne TestEightHostGoes TestEightOnTheEngine TestEightStalls TestFourOnTheEngine TestEightHostile; do
+  need_line $E "    $part();" "the test of eight runs its part $part"
+done
+[ "$(grep -c '^    "' $E)" = "123" ] || fail "$E no longer holds the 123 lines the code of before wrote for the evening of a title of four (41 for 7, 3 and 1 clients asked)"
+[ "$(grep '^    "' $E | md5sum | cut -d' ' -f1)" = "d2d57f5d881dd4c6225076b612c7dc15" ] || fail "$E: a line of the evening of a title of four is not the one the code of before wrote (the lines are not edited to make the test pass: a line that changes is a title of four that changed)"
+need_line $E '            HoldTrace("zeroed", tr, r.want, r.n, false);' "the evening of a zeroed configuration is held whole, the Kick calls too"
+need_line $E '            HoldTrace(said == 0 ? "0" : "4", tr, r.want, r.n, false);' "... and of a configuration that says 0 or 4"
+need_line $E '        HoldTrace("8", tr, r.want, r.n, true);' "a title of eight whose game asks for three clients has the same evening"
+need_line $E '    static const u8 kFour[14] = {2, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 2, 4, 4};' "the nodes a title of four announces for 0..8, 15, 255 ... clients asked, written by hand"
+need_line $E '    static const u8 kEight[14] = {2, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 2, 8, 8};' "... and a title of eight"
+need_line $E '    static const u8 kWant[12] = {4, 2, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8};' "what a configuration says and the ceiling it means: 0 is four"
+need_line $E '    CHECK_EQ(JoinNow(e.air, e.all, ninth, h, kMk7Low, 4000), 0xC920AFFEu);' "the ninth player is never answered"
+need_line $E '    CHECK(e.host_ring.high.load() <= 7);' "the ring of the lobby's messages: seven wait at most with seven clients"
+[ "$(grep -c 'CHECK_EQ(e.host_ring.lost.load(), 0u);' $E)" = "3" ] || fail "$E: nothing is pushed out of the creator's ring in the plain session, after START with the creator stalled and after GO with the creator stalled (three checks)"
+need_line $E '        CHECK_EQ(EightEngines::Clients(h), std::string("7:2,3,4,5,6,7,8"));  // nobody was thrown out' "with the seven clients stalled what the ring loses is asked again: nobody is thrown out"
+# - the chain test of the built plugin (Tests/chain_sim/chain_sim.py, run by Tests/stack_usage.sh) builds the hub in a block of its own and compares the object word by word: the block
+#   and the picture are as large as the size the probe allows (they were 512 and 416 bytes, written by hand: with the hub of 536 the object ran over the next block and the words the
+#   test looks for were out of the picture - the test fell with an error of its own, not with a word about the size)
+HUB_MAX=$(grep -o 'static_assert(sizeof(DlpHub) <= [0-9]*' Tests/dlp_stack_probe.cpp | grep -o '[0-9]*$')
+HUB_SIM=$(grep -o '^HUB_BYTES = [0-9]*' Tests/chain_sim/chain_sim.py | grep -o '[0-9]*$')
+{ [ -n "$HUB_MAX" ] && [ -n "$HUB_SIM" ] && [ "$HUB_SIM" -ge "$HUB_MAX" ]; } || fail "Tests/chain_sim/chain_sim.py looks at '$HUB_SIM' bytes of the hub and Tests/dlp_stack_probe.cpp allows it '$HUB_MAX': the chain test must see the whole object (HUB_BYTES at least the size the probe holds)"
+need_line Tests/chain_sim/chain_sim.py '        self.hub = sim.alloc(HUB_BYTES)  # (a block as large as the object: in 512 bytes the hub of 536 would run over the next block)' "the chain test builds the hub in a block as large as the picture it takes of it"
+[ "$(tr -d '\r' < Tests/dlp_cap_guard_test.cpp | md5sum | cut -d' ' -f1)" = "bb568bc088d534448bf736cefef6d903" ] || fail "Tests/dlp_cap_guard_test.cpp is not the file that was written before the lobby held eight players (analysis/lobby-otto-2026-11-13/guardia/dlp_cap_guard_test.cpp.2026-11-13): the guard of the titles of four is not edited to make it pass, and a change to it is made here as well, in the open"
+
+# - the corrections after the four reviews of 2026-11-13 (analysis/lobby-otto-2026-11-13/correzioni/RAPPORTO.md). The lines whose MEANING changed with the tables (they are bounded by
+#   kMaxPlayers / kMaxClients, which went from 4 / 3 to 8 / 7) and that only Tests/dlp_eight_test.cpp held: each is named here, the twins are counted and each twin has its mutant
+IP=Includes/azl/dlp_ipc.hpp
+LN=Sources/azl/dlp_lobby_net.cpp
+need_line $T '    if (data[8] < 2 || data[8] > kMaxPlayers) {' "the codec takes an announcement of 2..kMaxPlayers nodes - what the format can say; the ceiling of a title is the lobby's to apply (ScanAbsorb)"
+need_after $L 'DLP_ALWAYS_INLINE u32 CeilingClients() const {' 'return Ceiling() - 1;' "the clients of a title are its players less the host"
+need_line $L '        a->max_nodes = static_cast<u8>(max_clients_ + 1);' "a lobby announces the clients its game asked for (cut to the ceiling of its title) and the host: the network the room carries has as many nodes"
+need_line $L '        if (tab_ != kTabHost || from < kFirstClientNode || from > kMaxPlayers) {' "the creator takes the START_ACK / GO_ACK of every client node the tables hold (2..8): the state of its slot says whether it is a client"
+[ "$(grep -c -F 'if (tab_ != kTabHost || node < kFirstClientNode || node > kMaxPlayers || !Listed(u_.host.t[node - kFirstClientNode].state)) {' $L)" = "2" ] || fail "$L: the two TrackOf (the one that writes and the const one) know every client node the tables hold, 2..kMaxPlayers, and nothing past them"
+[ "$(grep -c -F 'for (u32 i = 0; i < kMaxPlayers; ++i) {' $L)" = "3" ] || fail "$L: three loops walk the whole roster of a session (the ids of GetConnectingNodes, the record of GetNodeInfo, the read from the engine): the eight entries, not the first four"
+need_after $L 'u32 ClientConnectingNodes(u8* ids, u32 capacity, u32* total) const {' 'for (u32 i = 0; i < kMaxPlayers; ++i) {' "GetConnectingNodes counts every entry of the roster"
+need_after $L 'u32 ClientNodeInfo(u16 node, NodeEntry* out) const {' 'for (u32 i = 0; i < kMaxPlayers; ++i) {' "GetNodeInfo looks at every entry of the roster"
+need_after $L 'SessionTable& s = u_.session;' 'for (u32 i = 0; i < kMaxPlayers; ++i) {' "the roster read from the engine fills (or clears) every entry"
+need_line $L '            e.node = i < n ? nodes[i] : 0;' "an entry of the roster past the members read is empty: nothing of the array past them is taken"
+need_line $L '        s.host.total_nodes = static_cast<u8>(n > s.host.max_nodes ? s.host.max_nodes : n);' "the count a client in a session keeps for its own lobby (what GetServerInfo gives its game) is the members read, at every read and for any number of them up to what the host announced"
+need_line $L '                        ids[count] = static_cast<u8>(s + kFirstClientNode);' "the id of a listed client is its slot + 2, for every slot"
+need_line $L '                if (srv_state_ == kSrvAccepting && node <= max_clients_ + 1) {' "the creator takes the nodes up to the clients its game asked for, and no other"
+need_line $L '            } else if (t.state == kTrkEjected && Elapsed(now, t.sent_ms) >= kResendMs) {' "a node the creator could not take is ejected again every kResendMs while it lingers, whatever its id"
+need_line $L '            if (OwesAnswer(t.state, go) && (!due_only || Elapsed(now, t.sent_ms) >= kResendMs)) {' "START / GO go to the clients that owe an answer and to no other slot"
+need_line $IP '        const u32 want = Min(cmd[1] & 0xFFFF, kMaxPlayers);' "GetConnectingNodes asks the lobby for as many ids as the game's vector holds, kMaxPlayers at most"
+need_line $IP '        const u32 capacity = Min(Min(n, kMaxClients), bytes / 2);' "GetConnectingClients asks the lobby for as many ids as the game's vector and its mapped bytes hold, kMaxClients at most"
+need_line $IP '            count = Min(count, (sbuf[0] >> 14) / 2);' "GetConnectingNodes never writes more ids than the bytes of the game's static buffer hold"
+[ "$(grep -c -F '            StoreLE16(dst + 2 * i, ids[i]);' $IP)" = "2" ] || fail "$IP: the two handlers of the ids keep them as bytes in their frames and store each as the u16 the game reads (two stores, one per handler: both bytes of every element are written)"
+need $LN 'channel, a.max_nodes, announce, kAnnounceSize) !=' "the network the adapter hosts has the nodes the lobby announced (8 for the seven clients of Mario Kart 7, 4 or fewer for a title of four)"
+# - flags2_ carries the ceiling of the title in its high half: the plain writes are counted above; a compound write (|=, &=, ^= ...) is ONE, the bit of the last look at the roster,
+#   and an increment is none (the review: 'flags2_ &= 0x0F' in a teardown passed the count of the plain writes)
+[ "$(grep -c -E 'flags2_ *([|&^+*/%-]|<<|>>)=' $L)" = "1" ] || fail "$L has another compound write of flags2_ (the only one sets kF2FinalRoster): the ceiling of the title lives in the high half of that byte"
+need_line $L '                flags2_ |= kF2FinalRoster;  // the roster is read once more at the end of this poll, then it freezes' "the one compound write of flags2_ sets one low bit and keeps the ceiling of the title"
+! grep -q -E '(\+\+|--) *flags2_|flags2_ *(\+\+|--)|&flags2_' $L || fail "$L steps flags2_ or takes its address: the ceiling of the title lives in the high half of that byte"
+# - the evening of a title of four (Tests/dlp_eight_test.cpp): its lines are held by their checksum above; here the COMPARISON is held - the driver that plays the evening, the
+#   function that compares and its caller, by the checksum of their text, and the four statements that are the comparison by name (the review: each could be dropped and the test
+#   still passed)
+need_line $E '    CHECK_EQ(tr.lines.size(), n);' "the evening of a title of four has the number of lines of before"
+need_line $E '        if (but_the_kicks && at != std::string::npos) {' "the Kick calls are left out of the comparison only for the title of eight asked for three clients"
+need_line $E '    for (std::size_t i = 0; i < n && i < tr.lines.size(); ++i) {' "every line of the evening is compared"
+need_line $E '        CHECK(strip(tr.lines[i]) == strip(want[i]));' "the evening of a title of four is compared line by line with what the code of before wrote"
+need_line $E '    for (const Run& r : kRuns) {' "the evening is played for the three numbers of clients asked (7, 3, 1)"
+need_line $E '    static const Run kRuns[3] = {{7, kBefore7, sizeof(kBefore7) / sizeof(kBefore7[0])},' "... 7 clients asked against the lines of 7"
+need_line $E '                                 {3, kBefore3, sizeof(kBefore3) / sizeof(kBefore3[0])},' "... 3 against the lines of 3"
+need_line $E '                                 {1, kBefore1, sizeof(kBefore1) / sizeof(kBefore1[0])}};' "... 1 against the lines of 1"
+FOUR_SUM=$( { sed -n '/^\/\/ ---- \[four-trace: /,/^\/\/ ---- \[end of four-trace\] ----$/p' $E; sed -n '/^\/\/ 4\. A whole evening of a title of four, as before\.$/,/^\/\/ 5\. The session of eight on the in-memory air\.$/p' $E; } | tr -d '\r' | md5sum | cut -d' ' -f1)
+[ "$FOUR_SUM" = "69b57cd241e06c571637bb15db9df1d7" ] || fail "$E: the evening of a title of four changed - its driver (the block [four-trace], which analysis/lobby-otto-2026-11-13/impl/strumenti compiles against the code of before), its lines, HoldTrace or TestTitleOfFour (checksum $FOUR_SUM): a change there is made in the open, with the tool of the photograph run again and this checksum"
+# - the count a client in the session reads, up to eight and down again, and the hostile run for every ceiling (two parts of the test of eight, in the list of its parts above)
+need_line $E '            CHECK_EQ(ServerInfoOf(*e.all[k], host), "8/" + std::to_string(i + 1));  // every client already in, after every entry' "every client of a session of eight reads the count of its lobby after every entry, up to 8/8"
+need_line $E '        std::snprintf(line, sizeof(line), "%u/%u", b.mem[kServerInfoMaxClients], b.mem[kServerInfoJoined]);' "... out of the two bytes of the record the games read"
+need_line $E '    for (const int k : {1, 2, 4, 5, 6, 7}) {' "... the six that stay after one left (8/7)"
+need_line $E '        CHECK_EQ(ServerInfoOf(*e.all[k], host), std::string("8/4"));' "... and down through four"
+need_line $E '    constexpr u32 kCommands = 60000;' "the hostile run has a fixed number of commands"
+need_line $E '    constexpr u64 kSeed = 20261113;' "... and a fixed seed"
+need_line $E '    for (const u32 said : {8u, 255u, 7u, 5u, 0u, 4u, 2u, 1u}) {' "the hostile run is made for a title of eight, of four (said and unsaid) and for the ceilings between and at the bounds"
+need_line $E '        const hostile::Seen seen = hostile::Run(said, kCommands, kSeed);' "... each with its ceiling"
+need_line $E '        CHECK(seen.clients[ceiling - 1] > 0);' "the hostile run reached a lobby full to the ceiling of its title as a creator (the last slot of the tables for a title of eight)"
+need_line $E '        CHECK(seen.nodes[ceiling] > 0);' "... and as a client"
+need_line $E '        CHECK_EQ(seen.most_announced, ceiling);' "... announced the ceiling and never more"
+need_line $E '        CHECK_EQ(seen.most_sent_to, ceiling);' "... and wrote to its last client and to no node past it"
+need_line $E '        game.Verify(id, sv);' "after every command of the hostile run the game's memory is checked byte by byte against what the resolver granted"
+need_line $E '        HOSTILE(lobby.max_players() == ceiling, "the ceiling became %u (it was %u)", lobby.max_players(), ceiling);' "... and the ceiling of the title is what it was"
+need_line $E '                HOSTILE(total <= lobby.max_clients_, "GetConnectingClients total %u, the game asked for %u clients", total, lobby.max_clients_);' "... and the creator never has more clients than its game asked for"
+need_line $E '            CHECK_EQ(h.net.Sent(1, node) + h.net.Sent(3, node), 0);  // (no START and no GO to a node that is not a client)' "START and GO are never written to a node the creator ejected and that still lingers (a slot that is not a client)"
+[ "$(grep -c -F '++g_failures;' $E)" = "1" ] || fail "$E: a failed check of the hostile run counts as a failure of the test (the one ++g_failures of the file is HOSTILE's)"
+# - Tetris (the user, 2026-11-13: "Tetris has eight players too"): it plays in eight with the game's OWN nwm::UDS network ("hosting network (max 8 nodes" on a console the same day)
+#   and never asks for the Download Play services: it has no Download Play column (azl/title_rules.hpp) and must not get one (a column would hand its dlp sessions to the fake lobby)
+! tr -d '\r' < $P | grep -q -i '4C100ull' || fail "$P names Tetris (000400000004C100): it has no Download Play column - it plays in eight with its own nwm::UDS network, which is not the lobby's business"
+! tr -d '\r' < Includes/azl/title_rules.hpp | grep -q -i '0x0004C100u' || fail "Includes/azl/title_rules.hpp names Tetris (000400000004C100): it has no row - it plays in eight with its own nwm::UDS network, which is not the lobby's business"
+need $D '0xFFFFFFFFFFFFFFFFull, 0x000400000004C100ull,' "the plugin test holds Tetris among the games that keep the real services (no row, no hub, the default ceiling)"
+need_line $D '    CHECK(DlpModeOf(0x000400000004C100ull) == DlpGameMode::None);  // Tetris: eight players on its own nwm::UDS network ("max 8 nodes" on a console), no row here' "... and by name"
+
+# ---- The game's own network of EIGHT nodes (2026-11-13, Tests/uds_eight_test.cpp): Tetris - and Mario Kart 7 after its lobby - open a nwm::UDS network of eight, which no console
+# session has shown. The suite builds and runs the test, it runs every part and stops at undefined behaviour, and its open points (KNOWN_GAP_EQ: what a console does and the engine
+# of today does not - analysis/lobby-otto-2026-11-13/revisione-uds-normale-a-otto/RAPPORTO.md) pass ONLY with today's value: the day a point is closed its lines fail, say so, and
+# are turned into CHECK_EQ. Their number is held, so that none is dropped quietly.
+U=Tests/uds_eight_test.cpp
+need Tests/run.sh 'g++ $CXXFLAGS Tests/uds_eight_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/uds_eight_test"' "the suite builds the test of the game's network of eight nodes"
+need_line Tests/run.sh '  "$OUT/uds_eight_test"' "... and runs it"
+for part in TestEightNodes TestEightThroughTheHost TestEightAtOnce TestAzaharAskTogether TestLateGoodbyesOfMany TestEightLoad; do
+  need_line $U "    $part();" "the test of the network of eight nodes runs $part"
+done
+need $U 'return "halt_on_error=1:print_stacktrace=1";' "the test of the network of eight nodes stops at the first undefined behaviour"
+need_line $U '    return g_failures ? 1 : 0;' "the test of the network of eight nodes fails when a check failed"
+need_line $U 'constexpr u8 kMaxNodes = 8;' "the network of the test has eight nodes"
+need_line $U 'constexpr u32 kTetrisRecvBuffer = 11824; // what Tetris gives Bind (console log of 2026-11-13: "recv buffer 11824, ring 16384 bytes")' "the binds of the test are as large as Tetris's"
+need $U '        if (kg_got == kg_today) {' "a known gap passes with what the engine does today and with nothing else (the console's value fails and says that the point was closed)"
+[ "$(tr -d '\r' < $U | grep -c '^ *KNOWN_GAP_EQ("')" = "2" ] || fail "$U no longer has its 2 known-gap lines (the answer of a full host, twice): a point that was closed is turned into a CHECK_EQ here and in this count, never deleted"
+# (2026-11-15, decision D5) GB-01 and the table of who left are closed: their 15 lines are CHECK_EQ with the console's value, none deleted
+[ "$(tr -d '\r' < $U | grep -c '// (closed 2026-11-15, decision D5: ')" = "15" ] || fail "$U no longer has the 15 checks of GB-01 and of the table of who left, closed on 2026-11-15 (a client that leaves, comes back, is replaced by another console, is ejected; six guests that say goodbye twice)"
+need_line $U '    KNOWN_GAP_EQ("A2+GB-07 (a full host)", Join(room, ninth, host), 0xC8611001u, res::kConnectTimeout);' "the ninth console is tried, and what it is answered is held"
+need_line $U '        Hold(when, "beacon", "encrypted tags", encrypted_tags, 2);' "the beacon of a network of eight is read with its two encrypted tags after every join"
+need_line $U '        CheckTables(when, roster, [&](Station& s) { return &s == &joiner ? roster.Mask() : 1 << (k - 1); });' "the tables of every node are held after every join"
+need_line $U '    CHECK_EQ(stall8, 8u);' "the time a game may stay away from its bind with eight nodes is held (8 frames between two reads lose the first frame)"
+need_line $U '    CHECK_EQ(stall4, 18u);' "... and with four (18)"
+need_line $U '    CHECK_EQ(eight.client_rx_frames - eight.beacons, u64(7) * kTicks);         // one console receives 420 data frames a second' "the frames a console of eight receives are counted"
+
+# - the test of eight through the hubs (Tests/dlp_eight_hub_test.cpp, the review of 2026-11-13): the whole chain a console runs - the hub, the service, the lobby, the adapter, the
+#   real engine - with the words of Mario Kart 7 and a ceiling of eight; built with the hub, run under a timeout, every part of it called
+H8=Tests/dlp_eight_hub_test.cpp
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_eight_hub_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_eight_hub_test"' "the suite builds the test of eight through the hubs, with the hub"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_eight_hub_test"' "the suite runs the test of eight through the hubs, under a timeout"
+need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/dlp_eight_hub_test.cpp Sources/azl/dlp_hub.cpp' "the library's dlph_wire.o is built before the test of eight through the hubs, which links it"
+need $H8 'return "halt_on_error=1:print_stacktrace=1";' "the test of eight through the hubs stops at the first undefined behaviour"
+for part in E1_SevenTogether_E2_Churn E3_StartLosesTwo E4_HostGoes E5_ThenTheGamesNetwork; do
+  need_line $H8 "    $part();" "the test of eight through the hubs runs its part $part"
+done
+need_line $H8 '    Con8(MockRoom& room, u8 last, const char* nm, u8 max_players = 8)' "the consoles of the test of eight through the hubs have the ceiling of Mario Kart 7's rows"
+need_line $H8 '    u32 SvInit(u32 clients = 7) {' "the creator of the test of eight through the hubs asks for seven clients, as Mario Kart 7 did on a console"
+need_line $H8 '        return Ask(kSv, 0x000F0303, {0x00089000, clients, 0x4A, 0, 0x00040000, 2, n[0], n[1], n[2], n[3], n[4], 0, 0x04000000, 0x7777, 0x8888});' "... with the words of its InitializeWithName"
+need_line $H8 '        if (Ask(kSv, 0x000B0042, {0x0F, 0x1EC, kIdsAt}) != 0) {' "the creator's game reads its clients in a vector of 15, as Mario Kart 7 did on a console"
+need_line $H8 '            if (h().SvClients() != "7:2,3,4,5,6,7,8") {' "seven clients, nodes 2..8, are what the creator's game must read after seven entered together"
+need_line $H8 '                if (c[i]->FkNodes() != "8:1,2,3,4,5,6,7,8") {' "eight nodes are what every client's game must read"
+need_line $H8 '    CHECK(took >= 1450 && took <= 2600);  // (not before the grace: the two are waited for; not long after it)' "the two clients that do not answer START are waited for until the grace, and thrown out at it"
+need_line $H8 '    CHECK_EQ(nodes_seen, 0x1FEu);' "after the lobby the eight consoles are the eight nodes of the game's own network"
+
+# ---- Mario Kart 7 on the REAL Download Play with eight players (2026-11-13; analysis/mk7-realdlp-2026-11-13/impl/RAPPORTO.md) ----
+# A console and an Azahar did not see each other in Mario Kart 7: the lobby spoke its dialect, Azahar the real Download Play. The five rows of the game are RealDlp now (pinned with the
+# rows), the adapter holds host + 7 clients with the ceiling of the title (pinned with the adapter), the engine tells the clients that remain of a client that left (pinned with the
+# engine). The contract is the capture of eight Azahar of that day: its bytes are Tests/dlp_real_mk7_golden.inc, cut out by Tests/make_dlp_real_mk7_goldens.py (the title and the icon of
+# the game replaced by the sum of their words, as in Luigi's), and Tests/dlp_real_mk7_test.cpp holds the adapter to them: built, run under a timeout, every part of it called.
+M7=Tests/dlp_real_mk7_test.cpp
+MG=Tests/dlp_real_mk7_golden.inc
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_mk7_test.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_mk7_test"' "the suite builds the test of Mario Kart 7 on the real Download Play"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_mk7_test"' "the suite runs the test of Mario Kart 7 on the real Download Play, under a timeout"
+need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/dlp_real_mk7_test.cpp Sources/azl/dlp_lobby_net.cpp' "the library's dlph_wire.o is built before the test that links it"
+need $M7 'return "halt_on_error=1:print_stacktrace=1";' "the test of Mario Kart 7 stops at the first undefined behaviour"
+need_line $M7 '#include "dlp_real_mk7_golden.inc"' "the test of Mario Kart 7 is held to the capture of eight Azahar"
+for part in G_Capture A_HostSeven B_SearchEight C_OneLeaves D_Luigi; do
+  need_line $M7 "    $part();" "the test of Mario Kart 7 runs its part $part"
+done
+# - the golden data: generated, never edited (its checksum is held: whoever runs the script again on the same capture gets the same file), nothing of the game's in it
+[ -f Tests/make_dlp_real_mk7_goldens.py ] || fail "Tests/make_dlp_real_mk7_goldens.py is gone (the script that cuts the golden data of Mario Kart 7 out of the capture of eight Azahar)"
+head -1 $MG | grep -q "^// Generated by Tests/make_dlp_real_mk7_goldens.py from the capture of 2026-11-13" || fail "$MG is not marked as generated by Tests/make_dlp_real_mk7_goldens.py"
+[ "$(tr -d '\r' < $MG | md5sum | cut -d' ' -f1)" = "9e812a1acac858d379a557aaba9f757f" ] || fail "$MG is not the file Tests/make_dlp_real_mk7_goldens.py wrote from the capture of eight Azahar: the golden data are not edited by hand"
+need $MG '{"F0", "888.688", 1, 1, 65535, 768, kDlpRealMk7_00_F0, 0xed52db54, 0xfdff7f77, {0x40, 0x2f8}},' "frame 0 of the announcement carries no title and no icon of the game (+0x40..+0x2F7 is its sum only)"
+need_line $MG 'static const std::uint8_t kDlpRealMk7Seed[4] = {0x96, 0xa5, 0xa4, 0x23};' "the seed of the capture's checksums (found by trying: every packet is checked with it)"
+need_line $MG 'static const unsigned kDlpRealMk7MaxNodes = 8;  // frame 0, +0x20' "the capture's host announces eight nodes"
+need_line $MG 'static const DlpRealGolden kDlpRealMk7Dialog[65] = {' "the whole dialogue of the capture's good session: 65 packets, seven clients"
+need_line $MG 'static const DlpRealMk7Frame kDlpRealMk7Raw[5] = {' "the beacon alone and with eight nodes, the node map, the Logoff of the eighth node and its EAPoL-Start, as whole frames"
+# - what the test holds (each line is one of its claims; taken away, the claim is not made any more)
+need_line $M7 '    CHECK_EQ(kinds[static_cast<u8>(dlp_real::Kind::Auth)], 15u);' "G: every packet of the capture goes through the codec (15 Auth ...)"
+need_line $M7 '        CHECK(n == want.size() && std::memcmp(buf, want.data(), n) == 0);' "G: ... and is the packet our builder makes, byte for byte"
+need_line $M7 '            CHECK_EQ(h.max_nodes, 8u);' "G: the recorded beacon is a lobby of the real Download Play of eight nodes for the engine"
+need_line $M7 '            CHECK(!dialect.engine->HeardLobbyAt(0, 1000, &h));' "G: ... and nothing for an engine of the dialect"
+[ "$(grep -c -x '    CHECK_EQ(h.lobby.ServerInitialize(7, 0, h.name16), 0u);' $M7)" = "2" ] || fail "$M7: the console's game asks for SEVEN clients, as Mario Kart 7 did on a console, where it hosts (A and C: the line twice)"
+need_line $M7 '    CHECK_EQ(h.e().GetConnectionStatus().max_nodes, 8u);  // "hosting network (max 8 nodes ...)", as the capture'\''s beacon says' "A: the network the console hosts has eight nodes"
+need_line $M7 '        CHECK_EQ(NodeOf(m.e()), node);  // one at a time: the lowest free id, as the capture'\''s 2, 3, ... 8' "A: the seven come in one at a time, nodes 2..8"
+need_line $M7 '        CHECK_EQ(h.Clients(), want);' "A: GetConnectingClients after each admission"
+need_line $M7 '        CHECK_EQ(logoffs, i + 1u);' "A: every member is sent the Logoff of each admission"
+need_line $M7 '        CHECK_EQ(a3, 7u);' "A: ONE StartDistribution to each of the seven"
+need_line $M7 '        CHECK_EQ(a7, 7u);' "A: ONE final to each of the seven"
+need_line $M7 '                CHECK(Same(d.p, Mk7("A7", d.dest), kDlpRealMk7Seed));  // (the passphrase is the capture'\''s: the test'\''s game gave it)' "A: the final the console sends is the capture's final to that node, byte for byte"
+need_line $M7 '                std::printf("   a packet of the host that the capture does not have: %s\n", Hex(d.p.data(), d.p.size()).c_str());' "A: EVERY packet the host sends is compared: one the capture does not have is a failure"
+need_line $M7 '    CHECK_EQ(LoadLE32(c.Title() + kTitleInfoUniqueId), 0x307u);  // the unique id the game wants, from the child'\''s title id of the announcement' "B: GetTitleInfoInOrder gives the unique id 0x307"
+need_line $M7 '        return tick != 0 && tick <= platform::NowTicks() && before - (tick < before ? tick : before) < kFiveSecondsOfTicks / 5 &&' "B: the tick of GetServerInfo (+0x290) is never zero and never old"
+need_line $M7 '    while (platform::NowMs() - t_scan < 5600) {' "B: ... also after more than five seconds of scan"
+need $M7 '    CHECK_EQ(c.Nodes(), std::string("8:1,2,3,4,5,6,7,8"));' "B: the console that joined reads the eight nodes"
+need_line $M7 '    CHECK(PumpUntil(bs, 2000, [&] { return h.Clients() == "3:2,3,4" && c.Nodes() == "4:1,2,3,4" && MaskOf(m2.e()) == 0x0F && MaskOf(m3.e()) == 0x0F; }));' "C: a client left before the start: the host, the console client and the Azahar clients know"
+need_line $M7 '        CHECK_EQ(logoffs, 3u);' "C: ... told with one Logoff to each of the three that remain"
+need_line $M7 '    CHECK_EQ(NodeOf(m6.e()), 5u);' "C: the next client takes the place that was left"
+need_line $M7 '    CHECK_EQ(h.net.PeerState(5), RealDlpNet::kFree);         // its dialogue is forgotten' "C: the dialogue of the client that left - the fourth of the table - is forgotten"
+need_line $M7 '        CHECK_EQ(to_spectator, 1u);' "A: the only other Logoff of an admission is the spectator's own: its goodbye tells nobody"
+need_line $M7 '    CHECK_EQ(c.Nodes(), std::string("8:1,2,3,4,5,6,7,8"));  // the roster of the final, kept while the others leave' "B: the roster is the one of the final"
+need $M7 '                CHECK(!real.HostOpen(Ann(nodes), 6, me));' "D: an adapter nobody told refuses a network of more than four nodes"
+need_line $M7 '    CHECK_EQ(h.e().GetConnectionStatus().max_nodes, 2u);' "D: Luigi's Mansion hosts two nodes: ONE client"
+need_line $M7 '                CHECK(Same(d.p, Luigi(id), kDlpRealLuigiSeed));' "D: Luigi's host sends the bytes of its own capture"
+M7_AFTER=$(tr -d '\r' < $M7 | sed -n '/^    m.StopSession();$/,/^    CHECK_EQ(h.net.PeerState(2), RealDlpNet::kFree);$/p')
+echo "$M7_AFTER" | grep -q -x '            CHECK(false);' || fail "$M7: a frame of Luigi's host after its client left is no longer a failure (the refresh of the real Download Play's network must not reach a game with one client)"
+# - the models of Azahar the test extends keep Luigi's capture as what they send when nothing is said, and the game's behaviour of Mario Kart 7 is an option
+need_line Tests/azahar_dlp_host.hpp '                  const AzaharDlpWire& wire = kAzaharDlpLuigiWire)' "the model of Azahar's host sends Luigi's capture unless a test gives it another"
+need_line Tests/azahar_dlp_host.hpp 'inline const AzaharDlpWire kAzaharDlpLuigiWire = {kDlpRealLuigiAnnounce,   &kDlpRealLuigiDialog[0],  &kDlpRealLuigiDialog[4], &kDlpRealLuigiDialog[8],' "... the announcement, the Auth, StartDistribution, the Finish"
+need_line Tests/azahar_dlp_host.hpp '                                                  &kDlpRealLuigiDialog[10], &kDlpRealLuigiDialog[11], kDlpRealLuigiSeed};' "... the final, the notice, the seed"
+need_line Tests/azahar_dlp_peer.hpp '    std::atomic<bool> leave_at_final{false};  // the game stops the session at the final (Mario Kart 7)' "the model of Azahar's client stays after the final unless a test says otherwise (Luigi's Mansion as before)"
+
+# ---- The corrections of the review of Mario Kart 7 on the real Download Play (2026-11-13; analysis/mk7-realdlp-2026-11-13/correzioni/RAPPORTO.md) ----
+# - the refresh of a departure only while the network admits clients (its line is pinned with the engine, above): the test counts the Logoffs of the host from StartDistribution on
+need_line $M7 '        CHECK_EQ(late_logoffs, 0u);' "A: from StartDistribution on the host of Mario Kart 7 sends no Logoff (the seven that leave at the final are told of nobody)"
+need_line $M7 '    const std::size_t mark_start = wire.Mark();' "A: ... counted from the frame before StartDistribution"
+# - the refresh never reaches a spectator: one is in while the client leaves, in Mario Kart 7's lobby and in Luigi's
+need_line Sources/azl/uds_engine.cpp '        if (entry.second.connected && !entry.second.spec) {' "the refresh of a departure is for the clients, never for a spectator (a searcher in the middle of its probe)"
+need_line $M7 '        CHECK_EQ(watcher.engine->ConnectBeginDlp(h.mac(), 11, ConnectionType::Spectator), 0u);' "C: a spectator is in Mario Kart 7's lobby while the client leaves"
+need_line $M7 '            CHECK(out[k].dest != watcher.mac);  // never to the spectator (a Logoff makes an Azahar that is Connecting elsewhere a node of this network)' "C: ... and no Logoff of the departure goes to it"
+need_line $M7 '        CHECK_EQ(watcher.engine->ConnectBeginDlp(h.mac(), 6, ConnectionType::Spectator), 0u);' "D: a spectator is in Luigi's lobby while its one client leaves"
+echo "$M7_AFTER" | grep -q -x '        CHECK(announced > 0);  // (the spectator was there, looking, the whole time)' || fail "$M7: D no longer holds that the spectator of Luigi's host was looking while the client left (the announcement went on)"
+echo "$M7_AFTER" | grep -q -x '        CHECK_EQ(h.e().SpectatorCount(), 1u);' || fail "$M7: D no longer holds that the spectator of Luigi's host was still in after the client left"
+# - the loops of the adapter over its dialogues say the size of the table too (an index past peers_ is inside the object: no sanitizer sees it)
+[ "$(grep -c 's < kRealClients && s + 1 < players_' Sources/azl/dlp_real_net.cpp)" = "3" ] || fail "Sources/azl/dlp_real_net.cpp: the three loops over the dialogues (ForgetGone, Receive, PumpHost) no longer stop at the size of the table whatever the ceiling says"
+# - the switch of the title: the Logoff of an admission to the members one by one also in the GAME's own network. Off for every game; the plugin turns it on in one place, for the
+#   rows of the real Download Play that say more than four players (Mario Kart 7's five); the engine reads it in one place and no Shutdown turns it off
+need_line Includes/azl/uds_engine.hpp '    bool admission_to_members_ = false; ///< SetAdmissionToMembers: the title'\''s, kept across Shutdown' "the switch of the title is off unless the plugin turns it on"
+[ "$(grep -c 'admission_to_members_ = ' Sources/azl/uds_engine.cpp)" = "1" ] || fail "Sources/azl/uds_engine.cpp: the switch of the title is written in one place, SetAdmissionToMembers (Initialize and Shutdown leave it: the Download Play's lobby gives the engine back before the game's network starts)"
+need_after Sources/azl/uds_engine.cpp 'void UdsEngine::SetAdmissionToMembers(bool on) {' '    admission_to_members_ = on;' "SetAdmissionToMembers sets the switch"
+[ "$(grep -c 'admission_to_members_' Sources/azl/uds_engine.cpp)" = "3" ] || fail "Sources/azl/uds_engine.cpp: the switch of the title is read in one place (the Logoff of an admission) beside its setter and its getter"
+[ "$(grep -r -c 'SetAdmissionToMembers(' Sources | awk -F: '{ n += $2 } END { print n + 0 }')" = "2" ] || fail "the switch of the title is turned in one place (MakeRealDlpHub) beside its definition"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | sed -n '/^std::unique_ptr<DlpHub> MakeRealDlpHub(/,/^}/p' | grep -c -F '    engine->SetAdmissionToMembers(AdmissionToMembersOf(game_tid));')" = "1" ] || fail "Sources/ctr/plugin.cpp: MakeRealDlpHub tells the engine how this game's own network admits"
+need_after Sources/ctr/plugin.cpp 'bool AdmissionToMembersOf(u64 title_id) {' '    return dlp.mode == DlpGameMode::RealDlp && dlp.max_players > kTitlePlayers;' "the admissions of the game's own network go to its members one by one only for a row of the real Download Play with more than four players (Mario Kart 7)"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | sed -n '/^bool AdmissionToMembersOf(/,/^}/p' | grep -c -E '^ +return ')" = "1" ] || fail "Sources/ctr/plugin.cpp: AdmissionToMembersOf answers with its one return (a game with no row has kNoDlp: the Logoff of an admission broadcast as ever)"
+need_line Tests/plugin_dlp_test.cpp '        CHECK_EQ(AdmissionToMembersOf(game.title_id), is_mk7);' "the plugin test holds the switch to the five Mario Kart 7 ids, written by hand"
+need_line Tests/plugin_dlp_test.cpp '    CHECK_EQ(members_engines, 5u);  // ... and nobody else has the admissions of its own network sent to the members one by one' "... through the plugin's own decision, for five engines and no more"
+need_line Tests/plugin_dlp_test.cpp '            CHECK(engine8->admission_to_members());  // Mario Kart 7: the game'\''s own network admits to its members one by one' "MakeRealDlpHub turns the switch on for Mario Kart 7"
+need_line Tests/plugin_dlp_test.cpp '    CHECK(!engine->admission_to_members());   // Luigi'\''s Mansion: its own network broadcasts the Logoff of an admission, as ever' "... and leaves it off for Luigi's Mansion"
+need_line $U '            CHECK_EQ(wrong, 0u);' "seven Azahar clients that ask together each get their own id with the switch of the title"
+need_line $U '            CHECK_EQ(to_one, 35u); // the k-th admission to the spectator and the k clients that are in: 2 + 3 + ... + 8' "... every admission to the members one by one"
+need_line $U '            CHECK_EQ(logoffs_to[kBroadcastMac], 7u);' "without the switch an admission is ONE broadcast, as since 1.0"
+need_line $U '            CHECK_EQ(to_one, 0u);' "... and nothing else"
+need_line $U '            CHECK_EQ(wrong, 6u);' "... and the model of Azahar's client does take another's Logoff (the test would see the defect)"
+need_line $U '        CHECK_EQ(host.e().Shutdown(), 0u);' "the switch is tried across a Shutdown, as the Download Play's lobby leaves the engine"
+
+# ---- Enable Titles lists the games that were SOLD, not the homebrew (2026-11-14; analysis/enable-titles-nascosti-2026-11-14/RAPPORTO.md). The user's rule: no list
+# made by hand, the unique id of the title decides - two ranges, taken from the list of every 3DS title the public lobbies use (5217 titles, "#titles 2026-11-03") -
+# and 3DS Link itself (unique id 0x0F83D1, DlpLink/tools/common.sh) is the first that must not be there: a plugin enabled on the app that enables it. A title that is
+# not a sold game is a row only while a plugin is in its folder, and that row can only be switched off. ONLY this page lists by the rule: the scan, Titles Delivery,
+# the rooms and "My games" of the public lobbies and the look at the copies at every start see every application title, as before. The rule and the rows are
+# games.cpp's (built on a PC by games_test). The app puts the plugin in a folder on the user's word in TWO places - the switch of this page and "Enable the game?" of
+# the public lobbies - and both ask the rule about the TITLE itself (not about a state of a row, which a line could rewrite: the review's mutants R1-R4).
+SG_H=ConfigApp/source/games.hpp
+SG_C=ConfigApp/source/games.cpp
+SG_P=ConfigApp/source/pages_enable.cpp
+SG_L=ConfigApp/source/pages_lobbies.cpp
+SG_T=Tests/settings_test/games_test.cpp
+SG_I=Tests/settings_test/sold_catalog.inc
+need $SG_H 'constexpr u32 kSoldIdFirst = 0x00300;' "the first range of the sold games starts at 0x00300 (below it are the system's titles)"
+need $SG_H 'constexpr u32 kSoldIdLast = 0x01FFF;' "the first range of the sold games ends at 0x01FFF (the last id of the list is 0x01E46; homebrew is found from 0x03849 up)"
+need $SG_H 'constexpr u32 kSoldNewIdFirst = 0xF7000;' "the second range (New 3DS only, Super Nintendo Virtual Console) starts at 0xF7000"
+need $SG_H 'constexpr u32 kSoldNewIdLast = 0xF71FF;' "the second range ends at 0xF71FF, a little above the last id of the list (0xF715F): a homebrew was seen at 0xF7A3E, inside 0xF7000..0xF7FFF (3DS Link is 0xF83D1)"
+need_after $SG_H 'constexpr u32 UniqueIdOf(u64 tid) {' '    return static_cast<u32>(tid >> 8) & 0xFFFFFFu;' "the unique id is the three bytes in the middle of the low word"
+need_line $SG_C '    return IsApplicationTid(tid) && ((id >= kSoldIdFirst && id <= kSoldIdLast) || (id >= kSoldNewIdFirst && id <= kSoldNewIdLast));' "a sold game is an application title with its unique id in one of the two ranges"
+need_after $SG_C 'bool IsSoldGameTid(u64 tid) {' '    const u32 id = UniqueIdOf(tid);' "... the unique id, not the whole low word"
+sg=$(region $SG_C 'Listing ListingOf(u64 tid, Slot slot, const std::string& name) {' '}' | code_of | sed 's/[ ]*$//')
+need_nth "$SG_C, ListingOf" "$sg" 2 '    if (IsEnableTitle(tid, name)) {' "a sold game is listed whatever its folder holds (the question of the page, IsEnableTitle: the sold games with the two exceptions pinned below)"
+need_nth "$SG_C, ListingOf" "$sg" 3 '        return Listing::Game;' "a sold game is listed whatever its folder holds"
+need_nth "$SG_C, ListingOf" "$sg" 5 '    return slot != Slot::Off ? Listing::OffOnly : Listing::Hidden;' "a title that is not a sold game is listed only while a plugin is in its folder, to be switched off"
+sg=$(region $SG_C 'std::vector<EnableRow> EnableRows(const std::vector<u64>& tids, const std::vector<std::string>& names) {' '}' | code_of | sed 's/[ ]*$//')
+need_nth "$SG_C, EnableRows" "$sg" 3 '    const std::set<std::string> folders = ListPluginFolders();' "the rows take one listing of the plugins folder"
+need_nth "$SG_C, EnableRows" "$sg" 6 '        row.index = i;' "a row says which title it is"
+need_nth "$SG_C, EnableRows" "$sg" 7 '        if (folders.count(TidText(tids[i])) != 0) {' "the folder of a title is looked at when the listing has it"
+need_nth "$SG_C, EnableRows" "$sg" 8 '            row.info = ReadSlot(tids[i]);' "... and what it holds is the row's state"
+need_nth "$SG_C, EnableRows" "$sg" 10 '        row.listing = ListingOf(tids[i], row.info.slot, i < names.size() ? names[i] : std::string());' "the rule decides every row, from its own title, its own folder and its own name"
+need_nth "$SG_C, EnableRows" "$sg" 11 '        if (row.listing != Listing::Hidden) {' "a hidden title is not a row"
+need_nth "$SG_C, EnableRows" "$sg" 12 '            rows.push_back(row);' "a hidden title is not a row"
+[ "$(printf '%s\n' "$sg" | grep -c -E 'mkdir|rmdir|remove\(|fopen|rename|EnableGame|DisableGame|CopyPluginFile')" = 0 ] || fail "$SG_C: EnableRows writes or removes something (making the list never touches a folder, a hidden title's least of all)"
+# the page: its rows are EnableRows', every one of them, and nothing else enters the list
+need_line $SG_P '        for (const setup::EnableRow& listed : setup::EnableRows(tids, names)) {' "the page lists what EnableRows gives (the sold games, a homebrew only with a plugin in its folder), and gives it the names (an impostor is told by its name)"
+need_line $SG_P '            const titles::Game* game = games[listed.index];' "a row of the page is the title EnableRows named"
+need_line $SG_P '            e.slot = info.slot;' "the row's switch is what the folder holds"
+need_line $SG_P '            entries_.push_back(e);' "the rows of EnableRows are the list"
+[ "$(tr -d '\r' < $SG_P | code_of | grep -c -E 'entries_\.(push_back|emplace_back|emplace|insert|resize|assign|swap)|entries_ *=[^=]|inserter\(entries_|swap\(entries_')" = 1 ] || fail "$SG_P: the list of the page is filled in more or fewer than one place (a title enters it through EnableRows only: no second push_back, emplace_back, insert, resize, assign or swap)"
+! tr -d '\r' < $SG_P | code_of | grep -q -i -E 'listing|MayEnable' || fail "$SG_P: a row of the page carries a state that says whether it may be switched on (there is none: the page asks IsEnableTitle about the title itself, so no line can rewrite the answer)"
+[ "$(tr -d '\r' < $SG_P | code_of | grep -c 'IsEnableTitle(')" = 3 ] || fail "$SG_P: the page asks the rule in more or fewer than three places (the switch in Activate, the row in BuildRows, the card in DrawGameCard), each about e.game->tid"
+[ "$(tr -d '\r' < $SG_P | code_of | grep -c 'IsEnableTitle(e.game->tid, e.game->name)')" = 3 ] || fail "$SG_P: the page asks the rule about something else than the title of the row and its name (e.game->tid, e.game->name)"
+[ "$(tr -d '\r' < $SG_P | code_of | grep -c -E 'IsSoldGameTid\(|IsImpostor\(|IsDownloadPlayTid\(')" = 0 ] || fail "$SG_P: the page asks a part of the rule by itself (it asks IsEnableTitle, the whole of it: the sold games, not the impostors, and the Download Play application)"
+need_line $SG_P '            tids.push_back(game->tid);' "every title of the scan and the one in the card slot go through the rule (a card is a sold game: the same rule lists it)"
+# the switch: on only for a sold game. The gate is the first thing of the branch that switches ON, and it returns
+sg=$(region $SG_P '    void Activate(const Row& row, int step) override {' '    }')
+printf '%s\n' "$sg" | grep -F -x -A1 -- '        } else {' | grep -F -x -q -- '            if (!setup::IsEnableTitle(e.game->tid, e.game->name)) {' || fail "$SG_P: the branch of Activate that switches a title ON does not start with the question IsEnableTitle about the title of the row (a homebrew listed for its plugin - 3DS Link itself - could be switched on)"
+need_line $SG_P '        Entry& e = entries_[static_cast<std::size_t>(row.id)];' "the row Activate works on is the one that was pressed"
+[ "$(printf '%s\n' "$sg" | code_of | grep -c -E 'e\.game *=[^=]')" = 0 ] || fail "$SG_P: Activate changes which title its row is before it asks the rule"
+sg=$(printf '%s\n' "$sg" | grep -F -x -A6 -- '            if (!setup::IsEnableTitle(e.game->tid, e.game->name)) {')
+need_nth "$SG_P, Activate, a title that is not a sold game" "$sg" 3 '                if (step == 0) {' "A says why the switch does not go on"
+need_nth "$SG_P, Activate, a title that is not a sold game" "$sg" 4 '                    g.ShowToast(kNotSoldToast, col::kWarn, 5000);' "A says why the switch does not go on"
+need_nth "$SG_P, Activate, a title that is not a sold game" "$sg" 6 '                return;' "... and nothing is queued"
+need_nth "$SG_P, Activate, a title that is not a sold game" "$sg" 7 '            }' "... and nothing is queued"
+[ "$(tr -d '\r' < $SG_P | code_of | grep -c 'CopyKind::Enable')" = 1 ] || fail "$SG_P: the page queues the copy of a title that is switched ON in more or fewer than one place (the one behind the rule; an action for every title would be a second)"
+! tr -d '\r' < $SG_P | code_of | grep -q -E 'EnableGame\(|DisableGame\(|RefreshGameCopy\(' || fail "$SG_P: the page makes or removes a copy by itself (the worker does, after the page's questions)"
+need_line $SG_P '            } else if (e.slot == setup::Slot::Off && !setup::IsEnableTitle(e.game->tid, e.game->name)) {' "a homebrew that was switched off on this visit is not a switch any more"
+need_line $SG_P '                row.value = "not a sold game";' "... and its row says why"
+need_line $SG_P '        if (!setup::IsEnableTitle(e.game->tid, e.game->name) && e.slot != setup::Slot::Other) {' "the card of a title that is not a sold game says so"
+need_line $SG_P '            note = e.slot == setup::Slot::On ? kNotSoldOnNote : kNotSoldOffNote;' "the card of a title that is not a sold game says so"
+# ("not a sold game", never "not a game": the row may be a game installed under a made-up id that the user gave the plugin by hand)
+need_line $SG_P 'constexpr const char* kNotSoldOnNote = "Not a sold game: it can only be switched off, and then it leaves this list.";' "what the card of a title that is not a sold game says while the plugin is in its folder"
+need_line $SG_P 'constexpr const char* kNotSoldOffNote = "Not a sold game: it cannot be switched on, and it leaves this list when the page is opened again.";' "what that card says once it is off"
+need_line $SG_P 'constexpr const char* kNotSoldToast = "Not a sold game: 3DS Link cannot be switched on for it.";' "what A says on such a title that is off"
+! tr -d '\r' < $SG_P | code_of | grep -q -i -E '"[^"]*not a game' || fail "$SG_P: a text of the page says 'not a game' of a title that may be one (it is 'not a sold game')"
+need $SG_P 'Games installed on the SD card and the game in the card slot are listed here. Homebrew and other applications are not.' "the page with no row says that homebrew is not listed"
+need ConfigApp/source/pages_main.cpp 'Your games (not homebrew) are listed, each with a "' "the line of the main page says that homebrew is not listed"
+! grep -q -F 'and Download Play are listed' ConfigApp/source/pages_main.cpp || fail "ConfigApp/source/pages_main.cpp says again that Enable Titles lists Download Play (its row is gone: 1.1.4, spec 9)"
+# The other place where the user's word puts the plugin in a folder: "Enable the game?" of the public lobbies, asked when somebody in the room plays a title the
+# user owns. What the user owns there is the whole scan (3DS Link itself, the homebrew), and a member of a room declares the title id it likes: the question is asked
+# for a sold game only. Nothing else of that page asks the rule (the rooms, "My games" and the icons see every title).
+need_line $SG_L '                if (lobbies::TitleKey(game->tid) == mine->key && setup::IsSoldGameTid(game->tid) && setup::ReadSlot(game->tid).slot == setup::Slot::Off) {' "'Enable the game?' of the public lobbies is asked for a sold game only (not for 3DS Link itself, which every console that opens the page has)"
+[ "$(tr -d '\r' < $SG_L | code_of | grep -c -E 'IsSoldGameTid|ListingOf|EnableRows|kSoldId|kSoldNewId|UniqueIdOf|IsEnableTitle|IsImpostor|kImpostors|DownloadPlay|system_games')" = 1 ] || fail "$SG_L: the public lobbies ask the rule in more or fewer than one place (before 'Enable the game?' only: the rooms and 'My games' see every title the user owns)"
+[ "$(tr -d '\r' < $SG_L | code_of | grep -c 'CopyKind::Enable, ')" = 1 ] || fail "$SG_L: the public lobbies queue the copy of a title that is switched ON in more or fewer than one place (EnableNow)"
+[ "$(tr -d '\r' < $SG_L | code_of | grep -c 'EnableNow(')" = 2 ] || fail "$SG_L: EnableNow is called from more or fewer than one place (the answer to 'Enable the game?', which is asked behind the rule)"
+sg=$(region $SG_L '    void EnableNow(u64 tid, const std::string& game_name) {' '    }' | code_of)
+printf '%s\n' "$sg" | grep -q 'worker.Submit(tid, setup::CopyKind::Enable, g.paths.plugin_file);' || fail "$SG_L: the one copy the public lobbies queue is no longer EnableNow's"
+# ... and nobody else switches a title on: the files of the app that queue such a copy, and the ones that make it
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q 'CopyKind::Enable' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/copyworker.cpp ConfigApp/source/pages_dlpguest.cpp ConfigApp/source/pages_enable.cpp ConfigApp/source/pages_lobbies.cpp ConfigApp/source/copyworker.hpp " ] || fail "CopyKind::Enable is named in '$sg', expected copyworker.cpp, pages_dlpguest.cpp, pages_enable.cpp, pages_lobbies.cpp and copyworker.hpp only (a title is switched on from the three places that ask the rule of the sold games)"
+# (1.1.4, spec 9 point 4.2) the third: "<game> is not switched on in Enable Titles. Switch it on too?" of Download Play > Games, asked once, for a game of its list
+# (setup::IsGuestGame: a sold game that may have a child), only when its folder is empty (never over another plugin) and the plugin is there
+[ "$(tr -d '\r' < ConfigApp/source/pages_dlpguest.cpp | code_of | grep -c 'CopyKind::Enable')" = 1 ] || fail "ConfigApp/source/pages_dlpguest.cpp queues the copy of a title switched ON in more or fewer than one place (the answer Yes to its question)"
+need_line ConfigApp/source/pages_dlpguest.cpp '                                                   setup::CopyWorker::Get().Submit(game, setup::CopyKind::Enable, g.paths.plugin_file);' "Download Play > Games switches the game on in Enable Titles only on the user's Yes"
+need_line ConfigApp/source/dlp_guest.cpp '            l->out.enable_off = setup::ReadSlot(l->wanted).slot == setup::Slot::Off;' "... asked only over an empty folder (never another plugin's: the look of the game reads it, in its thread)"
+need ConfigApp/source/pages_dlpguest.cpp ' && look.enable_off && g.plugin_ready) {' "... and with the plugin there"
+need ConfigApp/source/pages_dlpguest.cpp '" is not switched on in Enable Titles. Switch it on too?", "Yes", "No",' "... with the question of spec 9"
+need_line ConfigApp/source/dlp_guest.cpp '        if (!setup::IsGuestGame(game->tid, game->name)) {' "the games of Download Play > Games (and the games it reads) are the ones setup::IsGuestGame lets have a child (sold games)"
+need_line ConfigApp/source/dlp_guest.cpp '        const bool on = guest_game && (record != nullptr || (wanted != 0 && tid == wanted));' "... and a game is on only by its record or the user's switch of Games (setup::IsGuestGame first)"
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E '(^|[^A-Za-z_])EnableGame\(' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/copyworker.cpp ConfigApp/source/games.cpp ConfigApp/source/games.hpp " ] || fail "EnableGame is called in '$sg', expected copyworker.cpp (the worker, for a copy that was queued) and games.cpp/games.hpp only"
+# ONLY Enable Titles lists by the rule, and nothing else of the app asks it (the scan keeps every application title: Titles Delivery can send a homebrew, the public
+# lobbies know what the user owns, and the look at the copies at every start goes through every folder of sd:/luma/plugins, a hidden title's too)
+sg=$(grep -l -E 'IsSoldGameTid|ListingOf|MayEnable|EnableRows|kSoldIdFirst|kSoldIdLast|kSoldNewId|UniqueIdOf' ConfigApp/source/*.cpp ConfigApp/source/*.hpp | sort | tr '\n' ' ')
+[ "$sg" = "ConfigApp/source/games.cpp ConfigApp/source/games.hpp ConfigApp/source/pages_enable.cpp ConfigApp/source/pages_lobbies.cpp " ] || fail "the rule of the sold games is used in '$sg', expected games.cpp, games.hpp, pages_enable.cpp and pages_lobbies.cpp only (the other lists of titles show every title)"
+need_line ConfigApp/source/titles.cpp '        if (setup::IsApplicationTid(impl->ctx.titleIds[i])) {' "the scan keeps every application title, a homebrew too (but the Download Play guests 3DS Link prepared: APP-STORE)"
+need_line ConfigApp/source/pages_delivery.cpp '    for (const std::unique_ptr<titles::Game>& game : titles::Scan().games()) {' "the icons of Titles Delivery come from the whole scan (what Send Titles lists is the delivery module's, not the scan's: a homebrew that is sent has its icon)"
+[ "$(tr -d '\r' < $SG_L | grep -c -F -x -- '        for (const auto& game : titles::Scan().games()) {')" = 1 ] || fail "$SG_L: what the user owns, for the public lobbies, is no longer the whole scan (PollTitles)"
+need_line ConfigApp/source/ui.cpp '    for (const std::string& name : setup::ListPluginFolders()) {' "the look at the copies at every start goes through every folder"
+# the test: every id of the list against the four numbers, the edges, a console's titles, the rows from the folders of a card
+need_line $SG_T '#include "sold_catalog.inc"' "the test holds the list of every title"
+need_line $SG_I '// 5217 titles' "the list of the test is the one of 2026-11-03"
+[ "$(tr -d '\r' < $SG_I | grep -o -E '0x[0-9A-F]{8},' | wc -l | tr -d ' ')" = 5217 ] || fail "$SG_I does not hold 5217 ids (made by Tests/make_sold_catalog.py from titles.txt)"
+need Tests/make_sold_catalog.py "OUT = os.path.join(HERE, 'settings_test', 'sold_catalog.inc')" "the script that makes the list of the test is there"
+for t in TestSoldGame TestEnableRows; do
+  need_line $SG_T "    $t();" "the test of the sold games ($t) runs"
+done
+for e in '!setup::IsSoldGameTid(App(0x002FF))' 'setup::IsSoldGameTid(App(0x00300))' 'setup::IsSoldGameTid(App(0x01FFF))' '!setup::IsSoldGameTid(App(0x02000))' \
+         '!setup::IsSoldGameTid(App(0xF6FFF))' 'setup::IsSoldGameTid(App(0xF7000))' 'setup::IsSoldGameTid(App(0xF71FF))' '!setup::IsSoldGameTid(App(0xF7200))' \
+         '!setup::IsSoldGameTid(App(0xF7FFF))' '!setup::IsSoldGameTid(App(0xF8000))'; do
+  need_line $SG_T "    CHECK($e);" "the test holds the edges of the two ranges"
+done
+need_line $SG_T '    CHECK(!setup::IsSoldGameTid(0x0004000E0016E700ull)); // update' "the test holds that only an application title is a sold game"
+need $SG_T '    CHECK(!setup::IsSoldGameTid(0x000400020016E700ull)); // demo' "the test holds that a demo with the id of a sold game is not one"
+need $SG_T '    CHECK(!setup::IsSoldGameTid(App(0x100300))); // (all 24 bits of the unique id' "the test holds that the unique id is 24 bits, not 20"
+need_line $SG_T '    CHECK(setup::kSoldIdFirst == 0x00300u && setup::kSoldIdLast == 0x01FFFu && setup::kSoldNewIdFirst == 0xF7000u && setup::kSoldNewIdLast == 0xF71FFu);' "the test holds the four numbers"
+need_line $SG_T '        const u64 tid = 0x0004000000000000ull | kSoldCatalog[i];' "the test asks the rule about every title of the list"
+need_line $SG_T '        sold += setup::IsSoldGameTid(tid) ? 1 : 0;' "the test asks the rule about every title of the list"
+need_line $SG_T '    CHECK(count == 5217);' "... all 5217 of them"
+need_line $SG_T '    CHECK(sold == count);' "... and every one is a sold game"
+need_line $SG_T '    CHECK(first == 4960 && second == 257);' "the test holds how the list is split between the two ranges"
+need_line $SG_T '    CHECK(low_first == 0x00300u && top_first == 0x01E46u);' "the test holds where the list is in the first range (the numbers of the comment)"
+need_line $SG_T '    CHECK(low_second == 0xF7000u && top_second == 0xF715Fu);' "the test holds where the list is in the second range"
+need_line $SG_T '        {0x000400000F83D100ull, false, "3DS Link itself"},' "the test holds that 3DS Link itself is not a sold game"
+need_line $SG_T '        {0x000400000F800100ull, false, "title manager"},' "the test holds a homebrew just above the second range"
+need_line $SG_T '        {0x0004000000384900ull, false, "emulator, just above the first range"},' "the test holds the homebrew nearest to the first range"
+need_line $SG_T '        {0x000400000F657400ull, false, "StreetPass relay, just under the second range"},' "the test holds the homebrew nearest to the second range"
+need_line $SG_T '        CHECK(setup::IsSoldGameTid(c.tid) == c.sold);' "the test asks the rule about the titles of a console"
+need_line $SG_T '        {0x000400000F7A3E00ull, false, "chat homebrew of another console, above the last title of the second range"},' "the test holds the homebrew that was seen inside 0xF7000..0xF7FFF"
+need_line $SG_T '    CHECK(games == 12 && homebrew == 16);' "... twelve games and sixteen homebrew"
+# the known limits of a rule on the id alone: held, so that whoever moves the ranges meets them
+for e in '{0x00040000000F9800ull, "coin tool under the id of a sold game"},' '{0x0004000000097800ull, "an old game wrapped as a title"},' \
+         '{0x0004000000124200ull, "Super Nintendo emulator"},' '{0x00040000000EC500ull, "a title of unknown origin that carries the name of a sold game"},'; do
+  need_line $SG_T "        $e" "the test holds the titles that are not sold games and pass for one (the known limits of the rule)"
+done
+need_line $SG_T '        CHECK(setup::IsSoldGameTid(c.tid));' "... and says that they pass"
+need_line $SG_T '    CHECK(passing == 4);' "... all four"
+need_line $SG_T '    CHECK(setup::ListingOf(a_tool, Slot::Off) == Listing::Hidden);' "the test holds that a homebrew with no plugin is hidden"
+need_line $SG_T '    CHECK(setup::ListingOf(a_tool, Slot::On) == Listing::OffOnly && setup::ListingOf(a_tool, Slot::Other) == Listing::OffOnly);' "the test holds that a homebrew with a plugin is listed"
+need_line $SG_T '    CHECK(setup::ListingOf(self, Slot::Off) == Listing::Hidden && setup::ListingOf(self, Slot::On) == Listing::OffOnly);' "the test holds 3DS Link itself, with and without the plugin"
+need_line $SG_T '    CHECK(setup::IsSoldGameTid(a_game) && !setup::IsSoldGameTid(a_tool) && !setup::IsSoldGameTid(self));' "the test holds the question the switch asks: a sold game yes, a homebrew and 3DS Link itself no"
+need $SG_T '        CHECK((rows[i].listing == Listing::Game) == setup::IsSoldGameTid(tids[rows[i].index]));' "the test holds that a row is a game's exactly when the switch of the page goes on for its title"
+need_line $SG_T '        if (setup::IsSoldGameTid(tids[row.index]) && row.info.slot == Slot::Off) {' "the test switches on what the page may, by the page's own question"
+need_line $SG_T '    const std::vector<setup::EnableRow> rows = setup::EnableRows(tids);' "the test makes the rows with the page's own function"
+need_line $SG_T '    CHECK(rows.size() == 8);' "the test holds that the two homebrew with no plugin are not rows"
+need_line $SG_T '        CHECK(rows[i].index == kWant[i].index && rows[i].info.slot == kWant[i].slot && rows[i].listing == kWant[i].listing);' "the test holds every row: which title, its folder, its listing"
+need_line $SG_T '    CHECK(switched == 3);' "the test switches on everything the page may: three sold games"
+need $SG_T '    CHECK(!Exists(setup::GamePluginDir(tool_off)));' "... and the hidden homebrew has no folder afterwards"
+need_line $SG_T '    CHECK(setup::EnableRows(tids).size() == 8 && setup::ListPluginFolders().size() == 9);' "the test holds that making the rows touches no folder"
+need_line $SG_T '    CHECK(after.size() == 6);' "the test holds that 3DS Link and a homebrew, switched off, leave the next list"
+need_line $SG_T '    CHECK(by_hand.size() == 7 && by_hand[1].index == 1 && by_hand[1].listing == Listing::OffOnly && by_hand[1].info.slot == Slot::On);' "the test holds that a plugin put in a folder by hand makes its title a row"
+need_line $SG_T '    CHECK(bare.size() == 5);' "the test holds a card with no plugins folder: the sold games, no homebrew"
+# ---- ... with ONE EXCEPTION, the page's only (2026-11-14, after the list was looked at on a console): a homebrew that carries the id of a sold game is told by its id
+# AND a part of its name (three titles that were seen and named, no more): hidden like any homebrew, a row that can only be switched off while a plugin is in its
+# folder; the real game under the same id stays. IsSoldGameTid is what it was, and "Enable the game?" of the public lobbies asks it alone.
+# The Download Play application of the system (a system application in the NAND, six ids, one per region) was a second exception, a row like a game's, until spec 9
+# of 1.1.4 (the user's decision of 2026-11-17): it is no row any more, the app reads nothing of the NAND for it, and its six ids stay for the one-time removal of a copy
+# an earlier build put in its folder (IsDownloadPlayLeftover, in the look at the copies), for IsGuestGame and for the comparison with the plugin's guard below.
+for e in '    0x0004001000020100ull, // JPN' '    0x0004001000021100ull, // USA' '    0x0004001000022100ull, // EUR' \
+         '    0x0004001000026100ull, // CHN' '    0x0004001000027100ull, // KOR' '    0x0004001000028100ull, // TWN'; do
+  need_line $SG_H "$e" "the Download Play application of every region is in the table (the six ids of the lists of the system titles)"
+done
+sg=$(region $SG_H 'constexpr u64 kDownloadPlayTids[] = {' '};' | code_of)
+[ "$(printf '%s\n' "$sg" | grep -c -E '0x[0-9A-Fa-f]+')" = 6 ] || fail "$SG_H: the table of the Download Play application holds more or fewer than six ids (another title of the NAND would be a row of Enable Titles)"
+[ "$(printf '%s\n' "$sg" | grep -c -E '^    0x000400100002[012678]100ull,')" = 6 ] || fail "$SG_H: an id of the table of the Download Play application is not 000400100002x100 (a system application, the region in one digit)"
+sg=$(region $SG_C 'bool IsDownloadPlayTid(u64 tid) {' '}' | code_of | sed 's/[ ]*$//')
+need_nth "$SG_C, IsDownloadPlayTid" "$sg" 2 '    for (const u64 known : kDownloadPlayTids) {' "the Download Play application is one of the six ids of the table"
+need_nth "$SG_C, IsDownloadPlayTid" "$sg" 3 '        if (tid == known) {' "... the whole id, not a part of it"
+need_nth "$SG_C, IsDownloadPlayTid" "$sg" 7 '    return false;' "... and no other title"
+need_after $SG_C 'bool IsDownloadPlayLeftover(u64 tid, Slot slot) {' '    return IsDownloadPlayTid(tid) && slot == Slot::On;' "a leftover of the Download Play application is one of its six ids AND a folder with our plugin and nothing else (never another .3gx of the user's)"
+for e in '    {0x00F98, "playcoin"},' '    {0x01242, "blargsnes"},' '    {0x00978, "pacintime"},'; do
+  need $SG_H "$e" "the table of the impostors holds the three titles that were seen: the id and a part of the name"
+done
+sg=$(region $SG_H 'constexpr Impostor kImpostors[] = {' '};' | code_of)
+[ "$(printf '%s\n' "$sg" | grep -c -E '^    \{0x[0-9A-Fa-f]+, "[a-z0-9]{8,}"\},')" = 3 ] || fail "$SG_H: the table of the impostors holds more or fewer than three rows of an id and a part of a name of eight letters or more (a row is a title that was SEEN and named; a short part would catch real names)"
+[ "$(printf '%s\n' "$sg" | grep -c -E '0x')" = 3 ] || fail "$SG_H: a row of the table of the impostors is not an id and a part of a name"
+! printf '%s\n' "$sg" | grep -q -i '0x00EC5' || fail "$SG_H: 0x00EC5 is among the impostors (nobody knows what that title is: it stays a game)"
+sg=$(region $SG_C 'bool IsImpostor(u64 tid, const std::string& name) {' '}' | code_of | sed 's/[ ]*$//')
+need_nth "$SG_C, IsImpostor" "$sg" 2 '    if (!IsApplicationTid(tid)) {' "an impostor is an application title"
+printf '%s\n' "$sg" | grep -F -x -q -- '        if (unique_id == known.unique_id && plain.find(known.name_part) != std::string::npos) {' || fail "$SG_C: an impostor is no longer told by its unique id AND the part of its name (the id alone would hide the real game under it, the name alone a game called alike)"
+printf '%s\n' "$sg" | grep -F -x -q -- '    const u32 unique_id = UniqueIdOf(tid);' || fail "$SG_C: IsImpostor does not compare the unique id of the title"
+need_after $SG_C 'bool IsEnableTitle(u64 tid, const std::string& name) {' '    return IsSoldGameTid(tid) && !IsImpostor(tid, name);' "the question of the page: a sold game that is not an impostor (and never the Download Play application of the system: spec 9)"
+! region $SG_C 'bool IsEnableTitle(u64 tid, const std::string& name) {' '}' | code_of | grep -q 'DownloadPlay' || fail "$SG_C: IsEnableTitle lets the Download Play application of the system be switched on again (its row of Enable Titles is gone: 1.1.4, spec 9)"
+sg=$(region $SG_C 'bool IsSoldGameTid(u64 tid) {' '}' | code_of)
+! printf '%s\n' "$sg" | grep -q -E 'DownloadPlay|Impostor|IsEnableTitle' || fail "$SG_C: IsSoldGameTid knows the exceptions (it is the rule on the id, as it was: the public lobbies ask it alone, and the Download Play application is no sold game)"
+# The scan reads nothing of the NAND any more (1.1.4, spec 9): the Download Play application of the system was its one title of the NAND, for the row of Enable Titles
+# that is gone; ScanSystemTitles, the made-up NAND of the test, ConsoleNand, ReadSystemGames, Scanner::system_games and Game::system went with it. A titles.cache
+# with the old record is written again once without it (the titles are not as many).
+SG_S=ConfigApp/source/titles.cpp
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do [ "$f" = ConfigApp/source/dlp_guest_ids_am.cpp ] && continue; tr -d '\r' < "$f" | code_of | grep -q 'MEDIATYPE_NAND' && printf '%s ' "$f"; done)
+[ -z "$sg" ] || fail "MEDIATYPE_NAND is named in '$sg': the app reads nothing of the NAND but the lists of the guard of the ids (dlp_guest_ids_am.cpp, DPAPP-2h: read only)"
+# (DPAPP-2h) ... and there only in the two lists it reads (the titles, the titles begun), never in a call that writes: that file writes nothing at all
+[ "$(tr -d '\r' < ConfigApp/source/dlp_guest_ids_am.cpp | code_of | grep -c 'MEDIATYPE_NAND')" = 2 ] || fail "ConfigApp/source/dlp_guest_ids_am.cpp names MEDIATYPE_NAND elsewhere than its two lists"
+need_line ConfigApp/source/dlp_guest_ids_am.cpp '        case kSrcNand: return ListTitles(MEDIATYPE_NAND, ids);' "DPAPP-2h: the titles of the NAND, listed"
+need_line ConfigApp/source/dlp_guest_ids_am.cpp '        case kSrcPendingNand: return ListPending(MEDIATYPE_NAND, ids);' "DPAPP-2h: the titles begun in the NAND, listed"
+! tr -d '\r' < ConfigApp/source/dlp_guest_ids_am.cpp | code_of | grep -q -E 'AM_(Delete|StartCia|FinishCia|CancelCIA|Install|Import|Commit|Begin|QueryAvailable)|FSUSER_(Delete|Create|Rename|Write|OpenFile)|FSFILE_Write|svcTerminate|svcCreate|svcMap|svcWrite' || fail "ConfigApp/source/dlp_guest_ids_am.cpp writes something (DPAPP-2h: the lists of the ids are read only)"
+! tr -d '\r' < ConfigApp/source/dlp_guest_ids_am.cpp | code_of | grep -q 'svcGetThreadList' || fail "ConfigApp/source/dlp_guest_ids_am.cpp calls svcGetThreadList (it keeps a reference on the process for ever)"
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E 'ScanSystemTitles|setup::Nand|ConsoleNand|ReadSystemGames|system_games|DownloadPlayAmong|kNandTitlesMost|kDownloadPlayPlainName|kBlankIconColor' && printf '%s ' "$f"; done)
+[ -z "$sg" ] || fail "the scan of the NAND for the Download Play application is back in '$sg' (spec 9 took it away with the row of Enable Titles)"
+! tr -d '\r' < ConfigApp/source/titles.hpp | code_of | grep -q -E 'bool system' || fail "ConfigApp/source/titles.hpp: a title of the scan can be a title of the system again (Game::system went with the row of the Download Play application)"
+[ "$(tr -d '\r' < $SG_S | code_of | grep -c -E 'impl->games\.(push_back|emplace_back|insert)')" = 1 ] || fail "$SG_S: the games of the scan are filled in more or fewer than one place (the application titles of the SD card)"
+need_line $SG_S '    if (have_versions && (fresh > 0 || now.size() != cached.size())) {' "the cache of the titles is written again only when a title was read from its file or the titles are not as many (an old cache with the record of the Download Play application is written again once)"
+# what still asks about the six ids: games.cpp (IsDownloadPlayTid, IsGuestGame, IsDownloadPlayLeftover), the page (IsEnableTitle) and the look at the copies of ui.cpp
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E 'IsDownloadPlayTid|kDownloadPlayTids|IsDownloadPlayLeftover|IsImpostor|kImpostors|IsEnableTitle' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/games.cpp ConfigApp/source/pages_enable.cpp ConfigApp/source/ui.cpp ConfigApp/source/games.hpp " ] || fail "the exception and the ids of the Download Play application are used in '$sg', expected games.cpp, pages_enable.cpp, ui.cpp (the one-time removal) and games.hpp only"
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E 'IsDownloadPlayTid|IsDownloadPlayLeftover' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/games.cpp ConfigApp/source/ui.cpp ConfigApp/source/games.hpp " ] || fail "the Download Play application is asked about in '$sg', expected games.cpp, ui.cpp and games.hpp only (the page never lists it)"
+# The one-time removal (spec 9, point 8): a folder of one of the six ids is never brought up to date by the look at the copies; when it holds our plugin and
+# nothing else the copy is taken away (Disable), and nothing else of it is touched. Since the review of spec 9 the six folders are looked at at EVERY start,
+# before the stamp of the plugin (DropDownloadPlayLeftovers): a console that had a 1.1.4 build before spec 9 has the same plugin, and the look at the copies,
+# which runs only when the plugin changes, never ran there.
+SG_U=ConfigApp/source/ui.cpp
+sg=$(region $SG_U 'void App::QueuePluginCopyRefresh() {' '}' | code_of | sed 's/[ ]*$//')
+printf '%s\n' "$sg" | grep -F -x -q -- '        if (setup::IsDownloadPlayTid(tid)) {' || fail "$SG_U: the look at the copies does not set the folders of the Download Play application apart"
+a=$(printf '%s\n' "$sg" | grep -F -x -n -m1 -- '        if (setup::IsDownloadPlayTid(tid)) {' | cut -d: -f1)
+b=$(printf '%s\n' "$sg" | grep -F -n -m1 -- 'worker.SubmitRefresh(tid, paths.plugin_file);' | cut -d: -f1)
+{ [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fail "$SG_U: the folders of the Download Play application are not set apart before any folder is brought up to date"
+sg=$(printf '%s\n' "$sg" | grep -F -x -A2 -- '        if (setup::IsDownloadPlayTid(tid)) {' | grep -v '^ *$' | code_of | sed 's/[ ]*$//')
+need_nth "$SG_U, the folder of the Download Play application" "$sg" 2 '            continue;' "... it is never brought up to date by the look at the copies"
+DL=$(region $SG_U 'int DropDownloadPlayLeftovers(setup::CopyWorker& worker) {' '}' | code_of | sed 's/[ ]*$//')
+need_nth "$SG_U, DropDownloadPlayLeftovers" "$DL" 3 '    for (const u64 tid : setup::kDownloadPlayTids) {' "the leftover is looked for in the six folders of the Download Play application, and in no other"
+need_nth "$SG_U, DropDownloadPlayLeftovers" "$DL" 4 '        if (setup::IsDownloadPlayLeftover(tid, setup::ReadSlot(tid).slot)) {' "its copy is taken away only when the folder holds ours and nothing else"
+need_nth "$SG_U, DropDownloadPlayLeftovers" "$DL" 5 '            worker.Submit(tid, setup::CopyKind::Disable, std::string());' "... by the thread of the copies (DisableGame: the copy, and the folder when it is empty)"
+need_nth "$SG_U, DropDownloadPlayLeftovers" "$DL" 6 '            ++submitted;' "... counted in the pass the main page tells about"
+need_nth "$SG_U, DropDownloadPlayLeftovers" "$DL" 7 '        }' "... and nothing else is queued for it"
+[ "$(tr -d '\r' < $SG_U | code_of | grep -c 'CopyKind::Disable')" = 1 ] || fail "$SG_U: the app takes a copy of the plugin away somewhere else than the one-time removal of the Download Play application's"
+QC=$(region $SG_U 'void App::QueuePluginCopyRefresh() {' '}' | code_of | sed 's/[ ]*$//')
+a=$(printf '%s\n' "$QC" | grep -F -x -n -m1 -- '    int submitted = DropDownloadPlayLeftovers(worker);' | cut -d: -f1)
+b=$(printf '%s\n' "$QC" | grep -F -x -n -m1 -- '    if (!stamp.empty() && stamp == app_cfg.plugin_stamp) {' | cut -d: -f1)
+{ [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fail "$SG_U: the leftover of the Download Play application is not looked for at every start, BEFORE the stamp of the plugin (the review of spec 9: a console with the same plugin never ran the look at the copies)"
+need_after $SG_U '    if (!stamp.empty() && stamp == app_cfg.plugin_stamp) {' '        plugin_pass_total = submitted;' "... and its removal is told by the main page like a pass"
+need_line $SG_U '    if (!stamp.empty() && stamp == app_cfg.plugin_stamp) {' "the look at the copies runs only when the plugin changed"
+# the page: the Download Play application enters the list with the titles of the scan, through the same rule, and the rule is given the names
+# the page: the titles of the scan and the one in the card slot, and nothing of the NAND
+! tr -d '\r' < $SG_P | code_of | grep -q -E 'system_games|->system|"  \(system\)"' || fail "$SG_P: the page lists a title of the system again (the Download Play application's row is gone: spec 9)"
+need_after $SG_P '            tids.push_back(game->tid);' '            names.push_back(game->name);' "every title goes through the rule with its name"
+need $SG_P '(e.game->card ? "  (game card)" : ""));' "the card of a title says when it is the one in the card slot"
+# the test: the six ids, a made-up NAND, the impostors by id and name, the rows, the folder, the cache
+need_line $SG_T '    TestExceptions();' "the test of the exception (and of the Download Play application that is no row) runs"
+need_line $SG_T '        CHECK(setup::kDownloadPlayTids[i] == kSix[i]);' "the test holds the six ids of the Download Play application"
+need_line $SG_T '        CHECK(!setup::IsApplicationTid(kSix[i]) && !setup::IsSoldGameTid(kSix[i]));' "the test holds that the Download Play application is no game for the rest of the app"
+need_line $SG_T '        CHECK(!setup::IsEnableTitle(kSix[i], "Download Play") && !setup::IsEnableTitle(kSix[i], "") && !setup::IsEnableTitle(kSix[i], "Fast PlayCoin"));' "the test holds that the switch of the page never goes on for the Download Play application (spec 9)"
+need_line $SG_T '        CHECK(setup::ListingOf(kSix[i], Slot::Off, "Download Play") == Listing::Hidden && setup::ListingOf(kSix[i], Slot::Off) == Listing::Hidden);' "... and that it is no row"
+need_line $SG_T '        CHECK(setup::IsDownloadPlayLeftover(kSix[i], Slot::On));' "the test holds that our copy in its folder is a leftover, in every region"
+need_line $SG_T '        CHECK(!setup::IsDownloadPlayLeftover(kSix[i], Slot::Other) && !setup::IsDownloadPlayLeftover(kSix[i], Slot::Off));' "... and that another plugin of the user's never is"
+need_line $SG_T '        CHECK(!setup::IsDownloadPlayTid(other));' "the test holds that no title near the Download Play application is taken for it"
+need $SG_T '        CHECK(!setup::IsDownloadPlayLeftover(other, Slot::On)); // (the one-time removal never reaches another title' "... and that the one-time removal never reaches another title's folder"
+need_line $SG_T '        CHECK(nand.size() == 14 && dlp_in_nand == 1 && rows_of_nand == 0);' "the test holds that no title of a NAND of any region is a row"
+need_line $SG_T '    CHECK(setup::IsImpostor(coin, coin_name) && setup::IsImpostor(snes, "blargSnes") && setup::IsImpostor(pac, "Pac-In-Time"));' "the test holds the three impostors by the names that were seen"
+need_line $SG_T '    CHECK(!setup::IsEnableTitle(coin, coin_name) && !setup::IsEnableTitle(snes, "blargSnes") && !setup::IsEnableTitle(pac, "Pac-In-Time"));' "... and that the switch does not go on for them"
+need_line $SG_T '    CHECK(!setup::IsImpostor(coin, japanese) && setup::IsEnableTitle(coin, japanese));' "the test holds that the real game under the id of an impostor stays a game"
+need_line $SG_T '    CHECK(!setup::IsImpostor(0x000400000016E700ull, coin_name) && setup::IsEnableTitle(0x000400000016E700ull, coin_name));' "the test holds that the name alone hides nothing"
+need $SG_T '    CHECK(!setup::IsImpostor(unknown, "Pok' "the test holds that the title nobody knows (0x00EC5) stays a game"
+need_line $SG_T '    CHECK(in_list[0] && !in_list[1] && !in_list[2]); // 0x00F98 IS a title of the list (why the id cannot leave the ranges); the other two are not' "the test holds why the id of an impostor cannot leave the ranges"
+need_line $SG_T '    CHECK(setup::ListingOf(coin, Slot::On, coin_name) == Listing::OffOnly && setup::ListingOf(coin, Slot::Other, coin_name) == Listing::OffOnly);' "the test holds that an impostor with a plugin can only be switched off"
+need_line $SG_T '    const std::vector<setup::EnableRow> page = setup::EnableRows(tids, names);' "the test makes the rows of a console with the page's own function, with the names"
+need_line $SG_T '    CHECK(page.size() == 4);' "the test holds the rows: the game, two impostors with a plugin, the title nobody knows (not the Download Play application)"
+need $SG_T '        CHECK((page[i].listing == Listing::Game) == setup::IsEnableTitle(tids[page[i].index], names[page[i].index]));' "the test holds that a row is a game's exactly when the switch of the page goes on for its title"
+need_line $SG_T '        CHECK(page[i].index == kPage[i].index && page[i].info.slot == kPage[i].slot && page[i].listing == kPage[i].listing);' "the test holds every row of that console: which title, its folder, its listing"
+need_line $SG_T '    CHECK(turned_on == 2);' "the test switches on everything the page may: the game and the title nobody knows, not the Download Play application"
+need_line $SG_T '    CHECK(setup::IsDownloadPlayLeftover(dlp, setup::ReadSlot(dlp).slot));' "the test holds that the copy an earlier build put in the Download Play application's folder is a leftover"
+need_line $SG_T '    CHECK(setup::DisableGame(dlp) && !Exists(setup::GamePluginDir(dlp)));' "... that the removal takes the copy and the folder"
+need_line $SG_T '    CHECK(setup::ReadSlot(dlp).slot == Slot::Other && !setup::IsDownloadPlayLeftover(dlp, setup::ReadSlot(dlp).slot));' "... and that a folder with another plugin of the user's is not a leftover"
+need_line $SG_T '    CHECK(Exists(setup::GamePluginDir(dlp) + "/Other.3gx") && Exists(setup::GamePluginPath(dlp)));' "... and is left whole"
+need_line $SG_T '    CHECK(last.size() == 4 && last[1].index == 1 && last[1].listing == Listing::OffOnly && last[2].index == 4 && last[3].index == 5);' "the test holds that an impostor, switched off, leaves the next list"
+need $SG_T '    CHECK(setup::LoadGameCache("sdmc:/3ds/titles.cache", 1, out) && out.size() == 2 && SameGame(out[1], in[1]) && setup::IsDownloadPlayTid(out[1].tid));' "the test holds that an old cache with the record of the Download Play application is still read"
+! grep -q -E 'TestSystemScan|MadeUpNand|ScanSystemTitles|DownloadPlayAmong' $SG_T || fail "$SG_T: the test of the scan of the NAND is back (the scan reads nothing of the NAND any more: spec 9)"
+# The plugin's side. The guard of GetTextSize (Sources/ctr/text_search_guard.cpp) lets the plugin start inside the Download Play application of the system (stage G0:
+# who joins a game with the system's Download Play, an Azahar among them). The app's table (games.hpp) is not a row of Enable Titles any more (spec 9): it says which
+# folders the one-time removal looks at and which titles IsGuestGame keeps out. The two tables must still be the same six titles: a title the guard answers for and the
+# app does not know would keep a copy an earlier build put in its folder, and a title of the app's table the guard does not answer for is one the plugin cannot start in.
+XP_APP=$(region $SG_H 'constexpr u64 kDownloadPlayTids[] = {' '};' | code_of | grep -o -E '0x[0-9A-Fa-f]{16}' | tr 'a-f' 'A-F' | sort -u | tr '\n' ' ')
+XP_GUARD=$(cat Includes/ctr/text_search_guard.hpp Sources/ctr/text_search_guard.cpp | tr -d '\r' | code_of | grep -o -E '0x0004001[0-9A-Fa-f]{9}' | tr 'a-f' 'A-F' | sort -u | tr '\n' ' ')
+[ -n "$XP_APP" ] || fail "the app's table of the Download Play application ($SG_H) is empty or gone: the one-time removal and IsGuestGame ask it"
+[ -n "$XP_GUARD" ] || fail "the guard of GetTextSize names no Download Play application (Includes/ctr/text_search_guard.hpp, Sources/ctr/text_search_guard.cpp)"
+[ "$XP_GUARD" = "$XP_APP" ] || fail "the app's table of the Download Play application ($SG_H: $XP_APP) and the titles the guard of GetTextSize answers for ($XP_GUARD) are not the same six titles"
+
+# ---- Mario Party: Island Tour as the HOST of the real Download Play (2026-11-14; stage H1 of analysis/island-tour-2026-11-13/plugin/PROGETTO-FINALE.md) ----
+# The game has only the host's side of its Download Play (dlp:SRVR); who joins is the system's Download Play application with the child 00040001000F8200 (an Azahar that has it
+# installed). ONE row of the table of games for the European id (the one whose code was read), RealDlp, closing after its mode: the hash of the MAC and the default of four players; since
+# 2026-11-14 one more for each of the game's other four regions, with the same values (the last block of this file); the
+# counts of the RealDlp rows (pinned with phase F5: nine that close after the mode, fourteen in all) hold that there is no other. The contract is the capture of two Azahar that played it
+# (2026-11-13): its bytes are Tests/dlp_real_island_golden.inc, cut out by Tests/make_dlp_real_island_goldens.py - the title and the icon of the game replaced by the sum of their
+# words, the passphrase by a stand-in, no name and no address of a node in any byte - and Tests/dlp_real_island_test.cpp holds the hub to them AS THE GAME DRIVES IT (Initialize with
+# no name for 3 clients, acceptance by hand, AcceptClient for each and StartDistribution in ONE frame, the passphrase once): built, run under a timeout, every part of it called
+# and counted (a part that returns early is a failure of the test). Its part L holds two LIMITS of the row as they are today, read from the game's code: StartDistribution and the
+# passphrase are sent once and their result dropped, so a command the hub refuses (no Tick of the network thread for a second) leaves the lobby where it is until the player leaves
+# it and comes back; and the game's back-while-distributing (EndAccepting and StartAccepting in state 6) is answered and not followed. A remedy changes those lines on purpose.
+ITP=Sources/ctr/plugin.cpp
+ITD=Tests/plugin_dlp_test.cpp
+ITT=Tests/dlp_real_island_test.cpp
+ITG=Tests/dlp_real_island_golden.inc
+ITS=Tests/make_dlp_real_island_goldens.py
+# - the row: one, the European id, its mode and nothing after it; the id nowhere else in the plugin's file (the ids of the other regions have their own rows: the last block)
+# (1.1.4, L4: the row is Mario Party: Island Tour's row of azl/title_rules.hpp, every region in it, with its Download Play column; plugin.cpp names no id of the game)
+need_line Includes/azl/title_rules.hpp '     {DlpGameMode::RealDlp, false, 4}},' "Mario Party: Island Tour, every region, speaks the real Download Play as the host (2026-11-14), with the hash of the MAC and four players: its Download Play column"
+need_after Includes/azl/title_rules.hpp '    {"Mario Party: Island Tour", {0x000DD400u, 0x000F8100u, 0x000F8200u, 0x00119300u, 0x00119B00u}, {30, 16, 2048, true, 4096, false, false, false},' '     {DlpGameMode::RealDlp, false, 4}},' "... the column of its row"
+[ "$(tr -d '\r' < $ITP | grep -c -i -E '0x00040000000F8200|0x00040000000F8100|0x00040000000DD400|0x0004000000119300|0x0004000000119B00')" = "0" ] || fail "$ITP names an id of Mario Party: Island Tour: its Download Play column is its row of azl/title_rules.hpp"
+# - the column has these THIRTY ids (nineteen until 2026-11-14, then the eleven of "every region of a game"), each held by its own AZL_DLP_AS_BEFORE to what the plugin's table answered
+#   (the id twice in the table is refused by the compiler: RowsAreSound). A stage that adds an id moves this number with it.
+[ "$(tr -d '\r' < $ITD | grep -c '^AZL_DLP_AS_BEFORE(0x000400')" = "30" ] || fail "$ITD: thirty ids of the Download Play column are held one by one to what the plugin's table answered before L4 (AZL_DLP_AS_BEFORE): an id more or less comes with its own stage and moves this number"
+need_line $ITD 'static_assert(kDlpGames.size() == 30, "the thirty ids of the Download Play column");' "the view of the column has thirty ids"
+# - the plugin test: the row in its table, counted, asked by name, through MakeRealDlpHub and through the plugin's own decision; the other regions among the games with no row
+need $ITD '0x0004000000122C00ull, 0x0004000000122E00ull, 0x0004000000189600ull, 0x0004000000189800ull, 0x00040000000A2400ull, 0x00040000000A2500ull,' "the plugin test holds the kiosk demos of Kirby Triple Deluxe, Kirby Planet Robobot and Mario Tennis Open among the games that keep the real services (the other regions of Mario Party: Island Tour have rows since 2026-11-14)"
+need_line $ITD '        {0x00040000000F8200ull, DlpGameMode::RealDlp, false, 4},    // Mario Party: Island Tour, Europe (2026-11-14: the console hosts, the real Download Play)' "the plugin test wants the row of Mario Party: Island Tour: RealDlp, the hash of the MAC, four players"
+need_line $ITD '    static const u64 island = 0x00040000000F8200ull;' "the plugin test names the id of Mario Party: Island Tour by hand"
+need_line $ITD '        CHECK_EQ(game.mode == DlpGameMode::RealDlp, is_luigi || is_mk7 || is_island || is_d6);' "the RealDlp rows are Luigi's, Mario Kart 7's, Mario Party: Island Tour's and the D6 rows that moved with their capture (d6_real), written by hand"
+need_line $ITD '    CHECK_EQ(real_d6, 2u);' "... and as many of D6 as d6_real lists (a row moves with its capture: Tests/dlp_real_lobby_games_test.cpp)"
+need_line $ITD '            CHECK_EQ(game.max_players, is_mk7 ? 8u : 4u);' "... of which only Mario Kart 7's have eight players"
+need_line $ITD '    CHECK_EQ(real_island, 5u);' "... FIVE of Mario Party: Island Tour, one for each region"
+need_line $ITD '    CHECK(DlpModeOf(island) == DlpGameMode::RealDlp);' "Mario Party: Island Tour by name: the real Download Play"
+need_line $ITD '    CHECK(!LobbySeedIsConsoles(island));' "... the hash of the MAC, not the console's seed"
+need_line $ITD '    CHECK_EQ(LobbyPlayersOf(island), 4u);' "... four players"
+need_line $ITD '    CHECK(!AdmissionToMembersOf(island));' "... and the admissions of its own network broadcast as ever"
+need_line $ITD '            CHECK_EQ(hub_i->lobby_.max_players(), 4u);  // Mario Party: Island Tour: four, the default of its row' "MakeRealDlpHub gives the lobby of Mario Party: Island Tour four players"
+need_line $ITD '            CHECK_EQ(real_i.players(), 4u);             // Mario Party: Island Tour: the adapter is told the same four' "... and its adapter the same four"
+need_line $ITD '            CHECK(!engine_i->admission_to_members());   // Mario Party: Island Tour: its own network broadcasts the Logoff of an admission' "... and leaves the engine's switch off"
+need_line $ITD '            CHECK_EQ(hub_i->lobby_.id_.seed, Fnv1a64(mac.data(), mac.size()));  // Mario Party: Island Tour: the hash of the MAC' "... with the hash of the MAC as the seed"
+need_line $ITD '            CHECK_EQ(hub_i->lobby_.max_clients_, 3u);  // Mario Party: Island Tour: the three clients the game asks for' "... and the three clients the game asks for are three"
+need_line $ITD '                island_hubs += tid == 0x00040000000F8200ull ? 1u : 0u;' "the plugin's own decision is run for the row of Mario Party: Island Tour"
+need_line $ITD '    CHECK_EQ(island_hubs, 1u);  // Mario Party: Island Tour with the plugin active: ONE hub, on the adapter of the real Download Play' "... and gives it ONE hub on the adapter of the real Download Play"
+# - the suite builds the test (after the library's file it links) and runs it under a timeout
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_island_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_island_test"' "the suite builds the test of Mario Party: Island Tour on the hub of the real Download Play"
+need_order Tests/run.sh 'gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"' 'Tests/dlp_real_island_test.cpp Sources/azl/dlp_hub.cpp' "the library's dlph_wire.o is built before the test that links it"
+need_line Tests/run.sh '  timeout 1200 "$OUT/dlp_real_island_test"' "the suite runs the test of Mario Party: Island Tour under a timeout: a hang is a failure, not a stop"
+# - the test: it stops at the first undefined behaviour, includes the capture, runs every part; the game's confirmation is ONE function, the accepts and the start with nothing
+#   between them, called by the part that hosts and by the part of the client that asks for the content
+need $ITT 'return "halt_on_error=1:print_stacktrace=1";' "the test of Mario Party: Island Tour stops at the first undefined behaviour"
+IT_CONFIRM=$(tr -d '\r' < $ITT | sed -n '/^static void Confirm(Game& g, const std::vector<u32>& waiting) {$/,/^}$/p')
+need_nth "$ITT, the confirmation" "$IT_CONFIRM" 1 'static void Confirm(Game& g, const std::vector<u32>& waiting) {' "the game's confirmation is one function"
+need_nth "$ITT, the confirmation" "$IT_CONFIRM" 2 '    for (const u32 node : waiting) {' "it accepts every client the game read in 0x40"
+need_nth "$ITT, the confirmation" "$IT_CONFIRM" 3 '        CHECK_EQ(g.AcceptClient(node).res(), 0u);' "... with AcceptClient"
+need_nth "$ITT, the confirmation" "$IT_CONFIRM" 4 '    }' "... and nothing after the accepts"
+need_nth "$ITT, the confirmation" "$IT_CONFIRM" 5 '    CHECK_EQ(g.StartDistribution().res(), 0u);' "... but StartDistribution, in the same frame of the game"
+need_nth "$ITT, the confirmation" "$IT_CONFIRM" 6 '}' "... and nothing after it"
+[ "$(tr -d '\r' < $ITT | grep -c -x ' *Confirm(g, waiting);')" = "5" ] || fail "$ITT: the part that hosts, the part of the client that asks for the content, two of the limits (the refused passphrase, the game's closeDistribute) and the wait for the children (1.1.4, H5) all confirm as the game does (the line five times)"
+# - what the test holds (each line is one of its claims; taken away, the claim is not made any more)
+need_line $ITT '#include "dlp_real_island_golden.inc"' "the test of Mario Party: Island Tour is held to the capture of two Azahar"
+need_line $ITT 'static constexpr u32 kIslandClients = 3;                    // what the game asks of Initialize' "the test's game asks for THREE clients, as the game's code does"
+need_line $ITT '    G_Capture();' "the test runs its part G (the capture against the codec)"
+need_line $ITT '    H_HostThree();' "the test runs its part H (the console hosts three clients)"
+need_line $ITT '    C_WantsContent();' "the test runs its part C (a client that asks for the content)"
+need_line $ITT '    L_Limits();' "the test runs its part L (the limits of the row, held as they are)"
+need_line $ITT '    CHECK(made >= least);' "a part of the test that made fewer checks than its least is a failure"
+need_line $ITT '    Ran("G", c, kLeastCapture);' "G: the part made its checks"
+need_line $ITT '    Ran("H, answers at once", c, kLeastHost);' "H, answers at once: the run made its checks"
+need_line $ITT '    Ran("H, the player waits", c, kLeastHost);' "H, the player waits: the run made its checks"
+need_line $ITT '    Ran("H, answers 100 ms away", c, kLeastHost);' "H, answers 100 ms away: the run made its checks"
+need_line $ITT '    Ran("H, answers 250 ms away", c, kLeastHost);' "H, answers 250 ms away: the run made its checks"
+need_line $ITT '    Ran("C, with two other clients", c, kLeastContent);' "C, with two other clients: the run made its checks"
+need_line $ITT '    Ran("C, alone", c, kLeastContentAlone);' "C, alone: the run made its checks"
+need_line $ITT '    Ran("L1, the passphrase refused", c, kLeastLimit);' "L1: the run made its checks"
+need_line $ITT '    Ran("L2, the start refused", c, kLeastLimit);' "L2: the run made its checks"
+need_line $ITT '    Ran("L3, the game'"'"'s closeDistribute", c, kLeastLimit);' "L3: the run made its checks"
+need_line $ITT 'static constexpr int kLeastCapture = 100;' "G makes at least 100 checks (113 today, always the same)"
+need_line $ITT 'static constexpr int kLeastHost = 1000;' "a run of H makes at least 1000 checks (2200 to 6400 on a free machine)"
+need_line $ITT 'static constexpr int kLeastContent = 800;' "C with two other clients makes at least 800 checks (1700 on a free machine)"
+need_line $ITT 'static constexpr int kLeastContentAlone = 350;' "C alone makes at least 350 checks (740 on a free machine)"
+need_line $ITT 'static constexpr int kLeastLimit = 1500;' "a run of L makes at least 1500 checks (3000 to 8800 on a free machine)"
+need_line $ITT '    return 0xC0DE5A00u | (v & 0xFFu);  // the game stores a byte: three stale bytes above it' "the test's game stores a BYTE into a request word, as the game's wrappers do"
+need_line $ITT '    return 0xC0DE0000u | (v & 0xFFFFu);  // the game stores a halfword: two stale bytes above it' "... and a HALFWORD where the game stores a halfword"
+need_line $ITT '    Rep Initialize(u32 clients, u32 child_index) { return Call(0x00010183, {0x85000, AsByte(clients), 0xE, AsByte(child_index), 0x40000, 2, 0x04000000, 0x11, 0x12}); }' "Initialize: the clients and the child's index are bytes"
+need_line $ITT '    Rep StartAccepting(u32 manual, u32 channel) { return Call(0x00050080, {AsByte(manual), AsByte(channel)}); }' "StartAccepting: by hand and the channel are bytes"
+need_line $ITT '    Rep AcceptClient(u32 node) { return Call(0x00090040, {AsHalf(node)}); }' "AcceptClient: the node is a halfword"
+need_line $ITT '    Rep ConnectingClients() { return Call(0x000B0042, {AsHalf(4), (8u << 4) | 0xC, cli_}); }' "GetConnectingClients: the count is a halfword"
+need_line $ITT '            if (!held_) {' "the network thread of the test can be held up (no Tick of the engine or of the hub)"
+need_line $ITT '        net.HoldUp();' "L1, L2: the network thread is held up before the game's ONE command"
+need_line $ITT '        Sleep(DlpHub::kAliveMs + 300);' "L1, L2: ... for longer than the hub takes it for alive"
+need_line $ITT '            CHECK_EQ(g.AcceptClient(waiting.at(0)).res(), 0u);                       // L2: the accept is answered on the game'"'"'s thread ...' "L2: with the network thread held up AcceptClient is still answered"
+need_line $ITT '            CHECK_EQ(g.StartDistribution().res(), DlpHub::kResultWirelessOff);       // L2: ... and the ONE StartDistribution is refused' "L2: ... and the ONE StartDistribution is refused"
+need_line $ITT '            CHECK_EQ(g.SendPassphrase(kDlpRealIslandPass).res(), DlpHub::kResultWirelessOff);  // L1: the ONE passphrase is refused' "L1: the ONE passphrase is refused"
+need_line $ITT '        CHECK(!moved);  // L: the lobby stays where it was: 2 after a refused StartDistribution, 8 after a refused passphrase' "L1, L2: the lobby stays where it was (the limit: the game never sends the command again)"
+need_line $ITT '        CHECK(guest.passphrase().empty());                    // L: the guest never gets a passphrase' "L1, L2: the guest never gets a passphrase"
+need_line $ITT '        LeaveAndComeBack(h, g);' "L1, L2: the way out is tried: the player leaves the lobby and comes back"
+need_line $ITT '    OpenIsland(h, g);  // L: ... and the hub accepts again' "L1, L2: after Finalize the hub accepts again"
+need_line $ITT '        CHECK_EQ(g.EndAccepting().res(), 0u);  // L3: EndAccepting while it distributes answers 0 ...' "L3: EndAccepting while the hub distributes answers 0"
+need_line $ITT '        CHECK(after_end == 6 || after_end == 8);  // L3: ... and changes nothing (Azahar'"'"'s host would be back at 1)' "L3: ... and changes nothing (the limit: Azahar's host goes back to accepting)"
+need_line $ITT '        CHECK_EQ(g.StartAccepting(1, 0).res(), kDlpInvalidState);  // L3: StartAccepting outside state 1 is refused (Azahar'"'"'s host accepts again)' "L3: StartAccepting while the hub distributes is refused"
+need_line $ITT '        CHECK(WaitFor(3000, [&] { return guest.state() == AzaharDlpClient::kComplete; }));  // L3: the guest got the final all the same' "L3: the guest gets the final all the same"
+need_line $ITT '    RunRefused(false);' "L1: the passphrase refused"
+need_line $ITT '    RunRefused(true);' "L2: the start refused"
+need_line $ITT '    RunCloseDistribute();' "L3: the game's closeDistribute"
+need_line $ITT '    RunHost(0, 0);' "H: answers at once, the player confirms at once"
+need_line $ITT '    RunHost(0, 1500);' "H: the player waits, as in the capture"
+need_line $ITT '    RunHost(100, 0);' "H: answers 100 ms away"
+need_line $ITT '    RunHost(250, 0);' "H: answers 250 ms away"
+need_line $ITT '    RunContent(false);' "C: with two clients that have the child"
+need_line $ITT '    RunContent(true);' "C: alone"
+need_line $ITT '        CHECK_EQ(dlp_real::AnnounceFrame(buf, i, kIslandChild, kIslandPlayers, kDlpRealIslandSeed), g.size);' "G: our announcement of this child for four nodes has the sizes of the capture's five frames"
+need_line $ITT '            CHECK(std::memcmp(buf + 0x10, g.bytes + 0x10, 0x28) == 0);  // SAME: the child 00040001000F8200, 00 10, 01 01, 00 03 ff c0, max_nodes 4, 23 zeros' "G: frame 0 of ours is the capture's from the child's id to the sizes"
+need_line $ITT '        CHECK(body_zero);  // ours: zeros there' "G: ours carries no sizes, no name and no icon of the child (stage H2 changes this line, not by accident)"
+need_line $ITT '            CHECK(std::memcmp(buf, g.bytes, g.size) == 0);  // SAME: frame 4 is zeros in Azahar'"'"'s too, the same bytes, checksum included' "G: frame 4 is the capture's, byte for byte"
+need_line $ITT '    CHECK(std::strcmp(Island("A1").time, Island("A3").time) == 0);  // the Auth and StartDistribution in the same instant: accepted and started in one step' "G: in the capture the Auth and StartDistribution leave in the same instant"
+need_line $ITT '        CHECK(n == want.size() && std::memcmp(buf, want.data(), n) == 0);' "G: every packet of the capture's dialogue is the one our builders make"
+need_line $ITT '            CHECK(std::memcmp(g.bytes + dlp_real::kPassphraseAt, kDlpRealIslandPass, 9) == 0);  // (the stand-in: the capture'"'"'s passphrase is not in the file)' "G: the final of the golden data carries the stand-in, not the capture's passphrase"
+need_line $ITT '    CHECK_EQ(g.Initialize(kIslandClients, 0).res(), 0u);' "the test's game calls Initialize with no name, three clients, the child 0"
+need_line $ITT '    CHECK_EQ(g.StartAccepting(1, 0).res(), 0u);' "... and accepts BY HAND"
+need_line $ITT '    CHECK_EQ(h.e().GetConnectionStatus().max_nodes, 4u);  // "hosting network (max 4 nodes ...)", as the capture'"'"'s beacon says' "the network the console hosts has four nodes"
+need_line $ITT '            CHECK(Frames(g, seen, 3000, [&](const std::string& line) { return line == want; }));' "H: the game lists each client in 0x40, waiting to be accepted"
+need_line $ITT '            CHECK_EQ(said, 0u);  // (as in the capture: nothing on channel 2 while the clients wait - and no announcement of ours, nobody is looking)' "H: nothing goes to the clients that wait"
+need_line $ITT '        CHECK_EQ(g.calls(0x09), kIslandClients);  // H: three AcceptClient ...' "H: the confirmation is three AcceptClient ..."
+need_line $ITT '        CHECK_EQ(g.calls(0x07), 1u);              // H: ... and ONE StartDistribution, before the game read anything again' "H: ... and ONE StartDistribution"
+need_line $ITT '        CHECK(seen.Has("state 8, 3 clients: 2=07 3=07 4=07"));' "H: the game reads state 8 with the three still listed"
+need_line $ITT '        CHECK(to8 < DlpLobby::kStartGraceMs);  // (every client answered: nobody was thrown out at the lobby'"'"'s grace)' "H: state 8 comes from the clients' answers, not from the lobby's grace"
+need_line $ITT '        CHECK_EQ(g.calls(0x08), 1u);  // H: the passphrase was given ONCE' "H: the passphrase is given ONCE"
+need_line $ITT '        CHECK(seen.Has("state 9, 0 clients:"));  // at 9 the game waits for GetConnectingClients = 0: it is 0 at the first read' "H: at state 9 the game has no client left to wait for"
+need_line $ITT '            CHECK(pass.size() == 9 && std::memcmp(pass.data(), kDlpRealIslandPass, 9) == 0);' "H: every client has the final with the passphrase the game gave"
+need_line $ITT '            CHECK_EQ(m->received(4, 0) + m->received(4, 1), 0u);  // nothing of the child was sent' "H: no client got a fragment of the child"
+need_line $ITT '        CHECK_EQ(d.p[0x0D], want_seq);' "H: the sequence of the host's packets (where ours differs from the capture's host) is held"
+need_line $ITT '        CHECK(Same(p, g, kDlpRealIslandSeed));' "H: EVERY packet the host sends has the capture's form, byte for byte but the sequence and the id"
+need_line $ITT '        CHECK_EQ(w.early, 0u);          // before the game accepted: the Auth and nothing else (ours sends it at the admission, Azahar'"'"'s host at the accept)' "H: before the game accepts the host sends the Auth and nothing else"
+need_line $ITT '                CHECK_EQ(w.a3_to[s], 1u);  // ONE StartDistribution to each' "H: ONE StartDistribution to each client"
+need_line $ITT '                CHECK_EQ(w.a7_to[s], 1u);  // ONE final to each' "H: ONE final to each client"
+need_line $ITT '        CHECK_EQ(w.content, 0u);  // H: not one fragment of the child on the wire' "H: not one fragment of the child on the wire"
+need_line $ITT '            CHECK(found.host_mac_address == h.mac());  // the address announced in the Download Play is the BSSID of the game'"'"'s network' "H: the game's own network is found at the address the Download Play's host had"
+need_line $ITT '            CHECK(o.from == h.mac());' "H: every beacon of the two networks has one transmitter"
+need_line $ITT '        CHECK_EQ(mask, (1u << players) - 1u);  // every player the game counted is in its network' "H: every player the game counted comes back into its own network"
+need_line $ITT '    CHECK_RULES();  // no frame of the room broke a rule of Azahar'"'"'s (Tests/azahar_rules.hpp)' "H: no frame of the room breaks a rule of Azahar's"
+need_line $ITT '    cl[asks]->want_content = true;' "C: one client asks for the child's content"
+need_line $ITT '        CHECK_EQ(h.real.counters().content, 1u);' "C: the adapter counts the request of content"
+need_line $ITT '        CHECK(seen.Has(alone ? "state 8, 0 clients:" : "state 8, 2 clients: 2=07 4=07"));' "C: the game no longer lists the client that asked"
+need_line $ITT '        CHECK_EQ(g.ClientInfo(asked_node).res(), R_NO_DATA);' "C: GetClientInfo of the client that asked: no data"
+need_line $ITT '        CHECK_EQ(g.calls(0x08), 1u);  // C: the passphrase was given ONCE' "C: the game goes on: the passphrase once"
+need_line $ITT '        CHECK(seen.Has("state 9, 0 clients:"));  // C: the game reads 9 with nobody left to wait for, as if every player had the passphrase' "C: the game reads state 9 as if nothing happened"
+need_line $ITT '        CHECK(cl[asks]->passphrase().empty());                                   // the client that asked never gets the passphrase' "C: the client that asked never gets the passphrase"
+need_line $ITT '        CHECK_EQ(cl[asks]->received(4, 0) + cl[asks]->received(4, 1), 0u);       // ... and not one fragment of the child' "C: ... and not one fragment of the child"
+need_line $ITT '        CHECK_EQ(with_pass, n - 1);' "C: every other client has the passphrase"
+need_line $ITT '        CHECK_EQ(w.content, 0u);  // C: not one fragment of the child on the wire, though a client asked for it' "C: not one fragment of the child on the wire"
+need_after $ITT '            std::printf("   a packet of the host that the capture does not have: %s\n", Hex(d.p.data(), d.p.size()).c_str());' '            CHECK(false);' "H: a packet of the host that the capture does not have is a failure"
+# - the golden data: generated, never edited (its checksum is held: whoever runs the script again on the same capture gets the same file); nothing of the game's (title, icon),
+#   of the session's (passphrase) or of the players' (names, addresses) in it, and the script itself refuses to write a file that has any
+[ -f $ITS ] || fail "$ITS is gone (the script that cuts the golden data of Mario Party: Island Tour out of the capture of two Azahar)"
+head -1 $ITG | grep -q "^// Generated by Tests/make_dlp_real_island_goldens.py from the capture of 2026-11-13" || fail "$ITG is not marked as generated by Tests/make_dlp_real_island_goldens.py"
+[ "$(tr -d '\r' < $ITG | md5sum | cut -d' ' -f1)" = "8c1cbced33c304c331ce67618d4c255d" ] || fail "$ITG is not the file Tests/make_dlp_real_island_goldens.py wrote from the capture of two Azahar: the golden data are not edited by hand"
+need_line $ITG 'static const std::uint8_t kDlpRealIslandSeed[4] = {0xb8, 0xf4, 0x6b, 0xff};' "the seed of the capture's checksums (the one of all 2^32 that fits: every packet is checked with it)"
+need_line $ITG 'static const std::uint64_t kDlpRealIslandChild = 0x00040001000f8200ULL;  // frame 0, +0x10' "the capture's host announces the child 00040001000F8200"
+need_line $ITG 'static const unsigned kDlpRealIslandMaxNodes = 4;  // frame 0, +0x20' "the capture's host announces four nodes"
+need_line $ITG 'static const std::uint8_t kDlpRealIslandPass[9] = {0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x76, 0x00};  // the final, +0x14: the STAND-IN "1234567v" (seven hex digits and a '"'"'v'"'"', as the game makes it)' "the passphrase of the golden data is the stand-in"
+need_line $ITG '    {"F0", "285.079", 1, 1, 65535, 768, kDlpRealIsland_00_F0, 0x6afc8d60, 0x7f7f7f35, {0x40, 0x2f8}},' "frame 0 of the announcement carries no title and no icon of the game (+0x40..+0x2F7 is its sum only)"
+need_line $ITG 'static const DlpRealGolden kDlpRealIslandDialog[9] = {' "the whole dialogue of the capture's good session: nine packets"
+need_line $ITS 'STAND_IN = b'"'"'1234567v\x00'"'"'    # what replaces the passphrase of the final (+0x14, nine bytes)' "the script has a stand-in for the passphrase"
+need_line $ITS '            g = sealed(seed, g[:0x14] + STAND_IN + g[0x1D:])' "... and puts it in the place of the capture's passphrase, with the checksum made again"
+need_line $ITS '    refuse(any(p[:8] in g for pid, r, g, red in packets for p in passphrases), '"'"'a passphrase of the capture in a packet'"'"')' "... and refuses to write a packet that has a passphrase of the capture"
+need_line $ITS '            red = [(0x40, 0x2F8)]' "the script replaces the title and the icon of frame 0 by their sum"
+need_line $ITS '            red = [(0x10, len(b))]' "... and the icon of frames 1-3"
+need_line $ITS '    macs = [bytes.fromhex(tx[:17].replace('"'"':'"'"', '"'"''"'"')) for tx in (host_tx, client_tx)]' "the script takes the six BYTES of the address of each node of the capture"
+need_line $ITS '    refuse(not all(nicks) or any(len(mac) != 6 for mac in macs) or macs[0] == macs[1], '"'"'the two nodes of the capture are not read'"'"')' "... and stops if it did not read two nodes with a name and an address of six bytes each"
+need_line $ITS '    refuse(any(mac in p[2] or mac[::-1] in p[2] for mac in macs for p in packets), '"'"'an address of a node of the capture in a packet'"'"')' "the script refuses to write a packet whose BYTES hold an address of a node of the capture, straight or reversed"
+need_line $ITS '    refuse(any(n.encode(enc) in p[2] for n in nicks for enc in ('"'"'utf-8'"'"', '"'"'utf-16-be'"'"', '"'"'utf-16-le'"'"') for p in packets), '"'"'a name of a node of the capture in a packet'"'"')' "... nor a name of a node, as UTF-8 or as the UTF-16 the wire carries"
+need_line $ITS '    refuse(any(bad in text.lower() for bad in [tx[:17].lower() for tx in (host_tx, client_tx)] + [mac.hex() for mac in macs] + [n.lower() for n in nicks]),' "... nor a text (the comments, the numbers) that has an address as it is printed or a name"
+# - ... and it refuses by STOPPING (SystemExit, not an assert: python -O takes the asserts away), before the file is opened for writing: the function, statement by statement,
+#   and the last refusal above the line that writes
+IT_REFUSE=$(tr -d '\r' < $ITS | sed -n '/^def refuse(found, what):$/,/^$/p')
+need_nth "$ITS, the refusal" "$IT_REFUSE" 1 'def refuse(found, what):' "the script has one way to refuse"
+need_nth "$ITS, the refusal" "$IT_REFUSE" 2 '    """Stops - also under python -O, where an assert is not run - when something of the capture that must stay out is about to be written."""' "(what it is for)"
+need_nth "$ITS, the refusal" "$IT_REFUSE" 3 '    if found:' "it stops when what must stay out was found"
+need_nth "$ITS, the refusal" "$IT_REFUSE" 4 '        raise SystemExit('"'"'REFUSED, nothing written: '"'"' + what)' "... with SystemExit: it stops under python -O too"
+need_nth "$ITS, the refusal" "$IT_REFUSE" 5 '' "... and does nothing else"
+need_order $ITS '           '"'"'an address or a name of a node of the capture in the text'"'"')' '    open(dest, '"'"'w'"'"', newline='"'"'\n'"'"').write(text)' "the script looks for what must stay out BEFORE it writes the file"
+
+
+# ---- EVERY REGION OF A GAME (2026-11-14, the user's rule: "when we work on a game, every regional version of it goes in; the European one is only the one that is tried") ----
+# The table of games of the Download Play wiring has a row for every title id each of its games is sold with (3DS Link's catalogue of sold games: id, region, family): eleven rows
+# were added that day - Kirby Battle Royale Japan and Korea, Kirby Triple Deluxe Japan, Korea and Taiwan, Kirby Planet Robobot Korea, Mario Tennis Open Korea, Mario Party: Island
+# Tour USA, Japan, Taiwan and Korea - each with the mode and the values of the row of its game that was seen; NOT seen, their code not read. The kiosk demos that share a family with
+# a game (and Mario Kart 7's unidentified 8B500) stay out. The system's Download Play application is answered by the guard of GetTextSize in its six regional titles, from ONE list
+# (Includes/ctr/text_search_guard.hpp) that the plugin's start line reads too. The counts of the rows (thirty in all, fourteen RealDlp, nine that close after RealDlp, twenty-five
+# of four players in the plugin test) are held where they were held before, above.
+RGP=Sources/ctr/plugin.cpp
+RGD=Tests/plugin_dlp_test.cpp
+RGH=Includes/ctr/text_search_guard.hpp
+RGG=Sources/ctr/text_search_guard.cpp
+RGT=Tests/text_search_guard_test.cpp
+RGI=Tests/dlp_real_island_test.cpp
+# - the eleven rows, each whole (its id, the mode of its game, where it comes from)
+# (1.1.4, L4: the ids of every region are in the game's row of azl/title_rules.hpp, which says the rule; Tests/flow_relief_test.cpp holds every row to its whole family of the
+#  catalogue, the ids left out in kLeftOut with their reason)
+need_line Includes/azl/title_rules.hpp '// To add a game: one row, with the ids of ALL its regions (the catalogue of the app'"'"'s lobbies: the low word of the application'"'"'s title' "the table says its rule: every region of a game"
+need_line Includes/azl/title_rules.hpp 'inline constexpr u32 kLeftOut[] = {0x00122C00u, 0x00122E00u, 0x00189600u, 0x00189800u, 0x000A2400u, 0x000A2500u, 0x00081500u, 0x00081600u, 0x0008B500u};' "the ids of the families of the Download Play games that are not the game (kiosk demos, Mario Kart 7's unidentified 8B500) are left out, said"
+# - the ids that share a family with a game and are NOT the game nowhere in the plugin's file (the ids of the games: the block of phase 3)
+hit=$(tr -d '\r' < $RGP | grep -n -i -E '0x0004000000122C00|0x0004000000122E00|0x0004000000189600|0x0004000000189800|0x00040000000A2400|0x00040000000A2500|0x0004000000081500|0x0004000000081600|0x000400000008B500' | head -3)
+[ -z "$hit" ] || fail "$RGP names a kiosk demo of Kirby Triple Deluxe, Kirby Planet Robobot, Mario Tennis Open or Mario Kart 7, or Mario Kart 7's unidentified 8B500 (they share a family of the catalogue with the game and are not the game: no row): $hit"
+# - the plugin test: the eleven rows in its table, the kiosk demos among the games that keep the real services, and the families written by hand - every id of a game has the
+#   mode, the seed and the ceiling of the id of that game that was seen, and the table has no row outside them
+need_line $RGD '        {0x00040000001A8B00ull, DlpGameMode::ProbeOnly, false, 4},  // Kirby Battle Royale, Japan (2026-11-14: every region of a game, from the catalogue)' "the plugin test wants the row of Kirby Battle Royale, Japan"
+need_line $RGD '        {0x00040000001C2200ull, DlpGameMode::ProbeOnly, false, 4},  // Kirby Battle Royale, Korea (from the catalogue)' "the plugin test wants the row of Kirby Battle Royale, Korea"
+need_line $RGD '        {0x000400000010BE00ull, DlpGameMode::Lobby, false, 4},      // Kirby Triple Deluxe, Japan (from the catalogue)' "the plugin test wants the row of Kirby Triple Deluxe, Japan"
+need_line $RGD '        {0x0004000000120F00ull, DlpGameMode::Lobby, false, 4},      // Kirby Triple Deluxe, Korea (from the catalogue)' "the plugin test wants the row of Kirby Triple Deluxe, Korea"
+need_line $RGD '        {0x0004000000123200ull, DlpGameMode::Lobby, false, 4},      // Kirby Triple Deluxe, Taiwan (from the catalogue)' "the plugin test wants the row of Kirby Triple Deluxe, Taiwan"
+need_line $RGD '        {0x000400000017C600ull, DlpGameMode::RealDlp, false, 4},    // Kirby Planet Robobot, Korea (from the catalogue)' "the plugin test wants the row of Kirby Planet Robobot, Korea"
+need_line $RGD '        {0x00040000000B8800ull, DlpGameMode::Lobby, true, 4},       // Mario Tennis Open, Korea (from the catalogue: the console'"'"'s seed, as the game'"'"'s other rows)' "the plugin test wants the row of Mario Tennis Open, Korea, with the console's seed"
+need_line $RGD '        {0x00040000000F8100ull, DlpGameMode::RealDlp, false, 4},    // Mario Party: Island Tour, USA (from the catalogue: the values of the European row)' "the plugin test wants the row of Mario Party: Island Tour, USA"
+need_line $RGD '        {0x00040000000DD400ull, DlpGameMode::RealDlp, false, 4},    // Mario Party: Island Tour, Japan (from the catalogue)' "the plugin test wants the row of Mario Party: Island Tour, Japan"
+need_line $RGD '        {0x0004000000119300ull, DlpGameMode::RealDlp, false, 4},    // Mario Party: Island Tour, Taiwan (from the catalogue)' "the plugin test wants the row of Mario Party: Island Tour, Taiwan"
+need_line $RGD '        {0x0004000000119B00ull, DlpGameMode::RealDlp, false, 4},    // Mario Party: Island Tour, Korea (from the catalogue)' "the plugin test wants the row of Mario Party: Island Tour, Korea"
+need_line $RGD '    static const u64 islands[] = {0x00040000000F8200ull, 0x00040000000F8100ull, 0x00040000000DD400ull, 0x0004000000119300ull, 0x0004000000119B00ull};' "the plugin test names the five ids of Mario Party: Island Tour by hand"
+need_line $RGD '        CHECK(DlpModeOf(region) == DlpModeOf(island));  // every region of Mario Party: Island Tour: the mode of the European row' "every region of Mario Party: Island Tour has the mode of the European row"
+need_line $RGD '        {"Kirby Battle Royale", {0x00040000001C2100ull, 0x00040000001C2000ull, 0x00040000001A8B00ull, 0x00040000001C2200ull, 0}},  // AJ8: Europe, the id sold in more than one region, Japan, Korea' "the plugin test writes the family of Kirby Battle Royale by hand"
+need_line $RGD '        {"Kirby Triple Deluxe", {0x000400000010C000ull, 0x000400000010BF00ull, 0x000400000010BE00ull, 0x0004000000120F00ull, 0x0004000000123200ull}},  // BAL: Europe, USA, Japan, Korea, Taiwan' "... of Kirby Triple Deluxe"
+need_line $RGD '        {"Kirby Planet Robobot", {0x0004000000183600ull, 0x000400000017C600ull, 0, 0, 0}},  // AT3: the id sold in more than one region (FREE in the catalogue; Japan not verified), Korea' "... of Kirby Planet Robobot"
+need_line $RGD '        {"Mario Tennis Open", {0x000400000007C800ull, 0x000400000007C700ull, 0x0004000000064D00ull, 0x00040000000B9100ull, 0x00040000000B8800ull}},  // AGA: Europe, USA, Japan, Taiwan, Korea' "... of Mario Tennis Open"
+need_line $RGD '        {"Mario Kart 7", {0x0004000000030700ull, 0x0004000000030800ull, 0x0004000000030600ull, 0x0004000000030A00ull, 0x000400000008B400ull}},  // AMK: Europe, USA, Japan, Korea, Taiwan' "... of Mario Kart 7"
+need_line $RGD '        {"Luigi'"'"'s Mansion", {0x00040000001D1A00ull, 0x00040000001D1900ull, 0x00040000001D1800ull, 0x00040000001D4F00ull, 0}},  // BGN: Europe, USA, Japan, Korea' "... of Luigi's Mansion"
+need_line $RGD '        {"Mario Party: Island Tour", {0x00040000000F8200ull, 0x00040000000F8100ull, 0x00040000000DD400ull, 0x0004000000119300ull, 0x0004000000119B00ull}},  // ATS: Europe, USA, Japan, Taiwan, Korea' "... of Mario Party: Island Tour"
+need_line $RGD '            CHECK(DlpModeOf(region) == DlpModeOf(seen));  // a region of a game: the mode of the game' "a region of a game has the mode of the game (never another one)"
+need_line $RGD '            CHECK_EQ(LobbySeedIsConsoles(region), LobbySeedIsConsoles(seen));  // ... its seed' "... its seed flag"
+need_line $RGD '            CHECK_EQ(LobbyPlayersOf(region), LobbyPlayersOf(seen));  // ... its ceiling of players' "... its ceiling of players"
+need_line $RGD '    CHECK_EQ(family_ids, kRows);  // every row of the table is an id of one of the seven games, and every id of them has a row' "the table has as many rows as the seven games have ids"
+need_line $RGD '    CHECK_EQ(family_ids, 30u);' "... thirty"
+need_line $RGD '        CHECK(in_a_family);' "no row of the table is outside the seven games"
+need_line $RGD '            CHECK_EQ(hub_r->lobby_.tid_low_, static_cast<u32>(region));  // a region of Mario Party: Island Tour: the lobby has the low word of its own title' "MakeRealDlpHub gives the lobby of a region of Mario Party: Island Tour the low word of ITS title (the child it announces is made of it)"
+need_line $RGD '    CHECK_EQ(island_region_hubs, 4u);  // ... and one for each of its other four regions (USA, Japan, Taiwan, Korea), on the same adapter' "the plugin's own decision gives each of the other four regions of Mario Party: Island Tour a hub on the adapter of the real Download Play"
+# - the test of Mario Party: Island Tour, part R: the hub of each of the five ids announces the child of ITS OWN title
+need_line $RGI '    c.game_tid = tid;  // (the title of the row: the European one unless part R asks for another region'"'"'s)' "the test's hub takes the title it is told"
+need_line $RGI '    {0x00040000000F8200ULL, "Europe"}, {0x00040000000F8100ULL, "USA"},   {0x00040000000DD400ULL, "Japan"},' "part R runs Europe, USA and Japan"
+need_line $RGI '    {0x0004000000119300ULL, "Taiwan"}, {0x0004000000119B00ULL, "Korea"},' "... Taiwan and Korea"
+need_line $RGI '    const u64 child = dlp_real::kChildTidHigh | (static_cast<u32>(r.tid) & 0xFFFFFF00u);' "R: the child of a region is 00040001 above the low word of its own title, index 0"
+need_line $RGI '    Host h(room, 1, "Daisy", r.tid);' "R: the hub is made for the title of the region"
+need_line $RGI '        CHECK_EQ(pr.child_tid, child);  // R: the guest reads the child of the HOST'"'"'s region' "R: the guest reads the child of the host's region"
+need_line $RGI '        CHECK_EQ(pr.child_tid == kIslandChild, r.tid == kIslandTid);  // R: ... which is the European child for the European game and for no other' "R: no other region announces the European child"
+need_line $RGI '            CHECK(n != 0 && n == d.p.size() && std::memcmp(buf, d.p.data(), n) == 0);  // R: the announcement of this region'"'"'s child, byte for byte' "R: every frame of the announcement is the one of the region's child"
+need_line $RGI '                    CHECK_EQ(LoadBE32(tag + 4), kDlpRealIslandLobbyNet);  // R: the Download Play'"'"'s own network, the same in every region' "R: the Download Play's network is the same in every region"
+need_line $RGI '        CHECK(WaitFor(3000, [&] { return guest.state() == AzaharDlpClient::kComplete; }));' "R: the guest of every region gets the final"
+need_line $RGI '        RunRegion(r);' "R: every region is run"
+need_line $RGI '        Ran(r.region, c, kLeastRegion);' "R: every region made its checks"
+need_line $RGI 'static constexpr int kLeastRegion = 500;' "a region of R makes at least 500 checks (1150 to 1300 on a free machine)"
+need_line $RGI '    R_Regions();' "the test runs its part R (every region of the game)"
+# - the system's Download Play application: ONE list of its six regional titles, in the guard's header; the guard and the plugin's start line read it and nothing else names a title
+RG_LIST=$(tr -d '\r' < $RGH | sed -n '/^constexpr u64 kDownloadPlayTitles\[\] = {$/,/^};$/p' | sed '1d;$d')
+[ "$(printf '%s\n' "$RG_LIST" | grep -c .)" = "6" ] || fail "$RGH: the list of the titles of the Download Play application is six rows, one for each region of the console (Australia has the European title)"
+need_nth "$RGH, the list" "$RG_LIST" 1 '    0x0004001000020100ull, // the Download Play application, Japan (the system title list; not seen)' "the Download Play application, Japan"
+need_nth "$RGH, the list" "$RG_LIST" 2 '    0x0004001000021100ull, // the Download Play application, USA (the system title list; not seen)' "the Download Play application, USA"
+need_nth "$RGH, the list" "$RG_LIST" 3 '    0x0004001000022100ull, // the Download Play application, Europe and Australia (seen on a console, 2026-11-13; its code read, version 3073)' "the Download Play application, Europe (the one that was seen)"
+need_nth "$RGH, the list" "$RG_LIST" 4 '    0x0004001000026100ull, // the Download Play application, China (the system title list; not seen)' "the Download Play application, China"
+need_nth "$RGH, the list" "$RG_LIST" 5 '    0x0004001000027100ull, // the Download Play application, Korea (the system title list; not seen)' "the Download Play application, Korea"
+need_nth "$RGH, the list" "$RG_LIST" 6 '    0x0004001000028100ull, // the Download Play application, Taiwan (the system title list; not seen)' "the Download Play application, Taiwan"
+RG_IS=$(tr -d '\r' < $RGH | sed -n '/^constexpr bool IsDownloadPlayTitle(u64 title_id) {$/,/^}$/p')
+need_nth "$RGH, the question" "$RG_IS" 1 'constexpr bool IsDownloadPlayTitle(u64 title_id) {' "one question: is this title the Download Play application"
+need_nth "$RGH, the question" "$RG_IS" 2 '    for (const u64 title : kDownloadPlayTitles) {' "it walks the list"
+need_nth "$RGH, the question" "$RG_IS" 3 '        if (title == title_id) {' "a title of the list, whole (all 64 bits)"
+need_nth "$RGH, the question" "$RG_IS" 4 '            return true;' "... is the application"
+need_nth "$RGH, the question" "$RG_IS" 5 '        }' "(the end of the comparison)"
+need_nth "$RGH, the question" "$RG_IS" 6 '    }' "(the end of the list)"
+need_nth "$RGH, the question" "$RG_IS" 7 '    return false;' "every other title is not"
+need_nth "$RGH, the question" "$RG_IS" 8 '}' "... and nothing else"
+[ "$(tr -d '\r' < $RGH | grep -c -i -E '0x0004001[0-9A-F]{9}')" = "6" ] || fail "$RGH: a title of a system application outside the six rows of the list"
+hit=$(grep -r -n -i -E '0x0004001[0-9A-F]{9}' Sources Includes | grep -v "^$RGH:" | grep -v -i -E '0x000400100F[89A-F][0-9A-F]{5}ull' | head -3)
+[ -z "$hit" ] || fail "a title of a system application is named outside the list of $RGH (the guard and the start line read the list: a title written elsewhere is a second list): $hit"
+# (DPAPP-2h: the system ids of the prepared children, 00040010 with a low word of the band 0F8xxxxx-0FFxxxxx, are no system application's)
+[ "$(grep -r -o 'IsDownloadPlayTitle(' Sources | wc -l)" = "5" ] || fail "IsDownloadPlayTitle is asked in five places of the plugin, the guard of GetTextSize, the start line of EarlyInit, the probe of D-S1 (2026-11-15), DlpModeOf: SystemClient (1.1.4, G1) and AwaitsChildOf, the room's members in the Download Play application (1.1.4, H5: a game's host, never the application itself; route B adds 3DS Link's page there), and in no other (a sixth one is a new behaviour for the Download Play application: its own stage)"
+need_line $RGP '#include "ctr/text_search_guard.hpp"' "the plugin's start line reads the guard's list"
+# - the guard's PC test: the six titles by hand against the list, each answered under 1 MB + 9 bytes whatever the size of its code, its search with its own size, a title one bit away left alone
+need_line $RGT '    static const u64 kRegions[] = {0x0004001000020100ull, 0x0004001000021100ull, 0x0004001000022100ull,' "the PC test writes the six regional titles by hand (Japan, USA, Europe ...)"
+need_line $RGT '                                   0x0004001000026100ull, 0x0004001000027100ull, 0x0004001000028100ull};' "... (... China, Korea, Taiwan)"
+need_line $RGT '    CHECK_EQ(kListed, 6); // the list is these six titles and no other' "the PC test counts the list"
+need_line $RGT '        CHECK_EQ(azl::ctr::kDownloadPlayTitles[i] == kRegions[i], 1);' "... and holds it row by row against its own"
+need_line $RGT '            CHECK_EQ(azl_text_size_guard(0, gsp), 0x00100009); // every region of the Download Play application gets through' "the PC test holds the answer for every region"
+need_line $RGT '        for (const u32 size : {0x1000u, kDlplayCode, 0x00094000u, 0x000F0000u, 0x00100008u}) {' "... for codes of other sizes than the European one (a regional build was not read)"
+need_line $RGT '            CHECK_EQ(azl_text_size_guard(0, gsp_search), size); // the search of a regional build has its own size' "... and that the search of a regional build gets its real size"
+need_line $RGT '            CHECK_EQ(azl_text_size_guard(0, gsp), listed ? 0x00100009u : kDlplayCode); // one bit away is another title' "... and that a title one bit away from one of the six is left alone"
+need_line $RGT '        CHECK_EQ(azl::ctr::IsDownloadPlayTitle(title), 0);' "... and that the neighbours written by hand are not in the list"
+
+
+# The room's stream that stopped for good, and the relief of a dense broadcast stream (2026-11-14, Mario Party: Island Tour hosted by a console: five sessions of five ended
+# at the first throw of the dice). Two things of different reach, and the pins hold them apart:
+# - FOR EVERY GAME, the way out of ENet's limit of waiting data. The limit is what it was (192 KB: a larger one moves the dead end and takes memory), and at the limit ONE
+#   command is still taken: a reliable one that is the next of its channel's sequence, with commands waiting behind it, while the data is less than one largest packet over the
+#   limit. Everything else is refused as before, counted, NOT acknowledged (the room sends it again), and the rest of its datagram is still read.
+need_line Sources/azl/room_client.cpp "constexpr std::size_t kMaxWaitingData = 192 * 1024;" "the limit of waiting data is the 192 KB it was: the remedy is the way out of it, not a larger limit"
+need_order Sources/enet/peer.c "    if (peer -> totalWaitingData >= peer -> host -> maximumWaitingData)" "       if (! ENET_AZL_HOLE_CLOSER (peer, channel, azlReliable, reliableSequenceNumber))" "at the limit a command is refused unless it is the one that closes the hole"
+need_after Sources/enet/peer.c "       if (! ENET_AZL_HOLE_CLOSER (peer, channel, azlReliable, reliableSequenceNumber))" "++ peer -> host -> azlCounters.capRefused;" "a command refused at the limit is counted"
+need_after Sources/enet/peer.c "          ++ peer -> host -> azlCounters.capRefused;" "goto notifyError;" "... and refused: it is not queued and not acknowledged"
+need_line Sources/enet/peer.c "   ((reliable) && \\" "only a reliable command is taken over the limit"
+need_line Sources/enet/peer.c "    (sequence) == (enet_uint16) ((channel) -> incomingReliableSequenceNumber + 1) && \\" "... only the NEXT of its channel's sequence"
+need_line Sources/enet/peer.c "    ! enet_list_empty (& (channel) -> incomingReliableCommands) && \\" "... only while commands of the channel wait (behind it)"
+need_line Sources/enet/peer.c "    (peer) -> totalWaitingData - (peer) -> host -> maximumWaitingData < (peer) -> host -> maximumPacketSize)" "... and never beyond one largest packet over the limit: the waiting data is bounded"
+need_line Sources/enet/protocol.c "#define ENET_AZL_NOT_TAKEN(host) { if ((host) -> azlCapRefused) continue; goto commandError; }" "a command refused at the limit is skipped without its acknowledgement and the datagram is read on; any other failure drops the datagram as ENet does"
+[ "$(tr -d '\r' < Sources/enet/protocol.c | grep -c '^            ENET_AZL_NOT_TAKEN (host)$')" = "5" ] || fail "Sources/enet/protocol.c: the five handlers of data commands (reliable, unreliable, unsequenced and the two fragments) no longer all read the datagram on after a refusal at the limit"
+need_after Sources/enet/protocol.c "       command -> header.reliableSequenceNumber = ENET_NET_TO_HOST_16 (command -> header.reliableSequenceNumber);" "host -> azlCapRefused = 0;" "the mark of a refusal is cleared before every command"
+# - FOR THE TITLES OF THE TABLE ONLY (Includes/azl/title_rules.hpp: today Mario Party: Island Tour in its five regions), the same-frame filter and the hand-over burst. Their defaults are
+#   "off" - every frame is sent, one packet of the room a round - and one place turns them on, by the title's id: no ini key (the list of keys above), no menu entry.
+# - THE TABLE OF THE TITLES (Includes/azl/title_rules.hpp, 2026-11-15): the rules that hold for some games only are rows of one table, read in one place of
+#   the plugin. What is pinned here is the mechanism, not the rows: a game with no row runs with every rule off, the compiler holds every row to the bounds,
+#   the bounds are the measured ones, and a row is found by the application's id or its Download Play child's only. A new row needs no line here.
+need_line Includes/azl/title_rules.hpp "inline constexpr Rules kNoRules = {0, 1, 0, false, 0, false, false, false};" "a game with no row runs with every rule off"
+need_line Includes/azl/title_rules.hpp "static_assert(RowsAreSound(), \"a row of azl/title_rules.hpp is out of its bounds: an id missing or twice, or a rule beyond its bound\");" "the compiler holds every row to the bounds"
+need_line Includes/azl/title_rules.hpp "    return r < 0 ? kNoRules : kRows[r].rules;" "a title with no row gets no rule"
+need_line Includes/azl/title_rules.hpp "    if ((high != kTitleHighApplication && high != kTitleHighDlpChild) || low == 0) {" "a row is found by the application or its Download Play child only (an update, a system application: no row)"
+need_line Includes/azl/title_rules.hpp "inline constexpr u32 kSameFrameMsMax = 33;" "the window of the same-frame filter stays below a step of a game at 30 steps a second"
+need_line Includes/azl/title_rules.hpp "inline constexpr u32 kHandOverBurstMax = 32;" "a round hands over one read pass of ENet at the most"
+need_line Includes/azl/title_rules.hpp "inline constexpr u32 kCapDropMaxBound = 2048;" "the placeholders of the drop at the limit take about 200 KB of the plugin's heap at the most"
+need_line Includes/azl/title_rules.hpp "        if (rules.same_frame_ms > kSameFrameMsMax || rules.hand_over_burst < 1 || rules.hand_over_burst > kHandOverBurstMax ||" "... every rule of a row is checked against its bound"
+need_line Includes/azl/title_rules.hpp "            rules.cap_drop_max > kCapDropMaxBound) {" "... the drop's bound too"
+need_line Includes/azl/flow_relief.hpp "    return rules.same_frame_ms != 0 || rules.hand_over_burst > 1 || rules.cap_drop_max != 0 || rules.send_budget_bytes != 0;" "a title has the relief only when its row turns one of it on"
+need_line Tests/flow_relief_test.cpp "    for (std::size_t r = 0; r < title_rules::kRowCount; ++r) {" "the suite runs every row of the table"
+# (2026-11-15, L2) every row is held to the whole family of its game in the catalogue: the file is the generator's, the test is run
+head -1 Tests/title_families.inc | grep -q "made by" && sed -n 2p Tests/title_families.inc | grep -q "Tests/make_sold_catalog.py, do not edit by hand. 5217 titles" || fail "Tests/title_families.inc is not the one Tests/make_sold_catalog.py makes from titles.txt"
+[ "$(tr -d '\r' < Tests/title_families.inc | grep -o -E '\{0x[0-9A-F]{8}, 0x[0-9A-F]{6}\},' | wc -l | tr -d ' ')" = 5217 ] || fail "Tests/title_families.inc does not hold 5217 titles"
+need_line Tests/flow_relief_test.cpp "    TestFamilies();" "the suite holds every row to its family"
+# (2026-11-15, D-S1) the probe of the Download Play client's path runs in the Download Play application only, once, from the plugin thread
+need_after Sources/ctr/plugin.cpp "        if (IsDownloadPlayTitle(game_id_)) {" "            ProbeDownloadPlayOpens(); // (D-S1: the Download Play application only; the plugin thread, the file system open)" "the probe is for the Download Play application only"
+[ "$(cat Sources/ctr/*.cpp | tr -d '\r' | grep -c 'ProbeDownloadPlayOpens()')" = "2" ] || fail "the probe of the Download Play client is defined once and called once"
+# (2026-11-15) the friend code seed is never written whole in the log (L13, privacy: the logs go to the testers' threads): a format that prints
+# a seed is "%04lx..."; the two words of a seed side by side ("seed %08lx%08lx" or "seed ... %08lx%08lx") are not in any source
+hit=$(cat Sources/*.cpp Sources/azl/*.cpp Sources/ctr/*.cpp | tr -d '\r' | grep -n -E 'seed[^"]*%08lx%08lx' | head -2)
+[ -z "$hit" ] || fail "a friend code seed is written whole in the log: $hit"
+need_line Tests/flow_relief_test.cpp "        CHECK_EQ(missing, std::size_t(0));" "... with no id of the family missing"
+need_line Includes/azl/room_client.hpp "    std::atomic<u32> hand_over_burst_{1}; ///< the room's packets handed over per round (SetHandOverBurst)" "one packet of the room a round is the default of every game"
+need_line Includes/azl/uds_engine.hpp "    std::atomic<u32> same_frame_ms_{0}; // SetSameFrameWindow: 0 = every frame is sent (read by SendTo before it takes the lock)" "every frame the game sends goes out by default"
+need_after Sources/ctr/plugin.cpp "    if (flow::IsDenseTitle(rules_id_)) {" "const title_rules::Rules rules = title_rules::RulesFor(rules_id_);" "the relief is read from the title's row (a prepared child's game's, 1.1.4 G4), in this one place"
+need_after Sources/ctr/plugin.cpp "        const title_rules::Rules rules = title_rules::RulesFor(rules_id_);" "room_->SetHandOverBurst(rules.hand_over_burst);" "the hand-over burst is the row's, for the titles of the table only"
+need_after Sources/ctr/plugin.cpp "        const title_rules::Rules rules = title_rules::RulesFor(rules_id_);" "engine_->SetSameFrameWindow(rules.same_frame_ms);" "the same-frame filter is the row's, for the titles of the table only"
+[ "$(cat Sources/*.cpp Sources/azl/*.cpp Sources/ctr/*.cpp | tr -d '\r' | grep -c 'SetHandOverBurst(\|SetSameFrameWindow(')" = "3" ] || fail "the hand-over burst and the same-frame filter are set somewhere else than in the one place of plugin.cpp that asks the list of titles (three lines: the two calls there and the engine's setter)"
+need_line Sources/azl/uds_engine.cpp "    const bool same_wanted = same_ms != 0 && dest_node_id == kBroadcastNetworkNodeId && data_size <= kMaxSendSize && data_size <= available;" "the same-frame filter looks only at frames for all nodes, and not at all while it is off"
+need_line Sources/azl/uds_engine.cpp "        if (same_wanted && !(lobby_inbox_ || dlp_net_) &&" "... and never in a Download Play lobby's network"
+need_line Sources/azl/room_client.cpp "             have = flow::MoreThisRound(++handed, hand_over, keep_running && Live(generation)) ? enet_host_check_events(client, &event) : 0) {" "the packets of a round beyond the first come from enet_host_check_events (no soc call), up to the round's share, and none for a session that is over"
+need_line Tests/run.sh '  "$OUT/enet_cap_test"' "the suite runs the test of the limit of waiting data"
+need_line Tests/run.sh '  "$OUT/flow_relief_test"' "the suite runs the test of the flow relief"
+
+
+# ---- A HOST OF ISLAND TOUR ANSWERS NO NEWCOMER FROM ANOTHER GAME (2026-11-14 evening: a member of the room with Tetris open came into the
+# network of Mario Party: Island Tour hosted by a console, as node 2, and held a place). Includes/azl/one_game_host.hpp: only while the console
+# hosts the application of a listed title (Island Tour, five regions), only a newcomer the room lists with a SOLD game that is not Island Tour
+# (the ranges of the app's ConfigApp/source/games.hpp, held equal here); no id, the Download Play application and child, a homebrew: answered.
+for k in "kSoldIdFirst = 0x00300;" "kSoldIdLast = 0x01FFF;" "kSoldNewIdFirst = 0xF7000;" "kSoldNewIdLast = 0xF71FF;"; do
+  [ "$(tr -d '\r' < Includes/azl/one_game_host.hpp | grep -c "^inline constexpr u32 $k")" = "1" ] || fail "Includes/azl/one_game_host.hpp: the range $k is not the app's"
+  [ "$(tr -d '\r' < ConfigApp/source/games.hpp | grep -c "^constexpr u32 $k")" = "1" ] || fail "ConfigApp/source/games.hpp: the range $k of the plugin is no longer the app's"
+done
+need_line Includes/azl/one_game_host.hpp "    return HostKeepsToItsGame(own_title) && IsSoldGame(member_title) && !title_rules::SameGame(own_title, member_title);" "another game is a sold game that is not this one (its row, any region), and only for a host whose row says so"
+need_line Includes/azl/one_game_host.hpp "    return static_cast<u32>(own_title >> 32) == kTitleHighApplication && title_rules::RulesFor(own_title).host_keeps_to_its_game;" "... a host as the application only"
+need_line Sources/ctr/plugin.cpp "        if (one_game::HostKeepsToItsGame(game_id_)) {" "the plugin lists the members of another game only for a host of a listed title"
+need_line Sources/ctr/plugin.cpp "                if (one_game::PlaysAnotherGame(game_id_, member.game_id)) {" "... by the id the room lists for them"
+[ "$(cat Sources/*.cpp Sources/azl/*.cpp Sources/ctr/*.cpp | tr -d '\r' | grep -c 'SetOtherGameMembers(')" = "2" ] || fail "the list of the members of another game is set in one place of the plugin (and defined once)"
+need_line Sources/azl/uds_engine.cpp "    if (!(known != node_map_.end() && known->second.connected) &&" "the rule is for newcomers: a node already in the network is never refused or put out by it"
+need_line Sources/azl/uds_engine.cpp "        ++g_stats.auth_other_game;" "a refused newcomer is counted"
+need_line Sources/azl/uds_engine.cpp "    other_game_.clear(); // (who plays what is the next room's list to say)" "the end of the room link voids the list"
+need_line Tests/test_main.cpp "    TestOtherGameNewcomer();" "the suite runs the test of the engine side"
+need_line Tests/test_main.cpp "    TestOneGameRule();" "... and of the rule"
+# (plugin-causa, 2026-11-14 22:50) The drop of a game frame at ENet's limit (ENetHost::azlCapDrop): off by default (refused, as ever), on for the listed titles
+# only, from the one place of plugin.cpp that asks the list; a frame is told by the room client's filter of relayed game frames and beacons; the placeholders
+# are bounded and counted, and a room's message is never dropped.
+need_line Includes/azl/room_client.hpp "    std::atomic<u32> cap_drop_max_{0};    ///< game frames dropped (acknowledged) at ENet's limit instead of refused, at most this many held (SetCapDrop; 0 = off)" "a frame at the limit is refused by default, for every game"
+need_line Sources/azl/room_client.cpp "        client->azlCapDrop = cap_drop_max != 0 ? EarlyFilter : nullptr; // (at the limit: a game frame dropped, not refused)" "what may be dropped is what a radio may lose: the room's game frames and beacons, never its own messages"
+need_line Sources/azl/room_client.cpp "        client->azlCapDropMax = cap_drop_max;                          // (... with the title's bound of the placeholders, never ENet's default)" "the bound of the placeholders is the row's, given to ENet with the filter"
+need_after Sources/ctr/plugin.cpp "        const title_rules::Rules rules = title_rules::RulesFor(rules_id_);" "room_->SetCapDrop(rules.cap_drop_max);" "the drop at the limit is the row's, for the titles of the table only"
+[ "$(cat Sources/*.cpp Sources/azl/*.cpp Sources/ctr/*.cpp | tr -d '\r' | grep -c 'SetCapDrop(')" = "1" ] || fail "the drop at the limit is set somewhere else than in the one place of plugin.cpp that asks the list of titles"
+# (2026-11-15, N2) the send budget of a round: off by default (the whole queue, as ever), the row's for the titles of the table, from the same one place of plugin.cpp
+need_line Includes/azl/room_client.hpp "    std::atomic<u32> send_budget_{0};     ///< bytes of the game's queue handed to ENet per round (SetSendBudget; 0 = all of it)" "a round sends the whole queue by default"
+need_line Sources/azl/room_client.cpp "                if (budget == 0) {" "with no budget the queue is taken whole"
+need_line Sources/azl/room_client.cpp "                } else if (tx_.TakeUpTo(&to_send, now_ms, &drops, budget)) {" "with one, up to it"
+[ "$(tr -d '\r' < Sources/azl/room_client.cpp | grep -c -x '                    tx_pending_.store(1, std::memory_order_relaxed);')" = "2" ] || fail "Sources/azl/room_client.cpp: what the send budget leaves, and the queue held for the ring, are taken in the next round, which comes at once (the two lines that say so)"
+need_line Sources/ctr/plugin.cpp "        room_->SetSendBudget(rules.send_budget_bytes);" "the send budget is the row's, for the titles of the table only"
+[ "$(cat Sources/*.cpp Sources/azl/*.cpp Sources/ctr/*.cpp | tr -d '\r' | grep -c 'SetSendBudget(')" = "1" ] || fail "the send budget is set somewhere else than in the one place of plugin.cpp that asks the list of titles"
+need_line Includes/azl/title_rules.hpp "        if (rules.send_budget_bytes != 0 && (rules.send_budget_bytes < kSendBudgetMin || rules.send_budget_bytes > kSendBudgetMax)) {" "a row's budget is held to its bounds"
+need_line Includes/azl/title_rules.hpp "inline constexpr u32 kSendBudgetMin = 1392;" "a budget is at least one datagram of the room's MTU"
+need_line Includes/azl/title_rules.hpp "inline constexpr u32 kSendBudgetMax = 65536;" "... and at most 64 KB"
+need_line Includes/azl/tx_queue.hpp "            if (any && moved + item.bytes.size() > max_bytes) {" "the budget stops before the item that would pass it, the first one always goes"
+need_line Tests/flow_relief_test.cpp "    TestSendBudget();" "the suite runs the scene of the send budget"
+# (2026-11-15, N3) after an absence, a title with a send budget reads the ring before its queue, for flow::kAwayDrainMaxMs at the most; every other title as ever
+need_line Includes/azl/flow_relief.hpp "inline constexpr u32 kAwayDrainMaxMs = 50;" "the queue is held for the ring 50 ms at the most"
+need_line Includes/azl/flow_relief.hpp "    return since != 0 && now_ms >= since && now_ms - since < kAwayDrainMaxMs;" "... from the start of the backlog"
+need_order Sources/azl/room_client.cpp "                if (budget == 0) {" "                } else if (flow::HoldsForTheRing(away_since, now_ms)) {" "a title with no budget never holds its queue for the ring"
+need_line Sources/azl/room_client.cpp "        flow::NoteAwayBacklog(client->azlAwayBacklog != 0, now_ms, &away_since); // (the ring's backlog after an absence: its start)" "the start of the backlog is kept every round, before the queue"
+need_line Tests/flow_relief_test.cpp "    TestRingFirst();" "the suite runs the scene of the ring read first"
+need_line Sources/enet/peer.c "       if (! ENET_AZL_HOLE_CLOSER (peer, channel, azlReliable, reliableSequenceNumber) && ENET_AZL_CAP_DROPS (peer, azlReliable, fragmentCount, data, dataLength))" "the command that closes the hole is never dropped, and a frame is dropped only where it would be refused"
+need_line Sources/enet/peer.c "   ((reliable) && (peer) -> host -> azlCapDrop != NULL && \\" "nothing is dropped without the filter (every game but the listed ones)"
+need_line Sources/enet/peer.c "    (peer) -> host -> azlCapDropHeld < ((peer) -> host -> azlCapDropMax != 0 ? (peer) -> host -> azlCapDropMax : ENET_AZL_CAP_DROP_MAX) && \\" "the placeholders of the dropped frames are bounded"
+need_line Sources/enet/protocol.c "       if (startCommand -> azlDispatched)" "a fragment of a packet dropped at the limit is acknowledged on its placeholder, never written into it"
+need_line Tests/enet_cap_test.cpp "    TestTheDropAtTheLimit();" "the suite runs the scene of the drop at the limit"
+need_line Tests/enet_cap_test.cpp "    TestTheDropInOrder();" "... and of a frame dropped in order (its placeholder freed at once)"
+need_line Tests/run.sh 'g++ $CXXFLAGS Tests/enet_cap_test.cpp $CORE "$OUT"/asan_enet_*.o -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_time_get -o "$OUT/enet_cap_test"' "the test of the limit links an ENet built with the address sanitizer (a placeholder read after it was freed is seen)"
+need_line Tests/run.sh '  gcc $CFLAGS -fsanitize=address,undefined -c Sources/enet/$f.c -o "$OUT/asan_enet_$f.o"' "... built so"
+need_line Sources/enet/peer.c "    return & azlDroppedCommand;" "the drop at the limit returns its sentinel, never the placeholder the dispatch may have freed"
+need_line Sources/enet/peer.c "    azlDroppedCommand.azlDispatched = 2;" "... which says dropped, so the fragment's handler acknowledges on it and writes nothing"
+need_line Sources/azl/room_client.cpp "        const u32 cap_drop_max = cap_drop_max_.load(std::memory_order_relaxed);" "the network thread reads the title's bound of the drop every round"
+need_line Includes/azl/room_client.hpp "        cap_drop_max_.store(placeholders);" "... the bound the plugin set"
+need_line Sources/enet/protocol.c "         enet_protocol_azl_note_sequence (host, & peer -> channels [command -> header.channelID], command -> header.reliableSequenceNumber);" "every reliable command of a channel is looked at for the numbers it skips (the line of the losses)"
+
+# ---- L4 (1.1.4, 2026-11-15): the Download Play column of azl/title_rules.hpp (it was kDlpGames of Sources/ctr/plugin.cpp) ----
+# The table of the Download Play wiring - for every game, its mode (the real services, the probe, the lobby of the dialect, the real Download Play), the console's seed and the
+# ceiling of its lobby - is a column of the rows of Includes/azl/title_rules.hpp, so that a game is one row with every region in it. The plugin's DlpModeOf,
+# LobbySeedIsConsoles, LobbyPlayersOf and AdmissionToMembersOf read it through title_rules::DlpOf, which answers for the APPLICATION's id only: a Download Play child, an
+# update or a system title has no column, as the plugin's table answered for whole ids. What must not change by accident: that every one of the thirty ids answers what the
+# plugin's table answered (AZL_DLP_AS_BEFORE in Tests/plugin_dlp_test.cpp, at compile time, and here the column against those lines), that the child has nothing, that the
+# compiler keeps a column to what its mode can use, that the extractor still cuts the plugin's names of the column, and that the Lobby branch of EarlyInit stays run.
+TR=Includes/azl/title_rules.hpp
+need_line $TR '    return static_cast<u32>(title_id >> 32) == kTitleHighApplication && RowOf(title_id) >= 0 ? kRows[RowOf(title_id)].dlp : kNoDlp;' "the Download Play column is the APPLICATION's: a child, an update, a system title has none (what the plugin's table answered for whole ids)"
+need_line $TR '        if ((dlp.mode == DlpGameMode::None || dlp.mode == DlpGameMode::ProbeOnly) && (dlp.console_seed || dlp.max_players != kDlpTitlePlayers)) {' "a game with no lobby has neither the console's seed nor a ceiling of its own (RowsAreSound)"
+need_line $TR '            rules.send_budget_bytes == 0 && !rules.worker_off_core1 && !rules.late_soc_block && !rules.soc_guest && row.dlp.mode == DlpGameMode::None) {' "a row that turns nothing on and has no Download Play column is refused"
+! tr -d '\r' < $TR | grep -q -E '\}, kNoRules(, kNoDlp)?\},' || fail "$TR: a row with no rule and no Download Play column (it turns nothing on)"
+need_line $TR 'static_assert(kNoDlp.mode == DlpGameMode::None && !kNoDlp.console_seed && kNoDlp.max_players == kDlpTitlePlayers,' "a game with no column keeps the real Download Play services, the hash of the MAC and four players: an assertion"
+need_after Sources/ctr/plugin.cpp 'DlpGameMode DlpModeOf(u64 title_id) {' '    return title_rules::DlpOf(title_id).mode;' "the plugin's mode of a game is its column's"
+need Tests/plugin_dlp_extract.py "start = text.index('DlpGameMode DlpModeOf(u64 title_id) {')" "the extractor cuts the plugin's text from DlpModeOf (the column itself is title_rules.hpp's, which the test includes)"
+ITD=Tests/plugin_dlp_test.cpp
+need_line $ITD 'struct DlpGame { u64 title_id; DlpGameMode mode; bool console_seed; u8 max_players; };' "the test views the column in the shape of the plugin's old table"
+need_line $ITD '            if (low == 0 || dlp.mode == DlpGameMode::None) {' "the view takes every id of every row that has a column, and only those"
+need_line $ITD '            view[at] = DlpGame{0x0004000000000000ull | low, dlp.mode, dlp.console_seed, dlp.max_players};' "... the application's id, its mode, seed and ceiling"
+need $ITD 'title_rules::DlpOf((tid) | 0x0000000100000000ull).mode == DlpGameMode::None,' "AZL_DLP_AS_BEFORE holds that the Download Play child of each id has no column"
+need $ITD 'title_rules::DlpOf(tid).max_players == (players) &&' "... and the ceiling of each id"
+need_stmt $ITD 'azl::ctr::LobbyStandInTest();' "the Lobby branch of EarlyInit is run with a stand-in that says Lobby (it stays run when no row is Lobby)"
+need_line $ITD '        CHECK(p.log_[0].find("the Download Play lobby is carried by the room") != std::string::npos);' "... and takes the hub of the dialect"
+# - the column against AZL_DLP_AS_BEFORE: every id of a row that has a column, with its mode, seed and ceiling, is one of those lines, and every line is such an id (a mode, a seed or a
+#   ceiling changed in the table, an id gone, a demo or another game added, an id in two rows: each is a difference here, before any compiler)
+dlp_col=$(tr -d '\r' < $TR | sed -n '/^inline constexpr Row kRows\[\] = {$/,/^};$/p' | sed 's://.*$::' | tr '\n' ' ' \
+  | grep -o -E '\{(0x[0-9A-Fa-f]{8}u(, )?)+\}, (kNoRules|\{[^{}]*\}),[[:space:]]*\{DlpGameMode::[A-Za-z]+, (true|false), [0-9]+\}' \
+  | while IFS= read -r row; do
+      v=$(printf '%s\n' "$row" | grep -o -E 'DlpGameMode::[A-Za-z]+, (true|false), [0-9]+\}$' | sed 's/DlpGameMode:://; s/[,}]//g')
+      for id in $(printf '%s\n' "$row" | sed 's/}, .*$//' | grep -o -E '0x[0-9A-Fa-f]{8}u'); do
+        printf '0x00040000%sull %s\n' "$(printf '%s' "${id:2:8}" | tr 'a-f' 'A-F')" "$v"
+      done
+    done | sort)
+dlp_as=$(tr -d '\r' < $ITD | grep -E '^AZL_DLP_AS_BEFORE\(' | sed -E 's/^AZL_DLP_AS_BEFORE\((0x[0-9A-Fa-f]{16}ull), ([A-Za-z]+), (true|false), ([0-9]+)\);$/\1 \2 \3 \4/' | sort)
+{ [ -n "$dlp_col" ] && [ "$dlp_col" = "$dlp_as" ]; } || fail "$TR: the Download Play column is not what AZL_DLP_AS_BEFORE of $ITD holds, id by id (mode, seed, ceiling): a value, an id or a row changed without its stage"
+FR=Tests/flow_relief_test.cpp
+need_line $FR '            CHECK(dlp.mode == row.dlp.mode);' "the suite holds the column of every row, the application's id"
+need_line $FR '            CHECK(title_rules::DlpOf(child).mode == DlpGameMode::None);' "... and never the child's"
+need_line $FR '                CHECK(title_rules::DlpOf(id).mode == DlpGameMode::None);' "... nor an update's, a system title's or a neighbour's"
+need_after $FR '    static const u64 kDownloadPlayOnly[] = {' '        0x0004000000030700ull, // Mario Kart 7' "the games with a column only (Mario Kart 7, Luigi's Mansion, Kirby Triple Deluxe, Mario Tennis Open) run with every other rule off"
+need_line $FR '    CHECK_EQ(dlp_only, std::size_t(4));' "... all four of them"
+need_line $FR '        CHECK(of_a_row);' "every id left out is of the family of a row (else it names nothing)"
+
+
+# ---- BASE (1.1.4, 2026-11-15): the pure headers of the Download Play from the console (contract K1-K4, analysis/piano-1.1.4-2026-11-15/specifiche/7-CONTRATTO.md) ----
+# K1: the prepared child of a game is ONE formula on the GAME, in Includes/azl/title_rules.hpp, for every game: an application of low word not 0 gets
+# 000400000F800000 | its low word's 23 low bits (the user's decision: no bound, the band 0x0F7xxxxx too), never itself nor 3DS Link; IsPreparedId says the band
+# and nothing else (who a prepared child is says the index). The app
+# and the plugin call it, nobody writes the formula again. K2-K4: the index and the blocks the app writes for the plugin (Includes/azl/dlp_children.hpp: its
+# folder, its header, sixteen rows, the 5,000 bytes of a block), the verdicts and the small line under a host's name (the name shortened, never the mark;
+# "OK"/"NO" until a real system font shows the two glyphs, analysis/piano-1.1.4-2026-11-15/g2-font/ESITO.md), and the map of dlp:CLNT
+# (Includes/azl/dlp_clnt_map.hpp). Pure: no allocation; what the Download Play application's thread will call is game-thread code.
+TR=Includes/azl/title_rules.hpp
+need_line $TR 'inline constexpr u64 kAppTid = 0x000400000F83D100ull;' "3DS Link's own title id, which is in the band of the prepared children, is never one"
+[ "$(grep -o 'kAppTid = 0x[0-9A-Fa-f]*ull' $TR)" = "$(grep -o 'kAppTid = 0x[0-9A-Fa-f]*ull' ConfigApp/source/dlp_prepare_logic.hpp)" ] || fail "$TR and the app (dlp_prepare_logic.hpp) do not say the same title id for 3DS Link"
+need_line $TR 'inline constexpr u32 kPreparedBand = 0x0F800000u;' "the band of the prepared children (the user's decision, 2026-11-15)"
+need_line $TR 'inline constexpr u32 kPreparedBandMask = 0xFF800000u;' "... 0x0F800000..0x0FFFFFFF"
+need_line $TR 'inline constexpr u32 kPreparedLowMask = 0x007FFFFFu;' "... above the game's 23 low bits"
+need_line $TR '    if (high != kTitleHighApplication || low == 0) {' "a prepared child is an application's only, for every low word (the user's decision: no bound of 23 bits, REGOLE-IMPLEMENTAZIONE.md)"
+need $TR 'static_assert(PreparedOf(0x000400000F700000ull) == 0x000400000FF00000ull' "the band 0x0F7xxxxx of the catalogue has its prepared children: an assertion"
+need_line $TR '    const u64 prepared = (static_cast<u64>(kTitleHighApplication) << 32) | (kPreparedBand | (low & kPreparedLowMask));' "the prepared child is 000400000F800000 | the GAME's low word"
+need_line $TR '    return (prepared == game || prepared == kAppTid) ? 0 : prepared;' "never the game itself, never 3DS Link"
+need_line $TR '    return static_cast<u32>(tid >> 32) == kTitleHighApplication && (static_cast<u32>(tid) & kPreparedBandMask) == kPreparedBand;' "IsPreparedId: an application in the band, nothing more"
+need $TR 'static_assert(PreparedOf(0x00040000000F8200ull) == 0x000400000F8F8200ull' "Island Tour (Europe) has its prepared child at 000400000F8F8200: an assertion"
+[ "$(grep -r -F 'kPreparedBand | (' Sources Includes ConfigApp/source | wc -l)" = "1" ] || fail "the formula of the prepared child is written more than once (K1: title_rules::PreparedOf is the one place)"
+# (any spelling of the band, of its mask or of the 23 bits in code, not comments: 32 or 64 bits - 0x0F800000, 0x000400000F800000, 0xFFFFFFFFFF800000,
+# 0x7FFFFF, 0x007FFFFF -, the shift by 23, the decimals; Sources, the app and every header but title_rules.hpp)
+K1_BAND='0x[0-9a-f]*(f800000|7fffff)(u|ul|ull|l|ll)?\b|<<[[:space:]]*23\b|\b(260046848|8388607|4286578688)(u|ul|ull|l|ll)?\b'
+hit=$(grep -r -n -i -E "$K1_BAND" Sources ConfigApp/source Includes | grep -v '^Includes/azl/title_rules.hpp:' | tr -d '\r' | sed -E 's#^([^:]*:[0-9]*:)(([^/]|/[^/])*)//.*$#\1\2#' | grep -i -E "$K1_BAND" | head -3)
+[ -z "$hit" ] || fail "the band of the prepared children is written outside azl/title_rules.hpp (call PreparedOf / IsPreparedId): $hit"
+need_line Tests/dlp_children_test.cpp '    CHECK(other_family == 0);' "no two families of the catalogue share a prepared id"
+need_line Tests/dlp_children_test.cpp '    CHECK(without == 0);              // (the user'"'"'s decision: a prepared child for every sold game, the band 0x0F700000..0x0F715F00 too)' "every sold id has a prepared child"
+need_line Tests/dlp_children_test.cpp '    CHECK(not_users == 0);' "... and it is the user's formula, written again in the test"
+# K2-K4, the shared header
+DC=Includes/azl/dlp_children.hpp
+game_thread_file Includes/azl/dlp_children.hpp 1
+hit=$(tr -d '\r' < $DC | sed 's://.*$::' | grep -n -E '\bnew\b|\b(malloc|calloc|realloc|free)[[:space:]]*\(|std::(string|vector|map|unique_ptr|make_unique)' | head -2)
+[ -z "$hit" ] || fail "$DC allocates (it is pure, and the Download Play application's thread calls it): $hit"
+need_line $DC 'inline constexpr char kGuestsDir[] = "/3ds/3DSLink/dlp-guests/";' "the folder of the children is under the plugin's data folder, and it is not 3DS Link Delivery's dlp/ (K2)"
+need_line $DC 'inline constexpr char kIndexPath[] = "/3ds/3DSLink/dlp-guests/index.txt";' "the index is in that folder (K2)"
+need_line $DC 'inline constexpr char kIndexHeader[] = "#dlp-children 1";' "the header of the index: another version is as if there were no file"
+need_line $DC 'inline constexpr std::size_t kMaxRows = 16;' "sixteen children, everywhere (the app's index, the plugin's table, G1's book)"
+need_line $DC 'inline constexpr std::size_t kIndexMaxBytes = 1024;' "the plugin reads 1 KB of the index at most"
+need_line $DC 'inline constexpr std::size_t kBlockBytes = 5000;' "a block is 5,000 bytes"
+need_line $DC 'inline constexpr std::size_t kBlockTransferAt = 4992; // u32 LE: what a host announces at frame 0 +0x38 (where the CIA'"'"'s meta block starts)' "the two sizes close the block"
+need_line $DC '           (r.prepared == 0 || r.prepared == title_rules::PreparedOf(r.game)) && (r.where == '"'"'S'"'"' || r.where == '"'"'C'"'"');' "a row names its game's prepared child or none: never another title of the band"
+need_line $DC '            if (!whole || n != sizeof(kIndexHeader) - 1 || std::memcmp(line, kIndexHeader, n) != 0) {' "the header is checked whole"
+need_line $DC '        const bool kept = whole && out->count < kMaxRows && ParseRow(line, n, &r) && FindRow(*out, r.child) < 0 &&' "a line cut before its end, a sixteenth-plus row, a bad line and a child twice are not kept"
+need_line $DC '        } else if (!p.plugin_present(p.ctx, row.prepared)) {' "the plugin in the prepared child's folder is looked at: without it the child starts with no plugin"
+need_after $DC 'inline Verdict VerdictFor(const Table* t, u64 child_tid, u32 ann_transfer, u32 ann_required) {' '        return Verdict::Unknown;' "no table: Unknown (the name as it is, refused)"
+need_line $DC '        return Verdict::NoRow;' "no row: NoRow (shown not ready, refused)"
+need_line $DC '    if ((ann_transfer != 0 && transfer != 0 && ann_transfer != transfer) || (ann_required != 0 && required != 0 && ann_required != required)) {' "another version only when both sides know a size"
+need_line $DC '    if (slot == nullptr || slot == &kNoBlockTag) {' "a Ready row is Ready only with its block read (lazy blocks: not read is not missing)"
+need_line $DC '        return slot == nullptr ? Verdict::Unknown : Verdict::NotPrepared; // (not read yet: never Ready before the sizes are known)' "... not read yet: Unknown; no block: NotPrepared - both refused"
+need_line $DC '    return b == &kNoBlockTag ? nullptr : b;' "BlockOf never hands out the mark of a missing block"
+need_line $DC '    return PutBlock(t, row, &kNoBlockTag);' "a missing block is marked once, in the same slot"
+need_after $DC 'constexpr bool MayJoin(Verdict v) {' '    return v == Verdict::Ready;' "only a Ready child joins: anything else would download (and the child never travels through the room)"
+need_line $DC 'inline constexpr MarkStyle kMarkStyle = MarkStyle::Text;' "the marks are OK/NO until a real system font shows the two glyphs (G2.0: not readable on the PC)"
+[ "$(grep -r -F 'kMarkStyle =' Sources Includes ConfigApp/source | wc -l)" = "1" ] || fail "the style of the marks is set somewhere else than its constant (no ini, no switch)"
+need_line $DC '    const u32 budget = kNameUnits - 1 - mark_units;' "the NAME is shortened, never the mark: the name keeps ten units less the space and the mark"
+need_line $DC '        StoreLE16(server_info + kServerInfoHostName + 2 * i, line[i]);' "the small line is the ten units at +0x1C and nothing else"
+need_line $DC '    for (const char* s = TitleLongTail(v); *s != '"'"'\0'"'"' && at + 1 < kTitleLongUnits; ++s) {' "title_long keeps its zero"
+need_line $DC '    StoreLE32(title_info + kTitleInfoSizeField, BlockTransfer(block));' "the size of a title from its block is the transfer size a host announces"
+# the app's paths are the plugin's (Tests/dlp_children_test.cpp builds the app's file), and the app reads the formula, never writes it
+DG=ConfigApp/source/dlp_guest_paths.cpp
+need_line ConfigApp/source/dlp_guest_paths.hpp 'constexpr const char* kGuestsDirName = "dlp-guests";  // the folder, in setup::kPluginDataDir' "the app's name of the children's folder"
+need_line $DG '    return std::string(setup::kPluginDataDir) + "/" + kGuestsDirName;' "the children's folder is under the plugin's fixed folder, not the app's (the plugin finds it without the app)"
+need_line $DG '    return azl::title_rules::PreparedOf(game);' "the app's prepared child is title_rules::PreparedOf"
+need_line Tests/dlp_children_test.cpp '    CHECK(std::string("sdmc:") + dc::kIndexPath == dlpguest::IndexPath());' "the app writes the index where the plugin reads it"
+need Tests/run.sh 'Tests/dlp_children_test.cpp ConfigApp/source/dlp_guest_paths.cpp -o "$OUT/dlp_children_test"' "the test builds the app's own file of the paths"
+# the map of dlp:CLNT
+CM=Includes/azl/dlp_clnt_map.hpp
+game_thread_file Includes/azl/dlp_clnt_map.hpp 1
+need_line $CM 'inline constexpr u32 kPosted = Bit(kInitialize) | Bit(kFinalize) | Bit(kStartScan) | Bit(kStopScan) | Bit(kStartSession) | Bit(kStopSession);' "six commands are posted to the network thread, every other is served on the caller's"
+need $CM 'Bit(kGetMyStatus) | Bit(kGetWirelessRebootPassphrase) | Bit(kStopSession) | Bit(kGetCupVersion) | Bit(kGetDupAvailability);' "the fifteen ids the Download Play application calls"
+need $CM 'inline constexpr u32 kCarriesMac = Bit(kGetServerInfo) | Bit(kGetTitleInfo) | Bit(kDeleteScanInfo) | Bit(kPrepareForSystemDownload) | Bit(kStartSession) |' "the requests that carry a host's MAC (the trace zeroes them)"
+need_line $CM '    return (id >= kInitialize && id <= kDeleteScanInfo) ? id : ((id >= kStartSession && id <= kStopSession) ? id - 2 : kNoFkcl);' "dlp:CLNT 01-0A are dlp:FKCL's, 0D-12 are FKCL 0B-10"
+need_line $CM '    return host_set && (autoconnect || menu_off);' "the room's Download Play only for a plugin that joins a room by itself ..."
+need_line Sources/main.cpp '    g_want_connected = (cfg.autoconnect || g_menu_off) && !cfg.host.empty();' "... the formula of Sources/main.cpp (the two change together)"
+need_line $CM '    return (lobby_word >> 24) == kCliStarted ? ((static_cast<u32>(kCliShownStarted) << 24) | (lobby_word & 0x00FFFFFFu)) : lobby_word;' "GetMyStatus shows the distribution's 6 as 7"
+need_line $CM 'inline constexpr u8 kCliShownStarted = 7;' "... 7: waiting, nothing to download"
+
+# ---- 1.1.4, G1: dlp:CLNT of the system's Download Play application (analysis/piano-1.1.4-2026-11-15/specifiche/1-G1.md with the contract K3-K7) ----
+CB=Includes/azl/dlp_clnt_book.hpp
+game_thread_file Includes/azl/dlp_clnt_book.hpp 1
+# the mode: the Download Play application only, every region of it (DlpModeOf's first line), decided once; local without a room to join by itself
+need_line Sources/ctr/plugin.cpp '    if (IsDownloadPlayTitle(title_id)) { return DlpGameMode::SystemClient; }  // 1.1.4 (G1): the system'"'"'s Download Play application (ctr/text_search_guard.hpp'"'"'s six ids): no row' "SystemClient is the Download Play application's six ids, DlpModeOf's first line (K5)"
+need_line Sources/ctr/plugin.cpp '    return DlpModeOf(title_id) == DlpGameMode::SystemClient && (!config_read_early || !clnt::UsesRoom(host_set, autoconnect, menu_off));' "the application stays local with the settings not read at the start, or with no room to join by itself (K5)"
+need_line Sources/ctr/plugin.cpp '    if (active_ && ClntStaysLocal(CTRPluginFramework::Process::GetTitleID(), config_read_early, !config_.host.empty(), config_.autoconnect, menu_off())) {' "the decision is EarlyInit's, from the settings, before the hooks"
+need_after Sources/ctr/plugin.cpp '    if (active_ && ClntStaysLocal(' '        active_ = false;' "a local Download Play application keeps no hook (the system's own Download Play)"
+need_line Sources/ctr/plugin.cpp '    } else if (DlpModeOf(game_id_) == DlpGameMode::SystemClient && active_) {' "the SystemClient branch of EarlyInit, after the RealDlp one"
+need_order Sources/ctr/plugin.cpp '    } else if (DlpModeOf(game_id_) == DlpGameMode::RealDlp && active_) {' '    } else if (DlpModeOf(game_id_) == DlpGameMode::SystemClient && active_) {' "... in the chain the extractor cuts"
+need_line Sources/ctr/plugin.cpp '            hle_->SetDlpClnt(true);' "the HLE serves dlp:CLNT only in that branch"
+[ "$(grep -r -o 'SetDlpClnt(' Sources | wc -l)" = "1" ] || fail "SetDlpClnt is called in one place (the SystemClient branch of EarlyInit)"
+need_order Sources/ctr/plugin.cpp 'hle_->SetDlpClnt(true);' 'hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' "dlp:CLNT is the hub's before the hooks are installed"
+need_line Includes/ctr/uds_hle.hpp '    void SetDlpClnt(bool on) { dlp_clnt_ = on && dlp_hub_ != nullptr; }' "dlp:CLNT is served only with a hub"
+need_line Sources/ctr/plugin.cpp '    cfg.any_title = 1;' "the Download Play application's lobby lists any game's host"
+[ "$(grep -r -F 'any_title = 1' Sources | wc -l)" = "1" ] || fail "only MakeClntHub turns any_title on (every game's lobby lists its own child)"
+need_line Includes/azl/dlp_lobby.hpp '        tid_low_ = cfg.any_title != 0 ? kAnyTitleLow : static_cast<u32>(cfg.game_tid);' "a lobby of any title keeps the mark, every other its title's low word"
+need_line Includes/azl/dlp_lobby.hpp '        if (((a.child_tid_low >> 8) != (tid_low_ >> 8) && tid_low_ != kAnyTitleLow) || !FilterPass(filter_, a.child_tid_low)) {' "the searcher's filter by game is off only for the mark"
+need_line Includes/azl/dlp_lobby.hpp '    static constexpr u32 kAnyTitleLow = 0xFFFFFFFFu;' "the mark is a low word no title has"
+need_line Sources/ctr/plugin.cpp '    real->SetClntBook(book);' "the searcher of the Download Play application feeds the book"
+[ "$(grep -r -o 'SetClntBook(' Sources/ctr | wc -l)" = "1" ] || fail "the book is given to the adapter in one place (MakeClntHub)"
+need_after Sources/azl/dlp_real_net.cpp '            probe_.max_nodes = dlp_real::AnnounceMaxNodes(buf_);' '            if (clnt_book_ != nullptr) {' "Collect notes the title of frame 0 only for an adapter that has a book"
+# the front-end: dlp:CLNT before dlp:FKCL, only with the flag, every other dlp service of the application the real one
+need_line Sources/ctr/uds_hle.cpp '    } else if (dlp_clnt_ && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:", 4) == 0) {' "dlp:CLNT is intercepted only with SetDlpClnt"
+need_order Sources/ctr/uds_hle.cpp '    } else if (dlp_clnt_ && cmd[3] == 8' '    } else if ((dlp_hub_ != nullptr || dlp_probe_fake_) && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:FKCL", 8) == 0) {' "... before the branch of dlp:FKCL"
+need_after Sources/ctr/uds_hle.cpp '        if (std::memcmp(&cmd[1], "dlp:CLNT", 8) != 0) {' '            return false;' "... and every other dlp service of the application is the real one"
+need_line Sources/ctr/uds_hle.cpp '        RunDlpClnt(*dlp_hub_, id, cmd);  // (1.1.4, G1: the Download Play application'"'"'s dlp:CLNT)' "a dlp:CLNT request goes to its own path"
+CLNT_REGION=$(tr -d '\r' < Sources/ctr/uds_hle.cpp | sed -n '/^__attribute__((noinline)) void NoteClntFirst(u32 id) {$/,/^    NoteCommand("dlp:CLNT", id, cmd\[1\]);$/p')
+[ -n "$CLNT_REGION" ] || fail "Sources/ctr/uds_hle.cpp: the functions of dlp:CLNT (NoteClntFirst .. RunDlpClnt) are not found"
+! printf '%s\n' "$CLNT_REGION" | grep -q 'svcCloseHandle' || fail "Sources/ctr/uds_hle.cpp: the path of dlp:CLNT closes a handle (Initialize's [5] [6] are the application's)"
+need_after Sources/ctr/uds_hle.cpp '    if (clnt::CarriesMac(id)) {' '        w[1] = 0; // (a host'"'"'s MAC: never in the log)' "the trace of a request of dlp:CLNT zeroes the MAC"
+need_line Sources/ctr/uds_hle.cpp '    const u32 shown = id == clnt::kGetWirelessRebootPassphrase || id == clnt::kGetNodeInfo ? 1u : n; // (the words the line shows: never the passphrase, never a seed)' "the trace of the replies of 0x11 and 0x10 shows their result only, never the passphrase nor a node's whole seed"
+[ "$(tr -d '\r' < Sources/ctr/uds_hle.cpp | grep -c -F 'i < shown ? cmd[1 + i] : 0u')" = "2" ] || fail "Sources/ctr/uds_hle.cpp: both the signature and the line of a dlp:CLNT reply leave out what is past 'shown' (the passphrase)"
+need_line Sources/ctr/uds_hle.cpp '    NoteCommand("dlp:CLNT", id, cmd[1]);' "NoteCommand stays the last call of a dlp:CLNT command"
+# the service: its own dispatch (Dispatch keeps the frame of the games), StartSession only for a ready child, never an error of InOrder / GetServerInfo
+need_after Includes/azl/dlp_ipc.hpp '    DlpOutcome Dispatch(DlpKind kind, u32* cmd, const u32* sbuf, const IpcResolver& r) {' '        if (kind == DlpKind::Clnt) {' "dlp:CLNT has a dispatch of its own, before anything of the games' path"
+need_line Includes/azl/dlp_ipc.hpp '        Fail(cmd, clnt::kGetTitleInfoInOrder, kNoData);' "GetTitleInfoInOrder ends with 'no data', never 'invalid state'"
+need_line Includes/azl/dlp_ipc.hpp '        Plain(cmd, join_id_, res);' "PollPending answers under the command that began the join (CLNT 0x0D)"
+need_line Includes/azl/dlp_ipc.hpp '        u32 res = join_id_ == clnt::kStartSession ? 0u : kInvalidState;  // (join_id_ is 0x0D only for a StartSession of dlp:CLNT not collected yet)' "a StartSession left by HOME during its join answers 0 (then 0x80), never 0xE0A0AC01; FKCL's answer without a join stays"
+need_line Includes/azl/dlp_ipc.hpp '                continue;  // (16 records and a 17th host: it waits, nothing known is evicted, and the known hosts in the slots after it are still delivered)' "a seventeenth host does not hide the known hosts in the slots after it"
+need_line Includes/azl/dlp_ipc.hpp '            b.Arm(b.PreparedFor(*g));' "the seam to G3 is armed with the row's prepared title (K7)"
+need_line Includes/azl/dlp_ipc.hpp '            Renumber(cmd, id);' "FKCL's 0D-10 under dlp:CLNT's numbers"
+[ "$(tr -d '\r' < Includes/azl/dlp_ipc.hpp | grep -c -F 'Renumber(cmd, id);')" = "3" ] || fail "Includes/azl/dlp_ipc.hpp: three FKCL replies renumbered (0F, 10, 11; 12 has its own)"
+need_line $CB '            if (used_ >= kRecords) {' "the book never evicts a host it knows: a seventeenth is refused"
+need_after $CB '            if (used_ >= kRecords) {' '                return false;' "... refused, not put in the place of another"
+need_after $CB '    void NewScan() {' '        override_ = 0;' "... and lifts the 0x80 forced (StartScan after a refusal)"
+need_line Includes/azl/dlp_ipc.hpp '            std::memcpy(dst + kServerInfoMac, mac.data(), 6);' "GetServerInfo of a host never delivered: zeros and its MAC, never an error"
+need_line Tests/chain_sim/chain_sim.py 'CLNT_CEILING = 520' "the chain test holds dlp:CLNT to 520 bytes at both levels (1-G1.md section 4.6)"
+need_after $CB '    void NewScan() {' '        this_scan_ = 0;' "a new scan forgets the marks ..."
+! tr -d '\r' < $CB | sed -n '/^    void NewScan() {$/,/^    }$/p' | grep -q 'rec_\|used_' || fail "$CB: NewScan forgets a record (GetServerInfo would fail on a host the application was told about)"
+need_line $CB '    static constexpr u32 kFrame0TitleAt = 0x40;' "the title of frame 0 at +0x40 ..."
+need_line $CB '            dst[kTitleInfoTitleShort + i] = title->short_be[i + 1];  // (big-endian units on the wire, little-endian in the record)' "... its big-endian units turned"
+need_line $CB '            wanted_.fetch_or(1u << r, std::memory_order_acq_rel);' "a block is asked of the plugin's thread, never read on a game's"
+need_line $CB '    dlp_children::WriteTitleLong(dst, g.name, v);' "title_long is always written (K4)"
+need_line $CB '    dlp_children::WriteLabel(dst, g.name, v);' "the small line is dlp_children's (K4)"
+# the hub: what no network thread ran is deferred or answered "wireless off"; HOME / the swap leave the session at the next Tick
+need_order Sources/azl/dlp_hub.cpp '            return AnswerUnservedClnt(cmd);' '        return AnswerUnserved(kind, cmd);' "a dlp:CLNT request nobody served has its own answer, the games' stays"
+need_after Sources/azl/dlp_hub.cpp '    if ((bits & kClntDeferred) != 0) {' '        svc_.ClntApplyDeferred();' "the next Tick does what dlp:CLNT deferred"
+need_after Sources/azl/dlp_hub.cpp '    if ((bits & kClntLeave) != 0) {' '        svc_.ClntLeave();' "... and leaves the session after HOME"
+need_line Sources/ctr/plugin.cpp '                dlp_hub_->RequestClntLeave();  // (1.1.4, G1: the Download Play application leaves its session at the next Tick: one atomic)' "HOME leaves the session of dlp:CLNT"
+need_order Sources/ctr/plugin.cpp '                dlp_hub_->RequestClntLeave();  // (1.1.4, G1: an Old 3DS gets the swap' '            const u32 gate_left = CloseGate(kSwapDrainTimeoutMs, dlp_hub_ ? &WakeHubForSwap : nullptr, dlp_hub_.get());' "... and so does the swap, before the gate closes"
+# the children (G2.3 with K2/K3): the index once, the blocks one at a time on the plugin's thread
+need_line Sources/ctr/plugin.cpp 'constexpr dlp_children::PresenceBy kChildrenPresence = dlp_children::PresenceBy::Index;' "the rows are believed until D-S1 says how the titles are looked for"
+need_line Sources/ctr/plugin.cpp '        LoadDlpChildren();  // (1.1.4, G1/G2.3: the Download Play application in the room only)' "the index is read once, in LateInit"
+need_line Sources/ctr/plugin.cpp '        ServeDownloadPlayClient();  // (1.1.4, G1: the Download Play application in the room only; a load when nothing is asked)' "the blocks are read on the plugin's thread"
+need_line Sources/ctr/plugin.cpp '        dlp_book_->WantRows(wanted);  // (one block per round: the others at the next ones)' "one block per round, never all of them at once"
+need_line Sources/ctr/plugin.cpp '        NoteClntSeam();  // (1.1.4, G1/K7: the seam to G3, read on this thread - where G3 jumps - without the hub'"'"'s lock, room link or not)' "the plugin's thread reads the seam to G3 (K7)"
+need_after Sources/ctr/plugin.cpp '        ServeDownloadPlayClient();  // (1.1.4, G1' '        NoteClntSeam();  // (1.1.4, G1/K7' "... in Plugin::Tick, beside the blocks"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | grep -c -F 'NoteClntSeam();')" = "1" ] || fail "Sources/ctr/plugin.cpp: the seam to G3 is read somewhere else than Plugin::Tick (the room's tick callback is the network thread, and stops with the link)"
+# the tools: the stack budgets, the chain test, the probe
+for f in RunDlpClnt ClntTraceRequest ClntTraceReply WaitForClntJoin NoteClntFirst NoteClntTrouble; do
+  tr -d '\r' < Tests/stack_usage.sh | grep -q "^budget uds_hle \"azl::ctr::{anonymous}::$f\" " || fail "Tests/stack_usage.sh has no budget for $f (dlp:CLNT, a game thread)"
+done
+need_line Tests/stack_usage.sh 'budget dlp_hub "azl::DlpHub::AnswerUnservedClnt" 32' "the hub's answer to an unserved dlp:CLNT command has a budget"
+[ "$(tr -d '\r' < Tests/chain_sim/chain_sim.py | grep -c -F '            scenario_hub_clnt(elf, level)')" = "2" ] || fail "Tests/chain_sim/chain_sim.py runs scenario_hub_clnt in both lists"
+need Tests/chain_sim/chain_sim.py "                  'ClntBook'," "the spy network has the slot of the book (LOBBYNET_SLOTS, in the order of the vtable; H5's after it)"
+need Tests/dlp_stack_probe.cpp 'PROBE_NOINLINE bool p_ClntUnserved(DlpService* s, u32* cmd) { return s->ClntUnserved(cmd); }' "the probe measures what the hub asks of dlp:CLNT (its commands are p_Dispatch's: the kind is a parameter)"
+need Tests/dlp_stack_probe.cpp 'static_assert(sizeof(DlpClntBook) <= 1400,' "the book is 1400 bytes at most on ARM32"
+
+# ---- G4 (1.1.4, 2026-11-16): the prepared Download Play child (contract K8 of analysis/piano-1.1.4-2026-11-15/specifiche/7-CONTRATTO.md, 2-G3.md 2.3-2.5) ----
+# A title of the band of the prepared children is the prepared child only with its row of the index (the row whose `prepared` it is, never a formula
+# read backwards): it runs with the rules and the name of that row's game (the room is told its own id), its dlp:SRVR IsChild answers TRUE (a service of
+# the probe's kind made for it alone, never with a hub: a hub never says "child"), it joins the room in EarlyInit (a New 3DS, the settings saying the
+# plugin joins by itself), and the plugin loader's words of the launch (the 16 bytes of the jump, G3) are taken, wiped and never logged. Any other title
+# runs as before. The probe D-S1 opens the index's games and their PreparedOf (K1), never a fixed id derived with a mask.
+IP=Includes/azl/dlp_ipc.hpp
+need_line $IP '            cmd[2] = child_ ? 1u : 0u;  // (1.1.4, G4: true only for the prepared child, set once before the hooks)' "ProbeOnly's IsChild answers what SetChild set"
+need_after $IP '        } else if (id == kSvIsChild) {' '            cmd[2] = child_ ? 1u : 0u;' "... in the probe's IsChild"
+need_line $IP '        case kSvIsChild:           // every process is "not a child": [0x000E0080, 0, 0]' "a hub never answers 'child' (G4: the lobby's IsChild stays false)"
+need_after $IP '        case kSvIsChild:           // every process is "not a child": [0x000E0080, 0, 0]' '            Zeroed(cmd, id, 2);' "... zeros"
+[ "$(tr -d '\r' < $IP | code_of | grep -c -E '\bchild_\b')" = "3" ] || fail "$IP: child_ is read or written somewhere else than SetChild, the probe's IsChild and its member (G4)"
+need_order $IP '    u8 join_id_ = kFkStartFakeSession;' '    bool child_ = false;' "C9: the flag of G4 after G1's join_id_, in the padding (40 / 48 bytes)"
+need Tests/dlp_stack_probe.cpp 'PROBE_NOINLINE void p_SetChild(DlpService* s, bool on) { s->SetChild(on); }' "SetChild is measured on ARM32 like every public function of the service"
+UH=Sources/ctr/uds_hle.cpp
+need_line $UH '    } else if (dlp_child_ != nullptr && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:SRVR", 8) == 0) {' "dlp:SRVR is the plugin's for the prepared child only (its service made)"
+need_order $UH '} else if (dlp_hub_ != nullptr && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:SRVR", 8) == 0) {' '} else if (dlp_child_ != nullptr && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:SRVR", 8) == 0) {' "... a branch of its own after the hub's"
+need_after $UH '    } else if (dlp_child_ != nullptr) {' '        RunDlpChild(id, cmd);' "RunDlp sends the child's dlp:SRVR to its own path"
+need_line $UH '    if (!on || dlp_hub_ != nullptr || dlp_child_ != nullptr) {' "SetDlpChild: never with a hub, once"
+need_line $UH '        child->SetChild(true);' "... and its service says 'child'"
+[ "$(tr -d '\r' < $UH | code_of | grep -c -E '\bdlp_child_ = ')" = "1" ] || fail "$UH: dlp_child_ is set somewhere else than SetDlpChild (once, before the hooks)"
+need_line $UH '        dlp_child_->Dispatch(DlpKind::Srvr, cmd, nullptr, kChildNoResolver);' "the child's dlp:SRVR is the probe's kind of service: no buffer, no resolver, no lobby"
+need_line Tests/stack_usage.sh 'budget uds_hle "azl::ctr::UdsHle::RunDlpChild" 32' "the prepared child's dlp:SRVR has a stack budget (a game thread)"
+need Tests/callgraph_check.py 'RunDlpProbe|RunDlpChild|RunNdm' "the lock of RunDlpChild is the short one of the table of the fake sessions"
+P=Sources/ctr/plugin.cpp
+need_line $P '    rules_id_ = game_id_;' "every title's rules and name are its own row's ..."
+need_line $P '    rules_id_ = row.game;' "... but a prepared child's are its game's (the index's row)"
+[ "$(tr -d '\r' < $P | code_of | grep -c -E '\brules_id_ = ')" = "2" ] || fail "$P: the title of the rules is set somewhere else than EarlyInit and NotePreparedChild"
+need_after $P '    if (title_rules::PreparedSlotOfProcess(game_id_) != 0) { // (the build 2h: 00040010|low or 00040000|low of the band)' '        NotePreparedChild();' "only a title of the band (its system id, DPAPP-2h, or its key) looks for its row"
+[ "$(tr -d '\r' < $P | code_of | grep -c 'NotePreparedChild();')" = "1" ] || fail "$P: NotePreparedChild is called somewhere else than in EarlyInit"
+need_line $P '    prepared_child_ = scratch && PreparedChildRow(game_id_, read ? text.data() : nullptr, text.size(), scratch.get(), &row);' "a prepared child is one the index has a row for"
+[ "$(tr -d '\r' < $P | code_of | grep -c -E '\bprepared_child_ = ')" = "1" ] || fail "$P: prepared_child_ is set somewhere else than NotePreparedChild"
+need_line $P '    const u64 slot = title_rules::PreparedSlotOfProcess(own);' "PreparedChildRow: the key of the process's id (DPAPP-2h: its system id or the key; never 00040001)"
+need_line $P '    if (slot == 0 || text == nullptr || scratch == nullptr || !dlp_children::ParseIndex(text, size, scratch)) {' "PreparedChildRow: the band, an index"
+need_line $P '    const int r = dlp_children::FindPrepared(*scratch, slot);' "... and the row whose prepared title (the key) it is (K8: never a formula read backwards)"
+need_after $P '    if (prepared_child_ && active_) {' '        hle_->SetDlpChild(true);' "dlp:SRVR IsChild TRUE for the prepared child only, with the plugin on (G4 review)"
+[ "$(tr -d '\r' < $P | code_of | grep -c 'SetDlpChild(')" = "1" ] || fail "$P: SetDlpChild is called more than once"
+need_line $P '        if (JoinsEarly(prepared_child_, active_, !swap_console_, config_read_early, !config_.host.empty(), config_.autoconnect, menu_off())) {' "the early join: the prepared child only"
+need_line $P '    return prepared_child && active && new_console && config_read_early && clnt::UsesRoom(host_set, autoconnect, menu_off);' "... on a New 3DS, with the plugin on and the settings that join by themselves"
+[ "$(tr -d '\r' < $P | code_of | grep -c 'EarlyConnect();')" = "1" ] || fail "$P: EarlyConnect is called somewhere else than for the prepared child"
+need_after $P 'void Plugin::ResolveIdentity() {' '    if (identity_resolved_) {' "ResolveIdentity runs once (the prepared child's early join, then LateInit)"
+need_line $P '        header_words[i] = 0;' "the loader's words are wiped from the header once taken"
+need_line $P '    const bool found = TakeLoaderWords(words, shelter);' "... for the prepared child (NotePreparedChild)"
+hit=$(tr -d '\r' < $P | code_of | grep -n -E 'loader_words_|shelter|header_words' | grep -E 'Log\(|LogLine|\.Hex\(|\.Dec\(|%0?8?l?x' | head -2)
+[ -z "$hit" ] || fail "$P: the loader's words (the 16 bytes of the jump) go to the log: $hit"
+need_after $P '    if (flow::IsDenseTitle(rules_id_)) {' 'const title_rules::Rules rules = title_rules::RulesFor(rules_id_);' "the relief of a prepared child is its game's row"
+need_line $P '        flow::FormatLossLine(s, title_rules::RulesFor(rules_id_).cap_drop_max, flow_line, sizeof(flow_line));' "... and so is its line of the stats"
+need_line $P '        const u64 prepared_tid = title_rules::PreparedOf(game);  // (K1: the one formula, on the game)' "D-S1 opens the index's games and their PreparedOf (K1)"
+! tr -d '\r' < $P | code_of | grep -q -i '000FFFFF' || fail "$P: the mask of D-S1's first version (0xFFFFFFFF000FFFFF, wrong for Taiwan and Korea) is back"
+need $P 'dlp probe: from the Download Play application, the content 2 of %08lx%08lx: SD %s, card %s' "the probe's lines keep their text"
+need $P 'dlp probe: the prepared child %08lx%08lx, content 0 on the SD: %s' "... both"
+need_line Tests/dlp_ipc_test.cpp '    TestChildNeverInLobby();' "the suite holds the lobby's IsChild to false whatever SetChild says"
+need_line Tests/dlp_fkcl_test.cpp '    TestPreparedChild();' "the suite runs the prepared child's dlp:SRVR through the front-end"
+need_line Tests/plugin_dlp_test.cpp '    azl::ctr::PreparedChildTest();' "the suite runs the prepared child's decision"
+need_line Tests/plugin_dlp_test.cpp '    CHECK_EQ(games_taken, 0u);' "no sold game is ever taken for a prepared child"
+need_line Tests/plugin_dlp_test.cpp '    CHECK_EQ(prepared_found, 5217u);' "... and every sold game's prepared title, with its row, is"
+need Tests/stack_usage.sh 'budget uds_hle "azl::ctr::{anonymous}::NoteChildSrvr" ' "the lines of the prepared child's dlp:SRVR have a stack budget"
+[ "$(tr -d '\r' < Tests/chain_sim/chain_sim.py | grep -c -F '        scenario_prepared_child(elf, level)')" = "1" ] || fail "Tests/chain_sim/chain_sim.py does not run scenario_prepared_child (the child's IsChild against 520 at debug 1)"
+# G4, review (2026-11-16): the line of the child's dlp:SRVR says what the game is told (the plugin off or the hooks out: the real service, "not a child");
+# the row's name stays after LateInit (what an early join told the room, on every console); the probe D-S1 walks the index's games within its rows;
+# EarlyConnect sets what LateInit sets before the room, and resolves the identity (the nickname) BEFORE it connects.
+need_line $P '        Log("dlp: dlp:SRVR of the prepared child is %s", ChildSrvrLine(hle_->dlp_child(), active_, hook_stats_.gate_ready));' "the child's dlp:SRVR line knows the plugin's state and the hooks"
+need_order $P '            hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);' 'ChildSrvrLine(hle_->dlp_child(), active_, hook_stats_.gate_ready)' "... written after the hooks"
+need_line $P '    return !active   ? "the real one (the plugin is off for this launch): IsChild says false"' "ChildSrvrLine: the plugin off, the real service"
+need_line $P '           : !hooked ? "the real one (no hooks for this launch): IsChild says false"' "... the hooks out, the real service"
+need_line $P '           : has_service ? "answered by the plugin: IsChild says TRUE"' "... TRUE only with the service made"
+need_line Tests/plugin_dlp_test.cpp '    CHECK_EQ(says_true, 1u);' "the suite holds the child's dlp:SRVR line to TRUE in one case of eight"
+need_line $P '        name_source_ = NameSource::Index;  // (LateInit keeps it: the child'"'"'s own icon is not the game'"'"'s name, and the room was told this one)' "a prepared child's name is its row's game's ..."
+need_after $P '    if (name[0] != '"'"'\0'"'"') {' '        game_name_ = name;' "... set in NotePreparedChild"
+need_order $P 'void Plugin::ResolveGameName() {' '        if (name_source_ == NameSource::Index) {' "... and LateInit keeps it"
+rgn=$(region $P 'void Plugin::ResolveGameName() {' '}' | code_of | sed 's/[[:space:]]*$//' | grep -n -F -e 'if (name_source_ == NameSource::Index) {' -e 'if (R_FAILED(fsInit())) {' | cut -d: -f2- | tr '\n' '|')
+[ "$rgn" = "        if (name_source_ == NameSource::Index) {|    if (R_FAILED(fsInit())) {|" ] || fail "$P: ResolveGameName no longer keeps the index's name before it reads the icon ('$rgn')"
+need_after $P '        if (name_source_ == NameSource::Index) {' '            return;' "... returning before the icon"
+need_line $P '    const std::size_t games = listed ? index->count : 0;' "D-S1: the games are the index's rows"
+need_line $P '    for (std::size_t r = 0; r < games && r < kProbeRows; ++r) {' "... no row past the index's count, at most kProbeRows"
+need_after $P '    for (std::size_t r = 0; r < games && r < kProbeRows; ++r) {' '        const u64 game = index->rows[r].game;' "... and the title opened is the row's GAME"
+ec=$(region $P 'void Plugin::EarlyConnect() {' '}' | code_of | sed 's/[[:space:]]*$//')
+need_nth "$P, EarlyConnect" "$ec" 3 "    const Config& settings = config_;" "the early join reads the settings LateInit reads"
+need_nth "$P, EarlyConnect" "$ec" 4 "    platform::SetPreferredCore(settings.net_core);" "... the network's core"
+need_nth "$P, EarlyConnect" "$ec" 5 "    azl_enet_socket_buffers = settings.socket_buffers ? 1 : 0;" "... the socket buffers, before ENet's first socket"
+need_nth "$P, EarlyConnect" "$ec" 6 "    room_->SetFastData(settings.radio_like);" "... the radio level"
+need_nth "$P, EarlyConnect" "$ec" 7 "    ResolveIdentity();" "... the identity (the nickname of the join) before it connects"
+need_nth "$P, EarlyConnect" "$ec" 8 "    const bool started = Connect();" "... and then the room"
+
+# 1.1.4, H5 and H3 (analysis/piano-1.1.4-2026-11-15/specifiche/3-G2.md part H5, contract K6/C8, the user's caps of REGOLE-IMPLEMENTAZIONE.md): a game that hosts the real
+# Download Play waits in its state 9 for the guests of the system's Download Play application that went to start their child, and names on its screen a guest it
+# ejected because it asked for the content. Nothing of the child travels through the room; no MAC on the screen or in the log.
+CW=Includes/azl/dlp_child_wait.hpp
+game_thread_file Includes/azl/dlp_child_wait.hpp 1
+need_line $CW '    static constexpr u32 kLeaveMs = 5000;         // still in the room this long after the end: an emulator, it does not hold [estimate]' "H5: a guest still in the room 5 s after the end holds nothing (an Azahar)"
+need_line $CW '    static constexpr u32 kMaxMs = 15000;          // the longest wait, whatever happens (the user'"'"'s cap)' "H5: 15 s at most (the user's cap)"
+need_line $CW '    static constexpr u32 kStayedCapMs = 10000;    // with a guest that stayed in the room (an Azahar): its child already looks for the network (the user'"'"'s cap)' "H5: 10 s with an Azahar among the guests (the user's cap)"
+need_line $CW '    static constexpr u32 kBackGraceMs = 6000;     // after the first one back: its child looks for the network too (the user'"'"'s cap)' "H5: 6 s after the first one back (the user's cap)"
+need_line $CW '    static_assert(kMaxMs < 20000, "the game waits for GetConnectingClients = 0 at most 20 s in its state 9 (host/RAPPORTO.md 3.4)");' "H5: the wait ends before the game gives up in its state 9"
+need_line $CW '        const bool over = noted_ == 0 || e >= kMaxMs || (stayed_ != 0 && e >= kStayedCapMs) ||' "H5: the wait ends with nobody awaited, at 15 s, at 10 s with an Azahar ..."
+need_line $CW '                          (back_ != 0 && Elapsed(now_ms, first_back_) >= kBackGraceMs);' "... and 6 s after the first one back"
+need_line $CW '            } else if (e >= kLeaveMs) {' "H5: one that never left holds nothing after kLeaveMs"
+need_line $CW '        if (!on_ || armed_ || slot >= kSlots || !listed) {' "H5: a guest is noted only with the wait on, before the count, in a host's slot, listed by the room in the Download Play application"
+need_line $CW '        if (!on_ || armed_ || noted_ == 0) {' "H5: the count starts only with somebody noted"
+need_line $CW '        return armed_ ? noted_ : 0;' "H5: nobody is awaited before the count starts"
+hit=$(tr -d '\r' < $CW | code_of | grep -n -E 'Send|Log\(|printf|new |malloc' | head -2)
+[ -z "$hit" ] || fail "$CW sends, logs or allocates: the wait only reads the room's presence ($hit)"
+RN=Sources/azl/dlp_real_net.cpp
+RH=Includes/azl/dlp_real_net.hpp
+need_line $RH 'static_assert(dlp_real::ChildWait::kSlots == RealDlpNet::kRealClients, "H5: one slot of the wait per client of the host'"'"'s table");' "H5: one slot of the wait per client of the host"
+need_line $RH '    u8 ChildrenAwaited() const override {' "H5: the adapter answers the lobby's question (LobbyNet::ChildrenAwaited)"
+need_after $RH '    u8 ChildrenAwaited() const override {' '        return wait_.Awaited();' "... with the wait's mask"
+need_line $RN '    wait_.Reset();  // (H5: a new lobby - the wait of the last one is void)' "H5: HostOpen voids the wait of the last lobby"
+need_order $RN '    wait_.Reset();  // (H5: a new lobby - the wait of the last one is void)' '    hosting_ = true;' "... before the new lobby is hosted"
+need_after $RN 'void RealDlpNet::HostClose() {' '    wait_.Arm(Now());' "H5: the count starts when the Download Play's network ends (the lobby's 9)"
+need_after $RN '            p.flags = static_cast<u8>((p.flags & 0x0F) | (1u << kTriesShift));' '            NoteChild(node);' "H5: a guest is noted at its first final"
+[ "$(tr -d '\r' < $RN | grep -c 'NoteChild(')" = "2" ] || fail "$RN: NoteChild is defined once and called once (the first final)"
+need_line $RN '        wait_.Note(node - kFirstClientNode, mac, engine_->InRoom(mac) && engine_->InDownloadPlay(mac));' "H5: only a guest the room lists NOW in the Download Play application is noted (a guest that plays the game itself never)"
+need_after $RN 'void RealDlpNet::NoteChild(u8 node) {' '    if (wait_.on() && engine_->NodeMac(node, &mac)) {' "H5: nothing is noted with the wait off"
+need_line $RN '    if (!hosting_ && !session_ && !scanning_ && wait_.Awaited() == 0) {' "H5: the Pump runs while the wait counts"
+need_after $RN '    if (wait_.Awaited() != 0) {' '        PumpChildWait(now);' "H5: the wait is stepped by the network thread"
+need_line $RN '    } else if (scanning_) {' "H5: the wait alone probes nothing"
+body=$(region $RN 'void RealDlpNet::PumpChildWait(u32 now) {' '}' | code_of)
+case "$body" in *"engine_->InRoom(m)"*) ;; *) fail "$RN: the wait reads the room's presence (InRoom)";; esac
+case "$body" in *Send*|*Bind*|*Shutdown*|*Eject*) fail "$RN: PumpChildWait sends or touches the network: the wait only reads the presence";; esac
+need_after $RN '        if (p.needs_content) {  // (a download: this mode carries none; the lobby sees the node go and expels it)' '            NoteContentGuest(node);' "H3: the guest that asks for the content is given to the plugin's thread before the ejection"
+[ "$(tr -d '\r' < $RN | grep -c 'NoteContentGuest(')" = "2" ] || fail "$RN: NoteContentGuest is defined once and called once (the content's ejection)"
+need_line $RN '    if (static_cast<u8>(in - content_out_.load(std::memory_order_acquire)) >= kContentQueue) {' "H3: a full ring drops the guest (never over the one the plugin reads)"
+LB=Includes/azl/dlp_lobby.hpp
+need_order $LB '    virtual DlpClntBook* ClntBook() { return nullptr; }' '    virtual u8 ChildrenAwaited() const { return 0; }' "C8: ChildrenAwaited is appended after ClntBook (the slots of the vtable stay where they are)"
+need_line $LB '        } else if (srv_state_ == kSrvComplete) {' "H5: the clients awaited are listed in state 9 only"
+need_after $LB '        } else if (srv_state_ == kSrvComplete) {' '            const u8 awaited = net_->ChildrenAwaited();' "... asked of the network there"
+[ "$(tr -d '\r' < $LB | grep -c 'for (u32 b = 0; b < kMaxClients; ++b) {')" = "1" ] || fail "$LB: the list of the awaited clients is one loop (state 9)"
+need_line $LB '        return srv_state_ == kSrvComplete && node >= kFirstClientNode && node <= kMaxPlayers &&' "H5: an awaited node is one of state 9, a client's id"
+[ "$(tr -d '\r' < $LB | grep -c 'if (AwaitedNode(node)) {')" = "2" ] || fail "$LB: GetClientInfo and GetClientState answer an awaited id"
+need_line $LB '                *word = (static_cast<u32>(kPeerComplete) << 24) | (1u << 16) | node;' "H5: an awaited id is a client that has the passphrase (0x09, joined)"
+need_line Sources/azl/dlp_hub.cpp '    const bool awaiting = b != &net_ && b->ChildrenAwaited() != 0;  // (1.1.4, H5: the adapter still counts - no hold, no request: Tick must run its Pump)' "H5: the hub stays active while the adapter counts"
+need_line Sources/azl/dlp_hub.cpp '    active_.store(held || lobby_.active() || awaiting, std::memory_order_relaxed);' "... (its Tick pumps the adapter)"
+need Tests/chain_sim/chain_sim.py "                  'ChildrenAwaited')" "C8: the spy network has the slot of the wait after the book's (LOBBYNET_SLOTS, in the order of the vtable)"
+need Tests/dlp_net_stack_check.sh "|SpectatorCount|NodeMac|InRoom|InDownloadPlay'" "H5: the engine's presence calls of the wait are held to the engine's budget"
+EN=Sources/azl/uds_engine.cpp
+need_line $EN '    download_play_.clear(); // (H5: so is who is in the Download Play application)' "H5: the end of the room link voids who is in the Download Play application"
+need_after $EN 'bool UdsEngine::InRoom(const Mac& mac) const {' '    return InRoomLocked(mac);' "H5: the presence of the wait is the engine's own (false at once for one out of the list)"
+need_line $P '    real->SetChildWait(DlpModeOf(game_tid) == DlpGameMode::RealDlp);  // (1.1.4, H5: a game that hosts the real Download Play waits in its state 9 for the guests of the Download Play application that went to start their child)' "H5: the wait is on for a game that hosts the real Download Play, in MakeRealDlpHub"
+[ "$(grep -r -o 'SetChildWait(' Sources/ctr | wc -l)" = "1" ] || fail "the wait for the children is switched in one place of the plugin (MakeRealDlpHub)"
+need_after $P '        if (dlp_real_ && dlp_real_->child_wait_on()) {' '            std::vector<Mac> download_play;' "H5: the list of the Download Play application's members is made for a host that waits only"
+need_line $P '                if (AwaitsChildOf(member.game_id)) {' "H5: a member is in the Download Play application by its game id (the six ids) or in 3DS Link's Download Play page (kAppTid; route B)"
+[ "$(cat Sources/*.cpp Sources/azl/*.cpp Sources/ctr/*.cpp | tr -d '\r' | grep -c 'SetDownloadPlayMembers(')" = "2" ] || fail "the members of the Download Play application are set in one place of the plugin (and defined once)"
+need_after $P '    } else if (dlp_real_) {' '        NoteRealDlpHost();' "H5/H3: a game that hosts the real Download Play reads the end of the wait and the guests ejected for the content, on the plugin's thread"
+[ "$(tr -d '\r' < $P | grep -c 'NoteRealDlpHost()')" = "2" ] || fail "$P: NoteRealDlpHost is defined once and called once (Plugin::Tick)"
+nh=$(region $P 'void Plugin::NoteRealDlpHost() {' '}' | code_of)
+case "$nh" in *"content_notices_.First(guest)"*) ;; *) fail "$P: H3 names a guest once for the game's run (ContentNotices::First)";; esac
+case "$nh" in *"PostNotification(dlp_real::ContentNoticeText(name));"*) ;; *) fail "$P: H3's notice is the text of ContentNoticeText, with the room's name";; esac
+case "$nh" in *"dlp_real::GuestName(room_members_, guest)"*) ;; *) fail "$P: H3 names the guest from the room's list";; esac
+case "$nh" in *%02*|*"guest["*|*"guest.data()"*) fail "$P: NoteRealDlpHost writes a MAC";; esac
+CN=Includes/azl/dlp_content_notice.hpp
+need_line $CN 'inline std::string ContentNoticeText(const std::string& name) {' "H3: the notice's text is made of the room's name and nothing else (never a MAC)"
+need_line $CN '        if (count_ >= kGuests) {' "H3: a guest that cannot be remembered is not told (never twice)"
+need_line Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_child_wait_test.cpp -o "$OUT/dlp_child_wait_test"' "the suite builds the test of the wait for the children"
+need_line Tests/run.sh '  "$OUT/dlp_child_wait_test"' "... and runs it"
+need_line Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_content_notice_test.cpp -o "$OUT/dlp_content_notice_test"' "the suite builds the test of the content's notice"
+need_line Tests/run.sh '  "$OUT/dlp_content_notice_test"' "... and runs it"
+need_line Tests/dlp_real_island_test.cpp '    W_ChildWait();' "the test of Island Tour runs its part W (the wait for the children)"
+need_line Tests/dlp_real_island_test.cpp '    h.real.SetChildWait(true);  // (what MakeRealDlpHub gives a game that hosts the real Download Play: Tests/plugin_dlp_test.cpp)' "... with the wait on"
+need_line Tests/plugin_dlp_test.cpp '        CHECK_EQ(real.child_wait_on(), g.mode == DlpGameMode::RealDlp);' "the plugin's test holds the wait to the games that host the real Download Play"
+need_line Tests/plugin_dlp_test.cpp '    azl::ctr::ChildWaitTest();' "... and runs it"
+need_line Tests/dlp_real_net_test.cpp '    H5_Wait();' "the adapter's test runs the wait (on, off, a guest that plays the game itself, a new lobby)"
+need_line Tests/dlp_lobby_test.cpp '    TestChildrenAwaited();' "the lobby's test holds the awaited clients to state 9"
+need_line Tests/dlp_real_engine_test.cpp '    H5_Presence();' "the engine's test holds NodeMac, InRoom and InDownloadPlay"
+
+RP=Tests/dlp_real_room_probe.cpp
+need_line $RP '    h.net.SetChildWait(true);' "I4 (H5): the probe of the real room hosts with the wait on"
+need_line $RP '            if (m.game_id == kDownloadPlayEur) {' "I4: the host is told who is in the Download Play application from the room's own lists"
+need_line $RP '        CHECK_EQ(end.stayed, 1u);  // an Azahar never leaves the room: it holds the host 5 s, no more' "I4: an Azahar that stays holds the host 5 s"
+need_line $RP '        CHECK_EQ(end.back, 1u);  // seen out, then back: the end with it' "I4: a console out of the room and back ends the wait"
+need_line $RP '    CHECK_EQ(h.Total(), 1u);  // state 9: the guest of the Download Play application is awaited' "I4: the guest is awaited in the lobby's 9"
+
+need Tests/dlp_chain_report.py "AWAITED_METHODS = ('ChildrenAwaited',)" "H5: the chain tool takes the lobby's question of state 9 for the getter it is (no call below it, nothing of the network)"
+need Tests/dlp_chain_report.py "            return Edge(caller, 'awaited', [], loc, ident, text)" "... an edge with no call below it"
+# ---- 1.1.4, APP-CORE: the Download Play child the app prepares with boot9.bin, the pure part (analysis/piano-1.1.4-2026-11-15/specifiche/6-APP-boot9.md
+# with its critic and K9 of 7-CONTRATTO.md): the composer, its AES, the built-in common KeyY 0, the test against the PC's P2a and P2n ----
+GL=ConfigApp/source/dlp_guest_logic.hpp
+GC=ConfigApp/source/dlp_guest_compose.cpp
+GT=Tests/settings_test/dlp_guest_test.cpp
+# the common KeyY 0: a built-in value like the other two, taken by name; never written out in a source or a test (the published tree), never its bytes here
+need_line ConfigApp/titleshare_host/builtin_keys.h '#define BK_COMMON_KEY_Y0      "commonKeyY0"' "the common KeyY 0 is a built-in value, by its name"
+need $GC 'bk_get(BK_GENERATOR_CONSTANT, out->generator) != 0 || bk_get(BK_COMMON_KEY_Y0, out->common_y0) != 0) {' "the composer takes the key generator's constant and the common KeyY 0 from the built-in values"
+if grep -rn -E 'COMMON_Y|commonKeyY0=|common_y0\[[0-9]+\] = 0x|common_y0\[\] = \{' ConfigApp Includes Sources Tests --include=*.c --include=*.h --include=*.cpp --include=*.hpp --include=*.inc --include=*.py --include=*.sh \
+    | grep -v -E '^Tests/policy_(check\.sh|mutants\.py):'; then
+  fail "a source or a test of the tree writes the common KeyY 0 out (it is only in builtin_keys_blob.h, obfuscated; the tests compare its SHA-256)"
+fi
+need_line Tests/settings_test/builtin_keys_test.cpp '    CHECK(Sha(y0, 16) == "0a1c7b55860589b0edd8874b5055e34716a2cde25bad1248bbbbeed1b340b1b8");' "the test holds the common KeyY 0 by its SHA-256 only"
+need_line Tests/settings_test/builtin_keys_test.cpp '    CHECK(sizeof(bk_blob) < 256);  // (bk_get refuses a blob of more than 256 bytes: three values are 146)' "the blob stays under the 256 bytes bk_get reads"
+# hidden, always: the console's build refuses a visible child; only the test's g++ line may ask for one (the P2a oracle)
+need_line $GC '#ifndef DLPGUEST_TEST_VISIBLE' "a visible child is refused outside the tests"
+need_after $GC '    if ((in.variant & kHide) == 0) {' '        return kErrCannotHide;  // the user'"'"'s decision: a prepared child is never installed visible (the plain P2a is made by Tests/ alone, for its md5)' "... with kErrCannotHide"
+[ "$(grep -r -F 'DLPGUEST_TEST_VISIBLE' ConfigApp Includes Sources | wc -l)" = "1" ] || fail "DLPGUEST_TEST_VISIBLE is named in the app beyond the one guard (a build of the console may never define it)"
+[ "$(tr -d '\r' < Tests/run.sh | grep -c -F -- '-DDLPGUEST_TEST_VISIBLE')" = "1" ] || fail "Tests/run.sh lets more than the composer's own test make a visible child"
+need_line $GL 'constexpr u8 kDefaultVariant = kHide;' "the default variant is the hidden child (the user's decision)"
+need_line ConfigApp/source/dlp_guest_compose.hpp '    u8 variant = kDefaultVariant;     // kHide, always, on the console' "the composer's input is hidden unless a test says otherwise"
+[ "$(grep -r -h -w 'kVisible' ConfigApp/source | grep -v -E '^[[:space:]]*//' | wc -l)" = "1" ] || fail "kVisible is used in the app (only the test makes a visible child: the console passes kHide)"
+need_line $GC '    if ((in.variant & kFixCrr) != 0) {' "kFixCrr (P2c) is not made before the console's S1"
+# the two layers, as the PC's tools take them off (cia_apri.py, ncch_chiaro.py)
+need_line $GL '    StoreBe64(iv, t.tid);' "the IV of the title key is the title id (big-endian) and 8 zeros"
+need_line $GL '    StoreBe16(iv, index);' "the IV of a content is its index (big-endian) and 14 zeros"
+need_after $GL 'inline void NcchCtr(u64 partition, u8 type, u8 ctr[16]) {' '    StoreBe64(ctr, partition);' "the NCCH counter starts with the partition id byte-reversed (read little-endian, written big-endian)"
+need_after $GL 'inline void NcchCtr(u64 partition, u8 type, u8 ctr[16]) {' '    ctr[8] = type;' "... then the region's type"
+need_line $GL '    } regions[3] = {{1, kExheaderAt, kPlainHead - kExheaderAt}, {2, plan.exefs_at, plan.exefs_size}, {3, plan.romfs_at, plan.romfs_size}};' "the three regions of the NCCH layer: exheader + access descriptor (1), ExeFS (2), RomFS (3)"
+need_line $GL '        Scramble(keys.ncch_x, head, keys.generator, p.key);' "the NCCH layer's key: KeyX 0x2C and the header's first 16 bytes"
+need_line $GL '    Scramble(keys.common_x, keys.common_y0, keys.generator, normal);' "the common key 0: KeyX 0x3D and KeyY 0"
+need_line $GL 'constexpr std::size_t kKeyX2CAt = 0x59D0;        // in the protected half' "KeyX 0x2C in boot9's protected half (sdcrypt.c sd_ncch_keyx)"
+need_line $GL 'constexpr std::size_t kKeyX3DAt = 0x5A20;' "KeyX 0x3D in boot9's protected half"
+need_line ConfigApp/source/aes_cbc.cpp '        std::memcpy(iv, cipher, 16);  // the IV of the next block (and of the next call): this cipher block' "CBC carries the IV from block to block and from chunk to chunk"
+need_line $GL '        if (head[0x18B] != 0 && head[0x18B] != 1) {' "only methods 0 and 1 are opened (method 1 with the KeyX of slot 0x25 from boot.firm: DPAPP-2e slot25)"
+# the changes of the content (rifai_ncch, the flags of ncch_chiaro.py, nascondi)
+for at in 0x3C8 0x400 0x800; do
+  need_line $GL "    list->Add($at, id, 8);" "the prepared id at $at of the content (DPAPP-2f: the exheader's ids, the id of the PROCESS Luma and the plugin read)"
+done
+# (DPAPP-2f, 2026-11-19) two ids: the NCCH's program id and partition id are the id of AM (AmTitleFor), the exheader's three are the prepared one -
+# never the other way round (0x400 is what Luma gives the process: the plugin knows the child by it, and its binary does not change)
+need_line $GL '    list->Add(0x118, am, 8);' "DPAPP-2f: the id of AM at 0x118 (the program id AM and NS read)"
+need_line $GL '    list->Add(0x108, am, 8);' "DPAPP-2f: ... and at 0x108 (the partition id, as makerom writes it)"
+need_line $GL '    StoreLe64(am, am_title);' "DPAPP-2f: the id of AM is the caller's am_title"
+need_line $GL '    StoreLe64(id, prepared);  // (0x400 is the id Luma gives the process and the plugin knows: NEVER the id of AM)' "DPAPP-2f: the exheader's ids are the prepared one"
+sg=$(region $GL 'inline NcchWhy HeaderPatches(const u8 plain_head[0xA00], u64 prepared, u64 am_title, PatchList* list) {' '}' | code_of)
+[ -n "$sg" ] || fail "$GL: HeaderPatches does not take the prepared id AND the id of AM (DPAPP-2f)"
+! printf '%s\n' "$sg" | grep -q -E 'list->Add\(0x(3C8|400|800), am,' || fail "$GL HeaderPatches: an exheader's id (0x3C8, 0x400, 0x800) gets the id of AM: Luma would give the process the id of AM and the plugin would not know the child (DPAPP-2f)"
+! printf '%s\n' "$sg" | grep -q -E 'list->Add\(0x1(08|18), id,' || fail "$GL HeaderPatches: 0x108 or 0x118 gets the prepared id: AM would install the title in the old form, which HOME shows black (DPAPP-2f)"
+
+need_line $GL '    list->Add(0x160, h, 32);' "the exheader's SHA-256 made again"
+need_line $GL '    const u8 flags = static_cast<u8>((plain_head[0x18F] | 0x04) & ~0x01);' "0x18F: NoCrypto on, fixed key off"
+need_line $GL '    list->Add(0x18B, &method, 1);' "0x18B: method 0"
+# (DPAPP-2e, 2026-11-18) the form makerom gives an application of the SD card (V2 of analysis/piano-1.1.4-2026-11-15/home-figlio-2026-11-18/varianti):
+# the partition id is the prepared id, the SCI says SDApplication, the ACI's ARM9 says SdApplication only when its access descriptor lets it - and
+# every one of them is under the exheader's new hash
+need_line $GL 'constexpr u32 kSciFlagsAt = 0x20D;         // the exheader'"'"'s 0x0D: the SCI'"'"'s flags, bit 1 SDApplication' "DPAPP-2e: the SCI's flags are the exheader's 0x0D"
+need_line $GL 'constexpr u8 kSciSdApplication = 0x02;' "DPAPP-2e: SDApplication is bit 1 of the SCI's flags"
+need_line $GL 'constexpr u32 kAciArm9At = 0x5F0;          // the exheader'"'"'s 0x3F0: the ACI'"'"'s ARM9 capabilities (u32 LE), bit 8 SdApplication' "DPAPP-2e: the ACI's ARM9 word is the exheader's 0x3F0"
+need_line $GL 'constexpr u32 kDescArm9At = 0x9F0;         // the exheader'"'"'s 0x7F0: the same word of the access descriptor, what the ACI may ask' "DPAPP-2e: the access descriptor's ARM9 word is the exheader's 0x7F0"
+need_line $GL 'constexpr u32 kArm9SdApplication = 0x100;' "DPAPP-2e: SdApplication is bit 8 of the ARM9 word"
+need_line $GL '    const u8 sci = static_cast<u8>(plain_head[kSciFlagsAt] | kSciSdApplication);' "DPAPP-2e: the SCI's flags keep theirs and say SDApplication"
+need_line $GL '    list->Add(kSciFlagsAt, &sci, 1);' "DPAPP-2e: ... written"
+need_line $GL '    if ((LoadLe32(plain_head + kDescArm9At) & kArm9SdApplication) != 0) {' "DPAPP-2e: the ACI says SdApplication only when its access descriptor lets it (an ACI that asks more is refused at the start)"
+need_line $GL '        StoreLe32(arm9, LoadLe32(plain_head + kAciArm9At) | kArm9SdApplication);' "DPAPP-2e: the ACI's ARM9 keeps its bits and says SdApplication"
+need_line $GL '        list->Add(kAciArm9At, arm9, 4);' "DPAPP-2e: ... written"
+need_line Tests/settings_test/dlp_guest_test.cpp '    CHECK(L64(c, 0x108) == am);  // the partition id is the program id, as makerom writes it (the build 2e: the output has no layer to count)' "DPAPP-2e: the test holds the partition id to the program id (DPAPP-2f: the id of AM)"
+need_line Tests/settings_test/dlp_guest_test.cpp '    CHECK(L64(c, 0x118) == am && L64(c, 0x3C8) == prepared && L64(c, 0x400) == prepared && L64(c, 0x800) == prepared);  // (2f: 0x400 never AM'"'"'s)' "DPAPP-2f: the test holds the two ids where they go"
+need_line Tests/settings_test/dlp_guest_test.cpp '        CHECK(same.sink.bytes == old_form.sink.bytes);  // (am_title = the prepared id: byte for byte the old form, the fallback'"'"'s CIA)' "DPAPP-2f: the test holds the old form byte for byte when the id of AM is the prepared one"
+need_line Tests/settings_test/dlp_guest_test.cpp '    CHECK_EQ(c[0x20D], m.plain[0x20D] | 0x02);  // the SCI'"'"'s flags say SDApplication' "DPAPP-2e: the test holds the SCI's SDApplication"
+need_line Tests/settings_test/dlp_guest_test.cpp '    CHECK_EQ(L32(c, 0x5F0), desc_sd ? (L32(m.plain, 0x5F0) | 0x100) : L32(m.plain, 0x5F0));  // the ACI'"'"'s ARM9 says SdApplication only if its descriptor lets it' "DPAPP-2e: the test holds the ACI's SdApplication to its descriptor"
+need_line Tests/settings_test/dlp_guest_test.cpp '        o.desc_sd = false;' "DPAPP-2e: the test makes a child whose descriptor does not let the ACI say SdApplication"
+need_line Tests/settings_test/dlp_guest_synth.hpp '    p[0x200 + 0x0D] = static_cast<u8>(o.sci_sd ? (p[0x200 + 0x0D] | 0x02) : (p[0x200 + 0x0D] & ~0x02));  // the SCI'"'"'s flags: SDApplication only with o.sci_sd (a child'"'"'s of the NAND: 0x01)' "DPAPP-2e: the made-up child has no SDApplication unless asked (the change is seen)"
+need_line Tests/settings_test/dlp_guest_synth.hpp '    p[0x200 + 0x3F1] = static_cast<u8>(o.aci_sd ? (p[0x200 + 0x3F1] | 0x01) : (p[0x200 + 0x3F1] & ~0x01));  // the ACI'"'"'s ARM9: SdApplication (bit 8) only with o.aci_sd' "DPAPP-2e: ... nor SdApplication in its ACI unless asked"
+need_line Tests/settings_test/dlp_guest_synth.hpp '    bool sci_sd = false;     // the SCI'"'"'s flags say SDApplication already (a child in the form of the SD card: the |= leaves it)' "DPAPP-2e rev: by default the made-up child is not in the form"
+need_line Tests/settings_test/dlp_guest_synth.hpp '    bool aci_sd = false;     // the ACI'"'"'s ARM9 says SdApplication already (with desc_sd false: an ACI above its descriptor, left as it is)' "DPAPP-2e rev: ... nor its ACI"
+need $GT '{0x108, 8}, {0x118, 8}, {0x3C8, 8}, {0x400, 8}, {0x800, 8}, {0x20D, 1}, {0x5F0, 4}, {0x160, 32}, {0x18B, 1}, {0x18F, 1}};' "DPAPP-2e: every other byte of the content is the source's"
+need_line $GL '    StoreLe32(word, before & ~1u);' "hidden: bit 0 of the icon's flags off"
+need_line $GL '    list->Add(icon_place.hash_at, h, 32);' "hidden: the icon's SHA-256 in the ExeFS header made again"
+need_line $GL '    list->Add(0x1C0, h, 32);' "hidden: the ExeFS's SHA-256 at 0x1C0 made again"
+need_line $GL '        StoreLe32(flags, LoadLe32(flags) & ~1u);' "hidden: the same bit in the meta block's SMDH"
+need_line $GL '    StoreBe64(front + lay.ticket_at + tik.body + kTicketTidAt, am_title);' "the ticket's title id is the id of AM (DPAPP-2f)"
+need_line $GL '    StoreBe64(t + tmd.body + kTmdTidAt, am_title);' "the TMD's title id is the id of AM (DPAPP-2f)"
+need_line $GL '    StoreBe16(t + tmd.chunk_at + 6, static_cast<u16>(tmd.type & ~1u));' "the content's type has no title key any more"
+need_line $GL '    sha256(t + tmd.chunk_at, kTmdChunkBytes, t + tmd.info_at + 4);' "the hash of the content records made again"
+need_line $GL '    sha256(t + tmd.info_at, kTmdInfoBytes, t + tmd.body + kTmdInfoHashAt);' "the hash of the info records made again"
+# the composer: nothing installed from a content its TMD does not name, a bad boot9.bin known before the stream, the front bounded, the keys wiped
+need_after $GC '    if (std::memcmp(orig_hash, tmd.hash, 32) != 0) {' '        return kErrSourceHash;  // the content is not the one its TMD names: nothing is installed' "the content's SHA-256 is its TMD's, or nothing is installed"
+need_order $GC '        return encrypted ? kErrTitleKey : kErrNcch;' '        sha256_update(&orig, in.buf, n);' "a wrong title key (boot9.bin) is known before any byte of the work file"
+need_order $GC '    if (HeaderPatches(plain_head, in.prepared, in.am_title != 0 ? in.am_title : in.prepared, &patches) != NcchWhy::Ok) {' '        sha256_update(&orig, in.buf, n);' "the changes (and the exheader's check) are made before the stream (DPAPP-2f: with the id of AM)"
+need_line $GC '    if (lay.content_at > sizeof(out->front)) {' "the front is bounded before it is read (Composed is on the heap, its front 16 KB)"
+need_line $GC '            AesCbcDecrypt(sec.dk, sec.iv, in.buf, n);' "the stream carries its CBC chain from chunk to chunk"
+need_line $GC '        Wipe(title_key, sizeof(title_key));' "the title key is wiped on every way out of Compose"
+need_line $GC '        Wipe(rk, sizeof(rk));' "the NCCH layer's round keys are wiped on every way out of Compose"
+need_line $GC '        Wipe(out, sizeof(*out));' "ComposeKeys leaves no half of the keys behind"
+need_line $GL '    Wipe(normal, sizeof(normal));' "the common key is wiped after the title key is opened"
+need_after $GL '    *out = p;' '    Wipe(p.key, sizeof(p.key));' "ReadNcch wipes its own copy of the NCCH layer's key (review of APP-CORE)"
+need_line $GC '    Wipe(plan.key, sizeof(plan.key));' "Compose wipes the NCCH layer's key once its round keys are made"
+need_line $GL '    Wipe(&s, sizeof(s));' "Scramble leaves no half of the key it makes on the stack"
+need_line ConfigApp/source/aes_cbc.cpp '    volatile u32* wipe = ek;  // (the expanded key of a title key: not left on the stack)' "the expanded key is wiped"
+if grep -n -E '\b(Log|printf|fprintf|snprintf|puts|DebugEvent)\(' ConfigApp/source/dlp_guest_*.?pp ConfigApp/source/aes_cbc.?pp | grep -v -E ':[0-9]+:[[:space:]]*//'; then
+  fail "the composer writes something (a log line or a print): the keys and the game's bytes are never written anywhere"
+fi
+if grep -n -E 'enet_|room_|dlph_|dl_send|RoomClient|udsSend|MEDIATYPE_NAND|AM_DeleteAllPendingTitles' $(ls ConfigApp/source/dlp_guest_*.?pp ConfigApp/source/aes_cbc.?pp | grep -v -x -E 'ConfigApp/source/dlp_guest_ids(_am\.cpp|\.hpp)') || grep -n -E 'enet_|room_|dlph_|dl_send|RoomClient|udsSend|AM_DeleteAllPendingTitles' ConfigApp/source/dlp_guest_ids_am.cpp ConfigApp/source/dlp_guest_ids.hpp; then
+  fail "the composer has network or NAND code (it reads and writes only through its caller's functions)"
+fi
+# the test: built, run, the oracles' md5 of the PC, the private files read in place and skipped loudly without them
+need_line Tests/run.sh 'g++ $CXXFLAGS -DDLPGUEST_TEST_VISIBLE -IConfigApp/source Tests/settings_test/dlp_guest_test.cpp ConfigApp/source/aes_cbc.cpp ConfigApp/source/dlp_guest_compose.cpp "$OUT"/ts_aes.o "$OUT"/ts_sha256.o "$OUT"/ts_sdcrypt.o "$OUT"/ts_builtin_keys.o -o "$OUT/dlp_guest_test"' "the suite builds the composer's test with the app's own files"
+need_line Tests/run.sh '  "$OUT/dlp_guest_test"' "... and runs it"
+need_line $GT '    TestRealFiles();' "the test holds the composer to the PC's V2vis and V2 (P2a and P2n in the form makerom gives: DPAPP-2e) when the private files are there"
+need_line $GT '    const char* const kMd5[4] = {"a3774a9d6e22d4bc221afdfefef78a24", "50482992c22b89727dca37491a6c23c8", "9896d8d132208da5d63fb13ad62aa83f",' "... by their md5 (home-figlio-2026-11-18/varianti/IT-V2vis.cia, IT-V2.cia; the M3c1 of the build 2f)"
+need_line $GT '                                 "0709e310f52fe9e64c27ba521986f1f8"};' "DPAPP-2h: ... and M3a, the form made now (prova-2e-2026-11-19/prova-pc/varianti/IT-M3a.cia)"
+need_line $GT '    const char* const kOracles[4] = {"analysis/piano-1.1.4-2026-11-15/home-figlio-2026-11-18/varianti/IT-V2vis.cia",' "... read where they are"
+need_line $GT '                                     "analysis/piano-1.1.4-2026-11-15/prova-2e-2026-11-19/prova-pc/varianti/IT-M3c1.cia",' "DPAPP-2f: the oracle of the form M3c1"
+need_line $GT '                                     "analysis/piano-1.1.4-2026-11-15/prova-2e-2026-11-19/prova-pc/varianti/IT-M3a.cia"};' "DPAPP-2h: the oracle of the system form M3a"
+need_line $GT '        const u64 am = v == 2 ? 0x000400010F8F8200ull : (v == 3 ? 0x000400100F8F8200ull : 0);' "DPAPP-2f: M3c1 is composed with the id of AM 000400010F8F8200; DPAPP-2h: M3a with 000400100F8F8200 ..."
+need_line $GT '        const u64 process = v == 3 ? azl::title_rules::PreparedSystemOf(prepared) : prepared;' "DPAPP-2h: ... and the same id for the process (the exheader)"
+need $GT 'TestRealFiles SKIPPED' "... and says so loudly when it cannot"
+need_line $GT '        const u8 variant = v == 0 ? kVisible : kHide;' "the visible child is made for the P2a oracle only, the hidden one for P2n"
+need_line $GT '    TestChain();' "the test runs the whole chain on made-up children"
+need_line $GT '    TestRefusals();' "... and the refusals"
+need_line $GT '        CHECK_EQ(r.sink.calls, 0);  // nothing reaches the AM sink' "a damaged content reaches no AM sink"
+need_line $GT '        CHECK_EQ(r.temp.writes, 0);  // known before the stream: no byte of the work file' "a wrong KeyY is known before the stream"
+if grep -n -E 'fopen\([^)]*"w|ofstream|fwrite' $GT Tests/settings_test/dlp_guest_synth.hpp; then
+  fail "$GT writes a file (the composed CIA carries the game's bytes: it stays in memory)"
+fi
+# ---- 1.1.4, APP-STORE: the records, the registry, the decisions and the exclusions of the Download Play children the app prepares
+# (analysis/piano-1.1.4-2026-11-15/specifiche/6-APP-boot9.md 4.4-4.7 and 5, its critic 6-APP-boot9-CRITICO.md 3-6, K9 of 7-CONTRATTO.md) ----
+GS=ConfigApp/source/dlp_guest_store.cpp
+GD=ConfigApp/source/dlp_guest_decide.hpp
+GA=ConfigApp/source/dlp_guest_am.cpp
+GST=Tests/settings_test/dlp_guest_store_test.cpp
+# a record is the one proof that a title is ours, and only a sound one is read or written: the game's own prepared title, never a homebrew of the band
+need_line $GS '    return azl::title_rules::PreparedOf(g.game) != 0 && g.prepared == azl::title_rules::PreparedOf(g.game) &&' "a record names EXACTLY its game's prepared title (PreparedOf: never 3DS Link, never a homebrew of the band)"
+need_line $GS '        if (setup::ReadTextFile(GuestPath(p), kGuestMaxBytes, text) == setup::LoadResult::Loaded && ParseGuest(text, &g) && g.prepared == p) {' "a record is read only under its own name (and a .bak alone is the record: ReadTextFile)"
+need_line $GS '        if (PreparedOfName(name, ".guest", &p) || PreparedOfName(name, ".guest.bak", &p)) {' "... a record whose write was cut between its two renames is found by its .bak"
+need_after $GS 'bool Register(u64 prepared, u8 form) {' '    if (!azl::title_rules::IsPreparedId(prepared) || prepared == azl::title_rules::kAppTid) {' "only a title of the band is ever ours, never 3DS Link"
+# (DPAPP-2f) either id of a child of ours is ours: the prepared one, or its id of AM - only through PreparedOfAm, which maps a 00040001 of the band alone
+need_after $GS 'bool IsOwnedGuestTid(u64 tid) {' '    return SlotOf(SlotKeyOf(tid)) >= 0;' "DPAPP-2h: IsOwnedGuestTid knows every id of a child of ours (the key, M3c1's, the system id) through SlotKeyOf"
+need_line ConfigApp/source/dlp_guest_store.hpp '    return (static_cast<u32>(any >> 32) == azl::title_rules::kTitleHighApplication || static_cast<u32>(any >> 32) == azl::title_rules::kTitleHighDlpChild ||' "DPAPP-2h: SlotKeyOf maps only 00040000, 00040001 ..."
+need_line ConfigApp/source/dlp_guest_store.hpp '            static_cast<u32>(any >> 32) == azl::title_rules::kTitleHighSystemApplication) &&' "DPAPP-2h: ... and 00040010 ..."
+need_line ConfigApp/source/dlp_guest_store.hpp '                   azl::title_rules::IsPreparedId((static_cast<u64>(azl::title_rules::kTitleHighApplication) << 32) | static_cast<u32>(any))' "DPAPP-2h: ... whose low word is of the band (the game's own child is never one, nor the system's Download Play)"
+need_line ConfigApp/source/dlp_guest_store.hpp '    return form == kFormDlpChild ? ((static_cast<u64>(azl::title_rules::kTitleHighDlpChild) << 32) | static_cast<u32>(prepared))' "DPAPP-2f: AmTitleFor, the one formula of the id of AM ..."
+need_line ConfigApp/source/dlp_guest_store.hpp '                                 : (form == kFormSystem ? azl::title_rules::PreparedSystemOf(prepared) : prepared);' "DPAPP-2h: ... the system form's by PreparedSystemOf (title_rules: the one formula)"
+need_line ConfigApp/source/dlp_guest_store.hpp '    return form == kFormSystem ? azl::title_rules::PreparedSystemOf(prepared) : prepared;' "DPAPP-2h: ProcessIdFor: the exheader's id, the folder of /luma/plugins (the system id, or the key)"
+# the start: the registry is read before the first scan and before any copy of the plugin is queued; a run that died is taken away in order, the record last
+need_after $GS 'StartReport SweepAtStart(StartConsole& console) {' '    std::vector<Guest> guests = LoadRegistry(&r.unowned);' "the start reads which titles are ours first"
+need_line $GS '    if (guests.empty() && !IsDir(GuestsDir())) {' "a console that never prepared a child gets no folder"
+need_order $GS '        const bool folder_gone = console.DisableFolder(ProcessIdFor(g.prepared, kFormSystem), g.game) & console.DisableFolder(g.prepared, g.game);' '            DropGuest(g.prepared);' "the plugin's folders of a title taken away (DPAPP-2h: the system id's and the key's) go before its record (a folder left behind would be refreshed for ever)"
+need_line $GS '            console.DeletePending(g.prepared, g.form);' "the start cancels what AM may have begun of THAT title (DPAPP-2f: in the record's form)"
+need_line $GS '            title_gone = at == Presence::Absent || (ours_to_delete && console.DeleteTitle(g.prepared, g.form, TicketMayGo(g, g.form, title_ours_now)));' "... and deletes the title, which is ours (only a title AM does not list is gone: a Broken one is deleted); its ticket only by TicketMayGo (DPAPP-2h, R7)"
+need_line $GS '                if ((other_at == Presence::Present || other_at == Presence::Broken) && console.Product(g.prepared, other, other_product) &&' "DPAPP-2f: the start takes away another form's id only when AM lists it ..."
+need_line $GS '                    other_product[0] != '"'"'\0'"'"' && g.product[0] != '"'"'\0'"'"' && !OtherProduct(other_product, g.product)) {' "DPAPP-2f: ... and its product code reads and is the record's (K9.1)"
+need_line $GS '            g.state = GuestState::Removing;' "a title that cannot be taken away whole stays ours, as a removal"
+need_line $GS '    r.index_written = WriteIndex(IndexText(alive, {}, nullptr), true);' "the index is written again at every start (the plugin never reads the .bak)"
+need_after $GD '                              const char* other_product = "") {' '    if (g.state == GuestState::Installed) {' "an Installed record is kept at the start"
+need_line $GD '    if (g.state == GuestState::Preparing && g.prev_installed && at == Presence::Present && version == g.prev_version) {' "a run over an Installed child goes back to it when AM kept it (Finish never came)"
+# the leftovers: a .bak goes only when its file is whole, and is put back otherwise; a block only with no child there; nothing else
+need_after $GS '            if (IsFile(file)) {' '                std::remove(path.c_str());' "a .bak is dropped only when its file is whole"
+need_line $GS '                } else if (std::rename(path.c_str(), file.c_str()) == 0) {' "... and put back when it is alone (it IS the file)"
+need_order $GS '        } else if (EndsWith(name, ".bak")) {' '        if (PreparedOfName(name, ".part", &p)) {' "the halves of WriteTextFile are settled before the work files and the blocks"
+need_line $GS '                if (g == nullptr || g->state != GuestState::Preparing) {' "a work file goes unless a run is on it"
+need_line $GS '            const bool has_child = g != nullptr && (g->state == GuestState::Installed || (g->state == GuestState::Preparing && (g->prev_installed || g->prev_other)));' "a block goes only when no child of ours is there (DPAPP-2f-rev: the old child of a migration under way is one)"
+# the index: the Installed children, one row per child, 16 at most
+need_line $GS '        if (g.state == GuestState::Installed) {' "the index names a prepared title only when it is whole"
+need_line $GS '        if (children.size() >= dc::kMaxRows || dc::FormatRow(r, line) == 0) {' "at most kMaxRows rows, each one sound"
+need_line $GS '    if (!always && setup::ReadTextFile(path, azl::dlp_children::kIndexMaxBytes * 4, now) == setup::LoadResult::Loaded && now == text) {' "the index is written again only when it changed (but at the start)"
+# the decisions (reconciliation): every branch is the test's
+need_after $GD '        if (!s.on) {' '            return Act::Remove; // no longer a game that can have a child (setup::IsGuestGame): its child goes' "a record whose game can no longer have a child loses it"
+need_line $GD "            return g->where == 'C' || s.still_listed ? Act::Nothing : Act::Remove;" "a game gone from the SD card loses its child; a card that is out, or a game the scan did not recognise (AM still lists it, APP-WORKER review), does not"
+need_line $GD '        if (!s.prepared_installed || s.prepared_version != g->child_version) {' "a title of ours that is gone (the Installation check) is prepared again, not an error"
+need_line $GD '        if (g->composer < kComposerVersion) {' "a child of an older composer is prepared again"
+need_line $GD "        const bool repair = (s.card ? 'C' : 'S') != g->where || !s.plugin_on || !s.block_ok || s.language != g->language || s.other_form_ours;" "the folder, the block, the language, SD or card: repaired (DPAPP-2f: and the other form's id of our child)"
+need_after $GD '        if (repair) {' '            return Act::Repair;' "... a Repair when nothing else is to do (DPAPP-2f-rev)"
+need_line $GD '        return Act::Probe; // a game never looked at (at these versions)' "a game never looked at is probed"
+need_line $GD '        return same && (!s.other_form_present || s.other_form_ours) ? Act::Adopt : Act::Refuse;' "an id taken: adopted when it is our child (product code and version), refused otherwise - never deleted (DPAPP-2f: on either id)"
+need_line $GD '        if (!s.keys) {' "without boot9.bin nothing new is made"
+need_line ConfigApp/source/dlp_guest_store.hpp 'constexpr u8 kComposerVersion = 4;' "the composer's version the records carry (DPAPP-2j: 4, the form M3c1 again - the children of 1-3, the 2i's fallbacks in HOME among them, are to update)"
+need_line ConfigApp/source/dlp_guest_store.hpp '/// changes (kFixCrr after S1, a change to the hidden child...). The build 2e (2026-11-18, the form makerom gives an application of the SD card)' "DPAPP-2e rev: the composer's version says the exception of the build 2e (DPAPP-2f: and why it is 2 now)"
+# the games that may have a child: what Enable Titles may switch on, never the Download Play application, never a title with no prepared id
+need_line ConfigApp/source/games.cpp '    return IsEnableTitle(tid, name) && !IsDownloadPlayTid(tid) && azl::title_rules::PreparedOf(tid) != 0;' "a game with a child: one Enable Titles may switch on, not the system's application, never a homebrew of the band"
+need_after ConfigApp/source/games.cpp 'bool DisableGuestFolder(u64 prepared, u64 game) {' '    if (!IsGuestFolderOf(prepared, game)) {' "the folder of a prepared title only, never a game's or a homebrew's"
+need_after ConfigApp/source/games.cpp 'static bool IsGuestFolderOf(u64 process_id, u64 game) {' '    const u64 key = azl::title_rules::PreparedOf(game);' "DPAPP-2h: the folder of a process id of the game's prepared child ..."
+need_line ConfigApp/source/games.cpp '    return IsApplicationTid(game) && key != 0 && (process_id == key || process_id == azl::title_rules::PreparedSystemOf(key));' "DPAPP-2h: ... the key or its system id, nothing else"
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q 'DisableGuestFolder(' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/copyworker.cpp ConfigApp/source/dlp_guest_am.cpp ConfigApp/source/games.cpp ConfigApp/source/games.hpp " ] || fail "DisableGuestFolder is named in '$sg', expected copyworker.cpp (the thread of the copies, APP-WORKER), dlp_guest_am.cpp (the start), games.cpp and games.hpp only"
+# AM: our titles only, the SD card only, one pending title at a time
+need_after $GA 'Result DeletePendingPrepared(u64 prepared, u8 form) {' '    const u64 am = AmTitleFor(prepared, form);' "DPAPP-2f: AM is asked about the id of the form"
+need_after $GA '    const u64 am = AmTitleFor(prepared, form);' '    if (!PreparedBand(prepared) || !IsOwnedGuestTid(am)) {' "AM cancels and deletes only a title of ours"
+need_line $GA '    return AM_DeletePendingTitle(MEDIATYPE_SD, am);' "THAT pending title, on the SD card"
+[ "$(tr -d '\r' < $GA | code_of | grep -c '    if (!PreparedBand(prepared) || !IsOwnedGuestTid(am)) {')" = 3 ] || fail "$GA: DeletePendingPrepared, DeletePrepared and DeletePreparedTicket (DPAPP-2h-rev) do not all begin with the guard of a title of ours"
+[ "$(tr -d '\r' < $GA | code_of | grep -c 'AM_Delete')" = 7 ] || fail "$GA: AM is asked to delete something in more or fewer than the seven calls of the guarded functions (DPAPP-2f: AM_DeleteUserTitle of the old form; DPAPP-2h: BeginInstall's pending part behind its own guard; DPAPP-2h-rev: the ticket alone of DeletePreparedTicket)"
+# (DPAPP-2f) AM_DeleteTitle first (it takes a 00040001 away; Azahar's DeleteUserProgram refuses it), AM_DeleteUserTitle only for the old form after it
+# failed, then the list read again: a title AM still lists is not taken for gone
+need_order $GA '    r.title_rc = AM_DeleteTitle(MEDIATYPE_SD, am);' '        r.user_rc = AM_DeleteUserTitle(MEDIATYPE_SD, am);' "DPAPP-2f: AM_DeleteTitle before AM_DeleteUserTitle"
+need_after $GA '    r.title_rc = AM_DeleteTitle(MEDIATYPE_SD, am);' '    if (R_FAILED(r.title_rc) && form == kFormApplication) {' "DPAPP-2f: AM_DeleteUserTitle only for the old form, only after AM_DeleteTitle failed"
+need_line $GA '    r.still_listed = listed_read && std::find(ids.begin(), ids.end(), am) != ids.end();' "DPAPP-2f: the list read again after a removal"
+need_line $GA '    const bool listed_read = ListSdTitles(&ids);' "DPAPP-2f: the list read again after a removal (DPAPP-2h-sec: whether it was read)"
+need_line $GA '        return R_FAILED(r.title_rc) ? r.title_rc : kStillListed; // (the caller keeps the record, as Removing)' "DPAPP-2f: a title still listed is a failure"
+if grep -rn 'AM_DeleteAllPendingTitles' ConfigApp/source; then
+  fail "the app cancels every pending installation (Titles Delivery's and FBI's would go with ours): AM_DeletePendingTitle of one title only"
+fi
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q 'AM_DeleteTitle(' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/dlp_guest_am.cpp ConfigApp/source/titles.cpp " ] || fail "AM_DeleteTitle is called in '$sg', expected dlp_guest_am.cpp (a title of ours) and titles.cpp (the Installation check) only"
+need_after $GA 'StartReport StartGuests() {' '    SetThisId0(ReadThisId0());          // (DPAPP-2j, R-B: the folder of this console'"'"'s records)' "the start knows this console's ID0 before any record is read (DPAPP-2j)"
+need_after $GA '    SetThisId0(ReadThisId0());          // (DPAPP-2j, R-B: the folder of this console'"'"'s records)' '    return SweepAtStart(console);' "the start of the app is SweepAtStart on the console"
+# the start of the app: before the first scan, before RefreshInstall queues the copies of the plugin, after the first start's Yes
+need_after ConfigApp/source/pages_startup.cpp 'void SettleDownloadPlayGuests() {' '    dlpguest::StartGuests();' "the startup page settles the guests"
+need_after ConfigApp/source/pages_startup.cpp '            SettleDownloadPlayGuests();' '            g.RefreshInstall();' "... before the copies of the plugin are queued (a start that is not the first)"
+need_after ConfigApp/source/pages_startup.cpp '        SettleDownloadPlayGuests(); // (after the Yes: the start may write from here)' '        EnterScan();' "... and before the first scan of the first start"
+need_order ConfigApp/source/pages_startup.cpp '            SettleDownloadPlayGuests();' '        titles::Scan().Start(g.language);' "the registry is read before the first scan (LoadRegistry before the Start)"
+[ "$(tr -d '\r' < ConfigApp/source/pages_startup.cpp | code_of | grep -c 'SettleDownloadPlayGuests();')" = 2 ] || fail "the guests are settled in more or fewer than the two starts"
+# the exclusions: the scan, the catalog of Titles Delivery, the Installation check
+need_line ConfigApp/source/titles.cpp '        if (dlpguest::IsOwnedGuestTid(impl->ctx.titleIds[i])) {' "the scan leaves out the Download Play guests 3DS Link prepared (no game, no lobby's title)"
+need_order ConfigApp/source/titles.cpp '        if (dlpguest::IsOwnedGuestTid(impl->ctx.titleIds[i])) {' '        if (setup::IsApplicationTid(impl->ctx.titleIds[i])) {' "... before a title is taken as an application"
+need_order ConfigApp/source/titles.cpp '    impl->catalog_ready = catalog_build(&impl->ctx, &impl->catalog, OnProgress) == 0;' '    DropGuestTitles(impl);' "the catalog of Titles Delivery loses our titles once it is built ..."
+need_order ConfigApp/source/titles.cpp '    DropGuestTitles(impl);' '    UseAppNames(impl);' "... before it takes the names of the games"
+need_line ConfigApp/source/titles.cpp '                               [](u64 tid) { return dlpguest::NeverSent(tid); });' "the catalog loses what the registry says is ours (DPAPP-2h-sec: and every id of the band in a child's form)"
+need_line ConfigApp/source/dlp_guest_exclude.hpp '            if (is_ours(tid_of(group.members[k]))) {' "a member of ours leaves its group"
+need_line ConfigApp/source/dlp_guest_exclude.hpp '        if (kept > 0) {' "... and an empty group leaves the catalog (a group that holds a game too keeps it)"
+need_after ConfigApp/source/titles.cpp 'std::string NameInCatalog(const Scanner::Impl* impl, u64 tid) {' '    if (dlpguest::IsOwnedGuestTid(tid)) {' "the Installation check names a title of ours by what it is"
+# the test
+need_line Tests/run.sh 'g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/dlp_guest_store_test.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_sha256.o -o "$OUT/dlp_guest_store_test"' "the suite builds the store's test with the app's own files"
+need_line Tests/run.sh '  "$OUT/dlp_guest_store_test"' "... and runs it"
+for t in TestGuestText TestFolder TestRegistry TestCache TestIndex TestBlock TestSweep TestDecide TestGames TestExclude TestGuestFolderGuard TestStart; do
+  need_line $GST "    $t();" "the store's test runs $t"
+done
+need_line $GST '    CHECK(con.pending.size() == 5 && Has(con.pending, b.prepared) && Has(con.pending, c.prepared) && Has(con.pending, d.prepared) && Has(con.pending, e.prepared) && Has(con.pending, f.prepared));' "the start cancels the pending installations of the titles it takes away and of the run it undoes, and no other"
+need_line $GST '    CHECK(con.disabled.size() == 4 && con.record_missing_at_disable == 0);' "... the folder before the record"
+need_line $GST '    CHECK(key_clash == 0);' "a prepared id is the lobbies' key of no sold game"
+need_line $GST '    CHECK(s.temps == 2 && s.baks == 1 && s.restored == 1 && s.parts == 2 && s.blocks == 2);' "the sweep's counts"
+# ---- APP-STORE after its review (2026-11-16): a run that is undone, AM that does not answer, a title that is not ours any more, the slots, 16 children
+# a run undone at the start: THAT title's pending installation cancelled, and the record names the old child and is made again by the next look
+need_line $GS "            console.DeletePending(g.prepared, g.form); // (the new run's, cut before its Finish; Revert is of the same form only: prev_installed)" "a run undone at the start cancels what AM had begun of it (the installed child stays)"
+need_line $GS '            g.child_version = g.prev_version;' "a run undone names the child AM kept, not the one it was making (the index row)"
+need_after $GS '            g.child_version = g.prev_version;' '            g.composer = 0;' "a run undone is made again by the next look (its record held the new run's composer; DPAPP-2h-rev: Revert's own line, KeepNew has its own)"
+# a failure of AM is never 'the title is gone': only Absent is; a Broken title is deleted, a silent AM settles nothing
+need_line $GD '    if (at == Presence::Unknown) {' "the start settles nothing on a title AM said nothing about"
+need_line $GD '        return StartAct::Later;' "... it leaves the record as it is"
+need_line $GD '    if (!s.am_known) {' "Decide decides nothing on a prepared id AM said nothing about"
+need "$GA" 'return Presence::Unknown; // AM could not list the titles' "a list AM refused is Unknown, never Absent"
+need "$GA" 'return Presence::Broken; // listed, but AM cannot describe it' "a title AM lists but cannot describe is still there"
+need_after $GA 'Presence PresenceIn(const std::vector<u64>* listed, u64 prepared, u8 form, u16* version) {' '    if (listed == nullptr || !PreparedBand(prepared)) {' "no list, no answer"
+if grep -rn 'PreparedInstalled' ConfigApp/source; then
+  fail "PreparedInstalled is back (it read every failure of AM as 'the title is not there'): PreparedPresence"
+fi
+# a title that is not ours any more (another product code) is disowned: never installed over, never deleted, at the start or later
+need_line $GD "    return installed[0] != '\0' && recorded[0] != '\0' && std::strncmp(installed, recorded, kProductCompared) != 0;" "another title is told by two product codes READ and different (a code not read proves nothing)"
+need_line $GD 'constexpr std::size_t kProductCompared = 15;' "AM gives 15 characters of a product code"
+need_line $GD '        if (s.prepared_installed && OtherProduct(s.prepared_product, g->product)) {' "Decide disowns a record whose id holds another title"
+need_order $GD '        if (s.prepared_installed && OtherProduct(s.prepared_product, g->product)) {' '            return Act::Remove;' "... before a removal or a remake could touch that title"
+need_line $GD '    if (at != Presence::Absent && OtherProduct(product, g.product)) {' "the start disowns a record whose id holds another title"
+need $GD 'if (g.state == GuestState::Preparing && !g.prev_installed && g.product[0] == ' "the final review of 1.1.4: a first run cut before its record had a product code ..."
+need $GD "g.product[0] == '\\0' && at != Presence::Absent) {" "... with a title AM lists at the id (Present or Broken: Unknown is Later) ..."
+need_after $GD 'if (g.state == GuestState::Preparing && !g.prev_installed && g.product[0] == ' '        return StartAct::Disown;' "... disowns it, never deletes it (K9.1)"
+need_order $GD 'if (g.state == GuestState::Preparing && !g.prev_installed && g.product[0] == ' '    return StartAct::TakeAway;' "... before the take-away"
+need_line Tests/settings_test/dlp_guest_store_test.cpp '    CHECK(DecideAtStart(first, Presence::Present, 1024, "CTR-N-HBRW") == StartAct::Disown);' "the test: a first run with no product code, a homebrew at the id: disowned"
+need_line Tests/settings_test/dlp_guest_store_test.cpp '    CHECK(DecideAtStart(first, Presence::Broken, 0, "") == StartAct::Disown); // (listed, not described: still nobody'"'"'s to delete)' "the test: ... a Broken one too (the review of the final review's fixes of 1.1.4)"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '        CHECK(!b.con.product_at_begin.empty() && std::memcmp(b.con.product_at_begin.data(), b.made.plain.data() + 0x150, b.con.product_at_begin.size()) == 0);' "the test: the record has its product code when AM begins"
+need_line $GS '        if (act == StartAct::TakeAway) {' "the start deletes (and cancels) only a title of ours, never a disowned one"
+# the registry: a title past its slots is said so and left alone; the app makes 16 children at most
+need_line $GS '    return false; // every slot is taken: NOT ours to this run (the caller counts it; nothing deletes or hides its title)' "a full registry says so"
+need_after $GS '    for (Guest& g : guests) {' '        if (!IsOwnedGuestTid(g.prepared)) {' "the start leaves alone a record no slot was left for"
+need_line ConfigApp/source/dlp_guest_store.hpp 'constexpr std::size_t kMaxGuests = 16;' "the app makes 16 children at most (one row of the index each)"
+need_line $GS 'static_assert(kMaxGuests == azl::dlp_children::kMaxRows, "the app makes one child per row of the index, no more");' "... the index's rows"
+need_line $GD '    if (s.guests >= kMaxGuests) {' "a game past the 16 gets no child"
+need_order $GD '    if (s.guests >= kMaxGuests) {' '        return same && (!s.other_form_present || s.other_form_ours) ? Act::Adopt : Act::Refuse;' "... nor adopts one"
+need $GD 'std::strncmp(s.product, s.prepared_product, kProductCompared) == 0' "adoption compares the 15 characters AM gives"
+# the test holds them
+need_line $GST '            CHECK(g.child_version == 1008 && g.composer == 0);' "the test holds the record of a run undone"
+need_line $GST '    CHECK(r4.later == 2 && r4.taken == 0 && r4.reverted == 0 && r4.failed == 0);' "the test holds a start with AM silent"
+need_line $GST '    CHECK(Has(back.deleted, h.prepared) && !Has(back.deleted, k.prepared) && Has(back.pending, h.prepared) && !Has(back.pending, k.prepared));' "the test holds a Broken title deleted and another title never touched"
+need_line $GST '    CHECK(r8.unowned == 2 && r8.taken == static_cast<int>(kRegistrySlots) && over.disabled.size() == kRegistrySlots && over.pending.size() == kRegistrySlots);' "the test holds the records past the slots"
+# ---- 1.1.4, APP-WORKER: the source, AM, the worker, the reconciliation and the pages of the Download Play children the app prepares
+# (analysis/piano-1.1.4-2026-11-15/specifiche/6-APP-boot9.md 4.5-4.8 and 6, its critic 6-APP-boot9-CRITICO.md 4-6, K9 of 7-CONTRATTO.md) ----
+GR=ConfigApp/source/dlp_guest_run.cpp
+GW=ConfigApp/source/dlp_guest.cpp
+GRO=ConfigApp/source/dlp_guest_route.hpp
+GSRC=ConfigApp/source/dlp_guest_source.cpp
+GP=ConfigApp/source/pages_dlpguest.cpp
+GRT=Tests/settings_test/dlp_guest_run_test.cpp
+# $1 = what, $2 = a block of lines, $3 = a fixed string, $4 = another that must come LATER in the block, $5 = why
+order_in() {
+  local a b
+  a=$(printf '%s\n' "$2" | grep -F -n -m1 -- "$3" | cut -d: -f1)
+  b=$(printf '%s\n' "$2" | grep -F -n -m1 -- "$4" | cut -d: -f1)
+  { [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fail "$1: '$3' does not come before '$4' ($5)"
+}
+# Prepare: the title is ours (its record, Preparing) before AM is asked anything; nothing is deleted before (AM keeps the old one until its Finish);
+# the work file goes on every way out; a run that fails before the Finish puts the record back as it was; never a title that is not ours
+# (DPAPP-2f) Prepare and the one composition and install it calls (ComposeAndInstall, once for the hidden form and once more for the fallback): the
+# block is Prepare's lines, then ComposeAndInstall's - the order the work runs in
+PR="$(region $GR 'int Prepare(const Planned& job, const RunIn& in, WorkConsole& c, JobNote* note) {' '}')
+$(region $GR 'Took ComposeAndInstall(const Planned& job, const RunIn& in, WorkConsole& c, const Found& f, Guest& g, u8 form, const Ownership& own, bool over_ours,' '}')"
+CI=$(region $GR 'Took ComposeAndInstall(const Planned& job, const RunIn& in, WorkConsole& c, const Found& f, Guest& g, u8 form, const Ownership& own, bool over_ours,' '}')
+PO=$(region $GR 'int Prepare(const Planned& job, const RunIn& in, WorkConsole& c, JobNote* note) {' '}')
+order_in "$GR Prepare" "$PR" '    if (!SaveGuest(g)) {' '    const RunResult begun = c.BeginInstall(prepared, form, ticket_there, title_there);' "the record (Preparing) is written before AM begins the install"
+order_in "$GR Prepare" "$PR" '        std::memcpy(g.product, product, sizeof(g.product));' '    const RunResult begun = c.BeginInstall(prepared, form, ticket_there, title_there);' "the final review of 1.1.4: a first record has the child's product code before AM begins the install"
+order_in "$GR Prepare" "$PR" '        rc = SaveGuest(g) ? 0 : kErrTemp;' '    const RunResult begun = c.BeginInstall(prepared, form, ticket_there, title_there);' "... written, before AM is asked (a cut leaves a record the start holds against the title at the id)"
+need_after $GR '        std::memcpy(g.product, product, sizeof(g.product));' '        rc = SaveGuest(g) ? 0 : kErrTemp;' "... the product code itself (DPAPP-2h-sec: the record of the ticket word is another save, after the guard)"
+need $GR 'if (rc == 0 && g.product[0] == ' "... only for a record that has none (a run over our old child keeps the code it had)"
+order_in "$GR Prepare" "$PR" '    if (!Register(prepared, migrating ? before.form : form)) {' '    const RunResult begun = c.BeginInstall(prepared, form, ticket_there, title_there);' "... and the title is in the registry (DPAPP-2f-rev: in the form the console has until the new one is there)"
+order_in "$GR Prepare" "$PR" '    int rc = Compose(ci, &made);' '    const RunResult begun = c.BeginInstall(prepared, form, ticket_there, title_there);' "the child is composed (its SHA-256 checked) before AM is asked"
+order_in "$GR Prepare" "$PR" '    rc = Emit(made, &PartRead, file, &SinkCounted, &sent, &OnStep, &c, in.buf, in.buf_size);' '    RunResult finished = c.FinishInstall();' "AM is finished only after the whole CIA was given"
+# (DPAPP-2f) the record of the run (Preparing) is saved in Prepare - one line of its own, before ComposeAndInstall (the fallback's own save is another)
+[ "$(printf '%s\n' "$PO" | grep -c -x -F '    if (!SaveGuest(g)) {')" = 1 ] || fail "$GR: Prepare does not save the record (Preparing) before AM is asked"
+order_in "$GR Prepare" "$PO" '    if (!SaveGuest(g)) {' '    Took took = ComposeAndInstall(job, in, c, f, g, form, own, g.prev_installed && OursToDelete(fs, form, before), fs.version[form], smdh, product, &rc,' "DPAPP-2f: ... before the composition and the install"
+if printf '%s\n' "$CI" | code_of | grep -q -E 'DeleteTitle|DeletePrepared'; then
+  fail "$GR: ComposeAndInstall deletes a title (AM keeps the old child until its Finish: deleting it first makes a failed remake worse, critic 1.6)"
+fi
+# (DPAPP-2f) Prepare deletes ONE title: the old form's of a migration, only after the new one is there (its version read), only when it is ours
+[ "$(printf '%s\n' "$PO" | code_of | grep -c -E 'DeleteGuarded\(|DeleteTitle|DeletePrepared')" = 2 ] || fail "$GR: Prepare deletes a title elsewhere than the old form of a migration and the refused hidden id (DPAPP-2f-rev: its ticket), or not behind the guard of the ids (DPAPP-2h)"
+! printf '%s\n' "$PO" | code_of | grep -q -E 'c\.DeleteTitle\(' || fail "$GR: Prepare asks AM to delete a title without the guard of the ids (DPAPP-2h: DeleteGuarded)"
+order_in "$GR Prepare" "$PO" '    const Presence now = c.Installed(prepared, form, &version);' '                DeleteGuarded(c, in, before, before.form, true, TicketMayGo(before, before.form, true),' "DPAPP-2f: the old form goes only after the new one is on the SD card"
+order_in "$GR Prepare" "$PO" '            if (old.read[before.form] && OtherProduct(old.product[before.form], before.product)) {' '                DeleteGuarded(c, in, before, before.form, true, TicketMayGo(before, before.form, true),' "DPAPP-2f: ... and only our child (another product code: kept)"
+order_in "$GR Prepare" "$PO" '            } else if (!OursToDelete(old, before.form, before)) {' '                DeleteGuarded(c, in, before, before.form, true, TicketMayGo(before, before.form, true),' "DPAPP-2h, R6: ... and a listed title whose code does not read is kept (only a Broken one goes on the record alone)"
+need_line $GR '    if (saved && migrating && form != before.form && now == Presence::Present) {' "DPAPP-2f: ... of a migration, the new one listed (DPAPP-2h-sec: and its record written)"
+[ "$(printf '%s\n' "$CI" | code_of | grep -c -F 'std::remove(part.c_str());')" = 4 ] || fail "$GR: the work file is not removed on each of the four ways out after it was made (the composer's failure, AM's begin, the write, the end)"
+! printf '%s\n' "$CI" | code_of | grep -q -F 'Undo(' || fail "$GR: ComposeAndInstall puts a record back (the caller does: Prepare, on every way that did not end Done)"
+need_after $GR '    if (took != Took::Done) {' '        UndoLeft(undo, g, form, ticket_left);' "a run that fails before AM's Finish puts the record back (DPAPP-2f: every way out of ComposeAndInstall that is not Done; DPAPP-2h-sec: never forgetting a ticket it left)"
+{ [ "$(printf '%s\n' "$PO" | code_of | grep -c -F 'Undo(undo, prepared);')" = 4 ] && [ "$(printf '%s\n' "$PO" | code_of | grep -c -F 'UndoLeft(undo, g, form, ticket_left);')" = 4 ]; } || fail "$GR: Prepare does not put the record back on each of its eight ways out (the NAND after the Finish, the NAND not read with the title not on the SD card - DPAPP-2h-rev -, no fallback, the fallback's record, its open; DPAPP-2h-sec UndoLeft: a full card, an install not Done; DPAPP-2j-rev: the old guest of HOME kept)"
+[ "$(printf '%s\n' "$CI" | code_of | grep -c -F 'c.CancelInstall(prepared, form);')" = 2 ] || fail "$GR: an install begun is not given up (THAT pending title) when the write or the Finish fails"
+need_line $GR '    ci.variant = kHide; // the user'"'"'s decision: never visible in HOME (Compose refuses anything else on the console)' "the worker asks for the hidden child"
+need_line $GR '            return TakenError(t); // a title, a ticket, a process that is not ours: never installed over, never next to it (K9.1, R2-R5)' "a title at the id that is not ours is never installed over (DPAPP-2h: the guard of the ids, every form's id)"
+need_line $GR '        if (had && Listed(f.at[x]) && !(f.read[x] && OtherProduct(f.product[x], before.product))) {' "... (ours only with our record, and not another product code)"
+need_line $GR '    if (!am_said) {' "DPAPP-2h: Prepare acts on no title AM said nothing about (LookForms) ..."
+need_line $GR '    if (fs.at[g.form] == Presence::Unknown) {' "... nor Remove ..."
+[ "$(tr -d '\r' < $GR | grep -c -x -F '        if (at == Presence::Unknown) {')" = 1 ] || fail "$GR: DropOtherForm acts on a title AM said nothing about"
+need_after $GR '        if (f->at[form] == Presence::Unknown) {' '            return false;' "DPAPP-2h: LookForms says false when AM said nothing of one of the three ids"
+need_after $GR '    if (!am_said) {' '        return kErrInstall; // (AM said nothing: nothing is installed over a title nobody knows of)' "DPAPP-2f: ... nor next to the other forms' ids AM said nothing about"
+need_line $GR '        return kErrInstall; // (AM said nothing: nothing is installed over a title nobody knows of)' "nothing is installed when AM cannot say what is at the id"
+need_line $GR '    if (c.FreeBytes(&free) && free < 2 * cia_size + kSpaceSlack) {' "the SD card must hold the work file and the title (2 x the child + 4 MiB)"
+need_line $GR '    case dr::PackageWhy::RomFs: rc = out->route == Route::System ? kErrNoChild : kErrNcch; break;' "not a RomFS through our keys is not 'no child' (it is never written in children.cache)"
+# Remove: the row first, the title only while it is ours (same product code), the record last; Disown never asks AM anything
+RM=$(region $GR 'int Remove(const Planned& job, const RunIn& in, WorkConsole& c) {' '}')
+order_in "$GR Remove" "$RM" '    RewriteIndex(in.waiting); // (the row goes before the title' '    const bool folder = BothFoldersOff(c, g);' "the index loses the row before the title goes"
+order_in "$GR Remove" "$RM" '        if (fs.read[g.form] && OtherProduct(fs.product[g.form], g.product)) {' '            const RunResult rc = DeleteGuarded(c, in, g, g.form, true, TicketMayGo(g, g.form, true), "remove: title");' "a title is deleted only when it is still ours (its product code) ..."
+order_in "$GR Remove" "$RM" '        } else if (!OursToDelete(fs, g.form, g)) {' '            const RunResult rc = DeleteGuarded(c, in, g, g.form, true, TicketMayGo(g, g.form, true), "remove: title");' "DPAPP-2h, R6: ... read, or a Broken title"
+DO=$(region $GR 'bool DropOtherForm(WorkConsole& c, const RunIn& in, const Guest& g, const char* what) {' '}')
+order_in "$GR DropOtherForm" "$DO" '        if (!c.Product(g.prepared, other, product) || product[0] == '"'"'\0'"'"' || g.product[0] == '"'"'\0'"'"' || OtherProduct(product, g.product)) {' '        const RunResult rc = DeleteGuarded(c, in, g, other, true, true, what); // (ours, listed now in that form: its ticket too - R7)' "DPAPP-2f: the other form's id goes only when its product code reads and is the record's"
+need_line $GR '    if (!folder || !title_gone) {' "the record stays (Removing) until the plugin's copy and the title are gone"
+order_in "$GR DropRest" "$(region $GR 'int DropRest(Guest g, bool folder, bool title_gone, const RunIn& in, WorkConsole& c) {' '}')" '    std::remove(BlockPath(g.prepared).c_str());' '    const bool dropped = DropGuest(g.prepared);' "the record goes last"
+if region $GR 'int Disown(Guest g, const RunIn& in, WorkConsole& c) {' '}' | code_of | grep -q -E 'c\.(Installed|Product|DeleteTitle|BeginInstall|CancelInstall)'; then
+  fail "$GR: Disown asks AM about a title that is not ours any more"
+fi
+# AM: the install of a title of ours, on the SD card, nothing deleted before it but THAT title's pending part
+need_after $GA 'Result BeginInstall(u64 prepared, u8 form, bool ticket_expected, bool title_expected, Handle* handle) {' '    if (!Installable(form) || !PreparedBand(prepared) || !IsOwnedGuestTid(AmTitleFor(prepared, form))) {' "AM installs only a title of ours (DPAPP-2h: never in the form M3c1)"
+need_line $GA '    return AM_StartCiaInstall(MEDIATYPE_SD, handle);' "on the SD card"
+[ "$(cat ConfigApp/source/dlp_guest*.?pp | tr -d '\r' | code_of | grep -c 'AM_StartCiaInstall')" = 1 ] || fail "a CIA install begins somewhere else than BeginInstall in the files of the children"
+if region $GA 'Result BeginInstall(u64 prepared, u8 form, bool ticket_expected, bool title_expected, Handle* handle) {' '}' | code_of | grep -q -E 'DeletePrepared|AM_DeleteTitle|AM_DeleteTicket'; then
+  fail "$GA: BeginInstall deletes the title (AM keeps it until the Finish)"
+fi
+need_after $GA 'void CancelInstall(Handle handle, u64 prepared, u8 form) {' '        AM_CancelCIAInstall(handle);' "an install given up is cancelled"
+region $GA 'void CancelInstall(Handle handle, u64 prepared, u8 form) {' '}' | grep -q -F '    DeletePendingPrepared(prepared, form);' || fail "$GA: CancelInstall does not cancel THAT title's pending part"
+# the worker: one thread made like dlp_prepare.cpp's (the app's core, never the Old 3DS's core 1), joined with a wait that never times out, the keys wiped
+need_line $GW '    r->thread = threadCreate(RunMain, r.get(), kWorkerStack, prio < 0x3F ? prio + 1 : prio, -2, false);' "the worker's thread: core -2, a little less important than the screen"
+need $GW 'threadJoin(r->thread, U64_MAX);' "the worker is joined with a wait that never times out (a timeout is not negative)"
+need_line $GW '        Wipe(keys.get(), sizeof(Keys));' "the keys are wiped when the run ends"
+need_line $GW '        Wipe(boot9.get(), kBoot9Whole);' "boot9.bin is wiped once the keys are made"
+need_line $GW '    if (Running() || LookUnderWay() || !titles::Scan().done() || setup::CopyWorker::Get().PendingCount() > 0 || ui::g.module_holds > 0) {' "the reconciliation looks only when nothing else works on the same things (a look of Games under way too)"
+# (2026-11-17 evening, the console test: Download Play > Games blocked every ~8 s) the quiet pass of the page Download Play runs in the thread of the look
+# (StartGamesLook(true)): the records against the games, the quiet part of the plan; the page runs that part only, once an opening, holding the scan's games
+DP=$(region $GP 'class DlpPage : public ListPage {' '};')
+need_line $GW '        const Plan plan = Reconcile(looked.looks, g_known.records.size());' "the quiet look of the page Download Play gives the reconciliation's plan, in the thread of the look ..."
+need_line $GW '            l->out.quiet = plan;' "... as its quiet plan (the look of one game of Games gives that game's plan instead)"
+need_line $GP '                PushPage(new RunPage(look.quiet.quiet, false));' "... and the page runs its quiet part with no question"
+! printf '%s\n' "$DP" | code_of | grep -q 'heavy' || fail "$GP: the page Download Play looks at the heavy part of the plan (a child is prepared from Download Play > Games only: spec 9)"
+order_in "$GP DlpPage" "$DP" '        if (!looked_ && !looking_ && dlpguest::CanLook()' '            Hold(true);' "the page Download Play looks once an opening, when nothing else works on the same things ..."
+order_in "$GP DlpPage" "$DP" '            Hold(true);' '            looking_ = dlpguest::StartGamesLook(true);' "... holding the scan's games before the thread of the look starts"
+order_in "$GP DlpPage" "$DP" '            dlpguest::TakeGamesLook(&look);' '            looked_ = true;' "... and the look is taken (its thread joined) before the page says it looked"
+[ "$(printf '%s\n' "$DP" | code_of | grep -c -x -F '            looked_ = true;')" = 1 ] || fail "$GP: the page Download Play never says it looked (a quiet pass at every frame) or says it in two places"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'dlpguest::StartGamesLook(true)')" = 1 ] || fail "$GP starts the quiet look in more or fewer than one place (the page Download Play, when it opens)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'dlpguest::StartGamesLook()')" = 1 ] || fail "$GP starts the look of Games in more or fewer than one place (Look)"
+need $GW 'kLogName = "3DSLink-dlp-guests.log"' "every step of the worker is a line of its own log"
+if grep -n -E 'LogLine\(.*(keys\.|keys->|keys\.get|title_key|boot9\.get|ncch_x|common_|generator)' $GW; then
+  fail "$GW writes a key into the log"
+fi
+if grep -n -E 'enet_|room_|dlph_|dl_send|RoomClient|udsSend|MEDIATYPE_NAND|AM_DeleteAllPendingTitles' $GW $GP; then
+  fail "the worker or its pages have network or NAND code"
+fi
+# the plugin's copies of the prepared titles are the CopyWorker's: one thread writes AzaharLink.3gx.part
+need $GW 'copies.SubmitGuest(process_id, game, on, run->plugin_file);' "the worker hands the copy of the plugin to the CopyWorker"
+need_line ConfigApp/source/copyworker.cpp '        result.disable_ok = job.on ? EnableGuestFolder(job.tid, job.game, job.source.c_str()) == EnableResult::Ok : DisableGuestFolder(job.tid, job.game);' "the thread of the copies makes the folder of a prepared title"
+need_line ConfigApp/source/copyworker.cpp '            impl->guest_done.emplace_back(job.tid, result.disable_ok);' "... quietly (no CopyDone for a page to take)"
+need_after ConfigApp/source/games.cpp 'EnableResult EnableGuestFolder(u64 prepared, u64 game, const char* source) {' '    if (!IsGuestFolderOf(prepared, game)) { // (the same guard as DisableGuestFolder'"'"'s)' "the folder of a prepared title only, never a game's or a homebrew's (DPAPP-2h: the key's or the system id's)"
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q 'EnableGuestFolder(' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/copyworker.cpp ConfigApp/source/games.cpp ConfigApp/source/games.hpp " ] || fail "EnableGuestFolder is named in '$sg', expected copyworker.cpp, games.cpp and games.hpp only"
+# the reconciliation, never an event: nothing in the copies that end or in the switch; the two pages that switch games ask for a look when they are left
+if region ConfigApp/source/pages_enable.cpp '    void TakeFinishedCopies() {' '    }' | grep -q 'dlpguest'; then
+  fail "pages_enable.cpp: the children are hooked on a copy that ends (they are decided by the reconciliation)"
+fi
+if region ConfigApp/source/pages_enable.cpp '    void Activate(const Row& row, int step) override {' '    }' | grep -q 'dlpguest'; then
+  fail "pages_enable.cpp: the children are hooked on the switch (they are decided by the reconciliation)"
+fi
+# 1.1.4, spec 9 (the user's decision of 2026-11-17): no work of the children outside the Download Play page. Leaving Enable Titles or Public lobbies asks for no
+# look (the "Please wait / Download Play guests" that came after B), the sheet of Enable Titles says nothing of the children, and nobody asks "N games... Now / Later".
+for f in ConfigApp/source/pages_enable.cpp ConfigApp/source/pages_lobbies.cpp; do
+  ! tr -d '\r' < "$f" | code_of | grep -q -E 'dlpguest|dlp_guest' || fail "$f: the page works on the Download Play children again (they are the Download Play page's: spec 9)"
+done
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E 'AskReconcile|RefreshNotes|GameNote|Declined\(|AllDeclined|declined|Due::Ask' && printf '%s ' "$f"; done)
+[ -z "$sg" ] || fail "the look asked when a page is left, the notes of the sheet, the question Now / Later or its Later are back in '$sg' (spec 9 took them away)"
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E 'dlpguest::Poll\(|Due Poll\(|enum class Due|Due::' && printf '%s ' "$f"; done)
+[ -z "$sg" ] || fail "Poll and its Due are back in '$sg' (the quiet pass of the page Download Play is the thread of the look's: StartGamesLook(true))"
+[ "$(region ConfigApp/source/dlp_guest.hpp 'struct GamesLook {' '};' | code_of | grep -c -E '^    [^ ].*;')" = 10 ] || fail "ConfigApp/source/dlp_guest.hpp: the look gives something else than the rows, the children, the games to read, the games that wait for the keys, the card, the quiet plan and the plan of one game (the question of the heavy run is gone: spec 9)"
+if region $GW 'void LookMain(void* arg) {' '}' | code_of | grep -q -E 'heavy|ScanGeneration|generation'; then
+  fail "$GW: the look looks at the heavy part of the plan or at the generation of the scan (the pass of the page Download Play is quiet, once an opening: spec 9)"
+fi
+! grep -q -F '"Now", "Later"' $GP || fail "$GP: the question Now / Later is back"
+! tr -d '\r' < ConfigApp/source/pages_config.cpp | code_of | grep -q -E 'NewDlpGuestsPage|kDlpGuests' || fail "ConfigApp/source/pages_config.cpp: Settings has the row Download Play guests again (its page goes to Download Play > Games: spec 9)"
+! grep -r -q -E 'PollDlpGuestsAtStart|NewDlpGuestsPage' ConfigApp/source || fail "the main page polls the Download Play children again, or their old page is back (spec 9: the work is the page Download Play's)"
+! tr -d '\r' < ConfigApp/source/pages_main.cpp | code_of | grep -q -E 'dlpguest::(Poll|PlanFor|StartRun)\(|RunPage' || fail "ConfigApp/source/pages_main.cpp works on the Download Play children (nothing of them starts there: spec 9)"
+# (2026-11-17 evening, the console test) no reading of the background, from any page: main.cpp and the main page do nothing of the children but the app's end,
+# the jump to a prepared child of ours and the count of the guests ready (their records); Games reads its games when it is opened, with its bar
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E 'TickBackground|ReadingLeft|ReadingRounds|AfterBackground|LookAtCardSlot|BuildQueue|\bg_bg\b|->background\b' && printf '%s ' "$f"; done)
+[ -z "$sg" ] || fail "the reading of the background is back in '$sg' (2026-11-17, the console test: Games blocked every ~8 s; it reads its games when it is opened, in the thread of the look and the worker, with its bar)"
+[ "$(tr -d '\r' < ConfigApp/source/main.cpp | code_of | grep -o -E 'dlpguest::[A-Za-z_]+' | LC_ALL=C sort -u | tr '\n' ' ')" = "dlpguest::AmTitleOf dlpguest::FormOf dlpguest::IsOwnedGuestTid dlpguest::Jumpable dlpguest::Shutdown " ] || fail "ConfigApp/source/main.cpp works on the Download Play children (only the app's end and the jump to a prepared child of ours: nothing every frame)"
+[ "$(tr -d '\r' < ConfigApp/source/pages_main.cpp | code_of | grep -o -E 'dlpguest::[A-Za-z_]+' | LC_ALL=C sort -u | tr '\n' ' ')" = "dlpguest::Guest dlpguest::GuestState dlpguest::IsOwnedGuestTid dlpguest::LoadGuests " ] || fail "ConfigApp/source/pages_main.cpp works on the Download Play children (only their records, to count the guests ready: nothing every frame)"
+! tr -d '\r' < $GW | code_of | grep -q -E 'PushPage|ShowToast|NewConfirmPage|NewMessagePage' || fail "$GW pushes a page or says something: the look and the worker have no page and no question (the pages say it)"
+# the look of Games (and the quiet pass of the page Download Play) in a thread of its own: core -2 (never the Old 3DS's core 1), a little less important than
+# the screen, 128 KB of stack (L1), joined with a wait that never times out when it is taken and at the app's end; it starts only when no look nor run is under way
+SGL=$(region $GW 'bool StartGamesLook(bool quiet, u64 wanted) {' '}')
+order_in "$GW StartGamesLook" "$SGL" '    if (LookUnderWay() || Running() || !titles::Scan().done()) {' '    l->thread = threadCreate(LookMain, l.get(), kLookStack, prio < 0x3F ? prio + 1 : prio, -2, false);' "a look starts only when no look nor run is under way and the scan is over (the thread reads the scan's games)"
+order_in "$GW StartGamesLook" "$SGL" '        TakeEnds(&ends); // (a run that ended and that no page took - its page went - is let go here)' '    JoinLook();' "... a run that ended and that nobody took is taken first"
+need_line $GW '    l->thread = threadCreate(LookMain, l.get(), kLookStack, prio < 0x3F ? prio + 1 : prio, -2, false);' "the look runs in a thread of its own: core -2, a little less important than the screen"
+need_line $GW 'constexpr u32 kLookStack = 128 * 1024;' "... with 128 KB of stack (L1)"
+[ "$(tr -d '\r' < $GW | code_of | grep -c 'threadCreate(')" = 2 ] || fail "$GW makes a thread somewhere else than StartRun (the worker) and StartGamesLook (the look)"
+need $GW 'threadJoin(g_look->thread, U64_MAX);' "the look is joined with a wait that never times out (a timeout is not negative)"
+need_after $GW 'void Shutdown() {' '    JoinLook();' "the app's end joins the look (it ends by itself: AM and two small files)"
+order_in "$GW TakeGamesLook" "$(region $GW 'bool TakeGamesLook(GamesLook* out) {' '}')" '    JoinLook();' '    *out = std::move(g_look->out);' "the look is taken with its thread joined"
+# LookMain is the one caller of what reads AM, the records and children.cache for Games: never the thread of the screen
+LM=$(region $GW 'void LookMain(void* arg) {' '}')
+for s in '    l->out.children = InstalledChildren();' '    l->out.views = LookAtGames(games, &l->done, &census);' '    l->out.to_read = ToReadNow(games, &l->done, &l->out.no_keys, &l->out.no_keys_error);' '        const Looked looked = LookAround(games, l->wanted, false, &l->done, &census);' '            games.push_back(&l->out.card);' '            l->out.wanted = WantedOf(plan, l->wanted);'; do
+  printf '%s\n' "$LM" | grep -q -x -F -- "$s" || fail "$GW: LookMain no longer does '$s' (the look of Games and of the page Download Play is the thread's)"
+done
+for fn in LookAtGames ToReadNow InstalledChildren; do
+  [ "$(tr -d '\r' < $GW | code_of | grep -c "\b$fn(")" = 2 ] || fail "$GW: $fn is called somewhere else than LookMain (it reads AM, the records and children.cache: never on the thread of the screen)"
+done
+sg=$(for f in ConfigApp/source/*.cpp ConfigApp/source/*.hpp; do tr -d '\r' < "$f" | code_of | grep -q -E '\b(LookAtGames|ToReadNow|InstalledChildren)\(' && printf '%s ' "$f"; done)
+[ "$sg" = "ConfigApp/source/dlp_guest.cpp ConfigApp/source/dlp_guest.hpp " ] || fail "LookAtGames, ToReadNow or InstalledChildren are named in '$sg', expected dlp_guest.cpp (LookMain) and dlp_guest.hpp only"
+need_line $GW '            done->fetch_add(1); // (the bar of Download Play > Enable games: one game looked at)' "the look counts the games it looked at (the bar of Games)"
+# Games and the page Download Play hold the scan's games (ui::g.module_holds) only through their Hold, and give them back when they go. Games holds them
+# with dlp::WorkHolds, as a guest that is prepared (HOME and sleep off from the look to the list, the scan's games held; Take and Give once each, idempotent)
+GPG=$(region $GP 'class GamesPage : public ListPage {' '};')
+[ "$(printf '%s\n' "$GPG" | code_of | grep -c -E 'g\.module_holds|HoldHome|ReleaseHome|aptSetSleepAllowed')" = 0 ] || fail "$GP: Games touches ui::g.module_holds, HOME or the sleep itself (dlp::WorkHolds does it, in its Hold: a hold not given back keeps the scan and the delivery pages waiting)"
+printf '%s\n' "$GPG" | grep -q -x -F '    dlp::WorkHolds holds_; // HOME and sleep off, the scan'"'"'s games held: while the page looks and reads (Hold)' || fail "$GP: Games does not hold with dlp::WorkHolds"
+GH=$(printf '%s\n' "$GPG" | awk -v a='    void Hold(bool on) {' -v b='    }' '!on && index($0, a) { on = 1 } on { print } on && $0 == b { exit }')
+{ [ "$(printf '%s\n' "$GPG" | code_of | grep -c -E 'holds_\.(Take|Give)\(\)')" = 2 ] && [ "$(printf '%s\n' "$GH" | code_of | grep -c -E 'holds_\.(Take|Give)\(\)')" = 2 ]; } || fail "$GP: Games takes or gives its holds somewhere else than its Hold (Take and Give once each)"
+# (DPAPP-2h-sec) the page Download Play holds as Games does: dlp::WorkHolds (HOME and sleep off while its quiet look reads AM), Take and Give in its Hold only
+[ "$(printf '%s\n' "$DP" | code_of | grep -c -E 'g\.module_holds|HoldHome|ReleaseHome|aptSetSleepAllowed')" = 0 ] || fail "$GP: the page Download Play touches ui::g.module_holds, HOME or the sleep itself (dlp::WorkHolds does it, in its Hold)"
+printf '%s\n' "$DP" | grep -q -x -F '    dlp::WorkHolds holds_;' || fail "$GP: the page Download Play does not hold with dlp::WorkHolds (DPAPP-2h-sec)"
+DPH=$(printf '%s\n' "$DP" | awk -v a='    void Hold(bool on) {' -v b='    }' '!on && index($0, a) { on = 1 } on { print } on && $0 == b { exit }')
+{ [ "$(printf '%s\n' "$DP" | code_of | grep -c -E 'holds_\.(Take|Give)\(\)')" = 2 ] && [ "$(printf '%s\n' "$DPH" | code_of | grep -c -E 'holds_\.(Take|Give)\(\)')" = 2 ]; } || fail "$GP: the page Download Play takes or gives its holds somewhere else than its Hold (DPAPP-2h-sec)"
+# (the review of 2026-11-17 evening) a page that goes waits for a look of its own before it gives the hold back: the thread reads the scan's games, which a new
+# scan would free under it (B on the page Download Play during its quiet look, then a boot9.bin found from the main page: a crash)
+GDT=$(region $GP '    ~GamesPage() override {' '    }')
+order_in "$GP ~GamesPage" "$GDT" '        if (phase_ == Phase::Looking || phase_ == Phase::Planning) {' '            dlpguest::DropGamesLook();' "Games waits for a look of its own when it goes ..."
+order_in "$GP ~GamesPage" "$GDT" '            dlpguest::DropGamesLook();' '        Hold(false);' "... then it gives its hold back"
+DDT=$(region $GP '    ~DlpPage() override {' '    }')
+order_in "$GP ~DlpPage" "$DDT" '        if (looking_) {' '            dlpguest::DropGamesLook();' "... and so does the page Download Play"
+order_in "$GP ~DlpPage" "$DDT" '            dlpguest::DropGamesLook();' '        Hold(false);' "... before its hold"
+order_in "$GW DropGamesLook" "$(region $GW 'void DropGamesLook() {' '}')" '    JoinLook();' '    g_look.reset();' "DropGamesLook joins the thread before it lets the look go"
+# B on the page Download Play while its quiet look runs: the page goes when the look is over (taken, its thread joined), never before
+DOB=$(region $GP '    void OnBack() override {' '    }')
+printf '%s\n' "$DOB" | grep -F -x -A1 -- '        if (looking_) {' | grep -q -x -F '            leave_ = true; // (the quiet look ends by itself in a moment: the page goes then, never with its thread still reading the scan'"'"'s games)' || fail "$GP: B on the page Download Play leaves while its quiet look runs (the thread reads the scan's games: a new scan would free them under it)"
+order_in "$GP DlpPage" "$DP" '            dlpguest::TakeGamesLook(&look);' '            if (leave_) {' "... the page goes once the look is taken"
+printf '%s\n' "$DP" | grep -F -x -A1 -- '            if (leave_) {' | grep -q -F '                PopPage();' || fail "$GP: the page Download Play does not go after a B pressed during its look"
+[ "$(printf '%s\n' "$DP" | code_of | grep -c 'PopPage()')" = 1 ] || fail "$GP: the page Download Play goes somewhere else than after its look (B)"
+# a run does not start while a look reads the records and children.cache
+order_in "$GW StartRun" "$(region $GW 'int StartRun(const std::vector<Planned>& jobs) {' '}')" '    if (LookUnderWay()) {' '    r->thread = threadCreate(RunMain, r.get(), kWorkerStack, prio < 0x3F ? prio + 1 : prio, -2, false);' "a run never starts while a look reads the records and children.cache"
+# Games does no work on the thread of the screen: no AM, no records, no children.cache; the slot is read only on A on a card's row that has nothing to do
+if printf '%s\n' "$GPG" | code_of | grep -n -E 'LookAtGames|InstalledChildren|LoadGuests|LoadChildrenCache|ListSdTitles|KeysStamp|UpdateVersion|LookAround|PlanFor|ReadCardGame|ReadSlot'; then
+  fail "$GP: Games reads the games, the slot or a folder on the thread of the screen (the thread of the look does it: StartGamesLook)"
+fi
+# (the review of 2026-11-17 evening) A on a game that is off: its plan (the slot, AM, the records, its folder) is made in the thread of the look, the page shows
+# "Please wait" with the bar; PlanFor, which did it on the thread of the screen, is gone
+! tr -d '\r' < $GW | code_of | grep -q -E '\bPlanFor\(' || fail "$GW: PlanFor is back (the plan of a game switched on is made in the thread of the look: StartGamesLook with wanted)"
+! grep -r -q -F 'dlpguest::PlanFor' ConfigApp/source || fail "a page asks dlpguest::PlanFor again (on the thread of the screen)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'dlpguest::StartGamesLook(false, it.game)')" = 1 ] || fail "$GP: the plan of a game switched on is not asked of the thread of the look (SwitchOn), or is asked twice"
+SWO=$(region $GP '    void SwitchOn(const Item& it) {' '    }')
+order_in "$GP SwitchOn" "$SWO" '        Hold(true);' '        if (!dlpguest::StartGamesLook(false, it.game)) {' "the plan of a game holds the scan's games before its thread starts ..."
+printf '%s\n' "$SWO" | grep -F -x -A1 -- '        if (!dlpguest::StartGamesLook(false, it.game)) {' | grep -q -x -F '            Hold(false);' || fail "$GP: a plan that cannot start keeps the hold"
+need_line $GP '        phase_ = Phase::Planning;' "... and the page shows the card while it is made"
+TPL=$(region $GP '    void TakePlan() {' '    }')
+order_in "$GP TakePlan" "$TPL" '        dlpguest::TakeGamesLook(&look);' '        Hold(false);' "the plan is taken (its thread joined) before the hold is given back"
+order_in "$GP TakePlan" "$TPL" '        if (!skip_) {' '            AfterPlan(switching_, look);' "B while the plan is made switches nothing on"
+order_in "$GP Games::Update" "$(printf '%s\n' "$GPG" | awk -v a='    void Update(const Input& in) override {' -v b='    }' '!on && index($0, a) { on = 1 } on { print } on && $0 == b { exit }')" '        case Phase::Planning:' '                TakePlan();' "the plan is taken when its thread is over"
+need_line $GP '                skip_ = true; // (the look of the game ends by itself in a moment: then the list, nothing switched on)' "... B meanwhile waits for it"
+need $GP 'text = "Looking at " + switching_.name + ".";' "... the card says what the page does"
+need_line $GP '            if (it.card && !(look.has_card && look.card.tid == it.game)) {' "A on a card's row that has nothing to do looks at the slot the look of the game read (never the screen's thread)"
+need_line $GW '    l->wanted = wanted;' "the look of one game knows which"
+need_line $GW '        if (l->wanted != 0) {' "... and gives its plan"
+need_line $GW '    if (Running() || LookUnderWay() || !titles::Scan().done() || setup::CopyWorker::Get().PendingCount() > 0 || ui::g.module_holds > 0) {' "CanLook: nothing else works on the same things (a look under way too)"
+# the pages that use the delivery module wait for a run of the worker (the reading of Games, a guest prepared: the one virtual CIA of the module, L1, gAppCia)
+need_line ConfigApp/source/pages_dlp.cpp '        const bool scan_done = titles::Scan().done() && !dlpguest::Running();' "3DS Link Delivery waits for the worker of the children before it reads through the module"
+need_line ConfigApp/source/pages_dlp.cpp '            if (titles::Scan().done() && !dlpguest::Running()) {' "... and its wait goes on while the worker runs"
+need ConfigApp/source/pages_delivery.cpp 'ready_ = titles::Scan().done() && !dlpguest::Running() && delivery::AttachModule();' "Titles Delivery waits for the worker of the children"
+need ConfigApp/source/pages_delivery.cpp 'if (titles::Scan().done() && !dlpguest::Running() && delivery::AttachModule()) {' "... and so does its page that waits for the list"
+# a failure of a look is remembered (spec 9 point 5): with its versions, its reason and boot9.bin's stamp; what is not the game's is not; never as "no child"
+need_line $GR '        return Failed(job, in, open);' "a look whose content could not be opened is remembered as a failure (FailureKept)"
+need_line $GR '        return Failed(job, in, rc);' "... and one whose child's facts could not be read"
+need_line $GR '        failed.keys = in.keys_stamp;' "... with the stamp of the run's boot9.bin"
+need_line ConfigApp/source/dlp_guest_reconcile.hpp '    return guest_game && !has_record && fact == nullptr && (failure == nullptr || failure->keys != keys_stamp);' "Games reads a game children.cache knows nothing of, or whose failure was another boot9.bin's"
+FK=$(region ConfigApp/source/dlp_guest_reconcile.hpp 'inline bool FailureKept(int err, bool card) {' '}')
+need_nth "FailureKept" "$FK" 4 '    case kErrNoChild:     // (not a failure: "no child" is a fact, written as such)' "no child is a fact"
+need_nth "FailureKept" "$FK" 5 '    case kErrNoBoot9:' "no boot9.bin is not the game's failure (the game stays to read)"
+need_nth "FailureKept" "$FK" 6 '    case kErrBoot9NoKeys:' "... nor a boot9.bin without keys"
+need_nth "FailureKept" "$FK" 7 '    case kErrNoMovable:' "... nor movable.sed or the scan's context"
+need_nth "FailureKept" "$FK" 8 '    case kErrNoMemory:' "... nor the memory"
+need_nth "FailureKept" "$FK" 9 '    case kErrCancel: return false;' "... nor a stop"
+need_nth "FailureKept" "$FK" 10 '    case kErrNoSource: return !card;' "... nor a card taken out"
+need_nth "FailureKept" "$FK" 11 '    default: return true;' "everything else is the game's"
+need_line $GS '        if (c.error == 0 && c.game == game && c.game_version == game_version && c.update_version == update_version) {' "FindChildSeen never gives a failure (a failure is never 'no child')"
+need_line $GRT '    TestGames(a);' "the worker's test runs TestGames (the games to read, the failures, the rows of Games, on = a record)"
+need_line $GRT '    CHECK(!ToRead(true, false, nullptr, &failure, 7));    // failed with this boot9.bin: not again and again' "the test: a failure is not read again with the same boot9.bin"
+need_line $GRT '        CHECK(failed != nullptr && failed->error == kErrNoSource && failed->keys == 0x1234u && FindChildSeen(cache, kGame, 0x26, 0) == nullptr);' "the test: a failure remembered with its stamp"
+need_line $GRT '    CHECK(Decide(s) == Act::Nothing);                          // ... and nothing is made of it until the user switches it on (spec 9 point 7)' "the test: a game with no record is not on"
+need_line ConfigApp/source/dlp_guest_reconcile.hpp '            if (records + given >= kMaxGuests) {' "the reconciliation gives no child past the 16"
+# The review of spec 9 (2026-11-17): boot9.bin's stamp and the row "not read" had no pin. The run carries the stamp to the worker; the games to read skip a
+# failure remembered with this boot9.bin; the stamp is never 0 with the keys, and it is put aside (2026-11-17 evening: stat, the same path, size and time);
+# Games looks again when a run ends; a row "not read" reads its game again.
+need_line $GW '    in.keys_stamp = r->keys_stamp;' "the worker gets the stamp of the boot9.bin of its run (a failure remembered with 0 would be read again at every generation)"
+need_line $GW '    r->keys_stamp = KeysStamp();' "... taken when the run starts"
+need_line $GW '                   FindChildFailure(cache, p.game, p.game_version, p.update_version), stamp)) {' "the games to read skip a game whose failure is remembered with this boot9.bin"
+# (the review of 2026-11-17 evening) a look that stopped at the keys (no boot9.bin, no movable.sed: not the game's, never in children.cache) is kept this session with
+# the versions, boot9.bin's stamp and the scan: the game is not read again at every opening of Games (spec 9 point 5), its row says why
+need_line $GW '    return err == kErrNoBoot9 || err == kErrBoot9NoKeys || err == kErrNoMovable;' "the looks that stopped at the keys are no boot9.bin, a boot9.bin without keys, no movable.sed"
+TKE=$(region $GW 'bool TakeEnds(std::vector<JobEnd>* ends) {' '}')
+order_in "$GW TakeEnds" "$TKE" '        if (StoppedAtKeys(e.result)) {' '            g_known.keys_waits.push_back(w);' "TakeEnds keeps a look that stopped at the keys ..."
+need_line $GW '            w.keys = g_run->keys_stamp;' "... with the stamp of the run's boot9.bin"
+need_line $GW '            w.generation = titles::ScanGeneration();' "... and the scan"
+order_in "$GW TakeEnds" "$TKE" '        if (e.job.act != Act::Probe) {' '        if (StoppedAtKeys(e.result)) {' "... a look only (a Probe)"
+need_line $GW '                if (w.game == p.game && w.game_version == p.game_version && w.update_version == p.update_version && w.keys == stamp) {' "the games to read skip one that stopped at the keys, at the same versions and boot9.bin"
+need_line $GW '                no_keys->push_back(p);' "... and give it to the row that says why"
+order_in "$GW StartGamesLook" "$SGL" '        if (g_known.keys_waits[i].generation != titles::ScanGeneration()) {' '    l->thread = threadCreate(LookMain, l.get(), kLookStack, prio < 0x3F ? prio + 1 : prio, -2, false);' "... read again after a new scan (boot9.bin came)"
+need $GP 'Fmt("%d games wait for boot9.bin", n)' "Games says which games wait for boot9.bin ..."
+GAC=$(region $GP '    void Activate(const Row& row, int step) override {' '    }')
+printf '%s\n' "$GAC" | grep -F -x -A2 -- '        if (row.id == kWaitKeys) {' | grep -q -x -F '                Read(no_keys_); // (the user asks: read again now, whatever the session remembers)' || fail "$GP: A on the games that wait for the keys does not read them (with the keys)"
+need_line $GP '        if (items_.empty() && to_read_.empty() && no_keys_.empty()) {' "'No game with Download Play' only when no game waits"
+need_line $GW 'constexpr std::size_t kProbeFlushJobs = 8;' "a run of looks writes its log every eight games ..."
+need_line $GW '        if (!probes || (i + 1) % kProbeFlushJobs == 0) {' "... (a guest prepared or removed after each job)"
+[ "$(tr -d '\r' < $GW | code_of | grep -c -F 'FlushLog(r);')" = 2 ] || fail "$GW: the log of a run is not written after its jobs and at its end"
+need_line $GW '    s_stamp = h == 0 ? 1u : h;' "boot9.bin's stamp is never 0 with the keys (0 is 'no boot9.bin')"
+KS=$(region $GW 'u32 KeysStamp() {' '}')
+order_in "$GW KeysStamp" "$KS" '    if (stat(ui::g.boot9.path.c_str(), &st) != 0) {' '    FILE* f = std::fopen(ui::g.boot9.path.c_str(), "rb");' "boot9.bin's stamp is put aside (2026-11-17: the whole file was read again at every look): stat first ..."
+order_in "$GW KeysStamp" "$KS" '    if (s_stamp != 0 && s_path == ui::g.boot9.path && s_size == static_cast<u64>(st.st_size) && s_mtime == static_cast<long>(st.st_mtime)) {' '    FILE* f = std::fopen(ui::g.boot9.path.c_str(), "rb");' "... the same path, size and time give the stamp put aside, the file is not read"
+for s in '    s_path = ui::g.boot9.path;' '    s_size = static_cast<u64>(st.st_size);' '    s_mtime = static_cast<long>(st.st_mtime);'; do
+  printf '%s\n' "$KS" | grep -q -x -F -- "$s" || fail "$GW: KeysStamp does not put aside '$s' (the stamp of another file would be given)"
+done
+printf '%s\n' "$KS" | grep -F -x -A1 -- '    s_stamp = h == 0 ? 1u : h;' | grep -q -x -F '    return s_stamp;' || fail "$GW: KeysStamp does not give the stamp it put aside"
+need_line $GW '        v.shown = ShownOf(l.seen, failure, Decide(on));' "the rows of Games are ShownOf, with the failure remembered"
+need_line $GW '    ++g_runs_ended;' "the runs that ended are counted (TakeEnds): Games looks again when one ended"
+need_line $GP '        if (phase_ == Phase::List && runs_ != dlpguest::RunsEnded()) {' "Games looks again (in the thread of the look) when a run ended on the run page"
+need_line $GP '        runs_ = dlpguest::RunsEnded();' "... the runs counted when its rows are made"
+need_line $GP '            PushPage(new RunPage({p}, false, true)); // (asked: a failure is said, the remembered one or not)' "A on a row 'not read' reads that game again, and says how it went"
+# the new scan of the titles goes before the reading (boot9.bin came: the names, the icons and the generation with the keys did wait for the whole queue)
+CL=$(region $GW 'bool CanLook() {' '}')
+order_in "$GW CanLook" "$CL" '    if (Running() || LookUnderWay() || !titles::Scan().done()' '    if (ui::g.rescan_wanted) {' "a new scan that is wanted stops the look and the reading of Games (main.cpp starts it when the module is free)"
+printf '%s\n' "$CL" | grep -F -x -A1 -- '    if (ui::g.rescan_wanted) {' | grep -q -F 'return false;' || fail "$GW: CanLook lets the reading go on while a new scan is wanted (the scan waited for the whole queue)"
+# route K: the module gets the scan's context from the run itself
+RS=$(region $GW 'int StartRun(const std::vector<Planned>& jobs) {' '}')
+order_in "$GW StartRun" "$RS" '    delivery::AttachModule();' '    r->thread = threadCreate(RunMain, r.get(), kWorkerStack, prio < 0x3F ? prio + 1 : prio, -2, false);' "a run hands the scan's context to the delivery module before the worker starts (route K found none: 'Needs movable.sed')"
+# (2026-11-17 evening, no queue any more) a failure that is not the game's is not written: Games reads the game again at its next opening (ToReadNow); the
+# look reads the slot every time (a card put in later is one of the games); a reading that cannot start, or B, leaves "N games not checked yet", A reads them
+need_line $GW '    if (titles::ReadCardGame(ui::g.language, l->out.card) && !l->out.card.name.empty()) {' "the look reads the slot (a card put in after the scan is one of the games)"
+need $GP 'Fmt("%d games not checked yet", static_cast<int>(to_read_.size()))' "the games not read (the reading stopped, or no memory) are said ..."
+need_after $GP '        if (row.id == kUnread) {' '            Read(to_read_);' "... and A reads them"
+need_line $GP '            phase_ = Phase::List; // (no memory now: the row "N games not checked yet" stays, A tries again)' "a reading that cannot start leaves the row (A tries again), never a loop"
+# Games works in phases, the way Enable Titles shows its first scan: the titles (the scan's bar), the look (its thread's bar), the reading (the worker's bar,
+# "3 of 40", B stops after the game under way), the list; the screen only draws
+need $GP 'title = "Reading your titles...";' "Games says, as Enable Titles, that the titles are being read ..."
+need_line $GP '                fraction = setup::ProgressFraction(titles::Scan().progress_done(), titles::Scan().progress_total());' "... with the scan's bar"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'title = "Checking your games for Download Play...";')" = 2 ] || fail "$GP: Games does not say 'Checking your games for Download Play...' while the look and the reading work"
+need_line $GP '            fraction = setup::ProgressFraction(static_cast<u64>(done), static_cast<u64>(total));' "... with the bar of the look (its thread's count)"
+need_line $GP '            fraction = static_cast<float>(v.fraction);' "... and the worker's bar while it reads"
+need $GP 'B stops after the game under way and shows the list: the others are checked the next time.' "... and says what B does"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'dlp::TimeLeftText(v.seconds_left)')" = 2 ] || fail "$GP: the reading of Games does not say the time left, as the run page does (the review of 2026-11-17 evening)"
+need_line $GP '            DrawProgressBar(22, 100, 276, 12, fraction);' "the bar is drawn"
+GU=$(printf '%s\n' "$GPG" | awk -v a='    void Update(const Input& in) override {' -v b='    }' '!on && index($0, a) { on = 1 } on { print } on && $0 == b { exit }')
+order_in "$GP Games::Update" "$GU" '        case Phase::Titles:' '            if (dlpguest::CanLook() && --retry_ < 0) {' "the look starts only when nothing else works on the same things (the scan over, no copy, no run, no hold)"
+# (the review of 2026-11-17 evening) a look that could not start is tried again a second later and the card says so; the wait before the look says what it
+# waits for: the copies of the plugin with their bar, a new scan, a run
+LKF=$(region $GP '    void Look() {' '    }')
+order_in "$GP Look" "$LKF" '        if (!dlpguest::StartGamesLook()) {' '            retry_ = kRetryFrames;' "a look that cannot start waits a second before it is tried again ..."
+order_in "$GP Look" "$LKF" '            retry_ = kRetryFrames;' '            start_failed_ = true; // (the card says so, and B goes back)' "... and the card says so"
+need $GP 'text = "There is not enough memory now to check your games: 3DS Link tries again in a moment.";' "... in words"
+need_line $GP '                title = "Putting the plugin in your games...";' "the wait for the copies of the plugin says so ..."
+need_line $GP '                fraction = setup::ProgressFraction(static_cast<u64>(total - left), static_cast<u64>(total));' "... with its bar"
+need_line $GP '                text = "3DS Link reads your titles again (boot9.bin was found, or titles were installed).";' "... and a new scan that waits says so"
+[ "$(tr -d '\r' < $GP | grep -c -x -F '                title = "Reading your titles...";')" = 2 ] || fail "$GP: Games does not say 'Reading your titles...' while the scan runs and while a new one waits"
+[ "$(tr -d '\r' < $GP | grep -c -x -F '            fraction = setup::ProgressFraction(static_cast<u64>(done), static_cast<u64>(total));')" = 2 ] || fail "$GP: the look of Games or the plan of a game has no bar (its thread's count)"
+# (the review of 2026-11-17 evening) the look takes the generation of the scan it reads: a scan made again while the page waited is not a second look
+order_in "$GP Look" "$LKF" '        if (!dlpguest::StartGamesLook()) {' '        generation_ = titles::ScanGeneration();' "the look takes the generation of the scan it reads"
+order_in "$GP Games::Update" "$GU" '            if (dlpguest::GamesLookDone()) {' '                TakeLook();' "the look is taken when its thread is over"
+order_in "$GP Games::Update" "$GU" '            if (!dlpguest::Running()) {' '                dlpguest::TakeEnds(&ends); // (a look that failed shows on its row: "not read")' "the end of the reading is taken when the worker is over ..."
+order_in "$GP Games::Update" "$GU" '                dlpguest::TakeEnds(&ends); // (a look that failed shows on its row: "not read")' '                Relook(); // (what the reading found: the rows, in the thread of the look)' "... and then the rows are looked at again, in the thread of the look"
+need_line $GP '            Relook(); // (a guest prepared or removed on the run page: the rows are looked at again - once the message over this page is closed)' "after a run Games looks again only from its Update (this page on top): HOME is not held under the message of the run's end"
+need_line $GP '                Relook(); // (the card was taken out since the list was made: its row goes - the review of spec 9)' "... and the same before the message of a card taken out"
+RL=$(region $GP '    void Relook() {' '    }')
+[ "$(printf '%s\n' "$RL" | code_of | grep -c -F 'phase_ = Phase::Titles;')" = 1 ] && ! printf '%s\n' "$RL" | code_of | grep -q -F 'Look()' || fail "$GP Relook: a look again does not go through Phase::Titles (CanLook - no copy of the plugin waiting, no scan to make again - and the top of the page)"
+need_line $GP '        if (!looked_ && !looking_ && dlpguest::CanLook() && --retry_ < 0) {' "the page Download Play tries a look that could not start again a second later, not every frame"
+need_line $GP '                dlpguest::StopAfterCurrent(); // (the game under way is finished first; then the list: the others are read the next time, or with A)' "B while the worker reads stops after the game under way"
+# (the review of 2026-11-17 evening) ... and the page shows the list with the row "N games not checked yet" (A reads them), never goes: a user with many games sees
+# the games read so far
+! printf '%s\n' "$(region $GP '        case Phase::Reading:' '            return;')" | code_of | grep -q -E 'leave_|PopPage' || fail "$GP: B in the reading of Games leaves the page (the list and its row 'N games not checked yet' are never seen)"
+need_line $GP '            if (generation_ != titles::ScanGeneration()) {' "a new scan (boot9.bin came) makes Games read its titles again: its rows point into the old scan"
+# the reading: once an opening, never with Luma3DS too old, the scan's games held while the worker reads and given back on every way out
+need_line $GP '        if (!read_ && !to_read_.empty() && !g.luma_too_old) {' "Games reads the games never read once an opening, never with Luma3DS too old"
+need_line $GP '            read_ = true;' "... once an opening"
+need_line $GP '        if (!to_read_.empty() && !g.luma_too_old) {' "... and with Luma3DS too old the row of the games not checked is not there"
+RD=$(region $GP '    void Read(const std::vector<dlpguest::Planned>& jobs) {' '    }')
+order_in "$GP Read" "$RD" '        Hold(true);' '        if (dlpguest::StartRun(jobs) != 0) {' "the reading holds the scan's games before the worker starts (route K reads with the scan's context)"
+need_after $GP '        if (dlpguest::StartRun(jobs) != 0) {' '            Hold(false);' "... and gives them back when the run cannot start"
+need_after $GP '        if (!dlpguest::StartGamesLook()) {' '            Hold(false);' "a look that cannot start gives the hold back"
+TL=$(region $GP '    void TakeLook() {' '    }')
+order_in "$GP TakeLook" "$TL" '        dlpguest::TakeGamesLook(&look);' '        Hold(false);' "Games takes the look (its thread joined) before it gives the hold back"
+printf '%s\n' "$TL" | grep -F -x -A1 -- '        Hold(false);' | grep -q -x -F '        phase_ = Phase::List;' || fail "$GP: Games shows the list holding the scan's games (the scan and the delivery pages would wait for ever)"
+need $GP 'This Luma is not supported: a Download Play guest needs Luma3DS 13.0 or later.' "with Luma3DS too old A on a game that is off says why"
+# children.cache is not read while the worker may write it
+LA=$(region $GW 'Looked LookAround(const std::vector<const titles::Game*>& games, u64 wanted, bool every, std::atomic<int>* done = nullptr, const IdCensus* census = nullptr) {' '    };')
+printf '%s\n' "$LA" | grep -F -x -A4 -- '    if (!Running()) {' | grep -q -x -F '        g_known.cache = LoadChildrenCache();' || fail "$GW: LookAround reads children.cache while the worker may write it (the .bak put back loses its write)"
+[ "$(tr -d '\r' < $GW | code_of | grep -c 'LoadChildrenCache()')" = 2 ] || fail "$GW: children.cache is read somewhere else than LookAround (not while a run writes it) and ToReadNow (the thread of the look: no run under way)"
+# a child route F found without boot9.bin: written as such (Games shows it, the next start does not read it again), never a failure of the game's
+need_line $GR '        waits.error = kErrNoBoot9;' "a child route F found without boot9.bin is written (kErrNoBoot9)"
+need_line $GR '        waits.keys = in.keys_stamp;' "... with the stamp of the run (read again when boot9.bin comes)"
+need_line $GR '        Remember(waits);' "... in children.cache"
+need_line ConfigApp/source/dlp_guest_reconcile.hpp '    if (s.child == ChildFact::Unknown && failure != nullptr && failure->error == kErrNoBoot9) {' "... and Games shows it Off (A says that boot9.bin is needed)"
+need_line ConfigApp/source/dlp_guest_reconcile.hpp '    case kErrNoBoot9:' "FailureKept still says no for kErrNoBoot9 (not the game's failure)"
+# a card taken out WHILE its content is read is no source, never remembered (its "no child" or its child that does not read)
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F 'if (rc != 0 && job.card && !c.CardHolds(job.game)) {')" = 2 ] || fail "$GR: a card's look does not read the slot again after a package or the child's facts that did not read (a card taken out was remembered as the game's failure)"
+# a game updated whose Check failed: not On for ever, not checked again at every opening
+need_line ConfigApp/source/dlp_guest_reconcile.hpp '        return s.present && failure != nullptr ? Shown::NotRead : Shown::On;' "a game with a guest whose new version could not be read is 'not read', not On"
+need_line $GD '            return s.look_failed ? Act::Nothing : Act::Check;' "a Check that failed with this boot9.bin is not made again by itself"
+need_line $GW '        s.look_failed = failed != nullptr && failed->keys == stamp; // (a Check that failed is not made again at every opening of the page)' "... LookAround says it"
+need_line $GP '            AskRemove(Owned({children_[static_cast<std::size_t>(it->child)]}));' "... and X removes the guest of that row"
+# the run page: a run the user asked for says how it went; a removal says that it removes
+need_line $GP '            const bool told = heavy_ || asked_ || e.job.act == dlpguest::Act::Remove || e.job.act == dlpguest::Act::Disown || e.job.act == dlpguest::Act::Repair;' "a run asked on a row says its failure (a look again that failed for a reason not remembered left the old row)"
+need_line $GP '            PushPage(new RunPage(jobs, false, true));' "... the quiet work before a game is switched on too"
+need $GP '"Removing a Download Play guest"' "a removal is not said as a look"
+# "Switch it on in Enable Titles too?" only when a game is switched on (not for "to update")
+need_line $GP '        if (it.shown == dlpguest::Shown::Off && look.enable_off && g.plugin_ready) {' "the question of Enable Titles only when the game is switched on"
+# a card taken out with Games open: said, not "try again"
+need $GP ': the game card is not in the slot any more.' "A on the row of a card taken out says so"
+# the tests
+need_line $GRT '        CHECK(FindChildSeen(cache, kGame, 0x29, 0) == nullptr && waits != nullptr && waits->error == kErrNoBoot9 && waits->keys == 0u && !b.con.open);' "the test: a child route F found without boot9.bin is written with the stamp 0"
+need_line $GRT '        CHECK_EQ(RunJob(j, nochild.in, nochild.con, nullptr), kErrNoSource);' "the test: a card taken out while its package is read"
+need_line $GRT '        CHECK_EQ(RunJob(j, locked.in, locked.con, nullptr), kErrNoSource);' "the test: a card taken out while its child's facts are read"
+need_line $GRT '    CHECK(ShownOf(s, &waits, Act::Nothing) == Shown::Off);     // it has one: Off, and A says that boot9.bin is needed (the review of spec 9)' "the test: Games shows the child route F found"
+need_line $GRT '    CHECK(ShownOf(s, &failure, Act::Nothing) == Shown::NotRead); // (the review of spec 9) the look at the game'"'"'s new version failed: not On for ever' "the test: a guest whose new version could not be read"
+need_line $GRT '        CHECK(Decide(c) == Act::Nothing);' "the test: a Check that failed is not made again"
+need_line $GR '        rc = kErrNoSource; // (the card was taken out while its content was read: its "no child" or its broken package is not the game'"'"'s - the review of spec 9)' "a card taken out while its package is read is no source"
+need_line $GR '        rc = kErrNoSource; // (the card was taken out while its child was read: not the game'"'"'s, never remembered - the review of spec 9)' "... and while its child's facts are read"
+# (DPAPP-2h-sec) every run holds HOME and sleep off - the heavy one, the quiet one of the page and a removal the user confirmed (a Remove deletes in AM)
+RPG=$(region $GP 'class RunPage : public Page {' '};')
+[ "$(printf '%s\n' "$RPG" | code_of | grep -c -x -F '            holds_.Take();')" = 1 ] || fail "$GP: a run does not hold HOME and sleep off"
+[ "$(printf '%s\n' "$RPG" | code_of | grep -c 'g\.module_holds')" = 0 ] || fail "$GP: a run holds only the scan's games (DPAPP-2h-sec: every run holds HOME and sleep off)"
+need_order ConfigApp/source/main.cpp '    dlpguest::Shutdown();' '    FinishCopies();' "the worker is stopped before the copies (it may wait on one)"
+# the source: route F first; route K only for the SD card, and without movable.sed (or before the scan) it says so
+need_order $GSRC 'f_rc_ = FSUSER_OpenFileDirectly(&file_, ARCHIVE_SAVEDATA_AND_CONTENT, archive, file, FS_OPEN_READ, 0);' 'k_rc_ = dl_cia_open(game, &size, why, sizeof(why));' "route F is tried first"
+need_line $GSRC '        return CardRouteFRefused(static_cast<u32>(f_rc_)); // (a card has no installed title to read with the keys; FS'"'"'s "not found" is no child)' "a card is read by route F only; FS's not found is no child (the final review of 1.1.4)"
+need_line $GL '    return ((fs_result >> 21) & 0x3F) == 4 && ((fs_result >> 10) & 0xFF) == 17 && (fs_result & 0x3FF) == 120 ? kErrNoChild : kErrNoSource;' "a card's route F: FS's not found (summary 4, module 17, description 120) is no child, anything else no source"
+need_line Tests/settings_test/dlp_guest_test.cpp '    CHECK_EQ(CardRouteFRefused(not_found), kErrNoChild);' "the test: FS's not found is no child"
+need_line Tests/settings_test/dlp_guest_test.cpp '    CHECK_EQ(CardRouteFRefused(not_found + 1), kErrNoSource);             // (desc 121)' "the test: another description is no source"
+# (the review of the final review's fixes of 1.1.4) a card job reads the slot again after the open: a card swapped or pulled since the look that
+# planned it answers for another game, or none - neither its not found nor its child is written under the game
+need_line $GR '    if (job.card && !c.CardHolds(job.game)) {' "a card's job reads the slot again after the open"
+need_order $GR '    if (job.card && !c.CardHolds(job.game)) {' '        return open;' "... before a refusal of the open is returned (FS's not found is no child)"
+need_order $GR '    if (job.card && !c.CardHolds(job.game)) {' '    dr::PackageWhy why = dr::FindChildPackage(&ReadContentAt, &c, low, &out->pkg);' "... and before anything of the content is read"
+region $GR '    if (job.card && !c.CardHolds(job.game)) {' '    }' | grep -q -x -F '        return kErrNoSource;' || fail "$GR: a card that is not the game's any more is not 'no source' (tried again by the next look)"
+region $GR '    if (job.card && !c.CardHolds(job.game)) {' '    }' | grep -q -x -F '            c.CloseContent();' || fail "$GR: the content of a card that is not the game's any more is left open"
+need_line $GW '        return CardSlotHolds(game);' "... the console's answer is AM's list of the card in the slot"
+need_after $GA 'bool CardSlotHolds(u64 game) {' '    if (R_FAILED(FSUSER_CardSlotIsInserted(&inserted)) || !inserted) {' "... an empty slot (or FS that does not say) holds no game"
+need_line $GA '        if (ids[i] == game) {' "... the game itself in the slot, nothing else"
+need_line $GRT '        b.con.card_holds = false;' "the test: a card swapped after the look"
+need_line $GRT '        CHECK(LoadChildrenCache().empty());' "... its not found is not remembered"
+need_line $GRT '        CHECK(b.con.Count("begin") == 0 && !IsFile(GuestPath(kPrepared)) && !note.card_checked);' "... nor its child prepared"
+need_line $GSRC '        case DL_CIA_NO_KEYS: return kErrNoMovable;' "route K without movable.sed says so (K9.4)"
+need $GL 'case kErrNoMovable: return "Needs movable.sed' "... in words"
+need_line $GRO '        NcchCtr(k->partition, 3, ctr);' "the container's RomFS is the NCCH layer's region 3"
+need_line $GRO '        if ((bit & (0x80u >> (idx % 8))) == 0) {' "a content the CIA's bitmap does not name is not in the file"
+need_line $GRO '    if (!plain && (head[0x18B] != 0 || (flags & 0x20) != 0 || (flags & 0x01) != 0)) {' "a container boot9.bin cannot open is refused"
+need_line $GRO '    Wipe(k.rk, sizeof(k.rk)); // (the copy is out'"'"'s: this one does not stay on the stack)' "the layer's round keys are not left on the stack"
+need $GP 'r.label = "Needs boot9.bin";' "without boot9.bin the page of the children says so (the game's sheet in Enable Titles says nothing of the children any more: spec 9)"
+# the test
+need_line Tests/run.sh 'g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/dlp_guest_run_test.cpp ConfigApp/source/dlp_guest_run.cpp ConfigApp/source/dlp_guest_ids.cpp ConfigApp/source/dlp_guest_compose.cpp ConfigApp/source/aes_cbc.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_aes.o "$OUT"/ts_sha256.o "$OUT"/ts_sdcrypt.o "$OUT"/ts_builtin_keys.o -o "$OUT/dlp_guest_run_test"' "the suite builds the worker's test with the app's own files"
+need_line Tests/run.sh 'g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/dlp_guest_ids_test.cpp ConfigApp/source/dlp_guest_ids.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_sha256.o -o "$OUT/dlp_guest_ids_test"' "DPAPP-2h: the suite builds the test of the guard of the ids with the app's own file ..."
+need_line Tests/run.sh '  "$OUT/dlp_guest_ids_test"' "DPAPP-2h: ... and runs it"
+need_line Tests/run.sh '  "$OUT/dlp_guest_run_test"' "... and runs it"
+for t in TestRoute TestChildFacts TestPrepare TestRemoveDisown TestLooks TestGuestFolder TestReconcile; do
+  need_line $GRT "    $t();" "the worker's test runs $t"
+done
+need_line $GRT '        CHECK_EQ(b.con.record_state_at_begin, static_cast<int>(GuestState::Preparing)); // the title was ours before AM was asked' "the test holds the record before AM"
+need_line $GRT '        CHECK_EQ(b.con.Count("delete"), 0); // nothing deleted before (or after) the install' "... and nothing deleted by a Prepare"
+need_line $GRT '    CHECK(d.con.calls.empty() && d.con.titles.count(kAm) == 1);' "... and AM never asked by a Disown"
+need_line $GRT '    CHECK(c.con.Count("delete") == 0 && c.con.titles.count(kAm) == 1 && !IsFile(GuestPath(kPrepared)));' "... and a title that is not ours any more never deleted"
+need_line $GRT '        CHECK(FindChildSeen(cache, kGame, 0x25, 0) == nullptr);' "... and a content 2 our keys read as no RomFS never written as 'no child'"
+# APP-WORKER after its review (2026-11-16)
+# 1/4: a record's game the scan did not list is gone only when AM's list of the SD card does not hold it either (a game the scan did not recognise keeps
+# its child, even without boot9.bin)
+need_line $GW "            const bool still_listed = g.where != 'C' && StillOnSd(listed ? &sd : nullptr, g.game);" "... LookAround asks AM's list of the SD card for it"
+need_line ConfigApp/source/dlp_guest_reconcile.hpp '        return true; // (AM gave no list: nothing is taken for gone on a failure)' "... and a list AM did not give takes nothing for gone"
+need_line $GST '    CHECK(Decide(s) == Act::Nothing); // (the review of APP-WORKER: the guest of a game the scan missed was removed with no question)' "the test holds it"
+need_line $GRT '    CHECK(p.quiet.empty() && p.heavy.empty() && p.said.empty());' "... and the reconciliation's test"
+# 2: AM refuses a lower version at the Finish: only then, over our child, the old title is deleted and the install made once more
+need_line $GR '    if (finished != 0 && over_ours && at_version > made.tmd.version) {' "the old child is deleted only when AM refused an older child over it (DPAPP-2f: our child of the same form)"
+order_in "$GR Prepare" "$PR" '    RunResult finished = c.FinishInstall();' '        finished = InstallOverHigher(c, in, g, form, made, file, f.pkg.required_size); // (AM refused the older child over ours)' "... after the Finish refused, never before"
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F 'InstallOverHigher(')" = 2 ] || fail "$GR: InstallOverHigher is called somewhere else than after Prepare's Finish"
+IH=$(region $GR 'RunResult InstallOverHigher(WorkConsole& c, const RunIn& in, const Guest& g, u8 form, const Composed& made, FILE* file, u64 total) {' '}')
+order_in "$GR InstallOverHigher" "$IH" '    c.CancelInstall(g.prepared, form);' '    const RunResult deleted = DeleteGuarded(c, in, g, form, true, false, "install over a higher version: old child deleted");' "the refused install is given up before the old child is deleted (DPAPP-2h: behind the guard, the ticket kept)"
+order_in "$GR InstallOverHigher" "$IH" '    if (deleted != 0) {' '    const RunResult begun_again = c.BeginInstall(g.prepared, form, true, false); // (our old child is gone: no title expected at the id)' "nothing is installed again when the delete failed (the old child stays)"
+need_line $GRT '        CHECK(b.con.calls.size() > 4 && b.con.calls[1] == "begin" && b.con.calls[2] == "finish" && b.con.calls[3] == "cancel 1" && b.con.calls[4] == "delete");' "the test holds the delete after the Finish"
+# 3/7: without boot9.bin the start says nothing (the game's sheet and the page of the children say it: 6-APP-boot9.md 6)
+[ "$(tr -d '\r' < $GP | code_of | grep -c 'ShowToast')" = 1 ] || fail "$GP: a toast more than the guide's (without boot9.bin the start says nothing)"
+if grep -n -E 'Due::NoKeys|keys_said|^ *NoKeys,' $GW ConfigApp/source/dlp_guest.hpp $GP; then
+  fail "the start says again that boot9.bin is missing"
+fi
+# 5: the sheet's note keeps its four lines (the note of the guest, which could grow it, is gone: spec 9)
+need_line ConfigApp/source/pages_enable.cpp '        gfx::DrawWrapped(136, note_y, 244, 0.46f, col::kDim, note, 4);' "the sheet's note has its four lines"
+# 8: a record past the registry's slots is not offered for removal (its Remove would do nothing)
+need_line $GW '        row.owned = IsOwnedGuestTid(g.prepared);' "the page knows which rows are the app's to remove"
+need_line $GP '                AskRemove(Owned({children_[static_cast<std::size_t>(it.child)]}));' "... A removes only one of them"
+need_line $GP '        AskRemove(Owned(children_));' "... and so does X"
+# (1.1.4, spec 9 point 4) Download Play > Games (Enable games since 2026-11-18): the preparation opens only after its questions, from one place.
+# (2026-11-18, the console test of the build sessione-2c) as Enable Titles and Titles Delivery: the D-pad sets a game's switch the same way as A
+# (SwitchTarget: the plan in the thread of the look, the questions, the run page), the A button says Enable or Disable, the bar says "Enabled n / x", the
+# top screen draws the game and the SD card (ui::DrawSpaceBar) from what the look copied; the page Download Play has "Join lobby" (no count of guests)
+# and "Enable games" (the count)
+GAA=$(printf '%s\n' "$GPG" | awk -v a='    void Activate(const Row& row, int step) override {' -v b='    }' '!on && index($0, a) { on = 1 } on { print } on && $0 == b { exit }')
+order_in "$GP Games::Activate" "$GAA" '        if (phase_ != Phase::List) {' '        const bool toggle = item != nullptr && (item->shown == dlpguest::Shown::On || item->shown == dlpguest::Shown::Off);' "Enable games acts on its list only ..."
+order_in "$GP Games::Activate" "$GAA" '        const bool toggle = item != nullptr && (item->shown == dlpguest::Shown::On || item->shown == dlpguest::Shown::Off);' '        if (!toggle && step != 0) {' "... the D-pad only on a game's switch (On, Off): a row with no switch answers A only"
+printf '%s\n' "$GAA" | grep -F -x -A1 -- '        if (!toggle && step != 0) {' | grep -q -x -F '            return; // (the D-pad sets a switch: this row has none)' || fail "$GP: the D-pad acts on a row of Enable games that has no switch (to update, not read, the games not checked)"
+order_in "$GP Games::Activate" "$GAA" '        if (!toggle && step != 0) {' '            Read(to_read_);' "... before anything is read"
+order_in "$GP Games::Activate" "$GAA" '        if (toggle && SwitchTarget(on, step) == on) {' '                AskRemove(Owned({children_[static_cast<std::size_t>(it.child)]}));' "the D-pad sets the switch as Enable Titles does (right on, left off), and the removal asks first ..."
+order_in "$GP Games::Activate" "$GAA" '        if (toggle && SwitchTarget(on, step) == on) {' '            SwitchOn(it); // (Off, or A on "to update": made again)' "... and switching on goes the way of A (the plan in the thread of the look, the questions, the run page)"
+[ "$(printf '%s\n' "$GAA" | code_of | grep -c -E 'PushPage\(|StartRun|StartGamesLook|Hold\(|Submit\(')" = 2 ] || fail "$GP: Activate of Enable games starts work itself (only A on 'not read' pushes its run page, and DPAPP-2h's message of an id taken; a switch goes through SwitchOn and AskRemove, with their questions)"
+[ "$(printf '%s\n' "$GAA" | code_of | grep -c -F 'PushPage(pages::NewMessagePage(kTitle, it.name + ": " + dlpguest::Phrase(it.id_taken) + " " + AdviceText(it.id_taken)));')" = 1 ] || fail "$GP: DPAPP-2h: Enable on a game whose id is taken does not say it (and only that)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'SwitchTarget(')" = 1 ] || fail "$GP: the switch of Enable games is not set as Enable Titles sets it (SwitchTarget, once)"
+need $GP 'case dlpguest::Shown::Off: return "Enable";' "the A button of a game that is off says Enable ..."
+need $GP 'case dlpguest::Shown::On: return "Disable";' "... of a game that is on, Disable"
+! tr -d '\r' < $GP | code_of | grep -q -F 'return "Switch";' || fail "$GP: the A button of Enable games says Switch again"
+need_line $GP '        return Fmt("Enabled %d / %d", on, static_cast<int>(items_.size()));' "the bar of Enable games says how many are on of the games with a guest ..."
+need_line $GP '            on += Enabled(it) ? 1 : 0;' "... counting the games enabled (the review of 2026-11-18: the same count as the row Enable games)"
+need_line $GP '        return c.guest.state == dlpguest::GuestState::Installed && c.owned;' "... a game is enabled when its guest is made and ours ..."
+need_line $GP '        n += guest.state == dlpguest::GuestState::Installed && dlpguest::IsOwnedGuestTid(guest.prepared) ? 1 : 0;' "... which the row Enable games of the page Download Play counts the same way"
+! tr -d '\r' < $GP | code_of | grep -q -E 'Mb\(total_\)|u64 total_' || fail "$GP: the bar of Enable games says the megabytes again"
+need_line $GP '        return "Download Play > Enable games";' "the page is named as its row"
+need_line $GP '        join.label = "Join lobby";' "the page Download Play has the row Join lobby ..."
+need_line $GP '        games.label = "Enable games";' "... and the row Enable games"
+JR=$(printf '%s\n' "$DP" | awk '$0 == "        Row join;" { on = 1 } on { print } on && $0 == "        rows.push_back(join);" { exit }')
+{ [ -n "$JR" ] && [ "$(printf '%s\n' "$JR" | code_of | grep -c 'join\.value = ')" = 1 ] && ! printf '%s\n' "$JR" | code_of | grep -q -E 'ready_|ready"|enabled_|enabled"'; } || fail "$GP: the row Join lobby says the games ready again (or another value than 'one moment...'): how many lobbies there are is not known there"
+printf '%s\n' "$DP" | grep -q -x -F '        games.value = enabled_ > 0 ? Fmt("%d enabled", enabled_) : std::string("none enabled");' || fail "$GP: the row Enable games does not say how many games are enabled (the count of the bar Enabled n / x)"
+printf '%s\n' "$DP" | grep -q -x -F '        enabled_ = EnabledGuests(); // (the records, read once, not every frame)' || fail "$GP: the row Enable games does not count the games enabled as the bar does"
+need_line $GP '            DrawListTop();' "the top screen of the list of Enable games is its own (the game and the SD card), not the note of a row"
+need_line $GP '            DrawGame(*it);' "... the selected game"
+need_after $GP '            DrawGame(*it);' '            DrawSdCard(it);' "... and the SD card, under a game (what enabling it adds)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c 'DrawSdCard(')" = 2 ] || fail "$GP: the SD card of Enable games is drawn under a row that is not a game (or twice)"
+need_line $GP '            DrawNote(10, 32, 380, 168, *row);' "... a row that is not a game has its whole note (the review of 2026-11-18: 114 px cut what A does)"
+# (the review of 2026-11-18) a game "not read" says its reason and the advice wrapped, not cut on one line; "to update" says the guest there now; "not
+# enough space" counts the work file (twice while it is made), "to update" too; no text names the page by its old name
+need_line $GP '            size.clear(); // (not known: the reason and its advice take the two lines, wrapped - the review of 2026-11-18: one line cut them)' "a game not read says no size, its reason instead ..."
+need_line $GP '            note = std::string(dlpguest::Phrase(it.error)) + " " + AdviceText(it.error) + (it.child >= 0 ? " X removes its guest." : "");' "... the reason and its advice ..."
+need_line $GP '            gfx::DrawWrapped(26, 111, 352, 0.40f, note_color, note, 3);' "... wrapped on up to three lines"
+need $GP 'size += ", " + Mb(it.bytes) + " now";' "a game to update says the size of the guest there now (the red is the difference)"
+need_line $GP '        const u64 need = it != nullptr && (it->shown == dlpguest::Shown::Off || it->shown == dlpguest::Shown::ToUpdate) ? add + GuestSize(*it) : 0;' "not enough space counts the work file, to update too ..."
+need_line $GP '        if (need > 0 && total && free_bytes < need) {' "... and says it then"
+need_line $GL '    case kErrTooMany: return "Remove some guests in Download Play > Enable games.";' "DPAPP-2e: the advice of too many guests names the page Enable games, in dlp_guest_logic.hpp itself ..."
+need_line Tests/settings_test/dlp_guest_test.cpp '    CHECK(std::string(Advice(kErrTooMany)) == "Remove some guests in Download Play > Enable games.");  // (the build 2e: the page'"'"'s name now)' "DPAPP-2e: ... and the test says it"
+if tr -d '\r' < $GL | code_of | grep -n -F 'Download Play > Games'; then
+  fail "$GL names the page Download Play > Games (its name is Enable games since 2026-11-18)"
+fi
+need_after $GP 'std::string AdviceText(int err) {' '    return dlpguest::Advice(err);' "DPAPP-2e: AdviceText is Advice, the pages' one place (no text of its own)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'dlpguest::Advice(')" = 1 ] || fail "$GP says an advice of dlp_guest_logic.hpp without AdviceText (the pages' one place)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c 'DrawSpaceBar(')" = 1 ] || fail "$GP: the SD card of Enable games has not the bar of Titles Delivery"
+need_line $GP '            add = GuestSize(*it);' "... red what enabling the selected game adds"
+need_line $GP '            freed = it->bytes < used ? it->bytes : used;' "... the green shorter by what disabling it frees"
+need $GP '"+" + Mb(add) + " to add"' "... and the legend says it as Titles Delivery does"
+need $GP 'Mb(freed) + " freed"' "... or what is freed"
+need_line $GP '        const u64 total = g.status.sd_known ? g.status.sd_total : 0;' "the space is g.status's (main.cpp reads the card every ten seconds)"
+GLT=$(printf '%s\n' "$GPG" | awk '$0 == "    void DrawListTop() {" || $0 == "    void DrawGame(const Item& it) const {" || $0 == "    void DrawSdCard(const Item* it) const {" { on = 1 } on { print } on && $0 == "    }" { on = 0 }')
+[ "$(printf '%s\n' "$GLT" | grep -c -x -F '    }')" = 3 ] || fail "$GP: the drawing of the list's top screen is not in DrawListTop, DrawGame and DrawSdCard"
+if printf '%s\n' "$GLT" | code_of | grep -n -E 'FSUSER|ReadConsoleStatus|fopen|opendir|stat\(|AM_|LoadGuests|InstalledChildren|LookAtGames|ReadCardGame|ReadSlot|KeysReady|StartGamesLook|StartRun|Scan\(\)'; then
+  fail "$GP: the top screen of Enable games reads something on the thread of the screen (it draws what the look copied and g.status)"
+fi
+# ... the bar of the SD card is ui's: Titles Delivery and Enable games draw the same one, unchanged
+[ "$(grep -r -l -E '^void DrawSpaceBar\(.*\{' ConfigApp/source | tr '\n' ' ')" = "ConfigApp/source/ui.cpp " ] || fail "the bar of the SD card (DrawSpaceBar) is drawn by another file than ui.cpp: Titles Delivery and Enable games draw the same one"
+need_line ConfigApp/source/ui.hpp 'void DrawSpaceBar(float x, float y, float w, float h, double used, double added);' "... declared in ui.hpp"
+need_line ConfigApp/source/ui.cpp '    gfx::FillRect(x, y, used_w, h, col::kOn);' "... green what is there"
+need_line ConfigApp/source/ui.cpp '    gfx::FillRect(x + used_w, y, add_w, h, col::kOff);' "... red what is added"
+[ "$(tr -d '\r' < ConfigApp/source/delivery_run.cpp | code_of | grep -c 'DrawSpaceBar(')" = 1 ] || fail "ConfigApp/source/delivery_run.cpp: Titles Delivery does not draw the bar of the SD card (or draws it twice)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -E 'RunPage\([^,()]*, true(, (true|false))?\)')" = 1 ] || fail "$GP starts a heavy run (a child prepared, HOME off) in more or fewer than one place (the answer Prepare to the question of the space)"
+need_line $GP '                                           if (yes) {' "... on the answer"
+need $GP '"Prepare the Download Play guest of " + name + "? It takes about " + Mb(size) +' "... which says the space before"
+[ "$(tr -d '\r' < $GP | code_of | grep -c 'AskPrepare(')" = 3 ] || fail "$GP asks the question of the space from somewhere else than SwitchOn (its two ways: after the question of Enable Titles, or without it)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c 'SwitchOn(')" = 2 ] || fail "$GP switches a game on from somewhere else than A on its row"
+need_line $GP '        if (!dlpguest::KeysReady()) {' "switching on without boot9.bin says so (and Y / the button opens the guide): the switch stays Off"
+need $GP '"Remove " + what + "? It frees " + Mb(bytes) + "."' "switching off asks 'Remove ...? It frees N MB.'"
+need $GP 'r.value = "not read";' "a game whose look failed is grey, 'not read' (A reads it again)"
+need $GP 'r.value = "to update";' "a child of another version of the game is 'to update' (A makes it again)"
+need_after $GP '        if (looking_) {' '            pending_ = row.id; // (the quiet look ends in a moment: the row opens then)' "A on Join or Games while the quiet look runs opens the row when it ends (no run, no look under the page of route B)"
+need_line $GP '            Open(id); // (A pressed while the look ran: done now, or after its quiet work)' "... and it opens then"
+# (the review of 2026-11-17 evening) ... after the quiet work too (it was lost when the look found work), and the row says it is waiting
+order_in "$GP DlpPage" "$DP" '        if (looked_ && !looking_ && pending_ != 0) {' '            Open(id); // (A pressed while the look ran: done now, or after its quiet work)' "A pressed during the quiet look is done after the look and after its quiet work"
+order_in "$GP DlpPage" "$DP" '                PushPage(new RunPage(look.quiet.quiet, false));' '        if (looked_ && !looking_ && pending_ != 0) {' "... the row opens outside the block of the look"
+[ "$(printf '%s\n' "$DP" | grep -c -F '"one moment...";')" = 2 ] || fail "$GP: A pressed on Join or Games during the quiet look shows nothing"
+# (spec 9 point 10) no text says any more that the child is started by the system's app, switched on in Enable Titles, prepared from the main page or in Settings
+if grep -n -E "system's Download Play application starts|on in Enable Titles, and|turn one on in Enable Titles|prepares it from the main page|off and on again in Enable Titles|page Download Play guests|at the next start" $GP ConfigApp/source/pages_dlpjoin.cpp ConfigApp/source/dlp_join_logic.hpp ConfigApp/source/dlp_guest_logic.hpp; then
+  fail "a text of Download Play says again where the guests came from before spec 9 (Enable Titles, the main page, Settings, the system's app)"
+fi
+# ---- D6 (1.1.4, 2026-11-16): Kirby Triple Deluxe, Kirby Planet Robobot and Mario Tennis Open on the REAL Download Play, a row at a time, each with its
+# own Azahar - Azahar capture (5-L4.md, section 2): Tests/dlp_real_lobby_games_test.cpp holds every game whose golden file exists (G, A, B, C; F for Kirby, S for
+# a row with the console's seed) and refuses a RealDlp row without one; Tests/make_dlp_real_lobby_games_goldens.py writes no passphrase, address or name.
+# No pin per game row (the rule of the table): the rows are held by AZL_DLP_AS_BEFORE in Tests/plugin_dlp_test.cpp.
+need Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_lobby_games_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp' "the suite builds the test of D6, with the hub (F)"
+need_line Tests/run.sh '  timeout 1200 "$OUT/dlp_real_lobby_games_test"' "... and runs it"
+need Tests/lane.sh 'dlp_real_island_test dlp_real_lobby_games_test make_dlp_real_lobby_games_goldens dlp_chain_report' "... and so does the lane dlp"
+need_line Tests/dlp_real_lobby_games_test.cpp '        G_Capture(g);' "every game with its golden: the capture against the codec (G)"
+need_line Tests/dlp_real_lobby_games_test.cpp '        A_Host(g);' "... a console hosts the capture's Azahar clients (A)"
+need_line Tests/dlp_real_lobby_games_test.cpp '        B_Search(g);' "... a console searches an Azahar host (B)"
+need_line Tests/dlp_real_lobby_games_test.cpp '        C_OneLeaves(g);' "... four nodes, one leaves before the start (C, design D17)"
+need_line Tests/dlp_real_lobby_games_test.cpp '            F_NetworkGone(g);' "... Kirby: Finalize and StopSession with the network thread gone (F)"
+need_line Tests/dlp_real_lobby_games_test.cpp '            S_ConsoleSeed(g);' "... the rows with the console's seed: the seed in every node list (S)"
+need_line Tests/dlp_real_lobby_games_test.cpp '            CHECK(dlp.mode != DlpGameMode::RealDlp);' "a game without its golden (its capture) is never RealDlp: the rule of D6"
+need_line Tests/dlp_real_lobby_games_test.cpp '    {"Kirby Planet Robobot", 0x00183600, true, AZL_D6_PR, "no golden"},' "the three games of D6 are in the test's table (Planet Robobot)"
+need_line Tests/dlp_real_lobby_games_test.cpp '    {"Kirby Triple Deluxe", 0x0010C000, true, AZL_D6_TD,' "... Triple Deluxe"
+need_line Tests/dlp_real_lobby_games_test.cpp '    {"Mario Tennis Open", 0x0007C800, false, AZL_D6_MTO,' "... Mario Tennis Open"
+need_line Tests/dlp_real_lobby_games_test.cpp '            CHECK(std::memcmp(p.bytes + dlp_real::kPassphraseAt, g.pass, 9) == 0);  // (the stand-in: the capture'"'"'s passphrase is not in the file)' "G: the final of the golden holds the stand-in"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '            g = sealed(seed, g[:PASS_AT] + s + g[PASS_AT + PASS_LEN:])' "the generator writes the final with the stand-in, never the capture's passphrase"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '            refuse(any(a == b for a, b in zip(p[:8], s[:8]) if b != ord('"'"'v'"'"')), '"'"'the stand-in keeps a byte of the passphrase in its place'"'"')' "... refuses a stand-in that keeps a byte of it in its place"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '            refuse(any(p[i:i + 4] in g for i in range(0, 5)), '"'"'four bytes of a passphrase of the capture in '"'"' + pid)' "... refuses four bytes of it in a row anywhere in a packet"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '                refuse(any(g[PASS_AT + i] == p[i] and p[i] != ord('"'"'v'"'"') for i in range(8)), '"'"'a byte of a passphrase of the capture in its place in the final'"'"')' "... and a byte of it in its place in a final"
+# (2026-11-16, review of D6: the session walk, the nodes that left before the start and the text guard are functions held by their own self-test,
+# run by the suite and the lane dlp; the pins are on the conditions, not on the messages)
+need_line Tests/run.sh '  python3 Tests/make_dlp_real_lobby_games_goldens.py --selftest' "the suite runs the self-test of the generator of D6 (no capture, no numpy)"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    if any(p[:8].decode('"'"'latin-1'"'"').lower() in low or '"'"', '"'"'.join('"'"'0x%02x'"'"' % x for x in p[i:i + 4]) in low for p in passphrases for i in range(5)):' "the text it writes is searched for the passphrase: the condition, not its message (2026-11-16, review)"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '        found.append('"'"'a passphrase of the capture'"'"')' "... and a passphrase found there is a leak"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    if any(bad in low for bad in [tx[:17].lower() for tx in txs] + [mac.hex() for mac in macs] + [n.lower() for n in nicks]):' "... and for the addresses and the names of the nodes"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '        found.append('"'"'an address or a name of a node of the capture'"'"')' "... found there, a leak"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    leaks = leaks_in_text(text, txs, macs, nicks, passphrases)' "the generator looks at the text it is about to write"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    refuse(leaks, '"'"' and '"'"'.join(leaks) + '"'"' in the text'"'"')' "... and refuses it with a leak, before the file is opened"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '        if i == '"'"'A1'"'"' and after_final:' "a session begins at the first Auth after a final, not at every Auth"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '            after_final = True' "... a final ends the Auths of the session"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    session = last_session(ids)' "the session written is the last one that reached a final"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    good = ch2[begin:end]' "... up to the session after it (one that never reached a final is left out)"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    refuse(any(t_a3 < float(r[0]) <= t_last for r in ch1), '"'"'an announcement after StartDistribution'"'"')' "... and the announcement is checked up to its end"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '        if not tail:' "a node with its Auth and its answer only left before the start (D6-3 of the procedure): not a client, not a refusal"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    refuse(not played, '"'"'no client of the session played: every node left before the start'"'"')' "... but a session where nobody played is refused"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    clients, left = nodes_of(per_node)' "the clients of the golden are the nodes that played"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '        sys.exit(selftest())' "the self-test fails the suite when a case fails"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    return 1 if bad else 0' "... a case that fails is a failure"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    case('"'"'two clients at the final, one session (each its own final)'"'"', lambda: last_session(two), (0, 18))' "the self-test: two clients at the final"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    case('"'"'nodes: D6-3 came in and left before the start (PROCEDURA.md)'"'"', lambda: nodes_of({2: one, 3: ['"'"'A1'"'"', '"'"'A2'"'"']}), ([2], [3]))' "the self-test: a node that left before the start"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    case('"'"'text: the passphrase in a comment'"'"', lambda: leak(clean + '"'"'// stand-in for 1A2B3C4D\n'"'"'), ['"'"'a passphrase of the capture'"'"'])' "the self-test: the passphrase in the text"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '    case('"'"'text: four bytes of the passphrase as numbers'"'"', lambda: leak(clean + '"'"'{0x32, 0x62, 0x33, 0x63}'"'"'), ['"'"'a passphrase of the capture'"'"'])' "the self-test: four bytes of the passphrase as the numbers of the file"
+need_line Tests/make_dlp_real_lobby_games_goldens.py '            refuse(len(r[5]) != 0x18 or int.from_bytes(r[5][0x14:0x16], '"'"'big'"'"') == CONTENT,' "a capture whose client asked for the child is refused (not this mode)"
+need Tests/make_dlp_real_lobby_games_goldens.py 'refuse(any(mac in p[2] or mac[::-1] in p[2] for mac in macs for p in packets), '"'"'an address of a node of the capture in a packet'"'"')' "... and the addresses of the nodes in a packet"
+for f in Tests/dlp_real_kirby_td_golden.inc Tests/dlp_real_robobot_golden.inc Tests/dlp_real_tennis_golden.inc; do
+  [ ! -f $f ] || need $f '// Generated by Tests/make_dlp_real_lobby_games_goldens.py from the capture of ' "the goldens of D6 are the generator's, never written by hand"
+done
+[ -f Tests/dlp_real_robobot_golden.inc ] || fail "Tests/dlp_real_robobot_golden.inc is gone: it is the capture of Kirby Planet Robobot (2026-11-16) that its row moves to RealDlp with (passa_a_realdlp.py pr, after the entry from 3DS Link)"
+# ---- 1.1.4, B1 of route B (analysis/piano-1.1.4-2026-11-15/specifiche/8-INGRESSO-DA-3DSLINK.md, approved by the user on 2026-11-16): the plugin and
+# the shared parts. The 3DS Link app runs the Download Play session with the host and gives the 16 bytes to ns:s; the plugin only waits for the guest
+# that left from the app's page (D-B6), refuses every join of the system's Download Play application (D-B5), keeps the prepared child's identity in
+# the room for its first seconds (D-B9) and tells whether the room answered a polite leave (D-B10). hook.cpp does not change (no APT interception).
+P=Sources/ctr/plugin.cpp
+# D-B6: who a host of the real Download Play waits for
+need_line $P 'bool AwaitsChildOf(u64 game_id) {' "route B: one question for the members a host waits for (the extracted part: plugin_dlp_test calls it)"
+need_line $P '    return IsDownloadPlayTitle(game_id) || game_id == title_rules::kAppTid;' "route B: the Download Play application's six ids or the 3DS Link app's Download Play page (kAppTid), nothing else"
+need_order $P 'DlpGameMode DlpModeOf(u64 title_id) {' 'bool AwaitsChildOf(u64 game_id) {' "AwaitsChildOf is in the part plugin_dlp_extract.py takes (after DlpModeOf) ..."
+need_order $P 'bool AwaitsChildOf(u64 game_id) {' '// <<< end of the Download Play wiring (Tests/plugin_dlp_extract.py)' "... and before its end marker"
+[ "$(tr -d '\r' < $P | grep -c 'AwaitsChildOf(')" = "2" ] || fail "$P: AwaitsChildOf is defined once and asked once (OnRoomInfo's list of the members a host waits for)"
+need_stmt Tests/plugin_dlp_test.cpp 'azl::ctr::AwaitsChildTest();' "the PC test of AwaitsChildOf runs"
+need_line Tests/plugin_dlp_test.cpp '    CHECK(AwaitsChildOf(title_rules::kAppTid));' "the test: the 3DS Link app's page is awaited"
+need_line Tests/plugin_dlp_test.cpp '    CHECK_EQ(yes, 6u);' "the test: the six ids of the Download Play application are awaited"
+need_line Tests/plugin_dlp_test.cpp '        CHECK(!AwaitsChildOf(t));' "the test: 0, kAppTid's neighbours and other high words, games, children, an update are not"
+need_line Tests/plugin_dlp_test.cpp '        CHECK(!AwaitsChildOf(title_rules::PreparedOf(g.title_id)));' "the test: a prepared child is not"
+# D-B5: the system's Download Play application shows the hosts and never joins
+CM=Includes/azl/dlp_clnt_map.hpp
+need_line $CM '#define AZL_CLNT_SYSTEM_JOINS 0' "route B: the system's Download Play application never joins by default (only the tests of G1's join path set it)"
+need_line $CM 'inline constexpr bool kSystemAppJoins = AZL_CLNT_SYSTEM_JOINS != 0;' "... kSystemAppJoins is that switch, nothing else"
+[ "$(grep -r -n --include='*.cpp' --include='*.hpp' --include='*.h' --include='*.c' --include='*.inc' 'define AZL_CLNT_SYSTEM_JOINS' Sources Includes ConfigApp/source Tests | wc -l)" = "1" ] || fail "AZL_CLNT_SYSTEM_JOINS is defined in $CM only (a source that defines it turns G1's join path on)"
+! grep -n 'AZL_CLNT_SYSTEM_JOINS' Makefile ConfigApp/Makefile || fail "a Makefile of the plugin or of the app sets AZL_CLNT_SYSTEM_JOINS: the system's Download Play application would join (route B: never)"
+[ "$(tr -d '\r' < Tests/run.sh | grep -c -- '-DAZL_CLNT_SYSTEM_JOINS=1')" = "2" ] || fail "Tests/run.sh sets AZL_CLNT_SYSTEM_JOINS on the two lines of the tests of G1's join path only"
+need_line Tests/run.sh 'g++ $CXXFLAGS -DAZL_CLNT_SYSTEM_JOINS=1 Tests/dlp_ipc_test.cpp -o "$OUT/dlp_ipc_test_joins"' "the suite builds dlp_ipc_test with G1's join path"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_ipc_test_joins"' "... and runs it"
+need_line Tests/run.sh 'g++ $CXXFLAGS -DAZL_CLNT_SYSTEM_JOINS=1 Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test"' "the suite builds the searcher's test of the real Download Play with G1's join path (RC1, RC3, RC4, RC8 join)"
+need_line Tests/run.sh 'g++ $CXXFLAGS Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test_default"' "... and as the plugin has dlp:CLNT (RC1b: a ready host refused)"
+need_stmt Tests/run.sh 'timeout 1200 "$OUT/dlp_real_client_test_default"' "... and runs it"
+need Tests/lane.sh 'dlp_ipc_test dlp_ipc_test_joins dlp_lobby_sim_test' "the lane dlp builds and runs dlp_ipc_test_joins"
+need Tests/lane.sh 'dlp_real_client_test dlp_real_client_test_default dlp_real_hub_test' "the lane dlp builds and runs dlp_real_client_test_default"
+need Tests/ipc_test/build.sh 'g++ -m32 -std=c++17 -O1 -g -w -pthread -DAZL_CLNT_SYSTEM_JOINS=1 $INC' "the 32-bit dlp_lobby_hle_test has G1's join path: L16 joins with StartSession"
+need_line Includes/azl/dlp_ipc.hpp '        if (g == nullptr || !clnt::kSystemAppJoins || !dlp_children::MayJoin(v)) {' "StartSession: route B refuses every host (kSystemAppJoins false); with G1's join path only a host whose child is ready here: nothing is downloaded, nothing is sent otherwise"
+need_after Includes/azl/dlp_ipc.hpp '        if (g == nullptr || !clnt::kSystemAppJoins || !dlp_children::MayJoin(v)) {' '            b.ForceLost();' "... and the application sees 0x80"
+need Includes/azl/dlp_children.hpp 'case Verdict::Ready: return " - join it from the 3DS Link app";' "route B: title_long of a ready host says where to join it"
+need_line $P '        if (v == dlp_children::Verdict::Ready) {' "route B: a refused ready host has its own notice"
+need_order $P '        if (v == dlp_children::Verdict::Ready) {' '            PostNotification("3DS Link: join it from the 3DS Link app (Download Play page)");' "... which points to the 3DS Link app's Download Play page"
+need $P '": the passphrase came (route B: never armed)"' "the seam of K7 is inert on route B: its line says so"
+need_stmt Tests/dlp_ipc_test.cpp 'TestClntRouteB();' "the PC test of route B in dlp:CLNT runs"
+need_line Tests/dlp_ipc_test.cpp '        CHECK(cw.c.book.refused_verdict() == dlp_children::Verdict::Ready);' "the test: a ready host's StartSession is refused as Ready"
+need_line Tests/dlp_ipc_test.cpp '        CHECK_EQ(cw.c.book.armed_prepared(), 0u);  // the seam (K7) is never armed' "the test: the seam is never armed"
+need_line Tests/dlp_ipc_test.cpp '    CHECK(clnt::kSystemAppJoins ? joins > 0 : joins == 0);  // (route B: not one join begun in 20000 requests)' "the fuzz of dlp:CLNT begins no join on route B"
+need_line Tests/dlp_ipc_test.cpp '#if !AZL_CLNT_SYSTEM_JOINS' "dlp_ipc_test_joins runs the dlp:CLNT tests only (the rest does not depend on the switch)"
+need_stmt Tests/dlp_real_client_test.cpp 'RC1b_ReadyRefused();' "the searcher's test of route B runs (the ready host refused)"
+need_line Tests/dlp_real_client_test.cpp '        CHECK(a.book.refused_verdict() == dlp_children::Verdict::Ready);' "RC1b: refused as Ready"
+need_line Tests/dlp_real_client_test.cpp '        CHECK_EQ(h.sent("A1"), 0u);' "RC1b / RC5: the host never answered a client"
+need_line Tests/dlp_real_client_test.cpp '    CHECK(clnt::kSystemAppJoins);' "dlp_real_client_test runs G1's join path (RC1, RC3, RC4, RC8)"
+# (the final review of 1.1.4) the binaries built with no -D stand for the plugin's build: they assert route B's default instead of following it
+for f in Tests/dlp_ipc_test.cpp Tests/dlp_real_client_test.cpp; do
+  need_line $f '#ifndef AZL_CLNT_SYSTEM_JOINS' "$f knows whether it was built with no -D"
+  need_after $f '#ifndef AZL_CLNT_SYSTEM_JOINS' '#define AZL_TEST_PLUGIN_DEFAULT 1' "... then it is the plugin's build"
+  need_order $f '#define AZL_TEST_PLUGIN_DEFAULT 1' '#include "' "... decided before any header (the header's default would hide it)"
+  need_line $f 'static_assert(!azl::clnt::kSystemAppJoins, "the plugin'"'"'s build: the system'"'"'s Download Play application never joins (route B, K10 / D-B5)");' "the plugin's build is route B's, whatever the tests below do with the switch"
+  need_after $f '#ifdef AZL_TEST_PLUGIN_DEFAULT' 'static_assert(!azl::clnt::kSystemAppJoins,' "... asserted in the plugin's build"
+done
+# (the final review of 1.1.4) route B's refusal of StartSession needs no network thread: the same answer, 0x80 and notice when none ran it
+need_line Includes/azl/dlp_ipc.hpp '        if (!clnt::kSystemAppJoins && id == clnt::kStartSession && b != nullptr) {' "route B: a StartSession no network thread ran is refused as when one runs it, never 'wireless off'"
+need_after Includes/azl/dlp_ipc.hpp '        if (!clnt::kSystemAppJoins && id == clnt::kStartSession && b != nullptr) {' '            ClntStartSession(cmd, *b);' "... by ClntStartSession itself (0, then 0x80, and the notice)"
+need_order Includes/azl/dlp_ipc.hpp '        if (!clnt::kSystemAppJoins && id == clnt::kStartSession && b != nullptr) {' '        const bool deferred = b != nullptr && b->Defer(id, cmd[2] & 0xFF, &res);' "... before the book's deferral"
+need_line Tests/dlp_ipc_test.cpp '        CHECK_EQ(start[1], clnt::kSystemAppJoins ? R_WIRELESS_OFF : 0u);' "the test: an unserved StartSession is answered 0 on route B"
+need_line Tests/dlp_ipc_test.cpp '        CHECK_EQ(c.book.refusals(), clnt::kSystemAppJoins ? 0u : 1u);' "the test: ... and counted for the notice"
+# (the final review of 1.1.4) a record keeps the sizes its host announced: its title's slot may go to a later host
+need_line $CB '    u32 sizes_[kRecords][2]; // 128 B: the sizes (+0x38, +0x3C) the record'"'"'s host announced last, kept when its title'"'"'s slot goes to another host' "the book keeps two sizes per record"
+need_line $CB '            KeepSizes(r, TitleOf(g.host));' "a new record takes the sizes of its host's title"
+need_line $CB '        KeepSizes(IndexOf(host), t);' "frame 0 of a host with a record refreshes its sizes"
+need_line $CB '        const u32 transfer = t != nullptr ? t->transfer : (r >= 0 ? sizes_[r][0] : 0);' "the verdict takes the record's sizes when the title's slot is gone"
+need_line $CB '        const u32 required = t != nullptr ? t->required : (r >= 0 ? sizes_[r][1] : 0);' "... both of them"
+need_line $CB '        std::memset(sizes_, 0, sizeof(sizes_));' "Reset forgets the sizes with the records"
+need_line Tests/dlp_clnt_test.cpp '    CHECK(b.Deliver(a));  // (its title was heard before: the new record takes its sizes)' "the test: another version stays one when four later hosts take the title slots"
+# (the final review of 1.1.4) the app's Download Play page frees what the room's network thread uses only when that thread ended
+need_line Includes/azl/room_client.hpp '    bool Stop();' "RoomClient::Stop says whether the network thread ended"
+need_line Sources/azl/room_client.cpp '    const bool ended = thread_.JoinTimeout(kStopJoinMs);' "... from its bounded wait"
+need_line Sources/azl/room_client.cpp '    return ended;' "... and returns it"
+need_line Tests/room_integration.cpp '    CHECK(!room.Stop());                                 // the thread is asleep in the tick callback for 5 s: abandoned, and Stop says so' "the test: Stop says the thread was abandoned"
+need_line Tests/room_integration.cpp '    CHECK(room.Stop());                                   // (a thread that leaves in time: Stop says it ended - the app frees what it used only then)' "the test: ... and that it ended"
+need Tests/dlp_children_test.cpp '" - join it from the 3DS Link app"' "the test of title_long has the tail of route B"
+# D-B9: the prepared child keeps its identity in the room for its first seconds
+LP=Includes/azl/link_policy.hpp
+need_line $LP '        } else if ((collision || error == RoomClient::Error::RoomIsFull) && hold_ms_ != 0 && in.now_ms - in.launch_ms < hold_ms_) {' "route B: within HoldIdentity's window from the launch a collision keeps the MAC and the name, and a full room is not given up (Azahar's room checks its slots before any collision)"
+need_order $LP '        if ((collision || error == RoomClient::Error::RoomIsFull) && lost_ms_ != 0 &&' '        } else if ((collision || error == RoomClient::Error::RoomIsFull) && hold_ms_ != 0 && in.now_ms - in.launch_ms < hold_ms_) {' "... after our own old link (OldLink) ..."
+need_order $LP '        } else if ((collision || error == RoomClient::Error::RoomIsFull) && hold_ms_ != 0 && in.now_ms - in.launch_ms < hold_ms_) {' '        } else if (error == RoomClient::Error::MacCollision && prefer_real_mac_) {' "... and before the MAC and the name change"
+hold=$(region $LP '        } else if ((collision || error == RoomClient::Error::RoomIsFull) && hold_ms_ != 0 && in.now_ms - in.launch_ms < hold_ms_) {' '        } else if (error == RoomClient::Error::MacCollision && prefer_real_mac_) {' | code_of)
+case "$hold" in *"step.note = Note::HeldIdentity;"*) ;; *) fail "$LP: the hold says HeldIdentity (once)";; esac
+case "$hold" in *prefer_real_mac_*=*|*nickname_suffixed_*=*|*last_attempt_ms_*=*|*gave_up_*) fail "$LP: the hold changes who we are or the schedule (it must keep the MAC, the name and the 2 s schedule)";; esac
+need_line $LP '    void HoldIdentity(u32 ms) {' "the switch of the hold"
+[ "$(grep -r -o 'HoldIdentity(' Sources/ctr | wc -l)" = "1" ] || fail "the plugin holds its identity in one place (the prepared Download Play child)"
+need_after $P '    if (prepared_child_ && active_) {' '        rejoin_.HoldIdentity(kChildHoldIdMs);  // (1.1.4, route B D-B9' "the hold is the prepared child's, with the plugin on (the same block as its dlp:SRVR)"
+need_line $P 'constexpr u32 kChildHoldIdMs = 8000;' "the hold lasts 8 s from the launch (spec 8 D-B9: the app's exit at about 3 s at the worst; the child's 10 rounds on an Azahar host)"
+need $P 'case RejoinPolicy::Note::HeldIdentity:' "the plugin says the hold once in its log"
+need_stmt Tests/link_policy_test.cpp 'TestRejoinHold();' "the PC test of the hold runs"
+need_line Tests/link_policy_test.cpp '        CHECK(e.At(launch + 7999, State::Idle, Error::MacCollision).note == RejoinPolicy::Note::HeldIdentity);' "the test: the hold to its last ms"
+need_line Tests/link_policy_test.cpp '        CHECK(step.alive && step.connect && step.note == RejoinPolicy::Note::MacTaken);' "the test: past the hold the MAC the room hands out"
+need_line Tests/link_policy_test.cpp '        CHECK_EQ(attempts, 4u);  // 0, 2, 4, 6 s: the usual schedule' "the test: the hold keeps the 2 s schedule"
+need_line Tests/link_policy_test.cpp '        CHECK(step.alive && !step.connect && step.note == RejoinPolicy::Note::HeldIdentity);  // the full room at 1 s: held, not given up' "the test: a full room within the hold is held"
+need_line Tests/link_policy_test.cpp '        CHECK(!s.At(launch + 8000, State::Idle, Error::RoomIsFull).alive);  // past the hold: fatal, as for every other title' "the test: a full room past the hold gives up"
+need $P "no host is joined: the join is the 3DS Link app's" "route B: the start-up line of the Download Play application says it never joins"
+! grep -q 'only a child 3DS Link prepared is joined' $P || fail "$P: the start-up line of the Download Play application still describes G1's join (route B refuses every host)"
+# D-B10: did the room answer the polite leave
+RC=Sources/azl/room_client.cpp
+need_line Includes/azl/room_client.hpp '        return leave_ack_.load();' "LeaveAcknowledged says what the network thread wrote, nothing else"
+need_line $RC '    leave_ack_.store(false);' "every Start forgets the last leave's answer"
+need_line $RC '                leave_ack_.store(done);  // (1.1.4, route B D-B10: only what it tells; nothing else of the leave changes)' "the polite leave writes whether the room answered"
+[ "$(tr -d '\r' < $RC | grep -c 'leave_ack_.store(')" = "2" ] || fail "$RC: the answer of the leave is written by Start and by the polite leave only (a quick stop never acknowledges)"
+need_line Tests/room_integration.cpp '    CHECK(bob.room.LeaveAcknowledged());   // ... the real room answers the DISCONNECT' "the real room's answer to a polite leave is seen"
+need_line Tests/room_integration.cpp '    CHECK(!client.room.LeaveAcknowledged());  // (1.1.4, route B D-B10: a quick stop waits for no answer - never acknowledged)' "a quick stop is never acknowledged"
+# hook.cpp does not change for route B: no APT interception, no jump, no plugin loader's command, no reboot bytes (the fallback is not approved)
+if tr -d '\r' < Sources/ctr/hook.cpp | grep -n -E '0x0045004[0-9A-Fa-f]|0x0031[0-9A-Fa-f]{4}|ApplicationJump|plg:ldr|loader_words|WirelessReboot|RebootInfo'; then
+  fail "Sources/ctr/hook.cpp: route B needs no APT interception (GetWirelessRebootInfo, the jump, plg:ldr): the fallback of spec 8 is not approved by the user"
+fi
+if tr -d '\r' < Includes/ctr/hook.hpp | grep -n -E '0x0045004[0-9A-Fa-f]|0x0031[0-9A-Fa-f]{4}|ApplicationJump|plg:ldr|loader_words|WirelessReboot|RebootInfo'; then
+  fail "Includes/ctr/hook.hpp: route B needs no APT interception (the fallback of spec 8 is not approved by the user)"
+fi
+[ "$(tr -d '\r' < Includes/ctr/hook.hpp | md5sum | cut -d' ' -f1)" = "54f666af51005ade1c4c953a12c5ed7f" ] || fail "Includes/ctr/hook.hpp changed: route B leaves the hook as it was (spec 8, approved 2026-11-16: hook.cpp does not change; a change is the user's decision)"
+if grep -r -n -E 'IPC_MakeHeader\((4, 2, 4|14)|0x000E0000' Sources Includes ConfigApp/source; then
+  fail "plg:ldr's command 4 or 14 in the sources: never 14, and 4 is not route B's (the 16 bytes go through ns:s from the app)"
+fi
+# ---- 1.1.4, B2/B3 of route B (analysis/piano-1.1.4-2026-11-15/specifiche/8-INGRESSO-DA-3DSLINK.md, approved by the user on 2026-11-16): the 3DS Link app
+# runs the Download Play session with the host itself (ConfigApp/source/dlp_join*), gives the 16 bytes to ns:s SetWirelessRebootInfo (dlp_join_sys.cpp)
+# and chain-loads the hidden prepared child (main.cpp). No hook, no plg:ldr, no file on the SD card: the child's GetWirelessRebootInfo is the system's.
+JL=ConfigApp/source/dlp_join_logic.hpp
+JH=ConfigApp/source/dlp_join.hpp
+JC=ConfigApp/source/dlp_join.cpp
+JS=ConfigApp/source/dlp_join_sys.cpp
+JK=ConfigApp/source/dlp_join_kernel.cpp
+JT=Tests/dlp_join_test.cpp
+# ns:s command 6, as dlplay sends it (modalita-download/RAPPORTO.md 4.3), and nothing else
+need_line $JS '    Result rc = srvGetServiceHandle(&h, "ns:s");' "route B: the app opens ns:s by its name (Luma's sm checks no list; the rsf lists it anyway)"
+[ "$(grep -r -F 'srvGetServiceHandle(&h, "ns:s")' ConfigApp/source | wc -l)" = "1" ] || fail "ns:s is opened in one place of the app (dlp_join_sys.cpp)"
+[ "$(grep -r -n -E '"ns:[a-z]+"' ConfigApp/source | wc -l)" = "1" ] || fail "the app names an ns service somewhere else than dlp_join_sys.cpp"
+need_line $JS '    cmdbuf[0] = IPC_MakeHeader(6, 1, 2);' "ns:s SetWirelessRebootInfo is command 6 with one normal word and a static buffer (0x00060042)"
+need_line $JS '    cmdbuf[1] = 16;' "... word 1: the 16 bytes"
+need_line $JS '    cmdbuf[2] = IPC_Desc_StaticBuffer(16, 0);' "... word 2: the static buffer 0 of 16 bytes ((16 << 14) | 2)"
+need_line $JS '    cmdbuf[3] = (u32)buf;' "... word 3: where the 16 bytes are"
+[ "$(grep -c 'cmdbuf\[0\] = IPC_MakeHeader(' $JS)" = "1" ] || fail "$JS sends a request that is not ns:s command 6"
+need_order $JS '    rc = svcSendSyncRequest(h);' '    volatile u8* const wipe = buf;' "the copy of the 16 bytes is wiped right after the request"
+need_after $JS '    volatile u8* const wipe = buf;' '        wipe[i] = 0;' "... byte by byte, through a volatile pointer"
+need_order $JS '        wipe[i] = 0;' '        rc = static_cast<Result>(cmdbuf[1]);' "the answer is the command's result (cmdbuf[1]): anything but 0 means no jump"
+need_line ../DlpLink/rsf/3dslink.rsf '   - ns:s' "the rsf of 3DS Link lists ns:s (route B)"
+[ "$(awk '/^  ServiceAccessControl:/ { on = 1; next } on && /^   - / { n++ } on && !/^   - / { on = 0 } END { print n + 0 }' ../DlpLink/rsf/3dslink.rsf)" = "32" ] || fail "the rsf of 3DS Link lists other than 32 services (ns:s took the place of cam:u, which the app never used)"
+# the hand-over: TakeReboot, ns:s, the jump only on 0
+need_line $JC '    const u64 prepared = HandOver(*net_->core, &SetWirelessRebootInfo, rc);' "the page hands the game over with ns:s, through HandOver"
+[ "$(grep -r -o 'SetWirelessRebootInfo' ConfigApp/source --include=*.cpp | grep -v '^ConfigApp/source/dlp_join_sys.cpp:' | wc -l)" = "1" ] || fail "ns:s SetWirelessRebootInfo is sent from one place (Session::HandOverAndLeave)"
+need_line $JC '    return *rc == 0 ? prepared : 0;' "no jump unless ns:s answered 0 (the child would ask for bytes the system does not have)"
+need_order $JC '    *rc = send(info);' '    Wipe(info, sizeof(info));' "the 16 bytes on the stack of HandOver are wiped after ns:s"
+need_line $JL '    std::memcpy(out, mac, 6);' "the 16 bytes: [0..5] the host's MAC"
+need_line $JL '    std::memcpy(out + 6, passphrase, 9);' "... [6..14] the passphrase"
+need_line $JL '    out[15] = 0;' "... [15] 0"
+need_line $JL '    volatile u8* v = static_cast<volatile u8*>(p);' "Wipe writes through a volatile pointer (a store the compiler cannot leave out)"
+# TakeReboot: the state 9 only, the passphrase read there alone, the lobby let go after it
+need_line $JC '    if (lobby_.client_state() != azl::kCliComplete || joined_prepared_ == 0 || lobby_.ClientGroupOf(joined_) == nullptr) {' "TakeReboot only in the state 9 of the joined host"
+TRB=$(region $JC 'bool Core::TakeReboot(u8 (&info)[16], u64* prepared) {' '}')
+order_in "$JC TakeReboot" "$TRB" '    lobby_.ClientPassphrase(pass);' '    Wipe(pass, sizeof(pass));' "the passphrase's copy is wiped"
+order_in "$JC TakeReboot" "$TRB" '    ComposeRebootInfo(mac, pass, info);' '    lobby_.ClientStopSession();  // (as dlplay' "the lobby lets the passphrase go after the 16 bytes are made (as dlplay: StopSession after the passphrase)"
+order_in "$JC TakeReboot" "$TRB" '    lobby_.ClientStopSession();  // (as dlplay' '    MarkRelease();' "... and the leave counts its rounds from there (D-B10)"
+[ "$(grep -r -F 'ClientPassphrase(' ConfigApp/source | wc -l)" = "1" ] || fail "the app reads the passphrase in Core::TakeReboot only"
+# privacy: no MAC, passphrase or the 16 bytes in a line of the log (dlp_join*.cpp); the one snprintf that names a MAC makes the room's console id
+hit=$(grep -n -E '\b(Log|AppendLog|printf)\(' ConfigApp/source/dlp_join*.cpp ConfigApp/source/dlp_join*.hpp | grep -E '\b(pass|mac|info|joined_|ask_host_|buf)\b' | head -3)
+[ -z "$hit" ] || fail "a line of the log of route B names a MAC, the passphrase or the 16 bytes: $hit"
+[ "$(grep -h -E 'snprintf\(' ConfigApp/source/dlp_join*.cpp | grep -c -E '\b(pass|mac|info|joined_)\b')" = "1" ] || fail "a text of route B is made from a MAC or the passphrase (only the room's console id, from the console's own MAC)"
+need $JC 'std::snprintf(id, sizeof(id), "3ds-%02x%02x%02x%02x%02x%02x-dlp", in.mac[0]' "... and that one is the console id"
+# the Core's block wiped after its destructor (J10)
+need_order $JC '    core->~Core();' '    Wipe(core, sizeof(Core));  // (the block held the lobby' "EndCore wipes the Core's block after the destructor"
+# D-B10: two rounds of the network thread between the release and RoomClient::Stop
+need_line $JH 'constexpr u32 kLeaveRounds = 2;' "D-B10: the leave waits two rounds of the network thread after the release"
+need_line $JH 'constexpr u32 kLeaveWaitMs = 150;' "D-B10: ... at most 150 ms (the budget of D-B1.6)"
+need_line $JC '    release_mark_.store(rounds_.load() + kLeaveRounds);' "a release marks the round the queue has gone out by"
+need_line $JC '    return released_.load() && want_.load() == 0 && rounds_.load() >= release_mark_.load();' "LeaveFlushed: released, no intent waiting, the rounds run"
+LVR=$(region $JC 'bool LeaveRounds(Core& core, u64 (*now_ms)(), void (*sleep_ms)(u32)) {' '}')
+order_in "$JC LeaveRounds" "$LVR" '    core.AskEnd();' '    while (!core.LeaveFlushed()) {' "LeaveRounds lets the lobby go, then waits for the rounds"
+AKE=$(region $JC 'void Core::AskEnd() {' '}')
+order_in "$JC AskEnd" "$AKE" '    released_.store(false);' '    want_.fetch_or(kWantEnd);' "AskEnd forgets an earlier release before posting the end (a stale mark ended the leave while ClientFinalize queued the Deauthentication, review of B23)"
+[ "$(grep -c -F 'released_.store(false);' $JC)" = "1" ] || fail "released_ is cleared in one place (AskEnd)"
+# HostOf: full from the beacon's counts, the index file's row from missing_row (the only guards of a join from the list's copy, J4b)
+need_line $JC '    h.full = g.max_nodes != 0 && g.total_nodes >= g.max_nodes;' "HostOf: a host is full when its beacon says total == max"
+need_line $JC '    h.index_row = !Missing(g.child_tid_low);' "HostOf: a child BuildTable put in missing_row is 'index not written'"
+need_order $JC '    const bool rounds = LeaveRounds(*n->core, &azl::platform::NowMs, &azl::platform::SleepMs);' '            const bool ended = n->room.Stop();' "Session::Stop waits for the two rounds before RoomClient::Stop (its polite disconnect drops what is still queued)"
+need $JC '"the room answered" : "no answer in 500 ms: it may list this console a few seconds"' "Session::Stop says whether the room answered the leave (LeaveAcknowledged)"
+# (the final review of 1.1.4) the page frees what the room's network thread uses only when that thread ended
+need_line $JH 'bool EndNetParts(StopFn stop, FreeFn free) {' "the end of the session's parts"
+need_after $JH 'bool EndNetParts(StopFn stop, FreeFn free) {' '    if (!stop()) {' "... frees nothing when the thread was abandoned"
+need_after $JH '    if (!stop()) {' '        return false;' "... (left for good)"
+need $JC '    const bool freed = EndNetParts(' "Session::Stop ends its parts through EndNetParts"
+need_line $JC '        [n] { FreeNet(n); });' "... and frees them only there"
+need_line $JC '            const bool ended = n->room.Stop();' "... after RoomClient::Stop said whether the thread ended"
+need_line $JC '            return ended;' "... (its answer)"
+[ "$(grep -c 'FreeNet(n);' $JC)" = "4" ] || fail "$JC: the session's block is freed in Start's three refusals and through EndNetParts only"
+SST=$(region $JC 'Why Session::Start(const Facts& f, const SessionIn& in) {' '}')
+[ -n "$SST" ] || fail "$JC: Session::Start not found"
+if printf '%s\n' "$SST" | code_of | grep -q -F '[this'; then
+  fail "$JC: a callback of the room or of the engine captures the Session (it goes with the page; an abandoned network thread would use it)"
+fi
+need_stmt $JT 'J12_EndNetParts();' "the test of EndNetParts runs"
+need_line $JT '        CHECK_EQ(frees, ended ? 1 : 0);  // (abandoned: never freed under the thread)' "J12: nothing freed under an abandoned thread"
+# D-B4: who the page is in the room
+need_line $JC '    rc.game_id = azl::title_rules::kAppTid;' "the page is in the room as 3DS Link's id: a host with H5 waits for its child (AwaitsChildOf)"
+need $JC '    rc.preferred_mac = in.mac;  // (D-B4' "the page is in the room with the console's MAC: the child comes back with it"
+need_line $JC '    rc.game_name = "Download Play (3DS Link)";' "the page's name in the room"
+need_line $JC '    rc.nickname = in.nickname;' "the page's nickname is the one the child will have (g.EffectiveNickname)"
+# JoinGate: the plugin's own UsesRoom, the plugin on, the installed app, the worker
+need_line $JL '    if (!azl::clnt::UsesRoom(f.room_set, f.autoconnect, f.menu_off)) {' "JoinGate asks the plugin's own formula whether the child joins the room by itself"
+need_line $JL '    if (!f.plugin_on) {' "JoinGate: 3DS Link on (enabled && tunnel), or IsChild says false"
+need_line $JL '    if (!f.installed_app) {' "JoinGate: the installed app only (a .3dsx's way out is not proven)"
+need_line $JL '    if (f.guest_worker) {' "JoinGate: not while the worker of the children runs"
+need_line $JL '    return w.copies || w.titles_scan || w.update || w.lobbies_scan;' "AnyWork: every job the way out of main.cpp waits for, the public lobbies too"
+# ShowOf: Join only for a Ready child, in the index file, a host that is not full
+need_after $JL 'inline Show ShowOf(const Host& h) {' '    if (!h.index_row) {' "ShowOf: a child the index file does not have is grey first"
+need_line $JL '    if (h.v == azl::dlp_children::Verdict::Ready && !h.full) {' "ShowOf: Join only for a Ready child and a host that is not full"
+# BuildTable: the file the plugin reads, cut where the plugin cuts it; Ready only with an Installed record of ours, AM Present at its version
+need_line $JC '    const std::string path = std::string("sdmc:") + azl::dlp_children::kIndexPath;' "the page reads the index file the plugin reads (its own path, no copy)"
+need_line $JL '    if (whole.size() <= azl::dlp_children::kIndexMaxBytes) {' "... cut at the plugin's kIndexMaxBytes"
+need_line $JL '    t.index_found = index_text != nullptr && dc::ParseIndex(index_text, size, &t.index);' "BuildTable believes the FILE (the plugin's ParseIndex), not the records alone"
+need_line $JL '                g.game == row.game && g.child_version == row.version && dlpguest::IsOwnedGuestTid(row.prepared)) {' "a row is backed by an Installed record of ours with the same ids and version"
+need_line $JL '        return r >= 0 && x.match[r] != nullptr && (*x.present)(title_id, &version) == dlpguest::Presence::Present && version == x.index->rows[r].version;' "AM must say Present at the row's version (Unknown, Broken, Absent: not Ready)"
+need_line $JL '    dc::JudgeAll(t.index, t.verdict, probe, dc::PresenceBy::Am);' "the verdicts are the plugin's JudgeAll, the titles asked of AM"
+# AskJoin: ClntStartSession's sequence, refused for anything but a Join row
+DJN=$(region $JC 'void Core::DoJoin(bool rescanned) {' '}')
+order_in "$JC DoJoin" "$DJN" '    if (ShowOf(h) != Show::Join) {' '        lobby_.ClientStopScan();' "AskJoin refuses a row that is not Join before anything is sent"
+order_in "$JC DoJoin" "$DJN" '        lobby_.ClientStopScan();' '    lobby_.ClientAdoptGroup(chosen);' "AskJoin stops the scan (the lobby's join refuses the state 2) ..."
+order_in "$JC DoJoin" "$DJN" '    lobby_.ClientAdoptGroup(chosen);' '    if (lobby_.ClientJoinBegin(chosen.host, &res) == azl::JoinStep::Pending) {' "... and puts the chosen host in the lobby's table before the join"
+need $JC '    for (std::size_t i = 0; rescanned && g == nullptr && i < kSeen; ++i) {' "the list's copy of a host only after a new scan in the same round (a host the scan dropped - full, gone - is refused)"
+need_order $JC '        if ((want & kWantLeave) != 0) {' '            lobby_.ClientStartScan(0);  // (the list again: the session stays in the room)' "B: the list starts again, in the room"
+# the kernel of the app: exactly 0
+need_line $JK '    return svcWaitSynchronization(handle, timeout_ns) == 0;  // (exactly 0: the timeout 0x09401BFE is not negative)' "the app's kernel: a wait is signalled only on 0"
+# main.cpp: the chain-load to OUR prepared child, from the installed app, with the HOME Menu there
+need_line ConfigApp/source/main.cpp '    if (azl::title_rules::IsPreparedId(g.child_jump) && g.child_jump != azl::title_rules::kAppTid && dlpguest::IsOwnedGuestTid(g.child_jump) &&' "the app jumps only to a prepared title of ours"
+need_after ConfigApp/source/main.cpp '    if (azl::title_rules::IsPreparedId(g.child_jump) && g.child_jump != azl::title_rules::kAppTid && dlpguest::IsOwnedGuestTid(g.child_jump) &&' '        dlpguest::Jumpable(dlpguest::FormOf(g.child_jump)) && !envIsHomebrew() && R_SUCCEEDED(APT_IsRegistered(aptGetMenuAppID(), &home_menu)) &&' "... never to a child of the system form of the build 2h (DPAPP-2j: Jumpable), from the installed app, with the HOME Menu there"
+need_order ConfigApp/source/main.cpp '        dlpguest::Jumpable(dlpguest::FormOf(g.child_jump)) && !envIsHomebrew() && R_SUCCEEDED(APT_IsRegistered(aptGetMenuAppID(), &home_menu)) &&' '        aptSetChainloader(dlpguest::AmTitleOf(g.child_jump), MEDIATYPE_SD);  // (1.1.4, route B: the prepared Download Play child; ns:s holds its 16 bytes)' "... on the SD card"
+[ "$(grep -r -o 'aptSetChainloader(' ConfigApp/source | wc -l)" = "1" ] || fail "the app chain-loads a title in one place (main.cpp, route B)"
+# the worker and the look of the children never start from the page of route B, nor from any page but Download Play's
+! grep -r -q 'dlpguest::Poll(' ConfigApp/source || fail "dlpguest::Poll is back (the quiet pass is the thread of the look's, from the page Download Play)"
+[ "$(grep -r -l 'StartGamesLook(' ConfigApp/source | LC_ALL=C sort | tr '\n' ' ')" = "ConfigApp/source/dlp_guest.cpp ConfigApp/source/dlp_guest.hpp ConfigApp/source/pages_dlpguest.cpp " ] || fail "StartGamesLook is named outside the pages of Download Play (pages_dlpguest.cpp): the look would start from another page"
+# the test
+need_stmt $JT 'J1_IslandTour();' "the PC test of the page runs (J1/J10)"
+need_stmt $JT 'J1b_ScanThenJoin();' "... J1b"
+need_stmt $JT 'J4b_HostOf();' "... J4b"
+need_stmt $JT 'J5_Leaves();' "... J5"
+need_line $JT '        CHECK_EQ(a.flushed_at_deauth.load(), 0u);  // (D-B10: an earlier release never ends this leave)' "J5: LeaveFlushed is never true while the leave's Deauthentication is queued"
+need_line $JT '                flushed_at_deauth.fetch_add(w->LeaveFlushed() ? 1u : 0u);  // (inside the Step that queues it: the leave must not be over yet)' "J5: ... looked at inside the Step that queues it"
+need_line $JT '    CHECK(full.full);' "J4b: HostOf says full at total == max"
+need_line $JT '    CHECK_EQ(h.client_state(2), static_cast<u8>(AzaharDlpHost::NotJoined));  // (a full copy of the list: no join sent)' "J4b: a full copy of the list is not joined after SELECT + A"
+need_line $JT '    CHECK(!row.index_row);' "J4b: a child the index file lacks is 'index not written'"
+need_stmt $JT 'J7_OurHost();' "... J7"
+need_stmt $JT 'J8_Logic();' "... J8"
+need_stmt $JT 'J9_Table();' "... J9"
+need_stmt $JT 'J11_Compose();' "... J11"
+need_line $JT '    CHECK(!c->TakeReboot(info, &prepared));  // (not in the state 9: nothing)' "J1: TakeReboot in the state 5 gives nothing"
+need_line $JT '    CHECK(std::memcmp(info + 6, first, 9) == 0);  // the FIRST passphrase of the host' "J1: the 16 bytes carry the first passphrase"
+need_line $JT '    CHECK(std::all_of(pass, pass + 9, [](u8 x) { return x == 0; }));' "J1: the lobby forgot the passphrase"
+need_line $JT '    CHECK(c.End());' "J10: the block is zero after EndCore"
+need_line $JT '        CHECK(WaitFor(1500, [&] { return h.client_state(2) == AzaharDlpHost::NotJoined; }));  // (the Deauthentication went out before the room)' "J5: the leave's Deauthentication reaches the host"
+need_line $JT '        CHECK(WaitFor(1500, [&] { return h.e().SpectatorCount() == 0; }));  // (the probe'"'"'s Deauthentication reached the host)' "J5: the probe's too"
+need_line $JT '            queue_.clear();' "J5: the room of the test drops what is still queued at the leave (RoomClient::Stop)"
+need_line $JT '    CHECK_EQ(jump, p.send_rc == 0 ? kIslandPrepared : 0u);  // (a refusal of ns:s: no jump)' "J7: no jump when ns:s refuses"
+need_line $JT '    CHECK_EQ(cases, 4096u);' "J8: JoinGate on every Facts"
+need_line Tests/run.sh '  timeout 1200 "$OUT/dlp_join_test"' "run.sh runs dlp_join_test"
+need Tests/run.sh 'Tests/dlp_join_test.cpp ConfigApp/source/dlp_join.cpp' "run.sh builds dlp_join_test on the app's own dlp_join.cpp"
+[ "$(grep -c 'dlp_join_test ;;' Tests/lane.sh)" = "2" ] || fail "the lanes dlp and app run dlp_join_test"
+# ---- 1.1.4, B4 of route B (analysis/piano-1.1.4-2026-11-15/specifiche/8-INGRESSO-DA-3DSLINK.md 3.5, approved by the user on 2026-11-16): the page
+# Download Play (Azahar Emulator Room) and its row on the main page. The gate before anything and again at A, the join only of a selectable row, B
+# that leaves the host, the hand-over through Session::HandOverAndLeave and the jump only on ns:s's 0 to a title of ours. No log, no MAC in a text.
+JP=ConfigApp/source/pages_dlpjoin.cpp
+PMN=ConfigApp/source/pages_main.cpp
+need_line ConfigApp/source/pages.hpp 'ui::Page* NewDlpJoinPage();' "the page of route B is made through pages.hpp"
+need_line ConfigApp/source/pages.hpp 'ui::Page* NewDlpPage();' "the page Download Play is made through pages.hpp (spec 9)"
+need_line ConfigApp/source/pages.hpp 'ui::Page* NewDlpGamesPage();' "... and Download Play > Games"
+# the row of the main page: after Enable Titles, the installed app only, shut by an old Luma like its neighbours
+need $PMN 'join.label = "Download Play";' "the main page has the row Download Play (spec 9: the name of the system's app)"
+need $PMN '"Join a console or an Azahar emulator that hosts Download Play in your room. You need your own copy of the game, to join too: the "' "... which says that the own copy of the game is needed"
+need_after $PMN '        rows.push_back(enable);' '        // 1.1.4, route B and spec 9 (specifiche/8-INGRESSO-DA-3DSLINK.md, 9-DOWNLOAD-PLAY-APP.md): Download Play, its page with Join and Games. Only in the' "... right after Enable Titles"
+need_after $PMN '        if (!envIsHomebrew()) {' '            if (guests_ready_ < 0) {' "... only in the installed app (a .3dsx has no row: its way out is not the HOME Menu's)"
+need_order $PMN '            if (guests_ready_ < 0) {' '            join.label = "Download Play";' "... the row is made inside that test"
+need_line $PMN '            join.dim = g.luma_too_old;' "the row is faint with a Luma3DS that is too old, like its neighbours"
+need_after $PMN '        case kDlpJoin:' '            if (step == 0 && g.luma_too_old && dlpguest::LoadGuests().empty()) {' "A on the shut row says why (with Luma3DS too old the page opens only while guests are there, to remove them: the review of spec 9)"
+need $PMN 'PushPage(pages::NewDlpPage());' "A opens the page Download Play (Join and Games)"
+[ "$(grep -rn 'NewDlpPage()' ConfigApp/source | grep -v -E '^ConfigApp/source/(pages_main|pages_dlpguest)\.cpp:|^ConfigApp/source/pages\.hpp:' | wc -l)" = "0" ] || fail "the page Download Play is opened from somewhere else than the main page's row"
+[ "$(grep -rn 'NewDlpJoinPage()' ConfigApp/source | grep -v -E '^ConfigApp/source/(pages_dlpguest|pages_dlpjoin)\.cpp:|^ConfigApp/source/pages\.hpp:' | wc -l)" = "0" ] || fail "the page of route B is opened from somewhere else than the row Join of the page Download Play"
+[ "$(grep -c 'PushPage(pages::NewDlpJoinPage());' ConfigApp/source/pages_dlpguest.cpp)" = "1" ] || fail "the page Download Play does not open Join from its row (or opens it twice)"
+need_line ConfigApp/source/pages_dlpguest.cpp '            PushPage(pages::NewDlpGamesPage());' "the page Download Play opens Games from its row"
+[ "$(grep -rn 'NewDlpGamesPage()' ConfigApp/source | grep -v -E '^ConfigApp/source/(pages_dlpguest|pages_dlpjoin)\.cpp:|^ConfigApp/source/pages\.hpp:' | wc -l)" = "0" ] || fail "Download Play > Games is opened from somewhere else than its row and the refusal of Join"
+# (spec 9 point 10) the refusal NoGuests of Join says to switch a game on in Download Play > Games, and its button opens Games (never Enable Titles)
+need ConfigApp/source/dlp_join_logic.hpp 'case Why::NoGuests: return "No game is ready for Download Play: enable one in Download Play > Enable games";' "the refusal says where a guest is prepared"
+need ConfigApp/source/pages_dlpjoin.cpp 'PushPage(pages::NewConfirmPage(kShortTitle, said, "Enable games", "Back", [](bool yes) {' "... and its button is Enable games"
+need ConfigApp/source/pages_dlpjoin.cpp 'PushPage(pages::NewDlpGamesPage()); // (over the page Download Play: B comes back to it)' "... which opens Games"
+! grep -q 'NewEnableGamePage' ConfigApp/source/pages_dlpjoin.cpp || fail "ConfigApp/source/pages_dlpjoin.cpp opens Enable Titles again (a dead end: it prepares nothing)"
+need ConfigApp/source/pages_dlpjoin.cpp '"Its Download Play guest is not ready on this console: enable the game in Download Play > Enable games."' "the grey row 'not prepared' sends to Enable games"
+need ConfigApp/source/pages_dlpjoin.cpp '"Games without a Download Play guest on this console: enable the game in Download Play > Enable games, and 3DS Link prepares its guest."' "... and so does the row 'no guest here'"
+need ConfigApp/source/pages_dlpjoin.cpp '"The plugin is missing from its Download Play guest: disable the game and enable it again in Download Play > Enable games."' "... and the grey row 'no plugin'"
+# (2026-11-18, the console test) Join lobby: "Download Play" once, in the top bar; the bar of the touch screen says how the search goes; a host's row is
+# its game, and who hosts it (the console or the emulator), the room and the players are on the top screen
+need_line $JP 'constexpr const char* kTitle = "Download Play > Join lobby";' "the page is named as its row"
+! tr -d '\r' < $JP | code_of | grep -q -x -F '        return kShortTitle;' || fail "$JP: the page's title is Download Play again"
+need_after $JP '    const char* BarTitle() const override {' '        return search_.c_str();' "the bar of the touch screen says how the search goes ..."
+need_line $JP '        search_ = "Looking for hosts...";' "... looking for hosts"
+need_line $JP '            search_ = "Joining the room...";' "... joining the room"
+need_line $JP '            search_ = Fmt("%d host%s found", found_, found_ == 1 ? "" : "s");' "... or how many it found"
+! grep -q -F 'DrawTitleBar(gfx::kBottomW, kShortTitle' $JP || fail "$JP: the bar of the wait says Download Play again"
+need_line $JP '        DrawTitleBar(gfx::kBottomW, gfx::Ellipsize(bar, 0.56f, 200).c_str(), std::string());' "... it says the game being joined, or the room lost"
+! grep -q -F 'note_title = kTitle' $JP || fail "$JP: the card of the search says the page's title again"
+need $JP 'r.label = c != nullptr ? c->short_name : std::string("Another game");' "a host's row is its game ..."
+! tr -d '\r' < $JP | code_of | grep -q -E 'r\.label = (HostName|gfx::Clean\(m\.nickname\))' || fail "$JP: a row says who hosts again (the top screen says it)"
+need $JP 'gfx::Ellipsize("Hosted by " + HostName(h.g), 0.46f, 296)' "... who hosts it is on the top screen"
+need_after $JP '            } else if (row->id == kSearch) {' '                DrawSearch(*row);' "the rows of the search draw the search card: the room and the hosts found"
+DSR=$(region $JP '    void DrawSearch(const Row& row) const {' '    }')
+{ [ -n "$DSR" ] && ! printf '%s\n' "$DSR" | code_of | grep -q -E 'session_|core\(|LoadGuests|Hosts\('; } || fail "$JP: the search card looks at the session itself (it draws what the rows of this frame found)"
+# (the review of 2026-11-18) the search says each thing once: the bar how the search goes, the row what the list has, the card the room; the room is not
+# at the right of the bar (a long name ran over the title); the word of the moment (a join refused, "<host> left") is drawn under the cards
+{ [ -n "$DSR" ] && ! printf '%s\n' "$DSR" | code_of | grep -q -F 'note_title'; } || fail "$JP: the search card says the row's title again (the bar and the row say how the search goes)"
+need_line $JP '        gfx::DrawFitted(26, 48, 0.55f, 0.42f, 350, col::kAccent, gfx::Clean("Room " + RoomLabel()));' "... its title is the room"
+need_line $JP '            r.label = found_ > 0 ? "No lobby you can join yet" : "No lobby yet";' "the row of the search says what the list has, not the bar again ..."
+need $JP 'r.label = "Not in the room yet";' "... and while the room is joined"
+! tr -d '\r' < $JP | code_of | grep -q -E 'r\.label = "(Looking for hosts|Joining the room)' || fail "$JP: the row of the search says the bar again"
+! tr -d '\r' < $JP | code_of | grep -q 'BarRight' || fail "$JP: the room at the right of the bar again (a long name runs over the title; the top screen says it)"
+need_line $JP '        if (g.ToastActive()) {' "Join lobby draws the word of the moment ..."
+need_after $JP '        if (g.ToastActive()) {' '            DrawStatusStrip(10, 206, 380, 28);' "... under the cards (a join refused came back without a word)"
+# the facts of the gate (spec 8 pin 11): the page fills them from what the app knows now
+need_line $JP '    f.installed_app = !envIsHomebrew();' "the gate: the installed app (a .3dsx is refused)"
+need_line $JP '    f.plugin_on = g.cfg.enabled && g.cfg.tunnel;' "the gate: 3DS Link on (enabled && tunnel: the plugin of the child is active)"
+need_line $JP '    f.loader_on = g.loader == setup::LoaderState::Enabled;' "the gate: Rosalina's Plugin Loader on"
+need_line $JP '    f.autoconnect = g.cfg.autoconnect;' "the gate: the child joins the room by itself (UsesRoom: autoconnect ...)"
+need_line $JP '    f.menu_off = !setup::MenuOn(g.cfg);' "the gate: ... or the in-game menu off"
+need_line $JP '    f.guest_worker = dlpguest::Running();' "the gate: not while the worker of the children runs"
+need_line $JP '    w.copies = setup::CopyWorker::Get().PendingCount() > 0;' "the gate: no copy of the plugin waiting (the way out waits for them)"
+need_line $JP '    w.titles_scan = titles::Scan().started() && !titles::Scan().done();' "the gate: no scan of the titles running"
+need_line $JP '    w.update = UpdateBusy();' "the gate: no job of the update"
+need_line $JP '    w.lobbies_scan = lobbies::Scanner::Get().running();' "the gate: the asking of the public rooms is over"
+need_line $JP '    f.work_running = entry ? dlpjoin::EntryWork(w) : dlpjoin::AnyWork(w);' "the gate: the jobs counted as work (DPAPP-2h-rev U3: at the entrance only the session's)"
+# the gate before the session, and again at A before the join; HOME and sleep off from A
+BGN=$(region $JP '    void Begin() {' '    }')
+order_in "$JP Begin" "$BGN" '        dlpjoin::Why why = dlpjoin::JoinGate(FactsNow(InstalledGuests(), true));' '            why = Start();' "the page asks the gate before the session starts"
+JNP=$(region $JP '    void Join(const dlpjoin::Host& h) {' '    }')
+order_in "$JP Join" "$JNP" '        const dlpjoin::Why why = dlpjoin::JoinGate(FactsNow(dlpjoin::ReadyCount(session_.children()->table)));' '        if (why != dlpjoin::Why::Ok) {' "A asks the gate again (the work and the children of now)"
+order_in "$JP Join" "$JNP" '        if (why != dlpjoin::Why::Ok) {' '        holds_.Take();' "... before HOME and sleep go off"
+order_in "$JP Join" "$JNP" '        holds_.Take();' '        core->AskJoin(h.g.host);' "HOME and sleep are off before the join is asked"
+[ "$(grep -c 'AskJoin(' $JP)" = "1" ] || fail "the page asks a join in one place (Join, after the gate)"
+need_line $JP '            r.kind = show == dlpjoin::Show::Join ? Kind::Action : Kind::Info;' "only a Join row (Ready, in the index file, not full) can be activated"
+need_line $JP '        if (step != 0 || row.kind != Kind::Action || host < 0 || host >= static_cast<int>(hosts_.size())) {' "A on a grey row does nothing"
+# B leaves the host in the join, the lobby and after START (never after the passphrase); the host gone: the list again; HOME back with the list
+need_line $JP '        if (p == dlpjoin::Phase::Entering || p == dlpjoin::Phase::Waiting || p == dlpjoin::Phase::Starting) {' "B leaves in the join, the lobby and after START only"
+need_after $JP '            if ((in.down & KEY_B) || Tapped(in, LayoutFooter(ModeFooter()).back)) {' '                core->AskLeave();  // (ClientStopSession, then the list again: the page stays in the room)' "B lets the host go (ClientStopSession) and the list starts again"
+need_after $JP '        if (p == dlpjoin::Phase::HostLeft) {' '            core->AskLeave();' "the host gone: the lobby lets it go and the list starts again"
+need_after $JP '    void BackToList(const std::string& toast) {' '        holds_.Give();' "HOME and sleep come back with the list"
+# the hand-over: Session::HandOverAndLeave (ns:s, the room left), the jump only on 0 and only to a title of ours
+need_line $JP '        const u64 prepared = session_.HandOverAndLeave(&rc);' "the page hands the game over through Session::HandOverAndLeave"
+need_after $JP '        const u64 prepared = session_.HandOverAndLeave(&rc);' '        if (prepared != 0 && rc == 0 && dlpguest::IsOwnedGuestTid(prepared) && dlpguest::Jumpable(dlpguest::FormOf(prepared))) {' "the jump only when ns:s answered 0, to a prepared title of ours (DPAPP-2j: never of the system form of the build 2h)"
+need_after $JP '        if (prepared != 0 && rc == 0 && dlpguest::IsOwnedGuestTid(prepared) && dlpguest::Jumpable(dlpguest::FormOf(prepared))) {' '            g.child_jump = prepared;' "... and main.cpp chain-loads it"
+need_after $JP '            g.child_jump = prepared;' '            g.child_jump_left_ms = session_.left_room_ms();' "... with the time the room was left (the log's 'from the room exit to the jump')"
+[ "$(grep -r -o 'HandOverAndLeave(' ConfigApp/source | grep -v -E '^ConfigApp/source/dlp_join\.(hpp|cpp):' | wc -l)" = "1" ] || fail "the game is handed over from one place (the page of route B)"
+[ "$(grep -r -F 'g.child_jump = ' ConfigApp/source | wc -l)" = "1" ] || fail "the jump to a prepared child is set in one place (the page of route B, after ns:s answered 0)"
+# leaving the page: the polite leave of the session (D-B10), then the icons' textures
+need_after $JP '    void OnBack() override {' '        session_.Stop();' "B on the list leaves the room politely before the page goes"
+DTR=$(region $JP '    ~DlpJoinPage() override {' '    }')
+order_in "$JP ~DlpJoinPage" "$DTR" '        session_.Stop();' '        gfx::ReleaseIcons();' "the page leaves the room before its icons go"
+# privacy: the page writes no log and no file, and a host's MAC goes nowhere but AskJoin
+if grep -n -E '\b(Log|AppendLog|printf|snprintf|fopen|WriteTextFile)\(' $JP; then
+  fail "$JP writes a log or a file (the session's log says states and times only)"
+fi
+[ "$(grep -o -F '.g.host' $JP | wc -l)" = "1" ] || fail "a host's MAC is used in $JP somewhere else than AskJoin (never on a screen, never in a text)"
+# ---- review of B4 (2026-11-16): one look of the Core for the phase, the icon of the chosen child from the page's own copy, the members that host
+# a lobby by MAC, and the name of an "index not written" child
+need_line $JC '    return PhaseOf(v.word, v.joining, net_->room.state());' "Session::phase: the word and the join flag of one Core::Look"
+[ "$(grep -c -E 'core_->(Word|Joining)\(\)' $JC)" = "0" ] || fail "Session reads the word and the join flag apart (Word() then Joining() can straddle the Step that ends a join)"
+LOK=$(region $JC 'Core::View Core::Look() {' '}')
+order_in "$JC Look" "$LOK" '    azl::platform::LockGuard<azl::platform::Mutex> lock(mu_);  // (Step holds it' '    v.word = lobby_.ClientStatusWord();' "Core::Look takes the Core's lock before it reads"
+order_in "$JC Look" "$LOK" '    v.word = lobby_.ClientStatusWord();' '    v.refusals = refusals_.load();' "... and reads the four under it"
+need_after $JC '    v.word = lobby_.ClientStatusWord();' '    v.joining = joining_.load();' "... the join flag with the word"
+need_line $JP '        const dlpjoin::Phase p = session_.phase(&seen);  // (one look: the word, the join flag, the rounds and the refusals of the same Step)' "the page's phase comes with its look"
+need_line $JP '        } else if (seen.refusals != refusals_at_) {' "the page's 'no longer in the list' from the same look as the phase"
+need_line $JP '        } else if (seen.rounds >= rounds_at_ + 2) {' "the page's 'could not be joined' from the same look as the phase"
+[ "$(grep -c -E 'core->(Rounds|refusals)\(\) (>=|!=)' $JP)" = "0" ] || fail "the page compares rounds or refusals read after the phase (another Step's)"
+[ "$(grep -c 'chosen_icon_' $JP)" = "0" ] || fail "the page keeps a copy of the chosen icon: a second join refills its buffer under the same address and gfx draws the first game's texture"
+need_after $JP '    void DrawChosen(const std::string& phase) {' '        const Child* c = ChildOf(chosen_child_);' "the waiting screen draws the chosen child's icon from children_ (one buffer per child for the session)"
+need_line $JP '        chosen_child_ = h.g.child_tid_low;  // (its icon is drawn from children_: a copy here would keep the first join'"'"'s address and texture)' "the page remembers the chosen child by its id"
+need_line $JL '        if (h.g.host == member) {' "HostsALobby: a member hosts a lobby when its room MAC is the lobby's host"
+need_line $JC '                waiting.push_back({m.nickname, m.game_id, m.mac});' "the session keeps the members' room MAC (for HostsALobby only)"
+need_line $JC '        if (!HostsALobby(hosts, m.mac)) {  // (its lobby is in the list already: by MAC, the room'"'"'s nickname is not the beacon'"'"'s name)' "WaitingMembers leaves out the members that host a lobby of the scan"
+need $JP 'for (const dlpjoin::Member& m : session_.WaitingMembers(all)) {' "the page gives WaitingMembers every host of the scan"
+[ "$(grep -c -E '\bm\.mac\b' $JP)" = "0" ] || fail "the page reads a member's MAC (the session compares it, the page never sees it)"
+need_line $JP '            if (!listed && guest.state == dlpguest::GuestState::Installed && dlpguest::IsOwnedGuestTid(guest.prepared)) {' "the page names the Installed children of ours the index file lacks"
+need_order $JP '            if (!listed && guest.state == dlpguest::GuestState::Installed && dlpguest::IsOwnedGuestTid(guest.prepared)) {' '                c.short_name = dlpguest::GameName(guest.game);' "... by their game's name (an 'index not written' host is not 'another game')"
+need_stmt $JT 'J1c_Look();' "the PC test of Core::Look runs (J1c)"
+need_line $JT '        CHECK(!done.load());  // (Look waits for the Step under way: half of it is never read)' "J1c: Look waits for the lock a Step holds"
+need_line $JT '        CHECK(dlpjoin::HostsALobby(hosts, azahar));' "J8: a member hosts a lobby by its MAC, whatever its beacon's name"
+# ---- B5 of route B (spec 8 6.5, 2026-11-17): I5 over the real room of Tests/integration.sh - the app's page (its own Core) to the lobby's 9, its polite
+# leave, then the prepared child's plugin with HoldIdentity; I5a the child after the app is gone, I5b the app still listed while the child tries
+need Tests/run.sh 'Tests/dlp_real_room_probe.cpp Tests/mono_clock.cpp ConfigApp/source/dlp_join.cpp' "I5: the probe is built on the app's own dlp_join.cpp (the Core of the page, not a copy)"
+need_line $RP '#include "plugin_dlp_slice.inc"' "I5: the host's list of the members it waits for is the plugin's AwaitsChildOf, cut out of plugin.cpp"
+need_line $RP '            if (azl::ctr::AwaitsChildOf(m.game_id)) {' "I5: the host is told who it waits for by the plugin's own filter (kAppTid: the page)"
+need_line $RP '    RunI5(host, port, false);' "I5a runs: the child after the app's Stop"
+need_line $RP '    RunI5(host, port, true);' "I5b runs: the app still listed while the child tries"
+need_line $RP '        config.game_id = title_rules::kAppTid;' "I5: the page is in the room as 3DS Link's id (D-B4)"
+need_line $RP '        config.console_id_hash = "3ds-" + Hex12(console_) + "-dlp";' "I5: the page's console id has the -dlp suffix (D-B4)"
+need_line $RP '        config.preferred_mac = console_;  // (D-B4: the console'"'"'s own MAC - the child comes back with it)' "I5: the page joins with the console's MAC"
+need_line $RP '            rc.console_id_hash = "3ds-" + Hex12(console_);' "I5: the child has the plugin's console id"
+need_line $RP '            rc.preferred_mac = policy.prefer_real_mac() ? console_ : kNoPreferredMac;' "I5: the child's MAC is the policy's, as Plugin::Connect takes it"
+need_line $RP '        policy.HoldIdentity(kChildHoldMs);' "I5: the child holds its identity as the prepared child's EarlyInit sets it"
+need_line $RP 'static constexpr u32 kChildHoldMs = 8000;  // (Sources/ctr/plugin.cpp'"'"'s kChildHoldIdMs: what the prepared child gives HoldIdentity)' "I5: the probe's hold is the plugin's"
+need_line Sources/ctr/plugin.cpp 'constexpr u32 kChildHoldIdMs = 8000;' "... and the plugin's is 8 s (the probe's copy says the same)"
+need_after $RP '    bool Leave() {' '        const bool rounds = dlpjoin::LeaveRounds(*core, &platform::NowMs, &platform::SleepMs);' "I5: the page leaves as Session::Stop does: the two rounds first ..."
+need_after $RP '        const bool rounds = dlpjoin::LeaveRounds(*core, &platform::NowMs, &platform::SleepMs);' '        room.Stop();' "... then the room"
+need_line $RP '        rounds = app->Leave();' "I5: the page's leave is Session::Stop's"
+need_line $RP '    CHECK(rounds);  // (D-B10: two rounds of the network thread after the release, before the room was left)' "I5: the two rounds came"
+need_line $RP '    CHECK(ack);     // (the room answered the polite disconnect: LeaveAcknowledged)' "I5: the real room answered the leave"
+need_line $RP '    CHECK(child->room.mac() == console);  // the console'"'"'s own MAC, never a room-assigned one' "I5: the child keeps the console's MAC"
+need_line $RP '    CHECK(!child->policy.nickname_suffixed());  // the console'"'"'s name, never the suffix' "I5: the child keeps the console's name"
+need_line $RP '        CHECK_EQ(wrong_identity, 0u);' "I5: the room never lists the child under another MAC or a suffixed name"
+need_line $RP '        CHECK_EQ(child->joined_attempt, 1u);  // no collision: in at its first attempt' "I5a: no collision"
+need_line $RP '        CHECK_EQ(child->held, 1u);  // HeldIdentity said once' "I5b: the hold was used"
+need_line $RP '            CHECK(child->attempt_ms[child->joined_attempt - 1] >= app_gone_ms);' "I5b: in at an attempt after the app is gone ..."
+need_line $RP '            CHECK(child->attempt_ms[child->joined_attempt - 2] < app_gone_ms);' "... its first one"
+need_line $RP '    CHECK(exit_after_pass != 0 && exit_after_pass < dlp_real::ChildWait::kLeaveMs);  // (D-B1.6: out before the host takes the guest for an Azahar)' "I5: from the passphrase to the room exit under kLeaveMs"
+need_line $RP '    CHECK_EQ(end.back, 1u);  // route B: the page seen out, its child back with the same MAC: the end with it' "I5: the host's wait sees the page out and its child back"
+need_line $RP '    CHECK(std::memcmp(g_ns_bytes, host_mac.data(), 6) == 0 && std::memcmp(g_ns_bytes + 6, nine, 9) == 0 && g_ns_bytes[15] == 0);' "I5: the 16 bytes of the hand-over over the real room"
+[ "$(grep -c 'Hex12(' $RP)" = "3" ] || fail "$RP: a MAC is written out somewhere else than the two room identities (never in a line of the probe)"
+# ---- DPAPP-2e (2026-11-18): the line of the log of the children that reads a prepared title's icon by {tid, SD}, the way HOME is believed to read it
+# (FBI_reference/FBI/source/fbi/task/listtitles.c:30-36): after each install in the run's thread, and once an opening in the thread of the first look -
+# never the thread of the screen; a diagnostic only, nothing depends on it ----
+GW2=ConfigApp/source/dlp_guest.cpp
+GR2=ConfigApp/source/dlp_guest_run.cpp
+# (the order of the changes of the form makerom: here, where order_in is defined)
+HP=$(region ConfigApp/source/dlp_guest_logic.hpp 'inline NcchWhy HeaderPatches(const u8 plain_head[0xA00], u64 prepared, u64 am_title, PatchList* list) {' '}')
+order_in "ConfigApp/source/dlp_guest_logic.hpp HeaderPatches" "$HP" '    list->Add(kSciFlagsAt, &sci, 1);' '    ShaPatched(plain_head + kExheaderAt, kExheaderAt, kExheaderHashed, *list, h);' "DPAPP-2e: the SCI's change is under the exheader's new hash"
+order_in "ConfigApp/source/dlp_guest_logic.hpp HeaderPatches" "$HP" '        list->Add(kAciArm9At, arm9, 4);' '    ShaPatched(plain_head + kExheaderAt, kExheaderAt, kExheaderHashed, *list, h);' "DPAPP-2e: the ARM9's change too"
+[ "$(printf '%s\n' "$HP" | code_of | grep -c -F 'list->Add(')" = 10 ] || fail "ConfigApp/source/dlp_guest_logic.hpp HeaderPatches: another number of changes than the five ids, the SCI, the ARM9, 0x160, 0x18B and 0x18F (with HidePatches' three, 13 of the 16 a PatchList holds)"
+need_line $GW2 '    const Result open_rc = FSUSER_OpenFileDirectly(&handle, ARCHIVE_SAVEDATA_AND_CONTENT, archive, file, FS_OPEN_READ, 0);' "DPAPP-2e: HOME's icon is read by ARCHIVE_SAVEDATA_AND_CONTENT"
+need_line $GW2 '    const u32 archive_path[4] = {static_cast<u32>(am & 0xFFFFFFFFu), static_cast<u32>(am >> 32), MEDIATYPE_SD, 0};' "DPAPP-2e: ... with the title on the SD card (DPAPP-2f: by its id of AM)"
+need_line $GW2 '            lines.push_back(HomeIconLine("at the opening", AmTitleFor(g.prepared, g.form)));' "DPAPP-2f: the opening's lines by the id of AM of the record's form"
+need_line $GW2 '    static const u32 kIconPath[5] = {0x00000000, 0x00000000, 0x00000002, 0x6E6F6369, 0x00000000}; // the ExeFS, "icon" with its zeros (8 bytes)' "DPAPP-2e: ... the ExeFS's file icon"
+need_line $GW2 '    std::unique_ptr<u8[]> icon(new (std::nothrow) u8[kSmdhSize]);' "DPAPP-2e: the icon's 0x36C0 bytes are on the heap"
+need_line $GW2 '    const Result read_rc = FSFILE_Read(handle, &got, 0, icon.get(), kSmdhSize);' "DPAPP-2e: the whole SMDH is read"
+need $GW2 '"guest: home icon %016llX (%s): open rc=0x%08lX, read rc=0x%08lX %lu bytes, magic %s, flags 0x%08lX"' "DPAPP-2e: the line says the open, the read, the bytes, the magic and the flags"
+need_line $GW2 '    const u32 flags = got >= kSmdhFlagsAt + 4 ? LoadLe32(icon.get() + kSmdhFlagsAt) : 0;' "DPAPP-2e: ... the flags of the SMDH at 0x2028"
+[ "$(tr -d '\r' < $GW2 | code_of | grep -c 'FSFILE_Close(handle);')" = 2 ] || fail "$GW2: the icon's file is not closed on both ways out of HomeIconLine"
+[ "$(tr -d '\r' < $GW2 | code_of | grep -c 'HomeIconLine(')" = 3 ] || fail "$GW2: HomeIconLine is called somewhere else than the run's HomeIcon and LogHomeIconsOnce (the worker's threads only)"
+need_line $GW2 '        LogLine(run, "%s", HomeIconLine("after the install", AmTitleOf(prepared)).c_str());' "DPAPP-2e: the run's console writes the line in its log (DPAPP-2f: by the id of AM)"
+need_line ConfigApp/source/dlp_guest_run.hpp '    virtual void HomeIcon(u64 prepared) = 0;' "DPAPP-2e: the run asks for the line and gets nothing back (a preparation never fails because of it)"
+PR2=$(region $GR2 'int Prepare(const Planned& job, const RunIn& in, WorkConsole& c, JobNote* note) {' '}')
+order_in "$GR2 Prepare" "$PR2" '    c.Step("title version", AmTitleFor(prepared, form), now == Presence::Present ? static_cast<RunResult>(version) : -1);' '        c.HomeIcon(prepared);' "DPAPP-2e: HOME's icon is read after AM's commit and the title's version ..."
+order_in "$GR2 Prepare" "$PR2" '        c.HomeIcon(prepared);' '    const bool folder = c.Folder(ProcessIdFor(prepared, form), job.game, true);' "DPAPP-2e: ... before the plugin's folder, the block and the record"
+need_after $GR2 '    if (now == Presence::Present) {' '        c.HomeIcon(prepared);' "DPAPP-2e: ... only when AM lists the title"
+[ "$(tr -d '\r' < $GR2 | code_of | grep -c 'c.HomeIcon(')" = 1 ] || fail "$GR2: HOME's icon is read elsewhere than after an install"
+LM2=$(region $GW2 'void LookMain(void* arg) {' '}')
+[ "$(printf '%s\n' "$LM2" | code_of | grep -c -x -F '        LogHomeIconsOnce();')" = 1 ] || fail "$GW2: the quiet look does not write HOME's icons before it ends"
+[ "$(printf '%s\n' "$LM2" | code_of | grep -c -x -F '    LogHomeIconsOnce();')" = 1 ] || fail "$GW2: the look of Games does not write HOME's icons before it ends"
+[ "$(printf '%s\n' "$LM2" | grep -x -B1 -F '        l->finished.store(true);' | head -1)" = '        LogHomeIconsOnce();' ] || fail "$GW2: the quiet look does not read the icons right before it says it ended (after, the screen would wait in its join)"
+[ "$(printf '%s\n' "$LM2" | grep -x -B1 -F '    l->finished.store(true);' | head -1)" = '    LogHomeIconsOnce();' ] || fail "$GW2: the look of Games does not read the icons right before it says it ended (after, the screen would wait in its join)"
+[ "$(tr -d '\r' < $GW2 | code_of | grep -c 'LogHomeIconsOnce(')" = 3 ] || fail "$GW2: LogHomeIconsOnce is called somewhere else than LookMain (the thread of the look, never the screen's)"
+need_line $GW2 '    if (g_home_icons_logged.exchange(true) || ui::g.paths.datadir.empty()) {' "DPAPP-2e: once an opening of 3DS Link"
+need_line $GW2 '        if (g.state == GuestState::Installed && IsOwnedGuestTid(g.prepared)) {' "DPAPP-2e: ... for every prepared title of ours that is installed"
+sg=$(grep -r -l -E 'HomeIconLine|LogHomeIconsOnce' ConfigApp/source | LC_ALL=C sort | tr '\n' ' ')
+[ "$sg" = "ConfigApp/source/dlp_guest.cpp ConfigApp/source/dlp_guest_logic.hpp " ] || fail "HOME's icon is read in '$sg', expected dlp_guest.cpp only (dlp_guest_logic.hpp names it in a comment)"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '        CHECK(b.con.home_icons.size() == 1 && b.con.home_icons[0] == kPrepared);' "DPAPP-2e: the test sees HOME's icon read once after an install"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '        CHECK(b.con.StepAt("home icon") < b.con.StepAt("plugin folder") && b.con.StepAt("home icon") < b.con.StepAt("record and index"));' "DPAPP-2e: ... before the folder and the record"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '        CHECK_EQ(b.con.home_icons.size(), 1); // (a Finish that fails: no icon read)' "DPAPP-2e: ... and never after a Finish that failed"
+# ---- the review of DPAPP-2e (2026-11-18): a change the full PatchList refuses is said (never a child without it), the made-up child in the form
+# already and with an ACI above its descriptor, a Finish AM does not list reads no icon, the composer's version says its exception, the page's name
+# (Enable games) in the comments of the children, the line of HOME's icon says what it does not prove ----
+need_line ConfigApp/source/dlp_guest_logic.hpp '    bool lost = false; // an Add refused (the list full, a length out of 1..32): the changes are not all there and nothing may be made of them' "DPAPP-2e rev: the list remembers a change it refused"
+need_after ConfigApp/source/dlp_guest_logic.hpp '        if (n >= 16 || len == 0 || len > 32) {' '            lost = true;' "DPAPP-2e rev: ... at every refusal"
+need_line ConfigApp/source/dlp_guest_logic.hpp '    return list->lost ? NcchWhy::Patches : NcchWhy::Ok; // (a change refused: the hashes above were made without it)' "DPAPP-2e rev: HeaderPatches says a change refused"
+need_line ConfigApp/source/dlp_guest_logic.hpp '    return list->lost ? NcchWhy::Patches : NcchWhy::Ok; // (the same: a hidden child without one of its changes does not hold)' "DPAPP-2e rev: HidePatches says it too"
+[ "$(printf '%s\n' "$HP" | code_of | grep -c -F 'return list->lost ? NcchWhy::Patches : NcchWhy::Ok;')" = 1 ] || fail "ConfigApp/source/dlp_guest_logic.hpp HeaderPatches: it does not end saying a change refused"
+need_line Tests/settings_test/dlp_guest_test.cpp '        o.sci_sd = true;' "DPAPP-2e rev: the test makes a child in the form already"
+need_line Tests/settings_test/dlp_guest_test.cpp '        CHECK(r.sink.bytes.size() == p.cia.size() && r.sink.bytes[at + 0x20D] == p.plain[0x20D] && L32(r.sink.bytes, at + 0x5F0) == L32(p.plain, 0x5F0));  // (the form already: no bit moves)' "DPAPP-2e rev: ... and sees no bit move"
+need_line Tests/settings_test/dlp_guest_test.cpp '        o.aci_sd = true;   // (above its descriptor)' "DPAPP-2e rev: the test makes an ACI above its descriptor"
+need_line Tests/settings_test/dlp_guest_test.cpp '        CHECK(r.sink.bytes.size() == p.cia.size() && (L32(r.sink.bytes, at + 0x5F0) & 0x100) != 0 && L32(r.sink.bytes, at + 0x5F0) == L32(p.plain, 0x5F0));  // (an ACI above its descriptor kept)' "DPAPP-2e rev: ... and sees it kept"
+need_line Tests/settings_test/dlp_guest_test.cpp '        CHECK(HeaderPatches(m.plain.data(), prepared, prepared, &full) == NcchWhy::Patches && full.lost && full.n == 16);  // (7 + 10: one refused, said)' "DPAPP-2e rev: the test fills the list past 16 in HeaderPatches"
+need_line Tests/settings_test/dlp_guest_test.cpp '            CHECK(why == (extra == 13 ? NcchWhy::Ok : NcchWhy::Patches));  // (13 + 3 fit, 14 + 3 do not)' "DPAPP-2e rev: ... and in HidePatches"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '    bool finish_forgets = false; // AM takes the Finish but does not list the title after it' "DPAPP-2e rev: the fake AM can take a Finish and not list the title"
+need_after Tests/settings_test/dlp_guest_run_test.cpp '        if (!finish_forgets && !(hidden && hidden_not_listed)) {' '            titles[tmd.tid] = {lie_version != 0 ? lie_version : tmd.version, product};' "DPAPP-2e rev: ... and then does not list it"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '        b.con.finish_forgets = true;' "DPAPP-2e rev: the test of a Finish AM does not list"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '        CHECK(b.con.home_icons.empty()); // (AM does not list the title: no icon read)' "DPAPP-2e rev: ... reads no icon"
+need ConfigApp/source/dlp_guest.cpp 'rc 0 with magic SMDH does NOT prove that' "DPAPP-2e rev: the line of HOME's icon says what it does not prove"
+for f in ConfigApp/source/dlp_guest.cpp ConfigApp/source/dlp_guest.hpp ConfigApp/source/dlp_guest_run.cpp ConfigApp/source/dlp_guest_run.hpp ConfigApp/source/dlp_guest_logic.hpp; do
+  ! grep -q -F 'Download Play > Games' "$f" || fail "$f names the page Download Play > Games, comments too (its name is Enable games since 2026-11-18)"
+done
+# ---- DPAPP-2e slot25 (2026-11-18): a child of method 1 (0x18B = 1) opened with the KeyX of slot 0x25 that the app finds in the boot.firm the console
+# starts from (analysis/piano-1.1.4-2026-11-15/luigi-308-2026-11-18/CAUSA-E-PROGETTO.md, the way H); the line of the log of every 308; the composer's
+# version 2. Which key for which part, the two confirmations (0x1E0, .code), the wipes, boot.firm read only and only on the run's thread, the line of
+# the case and never a key in it, and no key in any file (the tests make theirs up) ----
+need_line $GL '        if (head[0x18B] != 0 && head[0x18B] != 1) {' "DPAPP-2e slot25: methods 0 and 1 only are opened (0x0A/0x0B and any other value: Method, 308)"
+need $GL '    p.two_keys = !plain && head[0x18B] == 1;' "DPAPP-2e slot25: method 1 has two keys"
+# which key: the exheader, the ExeFS's header, icon and banner (and what no file covers) under the primary key; the ExeFS's other files and the RomFS under the
+# secondary (Azahar am.cpp CryptoRegion, 3dbrew NCCH)
+need_line $GL '        if (!plan.two_keys || r.type == 1) {' "DPAPP-2e slot25: the exheader (and every region of method 0) under the primary key"
+need_line $GL '        if (r.type == 3) {' "DPAPP-2e slot25: the RomFS of method 1 ..."
+need_line $GL "            aes_ctr_crypt(rk2, ctr, a - r.at, buf + (a - off), static_cast<std::size_t>(b - a));  // method 1's RomFS: the secondary key" "DPAPP-2e slot25: ... under the secondary key"
+need_line $GL '            const u32* key = rk;' "DPAPP-2e slot25: a byte of the ExeFS no file of the secondary list covers (its header, icon, banner) under the primary key"
+need_line $GL '                    key = rk2;' "DPAPP-2e slot25: ... a file of the list under the secondary"
+need_line $GL '        if (std::memcmp(e, "icon", 4) == 0 || std::memcmp(e, "banner", 6) == 0) {' "DPAPP-2e slot25: icon and banner stay under the primary key (Azahar EXEFS_PRI)"
+need_line $GL '        const u64 span = (static_cast<u64>(size) + kMediaUnit - 1) / kMediaUnit * kMediaUnit;' "DPAPP-2e slot25: a file under the secondary key to its end rounded up to 0x200 (Azahar AlignUp)"
+need_line $GL '        if (off % 16 != 0 || 0x200ull + off + size > plan->exefs_size) {' "DPAPP-2e slot25: a file outside the ExeFS or off the 16-byte blocks is refused"
+need_line $GL '            if (i != j && x.at < y.at + y.size && y.at < x.at + x.size) {' "DPAPP-2e slot25: ... and two files over each other"
+need_line $GL '            std::memcpy(plan->code_hash, exefs_head + 0xC0 + (9 - i) * 32, 32);' "DPAPP-2e slot25: .code's SHA-256 is taken from the ExeFS header"
+need_line $GC "        const int keyed = SecondaryKey(in, src, plan, plain_head, part_b, sec.rk2, out);  // (method 1: the KeyX of slot 0x25, from boot.firm)" "DPAPP-2e slot25: the composer finds the secondary key before it opens anything of the child"
+need_order $GC '    if (HeaderPatches(plain_head, in.prepared, in.am_title != 0 ? in.am_title : in.prepared, &patches) != NcchWhy::Ok) {' '        const int keyed = SecondaryKey(in, src, plan, plain_head, part_b, sec.rk2, out);' "DPAPP-2e slot25 rev: the exheader's hash holds with the primary key before boot.firm is read (a damaged content is 309)"
+need_order $GC '        const int keyed = SecondaryKey(in, src, plan, plain_head, part_b, sec.rk2, out);' '    src.plan = &plan;' "DPAPP-2e slot25: ... and the secondary key is there before any part under it is read"
+need_line $GC '        if (ExefsKeys(exefs_head, &plan) != NcchWhy::Ok) {' "DPAPP-2e slot25: the ExeFS's files and their keys before any of them is read"
+need_order $GC '        if (ExefsKeys(exefs_head, &plan) != NcchWhy::Ok) {' '        IconPlace icon;' "DPAPP-2e slot25: ... before the icon is looked at"
+# the search: boot.firm whole and right, every 16 bytes aligned to 4, the ARM9's sections first; "IVFC" 0x10000, then 0x1E0 (the first confirmation)
+need_line $GL '    if (firm == nullptr || n < kFirmHeaderBytes || n > kFirmMaxBytes || std::memcmp(firm, "FIRM", 4) != 0) {' "DPAPP-2e slot25: a FIRM, whole and not too big"
+need_line $GL '            if (std::memcmp(hash, h + 0x10, 32) != 0) {' "DPAPP-2e slot25: every section's SHA-256 holds"
+need_line $GL '            if (s.offset < kFirmHeaderBytes || s.offset > n || s.size > n - s.offset) {' "DPAPP-2e slot25: every section inside the file"
+need_line $GL "            for (u32 at = sec[i].offset + ((0u - sec[i].load) & 3u); at <= last; at += 4) {  // (aligned to 4 where it is loaded: Luma's constant is aligned(4))" "DPAPP-2e slot25 rev: every 16 bytes aligned to 4 where the section is loaded is a candidate"
+need_line $GL '            if (sec[i].size < 16 || Arm9Section(sec[i], entry) != (pass == 0)) {' "DPAPP-2e slot25: the ARM9's sections first"
+need_line $GL '    return (s.load >= kArm9MemFrom && s.load < kArm9MemTo) || (arm9_entry >= s.load && arm9_entry - s.load < s.size);' "DPAPP-2e slot25: an ARM9 section by its load address or the entry point"
+need_line $GL '                if (std::memcmp(block, "IVFC", 4) != 0 || LoadLe32(block + 4) != kRomfsMagicVersion) {' "DPAPP-2e slot25: a candidate gives IVFC and version 0x10000"
+need_line $GL 'constexpr u32 kRomfsMagicVersion = 0x10000;       // the IVFC header of a RomFS: "IVFC", then 0x00010000' "DPAPP-2e slot25: ... the version of every RomFS"
+need_line $GL '                if (!RomfsHashHolds(rk, ctr, romfs, hashed, ncch_head + 0x1E0)) {' "DPAPP-2e slot25: CONFIRMED by the superblock's SHA-256 at 0x1E0"
+FS25=$(region $GL 'inline Slot25Search FindSlot25(' '}')
+order_in "$GL FindSlot25" "$FS25" '                if (!RomfsHashHolds(rk, ctr, romfs, hashed, ncch_head + 0x1E0)) {' '                std::memcpy(x_out, firm + at, 16);' "DPAPP-2e slot25: no KeyX is given before 0x1E0 holds"
+for w in 'Wipe(key, sizeof(key));' 'Wipe(block, sizeof(block));' 'Wipe(rk, sizeof(rk));'; do
+  [ "$(printf '%s\n' "$FS25" | code_of | grep -c -F -- "$w")" = 1 ] || fail "$GL FindSlot25: '$w' is not there once (the keys of the search are wiped)"
+done
+need_line $GL '    Wipe(piece, sizeof(piece));  // (plain bytes of a game)' "DPAPP-2e slot25: the superblock's bytes in the clear are wiped"
+# .code (the second confirmation): hashed in the clear in the stream, before the changes; compared before anything is made of the child
+need_line $GC '            sha256_update(&code, in.buf + (ca - off), static_cast<std::size_t>(cb - ca));' "DPAPP-2e slot25: .code is hashed in the stream"
+CP=$(region $GC 'int Compose(const ComposeIn& in, Composed* out) {' '}')
+order_in "$GC Compose" "$CP" '        NcchDecrypt(plan, sec.rk, sec.rk2, off, in.buf, n);' '            sha256_update(&code, in.buf + (ca - off), static_cast<std::size_t>(cb - ca));' "DPAPP-2e slot25: ... in the clear"
+order_in "$GC Compose" "$CP" '            sha256_update(&code, in.buf + (ca - off), static_cast<std::size_t>(cb - ca));' '        ApplyPatches(patches, off, in.buf, n);' "DPAPP-2e slot25: ... before the changes"
+need_line $GC '        if (std::memcmp(code_hash, plan.code_hash, 32) != 0) {' "DPAPP-2e slot25: .code's SHA-256 holds or nothing is made"
+need_after $GC '        if (std::memcmp(code_hash, plan.code_hash, 32) != 0) {' '            return kErrChildCrypto;  // (method 1) the KeyX found does not open .code: the second confirmation fails, nothing is installed' "DPAPP-2e slot25: ... 308, step code hash"
+order_in "$GC Compose" "$CP" '        if (std::memcmp(code_hash, plan.code_hash, 32) != 0) {' '    if (!MakeFront(out->front, lay, out->tik, tmd, in.am_title != 0 ? in.am_title : in.prepared, out->new_hash)) {' "DPAPP-2e slot25: ... before the front is made"
+# the keys of method 1 wiped: the secondary round keys on every way out of Compose, the KeyX and its normal key in SecondaryKey, boot.firm at the end of the run
+need_line $GC '        Wipe(rk2, sizeof(rk2));' "DPAPP-2e slot25: the secondary key's round keys are wiped on every way out of Compose"
+SK=$(region $GC 'int SecondaryKey(' '}')
+[ "$(printf '%s\n' "$SK" | code_of | grep -c -F 'Wipe(x, sizeof(x));')" = 2 ] || fail "$GC SecondaryKey: the KeyX found is not wiped on both of its ways out"
+[ "$(printf '%s\n' "$SK" | code_of | grep -c -F 'Wipe(key, sizeof(key));')" = 1 ] || fail "$GC SecondaryKey: the secondary normal key is not wiped"
+need_line $GW '        Wipe(firm.data.get(), firm.size); // (boot.firm holds the KeyX of slot 0x25: not left in the heap)' "DPAPP-2e slot25: boot.firm is wiped at the end of the run"
+# boot.firm: read only, from sdmc:/boot.firm then /boot.firm of the CTRNAND, when a child of method 1 asks, on the run's thread (FirmOf is the run's FirmFn)
+need_line $GW 'constexpr const char* kSdFirm = "sdmc:/boot.firm";' "DPAPP-2e slot25: the SD card's boot.firm first"
+need_line $GW 'constexpr const char* kNandFirm = "/boot.firm";' "DPAPP-2e slot25: ... then the CTRNAND's"
+need_line $GW '    FILE* file = std::fopen(kSdFirm, "rb");' "DPAPP-2e slot25: the SD card's boot.firm is opened to be read"
+need $GW 'FSUSER_OpenFileDirectly(&file, ARCHIVE_NAND_CTR_FS, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, kNandFirm), FS_OPEN_READ, 0);' "DPAPP-2e slot25: the CTRNAND's boot.firm is opened to be read, nothing else (CtrNandRo)"
+for fn in 'bool LoadSdFirm(' 'bool LoadNandFirm(' 'bool FirmOf('; do
+  if region $GW "$fn" '}' | code_of | grep -n -E 'FS_OPEN_WRITE|FS_OPEN_CREATE|FSFILE_Write|fwrite|fopen\([^)]*"[wa]|fopen\([^)]*\+|remove\(|rename\('; then
+    fail "$GW ${fn}...: boot.firm is written, made or moved (it is read, only)"
+  fi
+done
+need_line $GW '        const bool ok = LoadSdFirm(f, sd, sizeof(sd)) || LoadNandFirm(f, nand, sizeof(nand));' "DPAPP-2e slot25: the SD card's boot.firm first (the one boot9strap starts), the CTRNAND's only without it"
+need_line ../DlpLink/rsf/3dslink.rsf '   - CtrNandRo' "DPAPP-2e slot25: the app may read the CTRNAND (its boot.firm when the SD card has none)"
+[ "$(tr -d '\r' < $GW | code_of | grep -c -F 'LoadSdFirm(')" = 2 ] || fail "$GW: LoadSdFirm is called elsewhere than FirmOf (boot.firm is read only when a child of method 1 asks)"
+[ "$(tr -d '\r' < $GW | code_of | grep -c -F 'LoadNandFirm(')" = 2 ] || fail "$GW: LoadNandFirm is called elsewhere than FirmOf"
+[ "$(tr -d '\r' < $GW | code_of | grep -c -F '&FirmOf')" = 1 ] || fail "$GW: FirmOf is handed out more than once (the run's thread alone reads boot.firm)"
+RM=$(region $GW 'void RunMain(void* arg) {' '}')
+printf '%s\n' "$RM" | grep -q -F '    in.firm = &FirmOf;' || fail "$GW: FirmOf is not the FirmFn of the run (RunMain: the worker's thread, never the screen's)"
+[ "$(grep -r -l -E 'kSdFirm|kNandFirm|"sdmc:/boot\.firm"|"/boot\.firm"' ConfigApp/source --include=*.cpp --include=*.hpp --include=*.c --include=*.h | tr '\n' ' ')" = "ConfigApp/source/dlp_guest.cpp " ] || fail "boot.firm is opened by a file of the app other than dlp_guest.cpp (FirmOf: read only, on the run's thread)"
+# the line of the case: after the step "compose", for every 308 and for the KeyX found; its words; never a key in it
+need_line $GR '    if (rc == kErrChildCrypto || made.slot25 != Slot25Step::None) {' "DPAPP-2e slot25 rev: the line of the log for every 308 and every child the search ran for (also found, then failed)"
+order_in "$GR Prepare" "$PR" '    c.Step("compose", made.tmd.tid, rc);' '        c.Note(line);' "DPAPP-2e slot25: ... right after the step compose"
+need_order $GC '    std::memcpy(out->ncch_flags, plain_head + 0x188, sizeof(out->ncch_flags));' '    out->why = ReadNcch(plain_head, lay.content, *in.keys, &plan);' "DPAPP-2e slot25: the flags 0x188-0x18F are kept before the NCCH is judged"
+need $GC 't.Put(" why Method (0x18B=01: slot 0x25) step ");' "DPAPP-2e slot25: the line says method 1 and the step of the search"
+need $GC 't.Put(method == 0x0A ? ": slot 0x18, not supported)" : (method == 0x0B ? ": slot 0x1B, not supported)" : ": unknown)"));' "DPAPP-2e slot25: ... 0x0A, 0x0B, the rest"
+need $GC 't.Put(c.why == NcchWhy::Seed ? " why Seed (0x18F=" : " why FixedKey (0x18F=");' "DPAPP-2e slot25: ... seed and fixed key"
+need $GC 't.Put(" slot 0x25 key found at 0x");' "DPAPP-2e slot25: ... and where the KeyX was found (an offset)"
+if region $GC 'void CryptoLine(' '}' | code_of | grep -n -E '\b(rk2?|title_key|enc_key|keys|x_out|slot25_x|dk|front|meta|new_hash|firm)\b|\.keys|->keys'; then
+  fail "$GC CryptoLine reads something that is a key or a byte of the game (it says ids, flags, an offset, counts, a time)"
+fi
+need_line $GL '    case kErrChildCrypto: return "The guest is locked in a way 3DS Link could not open (see the log).";  // (DPAPP-2e slot25 rev: the case is in the log'"'"'s line)' "DPAPP-2e slot25 rev: the words of 308, true for every case of it"
+need_line $GL '    case kErrChildCrypto: return "Start Luma3DS from sd:/boot.firm and try again; if it fails, join with your own copy.";' "DPAPP-2e slot25 rev: ... and what to do, with the way out for the cases boot.firm does not help"
+need_line ConfigApp/source/dlp_guest_store.hpp '/// changed Compose and kept 1, by the decision of its task (home-figlio-2026-11-18/CAUSA-E-RIMEDIO.md 3.2); the build 2e slot25 kept 1 too.' "DPAPP-2e slot25 rev: the composer's version stays 1 (finding 1 of the review: no child made again without a reason)"
+# no key in any file: the app's sources of the children and their tests carry no 16-byte array and no 32 hex digits but the public vectors and md5 the test had
+for f in ConfigApp/source/dlp_guest*.?pp Tests/settings_test/dlp_guest_synth.hpp Tests/settings_test/dlp_guest_run_test.cpp Tests/settings_test/dlp_guest_test.cpp; do
+  if grep -n -E '(0x[0-9A-Fa-f]{2}, *){15}0x[0-9A-Fa-f]{2}' "$f"; then
+    fail "$f has an array of 16 bytes written out (a key? the KeyX of slot 0x25 is in no file: the app finds it in boot.firm, the tests make theirs up)"
+  fi
+done
+if grep -n -E '[0-9A-Fa-f]{32}' ConfigApp/source/dlp_guest*.?pp Tests/settings_test/dlp_guest_synth.hpp Tests/settings_test/dlp_guest_run_test.cpp; then
+  fail "a source of the children or its test has 32 hex digits written out (a key?)"
+fi
+[ "$(tr -d '\r' < $GT | grep -c -E '[0-9A-Fa-f]{32}')" = 9 ] || fail "$GT: another line with 32 hex digits (only FIPS-197, SP 800-38A and the md5 of V2vis/V2/M3c1/M3a are there: never a key of the console)"
+need_line Tests/settings_test/dlp_guest_synth.hpp '    Rng(o.rng ^ 0x2525).Fill(m.keys.slot25_x, 16);  // (a generator of its own: r'"'"'s sequence, and every child of method 0, as before)' "DPAPP-2e slot25: the tests' KeyX of slot 0x25 is made up"
+[ "$(tr -d '\r' < Tests/settings_test/dlp_guest_synth.hpp | grep -c -F 'slot25_x')" = 4 ] || fail "Tests/settings_test/dlp_guest_synth.hpp: the made-up KeyX of slot 0x25 comes from somewhere else than its generator"
+need_line Tests/settings_test/dlp_guest_synth.hpp '        KeyOf(o.method == 1 ? m.keys.slot25_x : m.keys.ncch_x, &p[0], m.keys.generator, key2);' "DPAPP-2e slot25: the made-up child of method 1 has its secondary key"
+need_line Tests/settings_test/dlp_guest_synth.hpp '            take(m.code_at, o.code_bytes);' "DPAPP-2e slot25: ... over .code"
+# (the review of DPAPP-2e slot25) the time of the search alone, a superblock too large, icon and banner never under a secondary span, Composed cleared
+# first, a failed read of boot.firm wiped, the handles closed on every way
+need_order $GC '        return done(Slot25Step::FirmMissing, kErrChildCrypto);' '        t0 = in.clock_ms();  // (after boot.firm is read: the ms of the line are the search'"'"'s, never the SD card'"'"'s or the CTRNAND'"'"'s)' "DPAPP-2e slot25 rev: the time starts after boot.firm is read"
+[ "$(tr -d '\r' < $GC | code_of | grep -c -F 'in.clock_ms()')" = 2 ] || fail "$GC: the clock is read elsewhere than at the search's start and end"
+need_line $GC '        return done(Slot25Step::RomfsLarge, kErrChildCrypto);  // (a superblock larger than the room to check it: never seen, never guessed)' "DPAPP-2e slot25 rev: a superblock too large has its own step"
+need_line $GL '    case Slot25Step::RomfsLarge: return "romfs too large";  // (the superblock 0x1B8 names is larger than the room to check it: no candidate tried)' "DPAPP-2e slot25 rev: ... and its name"
+need_line $GL '            primary[n_primary++] = {plan->exefs_at + 0x200 + off, size};' "DPAPP-2e slot25 rev: icon and banner are known to ExefsKeys"
+need_line $GL '            if (x.at < y.at + y.size && y.at < x.at + x.size) {' "DPAPP-2e slot25 rev: ... and no span of the secondary key falls on them"
+order_in "$GC Compose" "$CP" '    std::memset(out, 0, sizeof(*out));  // (first, before any way out: the run'"'"'s line reads slot25 of THIS child, never one of before)' '        return kErrCannotHide;  // the user'"'"'s decision: a prepared child is never installed visible (the plain P2a is made by Tests/ alone, for its md5)' "DPAPP-2e slot25 rev: Composed is cleared before any way out of Compose"
+[ "$(printf '%s\n' "$CP" | code_of | grep -c -F 'std::memset(out, 0, sizeof(*out));')" = 1 ] || fail "$GC Compose: Composed is not cleared once, first"
+[ "$(tr -d '\r' < $GW | code_of | grep -c -F 'Wipe(f->data.get(), static_cast<std::size_t>(n));')" = 2 ] || fail "$GW: a read of boot.firm that failed half way is not wiped before it is freed (it may hold the KeyX)"
+[ "$(region $GW 'bool LoadSdFirm(' '}' | code_of | grep -c -F 'std::fclose(file);')" = 2 ] || fail "$GW LoadSdFirm: the SD card's boot.firm is not closed on every way out"
+[ "$(region $GW 'bool LoadNandFirm(' '}' | code_of | grep -c -F 'FSFILE_Close(file);')" = 2 ] || fail "$GW LoadNandFirm: the CTRNAND's boot.firm is not closed on every way out"
+need_line $GC '    if (plan.two_keys && plan.exefs_size >= 0x200) {' "DPAPP-2e slot25 rev: the ExeFS's keys are known for the visible child too"
+[ "$(printf '%s
+' "$CP" | code_of | grep -c -F 'SecondaryKey(')" = 1 ] || fail "$GC Compose: the search in boot.firm is called elsewhere than once, after the exheader's hash"
+need_line $GC '        timed = true;' "DPAPP-2e slot25 rev: the search's time is taken"
+need_line $GL '                return NcchWhy::Regions;  // (a span of the secondary key over icon or banner)' "DPAPP-2e slot25 rev: a span of the secondary key over icon or banner is refused"
+# the tests
+need_line $GT '    TestSlot25();' "DPAPP-2e slot25: the test of method 1 runs"
+need_line $GT '            CHECK(r.slot25 == Slot25Step::Found && r.slot25_at == firm.key_at && r.firm_asks == 1);' "DPAPP-2e slot25: the test finds the made-up KeyX where it is"
+need_line $GT '        CHECK(Lower(r.line).find(key_hex) == std::string::npos);  // the KeyX is never in the line' "DPAPP-2e slot25: the test sees no key in the line"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::NoKey && r.slot25_at == 0);' "DPAPP-2e slot25: the test of a boot.firm without the KeyX"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::FirmMissing && r.temp.writes == 0 && r.sink.calls == 0);' "DPAPP-2e slot25: ... without boot.firm"
+need_line $GT '            CHECK(r.slot25 == Slot25Step::FirmBad && r.candidates == 0 && r.temp.writes == 0);' "DPAPP-2e slot25: ... a boot.firm with a wrong hash, no FIRM, cut, too big"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::NoRomfs && r.firm_asks == 0 && r.temp.writes == 0);' "DPAPP-2e slot25: ... a child without RomFS"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::RomfsHash && r.slot25_at == pf.key_at && r.temp.writes == 0);' "DPAPP-2e slot25: ... 0x1E0 wrong"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::CodeHash && r.slot25_at == pf.key_at && r.sink.calls == 0);' "DPAPP-2e slot25: ... .code wrong"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::Found && r.slot25_at == other.key_at);' "DPAPP-2e slot25: ... the KeyX in another section than the ARM9's"
+need_line $GRT '    TestSlot25();' "DPAPP-2e slot25: the worker's test of method 1 runs"
+need_line $GRT '        CHECK(FindChildFailure(LoadChildrenCache(), kGame, 0x10, 0) == nullptr);' "DPAPP-2e slot25: a 308 of a Prepare is not remembered (A tries again)"
+need_line $GRT '        CHECK(b.con.StepAt("compose") >= 0 && b.con.StepAt("compose") + 1 == b.con.StepAt("note"));' "DPAPP-2e slot25: the worker writes the line right after compose"
+need_line $GRT '        CHECK_EQ(RunJob(Job(Act::Prepare), b.in, b.con, &note), kErrSourceHash);' "DPAPP-2e slot25 rev: the worker's test of a key found, then 310"
+need_line $GT '        CHECK(r.line.find(" key found at 0x00005200, 5121 candidates, 3 ms") != std::string::npos);' "DPAPP-2e slot25 rev: the test of the search's time"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::Found && r.slot25_at == moved.key_at && moved.key_at == 0x5202);' "DPAPP-2e slot25 rev: the test of a section loaded off the file's boundaries"
+need_line $GT '        CHECK(r.firm_asks == 0 && r.slot25 == Slot25Step::None && r.temp.writes == 0);' "DPAPP-2e slot25 rev: the test of a damaged exheader (309 before boot.firm)"
+need_line $GT '        CHECK(r.slot25 == Slot25Step::RomfsLarge && r.firm_asks == 0 && r.candidates == 0);' "DPAPP-2e slot25 rev: the test of a superblock too large"
+
+# ---- DPAPP-2f (2026-11-19, analysis/piano-1.1.4-2026-11-15/prova-2e-2026-11-19): the hidden form M3c1, B2 and B3, the plugin untouched -----
+# Two ids of a prepared child (dlp_guest_store.hpp): AM's (the ticket, the TMD, the NCCH's 0x108/0x118: 00040001|low, which HOME drops by its category
+# with Luma's region-free patch) and the PROCESS's (the exheader's 0x3C8/0x400/0x800: the prepared id, which Luma gives the codeset and the plugin
+# knows). The index, the .guest, the .bin and /luma/plugins stay on the prepared id. The children of composer 1 are to update (D4); a system that
+# refuses the hidden form gets the old one (D2: kErrShownInHome, said on the sheet); the NAND is never named (D3: left to the user).
+GS2H=ConfigApp/source/dlp_guest_store.hpp
+need_line $GS2H 'constexpr u8 kPreparedForm = kFormDlpChild;' "DPAPP-2j: every child is prepared in the form M3c1 (the real AM refused the system form on the SD card, prova-2i; M3c1 it took, prova-2g)"
+need_line $GS2H 'constexpr bool kFallbackToApplicationForm = false;' "DPAPP-2j: no fallback to the old form - never a child in HOME without the user knowing it (kErrCannotHide)"
+need_line $GS2H '    kFormApplication = 0, ///< AM id = process id = the key (00040000): HOME shows it (a black icon with Luma'"'"'s region free); never installed again' "DPAPP-2f: the old form is 0 (a record without form= is of it)"
+need_line $GS 'std::atomic<u8> g_form[kRegistrySlots]; // (the build 2f) the form of the title of the same slot: AmTitleOf, the jump' "DPAPP-2f: the registry keeps each title's form"
+need_line $GS '            ok = ReadForm(v, &g.form);' "DPAPP-2f: a form this version does not know is a record refused ..."
+need_line $GS '    if (v != "app" && v != "dlp" && v != "sys") {' "DPAPP-2h: ... app, dlp, sys and nothing else"
+need_line $GS '    t += std::string("form=") + FormWord(g.form) + "\n"; // (the build 2f: the id AM has the title by, AmTitleFor; the build 2h: sys)' "DPAPP-2f: the record says its form"
+[ "$(grep -r -n -F 'AmTitleFor(' ConfigApp/source --include=*.cpp --include=*.hpp | grep -v -E '^ConfigApp/source/dlp_guest(_store|_am|_run|_ids|_ids_am)?\.(cpp|hpp):' | wc -l)" = 0 ] || fail "DPAPP-2f: the id of AM is made outside the store, AM, the worker and the controller of the children"
+[ "$(grep -r -n -i -E '0x000400010f[0-9a-f]{6}' ConfigApp/source --include=*.cpp --include=*.hpp | grep -v '^ConfigApp/source/dlp_guest_store\.hpp:' | wc -l)" = 0 ] || fail "DPAPP-2f: an id of AM of the hidden form is written by hand outside dlp_guest_store.hpp (use AmTitleFor)"
+# the fallback (D2): only for a system that did not take the hidden form - never for a hidden child it took before -, said by a step, with the memo
+PO2=$(region $GR 'int Prepare(const Planned& job, const RunIn& in, WorkConsole& c, JobNote* note) {' '}')
+[ "$(tr -d '\r' < $GR | grep -c -x -F '        if (had && Listed(f.at[x]) && !(f.read[x] && OtherProduct(f.product[x], before.product))) {')" = 1 ] || fail "$GR: Prepare installs next to (or over) a title that is not ours on one of the ids (DPAPP-2f; DPAPP-2h: the three, InstallOwnership)"
+need_line $GR '    if (took == Took::Refused && form != kFormApplication && !HiddenTakenBefore(had, before)) {' "DPAPP-2f: the fallback only when AM refused a hidden form it never took for this title (DPAPP-2f-rev: the record says it, as for the memo)"
+order_in "$GR Prepare" "$PO2" '        c.Step("hidden form not taken", AmTitleFor(prepared, form), rc);' '        if (!kFallbackToApplicationForm) {' "DPAPP-2f: the refusal is a line of the log before anything else"
+order_in "$GR Prepare" "$PO2" '            in.hidden_refused->store(true);' '        g.form = form;' "DPAPP-2f: ... and the memo of the session"
+order_in "$GR Prepare" "$PO2" '        c.Step("hidden form not taken", AmTitleFor(prepared, form), rc);' '        c.Step("fallback: made again in the old form", AmTitleFor(prepared, form), 0);' "DPAPP-2f: the fallback says itself"
+need_line $GR '            return kErrCannotHide;' "DPAPP-2f: the fallback switched off leaves no child (kErrCannotHide)"
+need_line $GR '            kept.composer = kComposerVersion;' "DPAPP-2f: the old child kept by a fallback is not made again at every look"
+need_line $GR '    return fell_back ? kErrShownInHome : 0; // (the fallback: the child works, HOME shows it - the sheet of the game says so)' "DPAPP-2f: the fallback ends with kErrShownInHome"
+need_line $GR '        c.Step("hidden form skipped: refused earlier in this session", prepared, 0);' "DPAPP-2f: the memo is a line of the log"
+need_line $GR '    if (refused_before && form != kFormApplication && !HiddenTakenBefore(had, before)) {' "DPAPP-2f: the memo never turns a hidden child back into the old form"
+need_after $GR 'bool HiddenTakenBefore(bool had, const Guest& before) {' '    return had && before.form == kPreparedForm;' "DPAPP-2f-rev: one condition for the memo and the fallback: the record of the hidden form (DPAPP-2j: M3c1, the form made)"
+need_after $GR '        if (sd == Presence::Absent) {' '            c.Step("not on the SD card: where AM put it is not looked at", AmTitleFor(prepared, form), -1);' "DPAPP-2f: a hidden form AM does not list on the SD card after its Finish is a refusal (the NAND is not looked at: D3)"
+need_line $GR '    g.composer = 0; // (nobody here saw how it was made: the next look prepares it again, in the system form)' "DPAPP-2f: an adopted child is made again by the next look (composer 0), in any form"
+need_line $GR '    for (const u8 x : kForms) {' "DPAPP-2h: Adopt looks at the forms in kForms' order (the system one first)"
+need_line ConfigApp/source/dlp_guest_logic.hpp 'constexpr int kErrShownInHome = 324;' "DPAPP-2f: the result of the fallback"
+need_line ConfigApp/source/dlp_guest_logic.hpp 'constexpr int kErrFirst = kErrNoBoot9, kErrLast = kErrSdIo;' "DPAPP-2j: ... the last of the results (330, an error of the SD card)"
+need_line $GW 'std::atomic<bool> g_hidden_refused{false};' "DPAPP-2f: the memo of the session is the controller's"
+need_line $GW '    in.hidden_refused = &g_hidden_refused; // (the build 2f: the memo of the session)' "DPAPP-2f: ... handed to the run"
+need_line $GW '        u8 form = record != nullptr ? record->form : kPreparedForm;' "DPAPP-2h: LookAround asks AM by the record's form, without a record the first form AM lists (kForms: the system one first)"
+need_line $GW '        row.at = PresenceIn(listed ? &sd : nullptr, g.prepared, g.form, &version); // (the build 2f: by the record'"'"'s form)' "DPAPP-2f: the page's rows by the record's form"
+need $GW '"guest: delete %016llX (%s form): title rc=0x%08lX, user rc=0x%08lX, ticket %s0x%08lX, pending rc=0x%08lX, %s"' "DPAPP-2f: every Result of a removal is a line of the log (DPAPP-2h: the ticket skipped said)"
+need_line $GP '                note = it.old_form ? "HOME shows it as a black icon: an older 3DS Link made it."' "DPAPP-2f: the sheet of a game whose child is in the old form says so (DPAPP-2f-rev: made by an older 3DS Link)"
+need_line $GP '                                   : "HOME shows it as a black icon: the system refused the hidden guest.";' "DPAPP-2f: ... or refused (the fallback)"
+need_line $GP '                                : (it.old_form ? "Its guest shows in HOME as a black icon: update it to hide it." // (the build 2f: composer 1, the old form)' "DPAPP-2f: ... and 'to update' says why"
+need_line ConfigApp/source/main.cpp '                                                    static_cast<unsigned long long>(dlpguest::AmTitleOf(g.child_jump))));' "DPAPP-2f: the log of the jump names the id of AM"
+need_line ConfigApp/source/pages_dlpjoin.cpp '            g.child_jump = prepared;' "DPAPP-2f: the jump keeps the prepared id (the guards of main.cpp); main.cpp asks AmTitleOf"
+# the plugin is untouched: the exheader's ids, IsPreparedId and the index stay what they were (Sources/ and Includes/ are not part of this piece)
+need_line Includes/azl/title_rules.hpp '    return static_cast<u32>(tid >> 32) == kTitleHighApplication && (static_cast<u32>(tid) & kPreparedBandMask) == kPreparedBand;' "DPAPP-2f: the plugin knows a prepared child by 00040000 of the band, as before (its binary is unchanged)"
+# B2: who hosts a game's Download Play (dlp_text.hpp, read only from title_rules)
+DT=ConfigApp/source/dlp_text.hpp
+need_line $DT '    return azl::title_rules::DlpOf(game).mode == azl::DlpGameMode::RealDlp' "DPAPP-2f B2: a console with 3DS Link hosts only the RealDlp rows"
+need_line $GP '            note = std::string("Ready. ") + dlp::HostsNote(it.game); // (B2 of the build 2f: who can host it)' "DPAPP-2f B2: the sheet of a game that is on says who hosts it"
+need_line $GP '                hosts += "\n" + dlpguest::GameName(e.job.game) + " - " + dlp::HostsNote(e.job.game); // (B2: who can host it; " - ", the note starts with "Hosts:")' "DPAPP-2f B2: ... and the end of a preparation"
+need_line Tests/settings_test/dlp_text_test.cpp '    TestHostsNote();' "DPAPP-2f B2: the test runs"
+# B3: the line of the scans, in memory, written once when the session ends; never a MAC, a name, a passphrase; never a write in BuildRows
+JL=ConfigApp/source/dlp_join_logic.hpp
+SL=$(region $JL 'inline std::string ScanLine(const std::vector<Host>& all, const Children& t, std::size_t members_waiting) {' '}')
+[ -n "$SL" ] || fail "$JL: ScanLine is not there (DPAPP-2f B3)"
+! printf '%s\n' "$SL" | code_of | grep -q -E 'g\.host|g\.name|nickname|passphrase|\.mac' || fail "$JL: ScanLine writes a MAC, a name or a passphrase (the log has states and times only)"
+need_line $JL '    static constexpr std::size_t kLines = 32;' "DPAPP-2f B3: at most 32 lines of the scans a session"
+need_line $JL '        if (line == last) {' "DPAPP-2f B3: a line like the last is not kept"
+need_after ConfigApp/source/dlp_join.hpp '    void NoteScan(const std::string& line) {' '        scan_log_.Note(line, azl::platform::NowMs());' "DPAPP-2f B3: NoteScan keeps the line in memory (no I/O), with its time (DPAPP-2f-rev)"
+SJ=$(region ConfigApp/source/dlp_join.cpp 'void Session::Stop() {' '}')
+order_in "ConfigApp/source/dlp_join.cpp Session::Stop" "$SJ" '    StopInto(&lines);' '    AppendLogLines(datadir_, lines); // (ONE write of the log: the scans and the leaving)' "DPAPP-2f B3: the lines are written after the room is left (DPAPP-2f-rev: in ONE write)"
+SI=$(region ConfigApp/source/dlp_join.cpp 'void Session::StopInto(std::vector<std::string>* lines) {' '}')
+[ -n "$SI" ] || fail "ConfigApp/source/dlp_join.cpp: Session::StopInto is not there (DPAPP-2f-rev)"
+[ "$(printf '%s\n' "$SI" | code_of | grep -c -E 'AppendLog|Log\(|WriteTextFile')" = 0 ] || fail "ConfigApp/source/dlp_join.cpp Session::StopInto writes the log itself (DPAPP-2f-rev: its lines go to the caller's ONE write)"
+order_in "ConfigApp/source/dlp_join.cpp Session::StopInto" "$SI" '    const bool rounds = LeaveRounds(*n->core, &azl::platform::NowMs, &azl::platform::SleepMs);' '    *lines = scan_log_.Take(); // (the build 2f, B3: the scans of the session, after the room is left - they came before the leaving)' "DPAPP-2f-rev: the scans taken once the rounds of the leaving ran"
+HL=$(region ConfigApp/source/dlp_join.cpp 'u64 Session::HandOverAndLeave(s32* rc) {' '}')
+[ "$(printf '%s\n' "$HL" | code_of | grep -c -E 'AppendLog|Log\(|WriteTextFile|Stop\(\)')" = 1 ] || fail "ConfigApp/source/dlp_join.cpp HandOverAndLeave: more than ONE write of the log on the way out of the jump (DPAPP-2f-rev: the leaving, the scans and the jump's line together)"
+order_in "ConfigApp/source/dlp_join.cpp HandOverAndLeave" "$HL" '    StopInto(&lines); // (the review of the build 2f: its lines go with the jump'"'"'s below, in one write)' '    AppendLogLines(datadir_, lines);' "DPAPP-2f-rev: the jump's write after the room is left"
+BR=$(region ConfigApp/source/pages_dlpjoin.cpp '    void BuildRows(std::vector<Row>& rows) override {' '    }')
+printf '%s\n' "$BR" | grep -q -F '            session_.NoteScan(dlpjoin::ScanLine(all, *session_.children(), waiting_rows));' || fail "ConfigApp/source/pages_dlpjoin.cpp BuildRows: the scan is not noted (DPAPP-2f B3)"
+! printf '%s\n' "$BR" | code_of | grep -q -E 'AppendLog|Log\(|fopen|WriteTextFile' || fail "ConfigApp/source/pages_dlpjoin.cpp BuildRows writes a file (the thread of the screen: the lines are kept in memory)"
+need_line Tests/dlp_join_test.cpp '    J13_ScanLine();' "DPAPP-2f B3: the test runs"
+# the tests of the build 2f
+need_line $GT '    TestTwoIds();' "DPAPP-2f: the composer's test of the two ids runs"
+need_line $GST '    TestForms();' "DPAPP-2f: the store's test of the forms runs"
+need_line $GRT '    TestForms();' "DPAPP-2f: the worker's test of the forms runs"
+need_line $GRT '        CHECK_EQ(RunJob(Job(Act::Prepare), b.in, b.con, nullptr), way == 3 ? kErrInstallCheck : kErrCannotHide);' "DPAPP-2j: the test of a refusal with the fallback off"
+need_line $GRT '        CHECK(b.con.titles.count(kAm) == 1 && b.con.titles.count(kPrepared) == 0 && b.con.deleted_ids.size() == 1 && b.con.deleted_ids[0] == kPrepared);' "DPAPP-2f: the test of the migration"
+
+# ---- DPAPP-2f-rev (2026-11-19): the two adversarial reviews of the build 2f, the plugin untouched ---------------------------------------------
+# a migration cut in the middle goes back to the child that worked (Guest::prev_other, StartAct::RevertOther); the begin is never a refusal of the
+# form; the memo and the fallback by the same condition; the memo's child said; the refused id's ticket dropped; the old form of a migration taken
+# away on the record's proof; composer 1 keeps its Repairs; the scans: the last 32, with their time, in the end's ONE write
+need_line $GS '    t += std::string("prev_other=") + (g.prev_other ? "installed" : "none") + "\n";' "DPAPP-2f-rev: the record says the migration's old child"
+need_line $GS '    t += "prev_other_version=" + Dec(g.prev_other_version) + "\n";' "DPAPP-2f-rev: ... and its version"
+need_after $GS '        } else if (key == "prev_other") {' '            ok = v == "none" || v == "installed";' "DPAPP-2f-rev: a value this version does not know is a record refused"
+need_line $GS '            other_at = console.Installed(g.prepared, g.prev_other_form, &other_version);' "DPAPP-2f-rev: the start asks AM of the old child of a migration (DPAPP-2h: in the form its record says)"
+need_line $GS '        const StartAct act = DecideAtStart(g, at, version, product, other_at, other_version, other_product);' "DPAPP-2f-rev: ... and the decision sees it"
+RO=$(region $GS '        if (act == StartAct::RevertOther) {' '        }')
+[ -n "$RO" ] || fail "$GS: the start does not go back to the old child of a migration that was cut (DPAPP-2f-rev)"
+[ "$(printf '%s\n' "$RO" | code_of | grep -c -E 'Delete[A-Za-z]*\(g\.prepared, (OtherForm|g\.prev_other_form)')" = 0 ] || fail "$GS RevertOther: AM is asked to touch the old form's id (DPAPP-2f-rev: the child that works is never touched; DPAPP-2h: prev_other_form)"
+order_in "$GS RevertOther" "$RO" '            console.DeletePending(g.prepared, g.form);' '            g.form = g.prev_other_form;' "DPAPP-2f-rev: the new form's pending title cancelled, then the record goes to the old form"
+order_in "$GS RevertOther" "$RO" '                console.DeleteTitle(g.prepared, g.form, TicketMayGo(g, g.form, title_ours_now));' '            g.form = g.prev_other_form;' "DPAPP-2f-rev: ... and the new form's title (the record's form, ours: Disown came first)"
+order_in "$GS RevertOther" "$RO" '            g.state = GuestState::Installed;' '            SetForm(g.prepared, g.form);' "DPAPP-2f-rev: Installed again, and the jump asks AM by the old form"
+need_line $GD '        if (other_at == Presence::Present && other_version == g.prev_other_version && !OtherProduct(other_product, g.product)) {' "DPAPP-2f-rev: back to the old child only when it is there whole, at its version, ours"
+need_after $GD '        if (other_at == Presence::Unknown) {' '            return StartAct::Later; // (AM said nothing of the old child: nothing is taken away on a guess)' "DPAPP-2f-rev: AM silent of the old child: nothing taken away"
+need_order $GD '    if (at != Presence::Absent && OtherProduct(product, g.product)) {' '    if (g.state == GuestState::Preparing && g.prev_other) {' "DPAPP-2f-rev: a title of another product at the new id is disowned first"
+need_line $GD '            return repair && g->composer != 0 ? Act::Repair : Act::Prepare;' "DPAPP-2f-rev: a child of composer 1 keeps its Repairs until the user updates it (composer 0: never)"
+need_line $GR '    g.prev_other = migrating && before.state == GuestState::Installed && fs.at[before.form] == Presence::Present;' "DPAPP-2f-rev: the record of a migration says its old child ..."
+need_line $GR '    g.prev_other_form = g.prev_other ? before.form : static_cast<u8>(kFormApplication);' "DPAPP-2h: ... and its form"
+order_in "$GR Prepare" "$PO" '    g.prev_other = migrating && before.state == GuestState::Installed && fs.at[before.form] == Presence::Present;' '    if (!SaveGuest(g)) {' "DPAPP-2f-rev: ... before AM is asked anything"
+need_line $GR '    SetForm(prepared, form); // (AM took the child in `form`: the jump, the Join and the line of HOME'"'"'s icon below ask AM by it from now on)' "DPAPP-2f-rev: the registry's form changes once AM took the new one"
+order_in "$GR Prepare" "$PO" '    if (took != Took::Done) {' '    SetForm(prepared, form); // (AM took the child in `form`: the jump, the Join and the line of HOME'"'"'s icon below ask AM by it from now on)' "DPAPP-2f-rev: ... never before"
+order_in "$GR Prepare" "$PO" '    SetForm(prepared, form); // (AM took the child in `form`: the jump, the Join and the line of HOME'"'"'s icon below ask AM by it from now on)' '        c.HomeIcon(prepared);' "DPAPP-2f-rev: ... and before the line of HOME's icon reads the new id"
+CB=$(region $GR 'Took ComposeAndInstall(const Planned& job, const RunIn& in, WorkConsole& c, const Found& f, Guest& g, u8 form, bool over_ours, u16 at_version, u8* smdh,' '}')
+BG=$(region $GR '    if (begun != 0) {' '    }')
+[ "$(printf '%s\n' "$BG" | code_of | grep -c -x -F '        return Took::Failed;')" = 1 ] || fail "$GR ComposeAndInstall: a begin that fails is taken for a refusal of the form (DPAPP-2f-rev: AM read nothing of the title)"
+[ "$(printf '%s\n' "$CB" | code_of | grep -c -F 'return Took::Refused')" = 0 ] || fail "$GR ComposeAndInstall: a plain Took::Refused (DPAPP-2f-rev: only a write of the sink or the Finish refuse, by their rc)"
+need_line $GR '        fell_back = true; // (the review of the build 2f: it ended with 0, "Ready", and HOME showed the black icon unsaid)' "DPAPP-2f-rev: the memo's child ends with kErrShownInHome"
+need_after $GR '        if (fs.at[form] == Presence::Absent) {' '            // (the review of the build 2f) no hidden title of this id was there: what AM may have kept of the refused one - its ticket, which' "DPAPP-2f-rev: the refused hidden id's ticket goes, only when no hidden title was there ..."
+need_line $GR '            const RunResult dropped = DeleteGuarded(c, in, g, form, true, true, "hidden form not taken: its ticket dropped");' "DPAPP-2h: ... behind the guard of the ids"
+order_in "$GR Prepare" "$PO" '        c.Step("hidden form not taken", AmTitleFor(prepared, form), rc);' '            const RunResult dropped = DeleteGuarded(c, in, g, form, true, true, "hidden form not taken: its ticket dropped");' "DPAPP-2f-rev: ... after the refusal, in the hidden form"
+need_line $GR '        if (migrating && before.form == kFormApplication && before.state == GuestState::Installed && fs.at[kFormApplication] == Presence::Present &&' "DPAPP-2f-rev: the old child kept by the fallback is of the fallback's form (DPAPP-2h: never a child of M3c1) ..."
+need_line $GR '            fs.version[kFormApplication] == before.child_version && SameChild(before, *in.composed)) {' "DPAPP-2f-rev: ... at the record's version, and this very child"
+need_line $GL '    case kErrShownInHome: return "It works. To try hiding it again: restart 3DS Link, disable and enable the game.";' "DPAPP-2f-rev: the advice says the memo goes with a restart"
+FN=$(region $GP '    void Finish() {' '    }')
+order_in "$GP Finish" "$FN" '                text += " Stopped: enable the game again in Enable games when you like."; // (before the hosts: never on the last game'"'"'s line)' '            text += hosts;' "DPAPP-2f-rev: 'Stopped' before the hosts' lines"
+need_line $JL '            lines.erase(lines.begin());' "DPAPP-2f-rev: the LAST lines of the scans are kept"
+need_line $JL '        lines.push_back(line + " (+" + std::to_string(now_ms - first_ms) + " ms)");' "DPAPP-2f-rev: each line has its time from the first scan"
+need_line Tests/dlp_join_test.cpp '    CHECK(taken[1] == "line 5 (+50 ms)" && taken.back() == "line 36 (+360 ms)"); // (the last ones: nearest the jump or the exit)' "DPAPP-2f-rev: the test of the last lines"
+need_line $GST '    CHECK(rm.reverted == 2 && rm.taken == 1 && rm.failed == 0);' "DPAPP-2f-rev: the test of a migration that was cut"
+need_line $GRT '        CHECK(b.con.prev_other_at_begin && b.con.form_of_at_begin == kFormApplication);' "DPAPP-2f-rev: the test of the record of a migration"
+need_line $GRT '        CHECK_EQ(RunJob(Job(Act::Prepare), b.in, b.con, nullptr), kErrInstall);' "DPAPP-2f-rev: the tests of a begin that fails and of a hidden child whose title went"
+need_after $GS '        if (act == StartAct::TakeAway) {' '            console.DeletePending(g.prepared, g.form);' "DPAPP-2f-rev: TakeAway cancels THAT title's pending installation (the line is in RevertOther too)"
+need_line $GS '        if (g.state == GuestState::Preparing && g.prev_other) {' "DPAPP-2f-rev: the start asks of the old child of a migration only"
+need_line $GR '        g.prev_other = had && before.form != form && before.state == GuestState::Installed && fs.at[before.form] == Presence::Present;' "DPAPP-2h: the fallback's record says the old child of another form (M3c1's) still there: a cut goes back to it"
+need_line $GR 'bool SameChild(const Guest& g, const Composed& made) {' "DPAPP-2f-rev: the old child is kept only when it is this very child"
+need_line $GR '    g.prev_installed = had && before.state == GuestState::Installed && before.form == form && fs.at[form] == Presence::Present;' "DPAPP-2f-rev: prev_installed is of the same form"
+need_line $GR '        g.prev_installed = had && before.state == GuestState::Installed && before.form == form && fs.at[form] == Presence::Present;' "DPAPP-2f-rev: ... in the fallback too"
+need_after $GD '    if (s.other_form_present) {' '        return Act::Refuse; // (LookAround fills prepared_* with the form it found' "DPAPP-2f-rev: a title not ours at the other id: refused, never prepared next to"
+need_line $GW "            const bool mine = read_of[x] && ours[0] != '\\0' && !OtherProduct(product_of[x], ours) &&" "DPAPP-2f-rev: LookAround takes another form for ours only by its product code read"
+need_line $GW '                              (record != nullptr || (c != nullptr && c->has_child && version_of[x] == c->child_version));' "DPAPP-2f-rev: ... and, with no record, at the child's version"
+need_after $JL '        any = false;' '        first_ms = 0;' "DPAPP-2f-rev: Take starts the clock of the scans again"
+
+# DPAPP-2g: after the reading Games gives its own hold back before the look again (CanLook wants module_holds == 0: it waited for itself and the
+# first opening stayed on "Please wait..." - found in Azahar by DPAPP-2f-azahar)
+order_in "$GP Games::Update" "$GU" '                dlpguest::TakeEnds(&ends); // (a look that failed shows on its row: "not read")' '                Hold(false); // (the page'"'"'s own hold goes first: CanLook waits for module_holds == 0, so the look again never starts under it - DPAPP-2g)' "DPAPP-2g: the end of the reading gives the hold back ..."
+order_in "$GP Games::Update" "$GU" '                Hold(false); // (the page'"'"'s own hold goes first: CanLook waits for module_holds == 0, so the look again never starts under it - DPAPP-2g)' '                Relook(); // (what the reading found: the rows, in the thread of the look)' "DPAPP-2g: ... before the look again"
+
+# DPAPP-2h (2026-11-19 evening): ONE id 00040010|low for every prepared child (pm, NS and AM see the same id: the form M3c1 of the builds 2f/2g left the
+# game in memory - prova-2g), the plugin changed only to know it, and the guard of the ids (mission critical: an id written over can break the console)
+TR=Includes/azl/title_rules.hpp
+ID=ConfigApp/source/dlp_guest_ids.cpp
+IDH=ConfigApp/source/dlp_guest_ids.hpp
+IDA=ConfigApp/source/dlp_guest_ids_am.cpp
+GD=ConfigApp/source/dlp_guest_decide.hpp
+GRT2H=Tests/settings_test/dlp_guest_run_test.cpp
+# the plugin: the one change - the process of the system id (or of the key) is the child of the key; nothing else of the plugin knows 00040010
+need_line $TR 'inline constexpr u32 kTitleHighSystemApplication = 0x00040010u;' "DPAPP-2h: the category of the system's applications, the one id of a prepared child"
+need_line $TR '    return IsPreparedId(prepared) ? (static_cast<u64>(kTitleHighSystemApplication) << 32) | static_cast<u32>(prepared) : 0;' "DPAPP-2h: PreparedSystemOf: the same low word under 00040010, only for a key of the band"
+need_line $TR '    return (high == kTitleHighApplication || high == kTitleHighSystemApplication) && IsPreparedId(slot) ? slot : 0;' "DPAPP-2h: PreparedSlotOfProcess: 00040000 or 00040010 of the band, never 00040001"
+need_line $TR '    const u64 slot = (static_cast<u64>(kTitleHighApplication) << 32) | static_cast<u32>(tid);' "DPAPP-2h: ... the key is the low word under 00040000"
+[ "$(tr -d '\r' < $P | code_of | grep -c -E 'PreparedSlotOfProcess|PreparedSystemOf|kTitleHighSystemApplication')" = 3 ] || fail "$P: DPAPP-2h: the plugin uses the system id elsewhere than PreparedChildRow, the start's NotePreparedChild and ChildPluginPresent"
+need_line $P '    std::snprintf(path, sizeof(path), "/luma/plugins/%016llX/AzaharLink.3gx", static_cast<unsigned long long>(title_rules::PreparedSystemOf(prepared)));' "DPAPP-2h: the system's Download Play page finds the plugin in the folder of the system id too (OK/NO of the hosts)"
+order_in "$P ChildPluginPresent" "$(region $P 'bool ChildPluginPresent(void* /*ctx*/, u64 prepared) {' '}')" '    if (File::Exists(path) == 1) {' '    std::snprintf(path, sizeof(path), "/luma/plugins/%016llX/AzaharLink.3gx", static_cast<unsigned long long>(title_rules::PreparedSystemOf(prepared)));' "DPAPP-2h: ... after the key's (the fallback form, the builds before)"
+# the forms: the system form made, M3c1 never installed, the key the name of the files
+need_line $GS2H '    kFormSystem = 2,      ///< AM id = process id = 00040010|low (M3a, the build 2h): the real AM refuses it on the SD card; never installed again' "DPAPP-2h: the system form (DPAPP-2j: never installed again)"
+need_line $GS2H '    return form == kFormDlpChild || (form == kFormApplication && kFallbackToApplicationForm);' "DPAPP-2j: Installable: M3c1, the old form only for a fallback (off), never the system form"
+need_line $GS2H 'constexpr u8 kForms[kFormCount] = {kFormDlpChild, kFormApplication, kFormSystem};' "DPAPP-2j: the forms, the one made (M3c1) first"
+need_line $GS '    if (g.prev_other && g.prev_other_form == g.form) {' "DPAPP-2h: a record whose old child is in the run's own form is refused"
+need_line $GS '            ok = v == "ours" || v == "other";' "DPAPP-2h: a ticket word this version does not know is a record refused (never taken for ours)"
+need_line $GS '    if (g.ticket_known) {' "DPAPP-2h: the ticket's word only when it is known (the records before stay 'unknown': TicketMayGo)"
+# the lists: on a console a list not read is "not read" (R1); only an emulator's missing list is empty
+[ "$(tr -d '\r' < $IDA | grep -c -x -F '        return OnEmulator(); // (an emulator that does not give it: empty)')" = 2 ] || fail "$IDA: DPAPP-2h: a list of the tickets or of the titles begun taken for empty on a console"
+need_line $IDA '        return emulator; // (an emulator that does not give it: empty)' "DPAPP-2h: ... nor the processes'"
+[ "$(tr -d '\r' < $IDA | grep -c -x -F '            if (!emulator) {')" = 2 ] || fail "$IDA: DPAPP-2h: a process whose id is not read is skipped on a console"
+# the census and its file
+need_line $GS '            const bool ours_to_delete = at == Presence::Broken || title_ours_now;' "DPAPP-2h R6: the start deletes the record's title only when ours by its code read, or Broken"
+need_line $IDH 'constexpr unsigned kNeededSources = SrcBit(kSrcSd) | SrcBit(kSrcNand) | SrcBit(kSrcTicket) | SrcBit(kSrcProcess);' "DPAPP-2h R1: the SD card, the NAND, the tickets, the processes are needed for any write"
+need_line $ID '        if (!census->valid || !st.read || st.count != ids.size() || st.fnv != fnv) {' "DPAPP-2h: only the sources that changed are put in again (count, FNV)"
+need_line $ID '    if (FnvOfText(body) != seal) {' "DPAPP-2h: ids.cache is never trusted without its seal"
+need_line $ID '        if (!seen[s] || c.ids[s].size() != c.src[s].count || FnvOfIds(c.ids[s]) != (c.src[s].read ? c.src[s].fnv : FnvOfIds({})) ||' "DPAPP-2h: ... nor with lists that are not the ones their lines say"
+need_line $ID '        if ((p & ~0xFFull) == (id & ~0xFFull)) {' "DPAPP-2h: a process is found without its low byte, as pm finds it (process_data.c:37)"
+need_line $ID '        m |= RunsAs(census.ids[kSrcProcess], am) || RunsAs(census.ids[kSrcProcess], process) ? SrcBit(kSrcProcess) : 0u;' "DPAPP-2h: ... by its id of AM or of the process"
+need $ID 'return setup::WriteTextFile(IdsCachePath(), CensusText(census));' "DPAPP-2h: ids.cache is written with WriteTextFile (SweepOrphans knows its .tmp and .bak)"
+# JudgeInstall: R1, R2 (every form's id, the titles and the titles begun of the NAND), R3, R4, R5 (every form's title, the ticket and the title begun of the id written)
+JI=$(region $ID 'IdTaken JudgeInstall(const LiveSlot& live, u8 form, const Ownership& own) {' '}')
+for l in '    if ((live.read & kNeededSources) != kNeededSources) {' '        return IdTaken::Unknown; // R1' \
+         '        if (live.mask[f] & (SrcBit(kSrcNand) | SrcBit(kSrcPendingNand))) {' '            return IdTaken::Nand; // R2: an id of the slot in the NAND - nothing of the slot is ever written' \
+         '        if (live.mask[f] & SrcBit(kSrcProcess)) {' '            return IdTaken::Running; // R3' '        if (live.mask[f] & SrcBit(kSrcCard)) {' '            return IdTaken::Card; // R4' \
+         '        if ((live.mask[f] & SrcBit(kSrcSd)) && !(own.sd_ours & FormBit(f))) {' '            return IdTaken::Sd; // R5: a title that is not ours at any id of the slot' \
+         '    if ((live.mask[form] & SrcBit(kSrcTicket)) && !own.ticket_ours) {' '        return IdTaken::Ticket; // R5: the ticket of the id written is somebody else'"'"'s' \
+         '    if ((live.mask[form] & SrcBit(kSrcPendingSd)) && !own.record) {' '        return IdTaken::Pending; // R5: a title begun at the id that no run of ours began'; do
+  printf '%s\n' "$JI" | grep -F -x -q -- "$l" || fail "$ID JudgeInstall: DPAPP-2h no longer has the line '$l'"
+done
+[ "$(printf '%s\n' "$JI" | grep -c -x -F '    for (const u8 f : kForms) {')" = 4 ] || fail "$ID JudgeInstall: DPAPP-2h: the NAND, the processes, the card and the SD card are not looked at on every form's id"
+JD=$(region $ID 'IdTaken JudgeDelete(const LiveSlot& live, u8 form, const Ownership& own) {' '}')
+for l in '    if ((live.read & kNeededSources) != kNeededSources) {' '    if (live.mask[form] & (SrcBit(kSrcNand) | SrcBit(kSrcPendingNand))) {' '    if (live.mask[form] & SrcBit(kSrcProcess)) {' \
+         '    if (live.mask[form] & SrcBit(kSrcCard)) {' '    if ((live.mask[form] & SrcBit(kSrcSd)) && !(own.sd_ours & FormBit(form))) {' '    if (!own.record) {'; do
+  printf '%s\n' "$JD" | grep -F -x -q -- "$l" || fail "$ID JudgeDelete: DPAPP-2h no longer has the line '$l'"
+done
+AW=$(region $ID 'bool AmMayWrite(const IdCensus& live, u64 am, u64 process, bool install, bool ticket_expected, bool title_expected) {' '}')
+for l in '    if (!live.valid || (read & needed) != needed || am == 0 || SlotKeyOf(am) == 0) {' \
+         '    if (Holds(live.ids[kSrcNand], am) || Holds(live.ids[kSrcPendingNand], am) || Holds(live.ids[kSrcCard], am)) {' \
+         '    if (RunsAs(live.ids[kSrcProcess], am) || RunsAs(live.ids[kSrcProcess], process)) {' '    if (install && Holds(live.ids[kSrcTicket], am) && !ticket_expected) {' \
+         '    if (install && Holds(live.ids[kSrcSd], am) && !title_expected) {'; do
+  printf '%s\n' "$AW" | grep -F -x -q -- "$l" || fail "$ID AmMayWrite: DPAPP-2h no longer has the line '$l'"
+done
+need_line $IDH '    return azl::title_rules::IsPreparedId(slot) && (slot & ~0xFFull) != (azl::title_rules::kAppTid & ~0xFFull) &&' "DPAPP-2h R0: never 3DS Link's id, with or without its low byte"
+need_line $IDH '    if (form == g.form && TicketWordHere(g)) {' "DPAPP-2h R7: the record's word on its ticket ... (DPAPP-2h-sec: on the console it was written on)"
+need_line $IDH '    return title_ours_now;' "DPAPP-2h R7: ... or, the records before and the other forms, our title listed now"
+# the worker: the console read again, held against the cache, judged - before EVERY write; the cache taken again after every write of the run
+need_line $GR '    if (!c.ReadIds(live)) {' "DPAPP-2h R1: a list of AM not read: nothing written"
+need_line $GR '            if (!SameSlot(was, now)) {' "DPAPP-2h R8: the cache held against the console ..."
+need_after $GR '                *in.ids = *live;' '                return kErrIdStale;' "DPAPP-2h R8: ... a difference stops the job, the cache taken again"
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F 'c.DeleteTitle(')" = 1 ] || fail "$GR: DPAPP-2h: a title is deleted elsewhere than DeleteGuarded"
+order_in "$GR DeleteGuarded" "$(region $GR 'RunResult DeleteGuarded(WorkConsole& c, const RunIn& in, const Guest& g, u8 form, bool ours, bool drop_ticket, const char* what) {' '}')" '    const int guard = GuardDelete(c, in, g, form, ours, what);' '    const RunResult rc = c.DeleteTitle(g.prepared, form, drop_ticket);' "DPAPP-2h: the guard right before the delete"
+need_line $GR '    const IdTaken t = JudgeDelete(SlotIn(live, g.prepared), form, own);' "DPAPP-2h: GuardDelete judges the console read again (R2-R4, R6)"
+order_in "$GR Prepare" "$PO" '        const IdTaken t = JudgeInstall(slot, form, own);' '    if (!SaveGuest(g)) {' "DPAPP-2h: the ids judged before anything is written (no record of a run refused)"
+order_in "$GR ComposeAndInstall" "$CI" '            const IdTaken t = JudgeInstall(slot, form, own);' '    const RunResult begun = c.BeginInstall(prepared, form, ticket_there, title_there);' "DPAPP-2h: ... and again right before AM is asked to install"
+order_in "$GR ComposeAndInstall" "$CI" '        rc = ReadLive(c, in, prepared, "the install", &live);' '            const IdTaken t = JudgeInstall(slot, form, own);' "DPAPP-2h: ... on the console read again then"
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F 'c.BeginInstall(')" = 2 ] || fail "$GR: DPAPP-2h: an install begun elsewhere than ComposeAndInstall and InstallOverHigher"
+# every write of AM of the run is followed by the cache taken again (the run's own writes are no difference for the next guard)
+miss=$(tr -d '\r' < $GR | code_of | awk '/c\.(CancelInstall|FinishInstall|BeginInstall|DeleteTitle)\(/ { want = NR + 2; what = $0; next } want && NR <= want && /Wrote\(c, in\);/ { want = 0 } want && NR == want { print what; want = 0 }')
+[ -z "$miss" ] || fail "$GR: DPAPP-2h: a write of AM not followed by Wrote (the cache would hold a write of the run for a difference): $miss"
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F 'Wrote(c, in);')" = 9 ] || fail "$GR: DPAPP-2h: another number of writes of AM followed by Wrote than the nine of the run"
+need_line $GR '        const bool in_nand = (slot.mask[form] & (SrcBit(kSrcNand) | SrcBit(kSrcPendingNand))) != 0;' "DPAPP-2h: after the Finish, where AM put it: the NAND read (read only)"
+need_after $GR '        if (in_nand) {' '            Undo(undo, prepared);' "DPAPP-2h: the NAND: never deleted there, the record as it was ..."
+need_after $GR '            Undo(undo, prepared);' '            return kErrPutInNand;' "DPAPP-2h: ... and said (329), no fallback"
+order_in "$GR Prepare" "$PO" '        if (in_nand) {' '    if (took == Took::Refused && form != kFormApplication && !HiddenTakenBefore(had, before)) {' "DPAPP-2h: the NAND before any fallback"
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F '!SlotIsSound(prepared)')" = 2 ] || fail "$GR: DPAPP-2h R0: Prepare and Adopt do not hold the key to SlotIsSound"
+need_line $GR '    ci.prepared = ProcessIdFor(prepared, form); // (the build 2h: the exheader'"'"'s ids - the process'"'"'s; in the system form 00040010|low)' "DPAPP-2h: the composer gets the process's id of the form ..."
+need_line $GR '    const u64 am = AmTitleFor(prepared, form);' "DPAPP-2h: ... and AM's (in the system form the same)"
+order_in "$GR Prepare" "$PO" '    const bool folder = c.Folder(ProcessIdFor(prepared, form), job.game, true);' '        const bool old_folder = c.Folder(ProcessIdFor(prepared, before.form), job.game, false);' "DPAPP-2h: the new folder before the old one goes"
+need_line $GR '    if (migrating && folder && ProcessIdFor(prepared, before.form) != ProcessIdFor(prepared, form)) {' "DPAPP-2h: the old folder only when the migration changed the process's id (never the fallback's own)"
+need_line $GR '    const int written = Emit(made, &PartRead, file, &SinkCounted, &sent, &OnStepToTheEnd, &c, in.buf, in.buf_size);' "DPAPP-2h: the second write of InstallOverHigher goes to its end (the old child is gone: a stop there would leave none; DPAPP-2j: AM's Result kept)"
+need_after $GR 'bool OnStepToTheEnd(void* ctx, int stage, u64 done, u64 total) {' '    static_cast<WorkConsole*>(ctx)->Progress(stage, done, total);' "DPAPP-2h: ... the bar moves ..."
+need_after $GR '    static_cast<WorkConsole*>(ctx)->Progress(stage, done, total);' '    return true;' "DPAPP-2h: ... and nothing stops it"
+need_line $GR '    const bool sys = c.Folder(ProcessIdFor(g.prepared, kFormSystem), g.game, false);' "DPAPP-2h: a removal takes the system id's folder away ..."
+need_line $GR '    const bool key = c.Folder(g.prepared, g.game, false);' "DPAPP-2h: ... and the key's"
+order_in "$GR Adopt" "$(region $GR 'int Adopt(const Planned& job, const RunIn& in, WorkConsole& c) {' '}')" '        const int rc = ReadLive(c, in, prepared, "the adoption", &live);' '    if (!SaveGuest(g)) {' "DPAPP-2h: no adoption with an id of the slot in the NAND, a process, the card"
+need_line $GR '    SayTicketOurs(g); // (DPAPP-2h-sec: with the stamp of this console - the ticket is in its ticket.db)' "DPAPP-2h: the record of a run says its ticket is ours (the guard let it go on only so)"
+# AM: the second guard, right before every call that changes something; never the form M3c1; the ticket only when ours
+IA=$(region $GA 'bool IdsAllow(u64 prepared, u8 form, bool install, bool ticket_expected, bool title_expected) {' '}')
+printf '%s\n' "$IA" | grep -F -x -q -- '    if (!ReadConsoleIds(&live)) {' || fail "$GA: DPAPP-2h: the second guard does not read the console's lists again"
+printf '%s\n' "$IA" | grep -F -x -q -- '    return AmMayWrite(live, AmTitleFor(prepared, form), ProcessIdFor(prepared, form), install, ticket_expected, title_expected);' || fail "$GA: DPAPP-2h: the second guard does not judge"
+order_in "$GA BeginInstall" "$(region $GA 'Result BeginInstall(u64 prepared, u8 form, bool ticket_expected, bool title_expected, Handle* handle) {' '}')" '    if (!IdsAllow(prepared, form, true, ticket_expected, title_expected)) {' '    return AM_StartCiaInstall(MEDIATYPE_SD, handle);' "DPAPP-2h: the second guard before the install"
+order_in "$GA DeletePrepared" "$(region $GA 'Result DeletePrepared(u64 prepared, u8 form, bool drop_ticket, DeleteReport* report) {' '}')" '    if (!IdsAllow(prepared, form, false, false, false)) {' '    r.title_rc = AM_DeleteTitle(MEDIATYPE_SD, am);' "DPAPP-2h: the second guard before the delete"
+need_after $GA '    if (drop_ticket && listed_read && !r.still_listed) {' '        r.ticket_rc = AM_DeleteTicket(am);' "DPAPP-2h R7: the ticket only when the caller says it is ours (DPAPP-2h-sec: and AM no longer lists the title)"
+order_in "$GA DeletePendingPrepared" "$(region $GA 'Result DeletePendingPrepared(u64 prepared, u8 form) {' '}')" '    if (!IdsAllow(prepared, form, false, false, false)) {' '    return AM_DeletePendingTitle(MEDIATYPE_SD, am);' "DPAPP-2h: the second guard before a pending title goes"
+[ "$(tr -d '\r' < $GA | code_of | grep -c 'IdsAllow(prepared, form')" = 4 ] || fail "$GA: DPAPP-2h: the second guard is not before each of the four calls that change something (DPAPP-2h-rev: the ticket alone)"
+# the controller: the console's lists for the guard; the cache of the look and of the run; B stops now
+need_line $GW '        return ReadConsoleIds(live); // (the build 2h: every list again, read only - the guard of every write)' "DPAPP-2h: the worker's ReadIds reads the console"
+need_line $GW '        in.ids = &ids;' "DPAPP-2h: the run holds its writes against the cache"
+order_in "$GW RunMain" "$(region $GW 'void RunMain(void* arg) {' '}')" '        if (LoadCensus(&ids)) {' '        in.ids = &ids;' "DPAPP-2h: ... the look's cache (made at the run when none reads whole)"
+need_line $GW '        SaveCensus(ids); // (what the console held after the run'"'"'s last write: the next look starts from it)' "DPAPP-2h: the run writes the cache back"
+order_in "$GW LookMain" "$(region $GW 'void LookMain(void* arg) {' '}')" '    LookIds(&census);' '        const Looked looked = LookAround(games, l->wanted, false, &l->done, &census);' "DPAPP-2h: every look brings the cache up to date first (in its thread)"
+need_line $GW '    RefreshConsoleIds(census, &rep);' "DPAPP-2h: ... only the sources that changed"
+need $GW 'RefreshLine(*census, rep, had ? "the look" : "the look, no cache that reads whole")' "DPAPP-2h: ... and the milliseconds in the log"
+[ "$(tr -d '\r' < $GW | code_of | grep -c -E 'ReadConsoleIds|RefreshConsoleIds')" = 3 ] || fail "$GW: DPAPP-2h: the console's lists read elsewhere than the worker's guard, the run's start and the look (never on the thread of the screen)"
+need_line $GW '            const IdTaken t = JudgeInstall(SlotIn(*census, prepared), kPreparedForm, own);' "DPAPP-2h: the look shows a conflict before anything is asked"
+need_line $GD '    if (s.id_taken != 0) {' "DPAPP-2h: a game whose id is taken is refused (never prepared, never adopted)"
+need_after $GW 'void StopNow() {' '        g_run->stopped_by_user.store(true);' "DPAPP-2h U2: B stops the run now ..."
+need_line $GW '        g_run->stop_now.store(true); // (the composition and the stream stop at their next step: kErrCancel, AM'"'"'s install cancelled, the record as it was)' "DPAPP-2h U2: ... through stop_now (the job given up cleanly)"
+need_line $GW '    v.stopping = r->stop_after.load() || r->stop_now.load();' "DPAPP-2h U2: the page says it stops"
+need $GW '" (stopped by the user)"' "DPAPP-2h U2: the log says the user stopped it"
+# the pages: B stops the preparation (U2), the strip (U5), the card centred above the footer (U6), the bar of Download Play (U4), Join waits with its card (U3)
+need_line $GP '                dlpguest::StopNow();' "DPAPP-2h U2: B on the run page stops the work now (it does not hide it)"
+[ "$(tr -d '\r' < $GP | code_of | grep -c -F 'dlpguest::StopAfterCurrent()')" = 1 ] || fail "$GP: DPAPP-2h U2: StopAfterCurrent elsewhere than the reading of Enable games"
+order_in "$GP RunPage::DrawTop" "$(tr -d '\r' < $GP | awk '!on && index($0, "        const dlpguest::RunView v = dlpguest::View();") { on = 1 } on { print } on && $0 == "    }" { exit }')" '        DrawStatusStrip(10, 206, 380, 28); // (the build 2h, U5: "3DS Link is ON / Room ..." under the card, as on every other screen)' '        DrawFrameBorder(gfx::kTopW);' "DPAPP-2h U5: the preparation shows the strip under its card"
+need_line $GP '        const float y = kBarH + 1.0f + (kFooterTop - kBarH - 1.0f - kH) * 0.5f;' "DPAPP-2h U6: the card of the run page centred above the footer"
+need_line $JP '        const float y = kBarH + 1.0f + (kFooterTop - kBarH - 1.0f - kH) * 0.5f;' "DPAPP-2h U6: ... and Join's"
+! tr -d '\r' < $GP | grep -q -F '(static_cast<float>(gfx::kScreenH) - kBarH - 1.0f - kH) * 0.5f' || fail "$GP: DPAPP-2h U6: a card centred on the whole screen over its footer"
+! tr -d '\r' < $JP | grep -q -F '(static_cast<float>(gfx::kScreenH) - kBarH - 1.0f - kH) * 0.5f' || fail "$JP: DPAPP-2h U6: a card centred on the whole screen over its footer"
+need_line ConfigApp/source/ui.hpp 'constexpr float kFooterTop = 213.0f;' "DPAPP-2h U6: where the footer's strip begins"
+need_line ConfigApp/source/ui.cpp '    gfx::FillRect(0, 213, gfx::kBottomW, 1, col::kLine);' "DPAPP-2h U6: ... the line of DrawFooterBackground, the same 213"
+need_line $GP '        return "Options"; // (the build 2h, U4: not "Download Play" once more - it is the title of the top screen, as Titles Delivery'"'"'s "Options")' "DPAPP-2h U4: the bar of the page Download Play is not its title again"
+! tr -d '\r' < $GP | grep -q -F ': (Removals() ? "Removing a Download Play guest" : "Download Play")' || fail "$GP: DPAPP-2h U4: the light run page says Download Play under Download Play"
+need_line $GP '    static constexpr const char* kStopText = "The work under way is given up: nothing is left half made.";' "DPAPP-2h U2: the question of B says what it does"
+need $GP 'text = cancelled.empty() ? std::string("Stopped:") : "Stopped: nothing of " + cancelled + " was installed. Enable it again when you like.";' "DPAPP-2h U2: the end says what B did"
+need_after $JP '        if (why == dlpjoin::Why::WorkRunning || why == dlpjoin::Why::GuestWorker) {' '            WaitFor(Wait::Entry);' "DPAPP-2h U3: Join waits for the work under way, with its card (never a refusal with no word)"
+need_line $JP '            if (!pages::WorkUnderWay(title, text, detail, fraction)) {' "DPAPP-2h U3: ... which work, said ..."
+need_line $JP '                DrawProgressBar(26, 118, 348, 14, fraction);' "DPAPP-2h U3: ... with its bar ..."
+need_after $JP '                    } else {' '                        Begin();' "DPAPP-2h U3: ... and Join starts by itself when it is over (the gate again: spec 8)"
+need_line $GP '        fraction = setup::ProgressFraction(titles::Scan().progress_done(), titles::Scan().progress_total());' "DPAPP-2h U3: the card of the work says the scan's bar"
+need_line $GP '        title = "Putting the plugin in your games...";' "DPAPP-2h U3: the card of the work under way says the copies of the plugin (Join's) ..."
+need_line $GP '        text = "3DS Link reads your titles again (boot9.bin was found, or titles were installed).";' "DPAPP-2h U3: ... and a new scan that waits"
+need_line $GP '    if (update::Worker::Get().ListsRunning() || lobbies::Scanner::Get().running()) {' "DPAPP-2h U3: ... and the public lobbies"
+need_line $GP '    if (u.stage == update::Stage::Checking) {' "DPAPP-2h U3: ... and the update"
+# the codes of the guard and their words: never "remove it with FBI" for a title of the system or another title's ticket
+need_line $GL 'constexpr int kErrIdSystem = 325, kErrIdTicket = 326, kErrIdRunning = 327, kErrIdStale = 328, kErrPutInNand = 329;' "DPAPP-2h: the results of the guard of the ids"
+need_line $GL '    case kErrIdTicket: return "Nothing to do: this game plays with its own copy.";' "DPAPP-2h: a title of the system or another title's ticket is never the user's to remove"
+need_line $GL '    case kErrIdRunning: return "Restart the console, then try again.";' "DPAPP-2h: a closed game still in memory: restart"
+# the jump and the Join: never a child of the form M3c1
+need_line ConfigApp/source/dlp_join.cpp '                     return dlpguest::Jumpable(dlpguest::FormOf(prepared)) ? dlpguest::PreparedPresence(prepared, version) : dlpguest::Presence::Absent;' "DPAPP-2j: a child of the system form of the build 2h is 'not prepared' in Join until Update; M3c1 is joined"
+need_line ConfigApp/source/dlp_join.cpp '    return stat(setup::GamePluginPath(dlpguest::ProcessIdOf(prepared)).c_str(), &st) == 0 && S_ISREG(st.st_mode);' "DPAPP-2h: Join finds the plugin in the folder of the process's id"
+# the tests of the build 2h are run
+need_line $GRT2H '    TestIds2h();' "DPAPP-2h: the worker's test of the guard runs"
+need_line $GT '    TestSystemForm();' "DPAPP-2h: the composer's test of the system form runs"
+for t in TestCensus TestCacheFile TestSlot TestJudge TestTicketAndSecondGuard TestBandAgainstSystemTitles; do
+  need_line Tests/settings_test/dlp_guest_ids_test.cpp "    $t();" "DPAPP-2h: the test of the ids runs $t"
+done
+
+# ---- DPAPP-2h-rev (2026-11-19 notte): the review of the build 2h - the ticket a run given up leaves (R1), the record before the old form goes (R2),
+# R6 in every delete (R3), the Installation check behind the guard (R4), the lists read whole (R5), Join that waits only for its own work (U3) ----
+GIDA=ConfigApp/source/dlp_guest_ids_am.cpp
+DLT=$(region $GR 'bool DropLeftTicket(WorkConsole& c, const RunIn& in, const Guest& g, u8 form, const char* what) {' '}')
+for l in '    if (at == Presence::Unknown) {' '    if (at != Presence::Absent) {' '    if (!c.ReadIds(&now) || !now.src[kSrcTicket].read) {' \
+         '    if ((SlotIn(now, g.prepared).mask[form] & SrcBit(kSrcTicket)) == 0) {' '    DeleteGuarded(c, in, g, form, true, true, what);'; do
+  printf '%s\n' "$DLT" | grep -F -x -q -- "$l" || fail "$GR DropLeftTicket: DPAPP-2h-rev R1 no longer has the line '$l'"
+done
+order_in "$GR DropLeftTicket" "$DLT" '    if (at != Presence::Absent) {' '    DeleteGuarded(c, in, g, form, true, true, what);' "DPAPP-2h-rev R1: never the ticket of a title AM lists"
+order_in "$GR DropLeftTicket" "$DLT" '    if ((SlotIn(now, g.prepared).mask[form] & SrcBit(kSrcTicket)) == 0) {' '    DeleteGuarded(c, in, g, form, true, true, what);' "DPAPP-2h-rev R1: only a ticket the console holds"
+CI2=$(region $GR 'Took ComposeAndInstall(const Planned& job, const RunIn& in, WorkConsole& c, const Found& f, Guest& g, u8 form, const Ownership& own, bool over_ours,' '}')
+[ "$(printf '%s\n' "$CI2" | code_of | grep -c -F '        *ticket_left = ticket_there || !DropLeftTicket(c, in, g, form, "install')" = 2 ] || fail "$GR: DPAPP-2h-rev R1: the ticket left is not looked at on both ways out after the Begin (the write, the Finish; DPAPP-2h-sec: and said to the caller)"
+[ "$(printf '%s\n' "$CI2" | code_of | grep -c -F 'DropLeftTicket(c, in, g, form, "install')" = 2 ] || fail "$GR: DPAPP-2h-rev R1: an install given up does not drop the ticket it left"
+order_in "$GR ComposeAndInstall" "$CI2" '    rc = Emit(made, &PartRead, file, &SinkCounted, &sent, &OnStep, &c, in.buf, in.buf_size);' '        *ticket_left = ticket_there || !DropLeftTicket(c, in, g, form, "install given up: the ticket it left dropped"); // (the review of the build 2h, R1: B leaves nothing)' "DPAPP-2h-rev R1: B in the write"
+need_after $GR '    } else if (TicketWordHere(g) && g.ticket_ours) {' '        title_gone = DropLeftTicket(c, in, g, g.form, "remove: the ticket left with no title dropped");' "DPAPP-2h-rev R1: a removal with no title takes the ticket the record says is ours (or the record stays)"
+need_line $GR '        took = ComposeAndInstall(job, in, c, f, g, form, own, g.prev_installed && OursToDelete(fs, form, before), fs.version[form], smdh, product, &rc,' "DPAPP-2h-rev R3: the fallback's InstallOverHigher only over a title ours by R6"
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F 'g.prev_installed, fs.version[form]')" = 0 ] || fail "$GR: DPAPP-2h-rev R3: InstallOverHigher may delete a title whose code does not read"
+need_line $GR '        const bool nand_read = after.src[kSrcNand].read; // (the review of the build 2h, R5: a NAND not read is never "absent")' "DPAPP-2h-rev R5: the NAND after the Finish read, or said not read"
+need_line $GR '        const Presence on_sd = nand_read ? Presence::Present : c.Installed(prepared, form, &sd_version);' "DPAPP-2h-rev R5: ..."
+need_after $GR '        if (on_sd == Presence::Absent || on_sd == Presence::Unknown) {' '            // (the review of the build 2h, R5) not on the SD card, and the NAND not read: where AM put it is not known - no fallback (it would' "DPAPP-2h-rev R5: no fallback when where AM put it is not known"
+PO2=$(region $GR 'int Prepare(const Planned& job, const RunIn& in, WorkConsole& c, JobNote* note) {' '}')
+order_in "$GR Prepare" "$PO2" '        if (on_sd == Presence::Absent || on_sd == Presence::Unknown) {' '    if (took == Took::Refused && form != kFormApplication && !HiddenTakenBefore(had, before)) {' "DPAPP-2h-rev R5: before any fallback"
+order_in "$GR Prepare" "$PO2" '    const bool saved = SaveGuest(g);' '    if (saved && migrating && form != before.form && now == Presence::Present) {' "DPAPP-2h-rev R2: the record is the new child's (Installed) before the old form goes"
+order_in "$GR Prepare" "$PO2" '    g.state = GuestState::Installed;' '    const bool saved = SaveGuest(g);' "DPAPP-2h-rev R2: ... Installed"
+order_in "$GR Prepare" "$PO2" '    const bool saved = SaveGuest(g);' '    const bool folder = c.Folder(ProcessIdFor(prepared, form), job.game, true);' "DPAPP-2h-rev R2: ... and before the folders"
+# the start
+need_line $GS '            if (at == Presence::Broken || title_ours_now) {' "DPAPP-2h-rev R3: RevertOther deletes the new form's title only when ours by R6"
+need_after $GS '            } else if (at == Presence::Absent && TicketWordHere(g) && g.ticket_ours) {' '                console.DropTicket(g.prepared, g.form); // (the review of the build 2h, R1: the ticket the run cut after its Begin left, ours by the record)' "DPAPP-2h-rev R1: RevertOther takes the ticket the cut run left"
+need_after $GS '            if (at == Presence::Absent && TicketWordHere(g) && g.ticket_ours) {' '                title_gone = console.DropTicket(g.prepared, g.form);' "DPAPP-2h-rev R1: TakeAway takes the ticket the cut run left, or the record stays"
+KN=$(region $GS '        if (act == StartAct::KeepNew) {' '        }')
+printf '%s\n' "$KN" | grep -F -x -q -- '            console.DeletePending(g.prepared, g.form);' || fail "$GS KeepNew: DPAPP-2h-rev R2: KeepNew does not cancel THAT title's pending part"
+! printf '%s\n' "$KN" | code_of | grep -q -F 'DeleteTitle' || fail "$GS KeepNew: DPAPP-2h-rev R2: a title is deleted (the new child is kept, the old form is a Repair)"
+printf '%s\n' "$KN" | grep -F -x -q -- '            g.composer = 0;' || fail "$GS KeepNew: DPAPP-2h-rev R2: the kept child is not made again by the next look"
+need_line $GD "        if (!Installable(g.prev_other_form) && at == Presence::Present && product[0] != '\\0' && g.product[0] != '\\0' && !OtherProduct(product, g.product)) {" "DPAPP-2h-rev R2: KeepNew only for a migration from M3c1 whose new child is there and ours"
+# AM: the ticket alone, the Installation check behind the guard
+DPT=$(region $GA 'Result DeletePreparedTicket(u64 prepared, u8 form) {' '}')
+order_in "$GA DeletePreparedTicket" "$DPT" '    if (!PreparedBand(prepared) || !IsOwnedGuestTid(am)) {' '    const Result rc = AM_DeleteTicket(am);' "DPAPP-2h-rev R1: a title of ours only"
+order_in "$GA DeletePreparedTicket" "$DPT" '    if (!IdsAllow(prepared, form, false, false, false)) {' '    const Result rc = AM_DeleteTicket(am);' "DPAPP-2h-rev R1: behind the second guard"
+order_in "$GA DeletePreparedTicket" "$DPT" '    if (listed(kSrcSd) || listed(kSrcPendingSd)) {' '    const Result rc = AM_DeleteTicket(am);' "DPAPP-2h-rev R1: never the ticket of a title AM lists"
+need_line $GA '        const bool gone = R_SUCCEEDED(DeletePreparedTicket(prepared, form));' "DPAPP-2h-rev R1: the start's DropTicket is DeletePreparedTicket"
+UMG=$(region $GA 'bool UnusableMayGo(u64 tid) {' '}')
+printf '%s\n' "$UMG" | grep -F -x -q -- '    if (!IsOwnedGuestTid(tid)) {' || fail "$GA UnusableMayGo: DPAPP-2h-rev R4: every title let through without the guard"
+printf '%s\n' "$UMG" | grep -F -x -q -- '    return ReadConsoleIds(&live) && AmMayWrite(live, tid, SlotKeyOf(tid), false, false, false) &&' || fail "$GA UnusableMayGo: DPAPP-2h-rev R4: a child of ours deleted by the Installation check without the live guard"
+need_line ConfigApp/source/titles.cpp '        if (!dlpguest::UnusableMayGo(t.tid)) {' "DPAPP-2h-rev R4: the Installation check asks the guard of the ids for a child of ours"
+order_in "ConfigApp/source/titles.cpp DeleteUnusable" "$(region ConfigApp/source/titles.cpp 'int DeleteUnusable(const std::vector<setup::UnusableTitle>& titles, int* failed) {' '}')" '        if (!dlpguest::UnusableMayGo(t.tid)) {' '            rc = AM_DeletePendingTitle(MEDIATYPE_SD, t.tid);' "DPAPP-2h-rev R4: ... before anything is asked of AM"
+# the lists read whole
+need $GIDA 'constexpr u32 kMaxListed = 65536;' "DPAPP-2h-rev R5: a list of 16384 tickets and more is read"
+need $GIDA 'constexpr s32 kMaxProcesses = 256;' "DPAPP-2h-rev R5: the processes' buffer"
+need_line $GIDA '    if (n == kMaxProcesses) {' "DPAPP-2h-rev R5: a full buffer of processes is not a list read whole"
+need $GIDA '    return got == count; // (the review of the build 2h, R5' "DPAPP-2h-rev R5: a list of titles shorter than its count is not read whole"
+[ "$(tr -d '\r' < $GIDA | code_of | grep -c -F '    if (got != count) {')" = 2 ] || fail "$GIDA: DPAPP-2h-rev R5: the tickets and the titles begun taken whole when AM gave fewer"
+need $ID 'constexpr std::size_t kIdsMaxBytes = 2 * 1024 * 1024;' "DPAPP-2h-rev R5: the cache of a console with many tickets reads again"
+need_after $ID '    if (!SlotIsSound(SlotKeyOf(am))) {' '        return false; // (the review of the build 2h, R5: R0 in the second guard too - never 3DS Link'"'"'s id, with or without its low byte)' "DPAPP-2h-rev R5: R0 in the second guard"
+# Join (U3), the counts, the words
+need_line $JL '    return w.update || w.lobbies_scan;' "DPAPP-2h-rev U3: the entrance waits only for the session's work (the network)"
+need_line $JP '        const dlpjoin::Why why = session_.Start(FactsNow(InstalledGuests(), true), in);' "DPAPP-2h-rev U3: the session starts without waiting for the copies or the scan"
+need_after $JP '        if (why == dlpjoin::Why::NoGuests && FactsNow(1).work_running) {' '            WaitFor(Wait::All);' "DPAPP-2h-rev U3: no child ready while copies or the scan run: waited for, said"
+need_after $JP '        const dlpjoin::Why why = dlpjoin::JoinGate(FactsNow(dlpjoin::ReadyCount(session_.children()->table)));' '        if (why == dlpjoin::Why::WorkRunning || why == dlpjoin::Why::GuestWorker) {' "DPAPP-2h-rev U3: A waits with the card ..."
+need_after $JP '        if (why == dlpjoin::Why::WorkRunning || why == dlpjoin::Why::GuestWorker) {' '            WaitFor(Wait::Join); // (the review of the build 2h, U3: the work the way out waits for, with its card and its bar - never a bare sentence)' "DPAPP-2h-rev U3: ... never the bare sentence"
+need_after $JP '                if (!f.work_running && !f.guest_worker) {' '                    if (wait_ == Wait::Join) {' "DPAPP-2h-rev U3: after A, the list again (A joins)"
+need_line $JP '                const dlpjoin::Facts f = FactsNow(1, wait_ == Wait::Entry); // (only the work: the records are read when it is over, in Begin)' "DPAPP-2h-rev U3: the entrance waits for its own work only"
+need $JP 'dlpguest::IsOwnedGuestTid(guest.prepared) && dlpguest::Jumpable(guest.form) ? 1u : 0u;' "DPAPP-2h-rev: the gate never counts a child that is not jumped to (DPAPP-2j: the system form)"
+need $JP 'made by a test build, its guest must be updated in Download Play > Enable games' "DPAPP-2h-rev: a child of M3c1 is said, never 'no game'"
+! tr -d '\r' < $JP | grep -q -F 'detail + " Join lobby starts by itself when it is over."' || fail "$JP: DPAPP-2h-rev: the waiting card says it twice"
+need $GP 'size.clear(); // (the review of the build 2h: the reason and its advice wrapped on their lines, as "not read" - one line cut them)' "DPAPP-2h-rev: Number taken wrapped"
+need_line $GP '                std::string& to = KeepsGuest(e.job.game) ? kept : cancelled;' "DPAPP-2h-rev: an Update stopped keeps its guest, said"
+# the build: --no-plugin never packs a plugin older than its sources
+need_line ../DlpLink/tools/build_all.sh 'if [ "$PLUGIN" = 0 ]; then' "DPAPP-2h-rev: the check of --no-plugin runs"
+need ../DlpLink/tools/build_all.sh 'newer="$(find AzaharLink/Sources AzaharLink/Includes -type f -newer AzaharLink/AzaharLink.3gx | head -3)"' "DPAPP-2h-rev: --no-plugin refuses a plugin older than its sources"
+need_after ../DlpLink/tools/build_all.sh '  if [ -n "$newer" ]; then' "togliere --no-plugin" "DPAPP-2h-rev: ... and stops"
+# the tests
+need_line $GRT2H '    TestIds2hRev();' "DPAPP-2h-rev: the worker's test of the review runs"
+need_line Tests/settings_test/dlp_guest_store_test.cpp '    TestStart2hRev();' "DPAPP-2h-rev: the start's test of the review runs"
+need_line Tests/settings_test/dlp_guest_ids_test.cpp '    TestSystemApplicationsListed();' "DPAPP-2h-rev: the 109 system applications held against the band"
+need_line Tests/dlp_join_test.cpp '        CHECK_EQ(dlpjoin::EntryWork(w), (bits & 12) != 0);' "DPAPP-2h-rev U3: the entrance's work tested"
+
+# ---- DPAPP-2h-sec (2026-11-20): the second review of the build 2h, after the test in Azahar -----------------------------------------------------------
+# F1 Titles Delivery never installs a title of the NAND, a guest, 3DS Link: the ids of an offer come over the air and the module deletes before it reads.
+RF=ConfigApp/titleshare_host/recv_filter.h
+DLC=ConfigApp/titleshare_host/delivery.c
+need_line $RF '    if(high != 0x00040000u && high != 0x00040002u && high != 0x0004000Eu && high != 0x0004008Cu) {' "DPAPP-2h-sec F1: Titles Delivery installs an application, a demo (second pass), an update or a DLC only"
+need_line $RF '    if(high == 0x00040000u && (tid & 0xFFu) == 0x02u) {' "DPAPP-2h-sec F1: ... never the variation FBI puts in the NAND"
+need_line $RF '    if(high == 0x00040000u && (tid & ~(uint64_t) 0xFFu) == 0x000400000F83D100ull) {' "DPAPP-2h-sec F1: ... never 3DS Link itself"
+need_after $DLC 'static int recv_refusal(uint64_t tid) {' '    const int why = dl_recv_refusal(tid);' "DPAPP-2h-sec F1: the receiver's adapter asks the filter"
+need_line $DLC '    if(ts_title_dest(tid) != MEDIATYPE_SD) {' "DPAPP-2h-sec F1: ... and the module's own media (the SD card only)"
+need_line $DLC '    return gRecvOwned != NULL && gRecvOwned(tid) ? DL_RECV_GUEST : DL_RECV_OK;' "DPAPP-2h-sec F1: ... and never a guest of this console"
+RA=$(region $DLC 'static int recv_adapter(void* arg, ts_recv_stats* st) {' '}')
+[ "$(printf '%s\n' "$RA" | code_of | grep -c -F 'recv_drop_refused(st->want, &st->m, st->m.count);')" = 2 ] || fail "$DLC: DPAPP-2h-sec F1: a refused title is not taken out of the choice before the screen and after it"
+order_in "$DLC recv_adapter" "$RA" '        memcpy(st->want, s.want, sizeof(st->want)); // (the choice is the screen'"'"'s)' '            recv_drop_refused(st->want, &st->m, st->m.count); // (DPAPP-2h-sec: and never a title refused here, whatever the screen did - the module' "DPAPP-2h-sec F1: the module takes the choice only after the filter"
+need_after $DLC 'static void recv_drop_refused(uint8_t* want, const ts_manifest* m, int count) {' '        if(recv_refusal(m->t[i].tid) != DL_RECV_OK) {' "DPAPP-2h-sec F1: the choice loses every refused title"
+need_order ConfigApp/source/delivery_run.cpp '    dl_set_recv_owned([](uint64_t tid) { return dlpguest::IsOwnedGuestTid(tid) ? 1 : 0; });' '    const bool started = RunOnBigStack([&]() { rc = dl_recv_run(&ReceiveTick, &run); });' "DPAPP-2h-sec F1: the receiver knows this console's guests before it starts"
+need_line ConfigApp/source/delivery_run.cpp '        } else if (row.id >= 0 && row.id < s.count && s.refused[row.id] == DL_RECV_OK) {' "DPAPP-2h-sec F1: a refused title is never chosen on the screen"
+TSR=ConfigApp/titleshare/source/receiver.c
+need_line $TSR '            Result r = ts_title_dest(m->t[p].tid) == MEDIATYPE_SD ? ts_am_begin(m->t[p].tid, wt->exists[p], &h) : (Result) 0xC8604C04;' "DPAPP-2h-sec F1: the module never opens AM on a title of the NAND"
+[ "$(tr -d '\r' < $TSR | code_of | grep -c 'ts_am_begin(')" = 1 ] || fail "$TSR: DPAPP-2h-sec F1: ts_am_begin is called somewhere else than behind the guard of the SD card"
+need_after $TSR 'static void scrub_failed(writer_t* wt, u64 tid) {' '    if(dest != MEDIATYPE_SD) {' "DPAPP-2h-sec F1: the cleanup after an error never deletes in the NAND"
+# every delete or install the app asks of AM names the SD card (the module's two places are behind their guards above)
+AMN=$(grep -rn --include='*.c' --include='*.cpp' --include='*.hpp' --include='*.h' -E 'AM_(DeleteTitle|DeletePendingTitle|DeleteUserTitle|StartCiaInstall)\(' ConfigApp/source ConfigApp/titleshare_host | tr -d '\r' | awk '{ l = $0; sub(/^[^:]*:[0-9]*:/, "", l); sub(/\/\/.*$/, "", l); if (l ~ /AM_(DeleteTitle|DeletePendingTitle|DeleteUserTitle|StartCiaInstall)\(/ && l !~ /AM_(DeleteTitle|DeletePendingTitle|DeleteUserTitle|StartCiaInstall)\(MEDIATYPE_SD,/) print }')
+[ -z "$AMN" ] || fail "DPAPP-2h-sec F1: the app asks AM to delete or install on another media than the SD card: $AMN"
+# ... and the sender never offers the band in a child's form
+need_line ConfigApp/source/dlp_guest_store.hpp '    return IsOwnedGuestTid(tid) || (SlotKeyOf(tid) != 0 && static_cast<u32>(tid >> 32) != azl::title_rules::kTitleHighApplication) ||' "DPAPP-2h-sec F1: the sender never offers an id of the band in a child's form"
+need_line ConfigApp/source/dlp_guest_store.hpp '           dl_recv_refusal(tid) != DL_RECV_OK;' "DPAPP-2j (R-E): ... nor anything a receiver does not take (only titles of the SD card, never a sold game's guest)"
+# F2 the fallback says nothing of the old form's ticket until its own guard; F3 the word holds on the console it was written on
+need_after $GR '        // (DPAPP-2h-sec) the word on the ticket was the system form'"'"'s: the old form'"'"'s id is judged by its own guard (ComposeAndInstall), and until then' '        g.ticket_known = false;' "DPAPP-2h-sec F2: the fallback forgets the system form's ticket word"
+order_in "$GR ComposeAndInstall" "$CI2" '            const IdTaken t = JudgeInstall(slot, form, own);' '            SayTicketOurs(g);' "DPAPP-2h-sec F2: the ticket said ours only after its guard"
+order_in "$GR ComposeAndInstall" "$CI2" '            SayTicketOurs(g);' '    const RunResult begun = c.BeginInstall(prepared, form, ticket_there, title_there);' "DPAPP-2h-sec F2: ... and written before AM is asked"
+need_after $GR '        if (rc == 0 && !(TicketWordHere(g) && g.ticket_ours)) {' '            SayTicketOurs(g);' "DPAPP-2h-sec F2: the record of the form written says its ticket once the guard let it go on"
+need_line ConfigApp/source/dlp_guest_store.hpp '    return g.ticket_known && g.console != 0 && g.console == ThisConsole();' "DPAPP-2h-sec F3: a record's ticket word holds on its own console only"
+need_line ConfigApp/source/dlp_guest_store.hpp '    g.console = ThisConsole();' "DPAPP-2h-sec F3: the ticket word is written with this console's stamp"
+need_line $GS '        t += "console=" + Dec(g.console) + "\n"; // (DPAPP-2h-sec: the console the ticket word holds on; an older app skips it)' "DPAPP-2h-sec F3: the record says its console"
+need_line $GS '            ok = ReadDec(v, 0xFFFFFFFFu, &n) && n != 0;' "DPAPP-2h-sec F3: a console that does not read refuses the record"
+need_line $GA '    SetThisConsole(ReadConsoleStamp()); // (before the start reads a record: SweepAtStart, then every run)' "DPAPP-2h-sec F3: the console's stamp is read at the start"
+[ "$(cat ConfigApp/source/dlp_guest_run.cpp ConfigApp/source/dlp_guest_store.cpp | tr -d '\r' | code_of | grep -c -E 'g\.ticket_known && g\.ticket_ours')" = 0 ] || fail "DPAPP-2h-sec F3: a ticket is dropped on the record's word without its console"
+# F4 a run given up never forgets a ticket of ours it left
+need_line $GR 'void UndoLeft(const Guest* before, Guest g, u8 form, bool ticket_left) {' "DPAPP-2h-sec F4: the undo that keeps the word on a ticket left"
+UL=$(region $GR 'void UndoLeft(const Guest* before, Guest g, u8 form, bool ticket_left) {' '}')
+order_in "$GR UndoLeft" "$UL" '    g.state = GuestState::Removing;' '    if (!SaveGuest(g)) {' "DPAPP-2h-sec F4: no record of before: it stays as a removal"
+printf '%s\n' "$UL" | grep -q -x -F '            SayTicketOurs(kept);' || fail "$GR: DPAPP-2h-sec F4: the record kept says the ticket its guard judged ours"
+# F5 the ticket of a title AM still lists is never deleted
+order_in "$GA DeletePrepared" "$(region $GA 'Result DeletePrepared(u64 prepared, u8 form, bool drop_ticket, DeleteReport* report) {' '}')" '    r.still_listed = listed_read && std::find(ids.begin(), ids.end(), am) != ids.end();' '        r.ticket_rc = AM_DeleteTicket(am);' "DPAPP-2h-sec F5: the ticket only after the list says the title is gone"
+[ "$(region $GA 'Result DeletePrepared(u64 prepared, u8 form, bool drop_ticket, DeleteReport* report) {' '}' | code_of | grep -c 'AM_DeleteTicket(')" = 1 ] || fail "$GA: DPAPP-2h-sec F5: DeletePrepared asks AM to delete the ticket in more than one place"
+# F6 the old form of a migration goes only with the new record written; F12 a full card is no refusal of the form
+CI3=$(region $GR 'Took ComposeAndInstall(const Planned& job, const RunIn& in, WorkConsole& c, const Found& f, Guest& g, u8 form, const Ownership& own, bool over_ours,' '}')
+need_after $GR '        if (card_full) {' '            // (DPAPP-2h-sec) a write AM refused with the card full is no refusal of the form: no memo, no fallback (the black icon of HOME), said' "DPAPP-2h-sec F12: a write refused with the card full"
+printf '%s\n' "$CI3" | grep -q -x -F '            return Took::Failed;' || fail "$GR: DPAPP-2h-sec F12: ... is no refusal"
+need_line $GR '        if (kFallbackToApplicationForm && in.hidden_refused != nullptr && !no_space) {' "DPAPP-2h-sec F12: no memo of a refusal with the card full (DPAPP-2j: nor with the fallback off)"
+need_after $GR '        if (no_space) {' '            c.Step("hidden form not taken: the SD card is full, no fallback", prepared, static_cast<RunResult>(free_now >> 20));' "DPAPP-2h-sec F12: no fallback with the card full"
+# F8 the copy of the plugin set aside, put back when the new one cannot take its place
+GC=ConfigApp/source/games.cpp
+CPF=$(region $GC 'bool CopyPluginFile(const char* src, const char* dst) {' '}')
+order_in "$GC CopyPluginFile" "$CPF" '    if (had && std::rename(dst, old.c_str()) != 0) {' '    if (std::rename(part.c_str(), dst) != 0) {' "DPAPP-2h-sec F8: the old copy set aside before the new one"
+printf '%s\n' "$CPF" | grep -q -x -F '            std::rename(old.c_str(), dst);' || fail "$GC: DPAPP-2h-sec F8: the old copy is not put back when the new one cannot take its place"
+! printf '%s\n' "$CPF" | code_of | grep -q -F 'std::remove(dst)' || fail "$GC: DPAPP-2h-sec F8: the copy deletes the old plugin before the new one is in place"
+# F10 the census sees the guest of the system form
+need_line ConfigApp/source/zombie_plan.hpp '    return high == 0x00040000u || high == 0x00040001u || high == 0x00040002u || azl::title_rules::PreparedSlotOfProcess(tid) != 0;' "DPAPP-2h-sec F10: a guest left in memory (00040010) is a closed game"
+# F14 the touch of the buttons as they are drawn (no START: the whole width)
+need_line $GP '        if (((in.down & KEY_B) || Tapped(in, LayoutFooter(StopFooter()).back)) && !dlpguest::View().stopping) {' "DPAPP-2h-sec F14: B Stop is touched where it is drawn"
+need_line $GP '        DrawFooter(StopFooter());' "DPAPP-2h-sec F14: ... the same footer drawn"
+! tr -d '\r' < $JP | code_of | grep -q -E 'Tapped\(in, (kBackButton|ActionButton\()' || fail "$JP: DPAPP-2h-sec F14: a button of the Join is touched where a footer with START would put it"
+need_line $JP '        DrawFooter(ModeFooter());' "DPAPP-2h-sec F14: the Join draws the footer it touches"
+# the tests
+need_line Tests/settings_test/dlp_guest_run_test.cpp '    TestSec2h();' "DPAPP-2h-sec: the worker's test runs"
+need_line Tests/settings_test/dlp_guest_store_test.cpp '    TestSec2h();' "DPAPP-2h-sec: the store's test runs"
+need_line Tests/settings_test/zombie_plan_test.cpp '    CHECK(IsGameTitle(0x000400100F8F8200ull));' "DPAPP-2h-sec F10: the census's test of the guest"
+
+# ---- DPAPP-2h-sec, second pass (2026-11-20): a ticket of ours is never left with no record that names it; a full card read before the cancel ----------
+# DeletePrepared: with drop_ticket, 0 only once the ticket was asked and taken away (a list not read, a ticket AM kept: kTicketLeft)
+DP2=$(region $GA 'Result DeletePrepared(u64 prepared, u8 form, bool drop_ticket, DeleteReport* report) {' '}')
+order_in "$GA DeletePrepared" "$DP2" '        return R_FAILED(r.title_rc) ? r.title_rc : kStillListed; // (the caller keeps the record, as Removing)' '    if (drop_ticket && (r.ticket_skipped || R_FAILED(r.ticket_rc))) {' "DPAPP-2h-sec second pass: a title still listed first"
+order_in "$GA DeletePrepared" "$DP2" '    if (drop_ticket && (r.ticket_skipped || R_FAILED(r.ticket_rc))) {' '    return R_SUCCEEDED(r.title_rc) || (form == kFormApplication && R_SUCCEEDED(r.user_rc)) ? 0 : r.title_rc;' "DPAPP-2h-sec second pass: a ticket not asked or kept is a failure before the 0"
+need_after $GA '    if (drop_ticket && (r.ticket_skipped || R_FAILED(r.ticket_rc))) {' '        return kTicketLeft;' "DPAPP-2h-sec second pass: ... said kTicketLeft (the caller keeps the record)"
+# the start's question about the ticket: the console's lists, read only
+TA2=$(region $GA '    Presence TicketAt(u64 prepared, u8 form) override {' '    }')
+order_in "$GA TicketAt" "$TA2" '        if (!PreparedBand(prepared) || !ReadConsoleIds(&live)) {' '            return Presence::Unknown;' "DPAPP-2h-sec second pass: a list not read is Unknown, never Absent"
+need_line $GA '        return std::binary_search(live.ids[kSrcTicket].begin(), live.ids[kSrcTicket].end(), am) ? Presence::Present : Presence::Absent;' "DPAPP-2h-sec second pass: TicketAt reads the list of the tickets"
+! printf '%s\n' "$TA2" | code_of | grep -q -E 'AM_Delete|Delete(Prepared|PendingPrepared)' || fail "$GA: DPAPP-2h-sec second pass: TicketAt deletes something"
+# a record whose ticket word is not known to be this console's: nothing dropped on it, never forgotten while a ticket is at the id
+need_line ConfigApp/source/dlp_guest_store.hpp '    return g.ticket_known && g.ticket_ours && (g.console == 0 || ThisConsole() == 0);' "DPAPP-2h-sec second pass: the word of the builds before, or of an unknown stamp"
+need_after $GS '            if (title_gone && TicketWordUnplaced(g)) {' '                title_gone = console.TicketAt(g.prepared, g.form) == Presence::Absent;' "DPAPP-2h-sec second pass: TakeAway keeps the record while a ticket is there"
+need_line $GS '                                            (console.Installed(g.prepared, other, &other_version) == Presence::Absent && console.DropTicket(g.prepared, other));' "DPAPP-2h-sec second pass: the other form's ticket a delete kept goes alone"
+need_after $GR '            if (title_gone && TicketMayGo(g, g.form, true)) {' '                title_gone = DropLeftTicket(c, in, g, g.form, "remove: the ticket of the title deleted dropped");' "DPAPP-2h-sec second pass: Remove takes the ticket a delete kept, or the record stays"
+need_after $GR '    } else if (TicketWordUnplaced(g)) {' '        const Presence ticket = TicketAtId(c, g, g.form, "remove");' "DPAPP-2h-sec second pass: Remove keeps a record of an unplaced word while a ticket is there"
+need_line $GR '        title_gone = ticket == Presence::Absent;' "DPAPP-2h-sec second pass: ... the record goes only with no ticket there"
+need_line $GR '        refused = ticket == Presence::Present ? kErrIdTicket : 0;' "DPAPP-2h-sec second pass: ... and the page says why (326)"
+TAI=$(region $GR 'Presence TicketAtId(WorkConsole& c, const Guest& g, u8 form, const char* what) {' '}')
+order_in "$GR TicketAtId" "$TAI" '    if (!c.ReadIds(&now) || !now.src[kSrcTicket].read) {' '        return Presence::Unknown;' "DPAPP-2h-sec second pass: a list not read is Unknown"
+order_in "$GR TicketAtId" "$TAI" '    if ((SlotIn(now, g.prepared).mask[form] & SrcBit(kSrcTicket)) == 0) {' '    return Presence::Present;' "DPAPP-2h-sec second pass: Absent only when the list of the tickets has none at the id"
+! printf '%s\n' "$TAI" | code_of | grep -q -E 'DeleteGuarded|DeleteTitle|DropLeftTicket|BeginInstall' || fail "$GR: DPAPP-2h-sec second pass: TicketAtId writes something"
+need_line $GR '        clean = clean && at == Presence::Absent && (rc == 0 || DropLeftTicket(c, in, g, other, what));' "DPAPP-2h-sec second pass: DropOtherForm takes the ticket a delete kept, or the record stays"
+# F12: the free space read when AM refuses, before the cancel and the remove of the work file
+need_after $GR 'bool SinkCounted(void* ctx, u64 off, const u8* buf, u32 len) {' '    const RunResult rc = s->c->Install(off, buf, len);' "DPAPP-2h-sec second pass F12: the counted sink writes to AM (DPAPP-2j: and keeps its Result)"
+need_line $GR '    s->end = off + len;' "DPAPP-2h-sec second pass F12: ... and counts what AM took"
+need_line $GR '        const u64 left_to_write = f.pkg.required_size > sent.end ? f.pkg.required_size - sent.end : 0;' "DPAPP-2h-sec second pass F12: what was still to write"
+need_after $GR '        const bool card_full = rc == kErrInstall && (fault == InstallFault::NoSpace || (c.FreeBytes(&free_now) && free_now < left_to_write + kSpaceSlack));' '        c.CancelInstall(prepared, form);' "DPAPP-2h-sec second pass F12: the room read before the cancel (DPAPP-2j: or FS said the card is full)"
+need_after $GR '    const bool full_at_finish = finished != 0 && c.FreeBytes(&free_at_finish) && free_at_finish < kSpaceSlack;' '    std::remove(part.c_str());' "DPAPP-2h-sec second pass F12: a Finish refused: the room read before the work file goes"
+need_after $GR '        if (full_at_finish || fault == InstallFault::NoSpace) {' '            *rc_out = kErrNoSpace;' "DPAPP-2h-sec second pass F12: ... no refusal of the form"
+# Titles Delivery: a demo of the SD card is received again
+need_line Tests/settings_test/dlp_guest_store_test.cpp '    CHECK(dl_recv_refusal(0x0004000200123400ull) == DL_RECV_OK && dl_recv_refusal(0x0004000200123402ull) == DL_RECV_OK);' "DPAPP-2h-sec second pass: the demo's test"
+need_line Tests/settings_test/dlp_guest_run_test.cpp '    TestSec2hSecond();' "DPAPP-2h-sec second pass: the worker's test runs"
+need_line Tests/settings_test/dlp_guest_store_test.cpp '    TestSec2hSecond();' "DPAPP-2h-sec second pass: the store's test runs"
+
+# ---- DPAPP-2j (2026-11-20, after the console's prova 2i): the form M3c1 again and the closed game it leaves freed (R-A), the records of each console
+# in the folder of its ID0 (R-B), chat/debug/menu off in the plugin too (R-C), the Result of AM or FS of a failed install never lost and an error of
+# the SD card never taken for a refusal of the form, no fallback to HOME (R-D), Titles Delivery that never sends a guest (R-E)
+ZF=ConfigApp/source/zombie_free.cpp
+ZP=ConfigApp/source/zombie_plan.hpp
+# R-C: the menu that reads no key is off (the plugin opened it on Select | its default), in both programs; the app keeps no chord of it
+need_line Includes/azl/ini_values.hpp '    return !MenuKeyIsOff(value) && ChordBits(value) == 1u ? std::string(kMenuKeyOff) : value;' "DPAPP-2j: a menu_key that names no key is off"
+need_line ConfigApp/source/settings.cpp '                if (!azl::ini::MenuKeyIsOff(cfg.menu_key)) { // (DPAPP-2j: a value with no key read is off, and no chord to keep)' "DPAPP-2j: the app keeps no chord of an unreadable menu_key"
+need_line Tests/log_files_test.cpp '    CHECK(ini::MenuKeyFromFile("xyz") == "off" && ini::MenuKeyFromFile("Select") == "off" && ini::MenuKeyFromFile(" select \r") == "off" &&' "DPAPP-2j: the test of the unreadable menu_key"
+need Includes/ctr/plugin.hpp "int debug = 0;" "DPAPP-2j: the plugin's debug is off without a file"
+need Includes/ctr/plugin.hpp "std::string menu_key = ini::kMenuKeyOff;" "DPAPP-2j: the plugin's menu is off without a file"
+# R-D: the Result of every write and Finish of an install up to the log, classified; only AM's own refusal is a refusal of the form
+need_line ConfigApp/source/dlp_guest_run.hpp '    virtual RunResult Install(u64 off, const u8* buf, u32 len) = 0;' "DPAPP-2j: the write of the install answers its Result, never a bool"
+need_line ConfigApp/source/dlp_guest.cpp '        return R_FAILED(rc) ? rc : 0; // (DPAPP-2j, R-D: AM'"'"'s or FS'"'"'s own Result, up to the line of the log)' "DPAPP-2j: the console gives the Result of FSFILE_Write up"
+need_line $GR '        s->last = rc;' "DPAPP-2j: the sink keeps the Result of the write that failed"
+need_line $GR '        const InstallFault fault = rc == kErrInstall ? NoteFault(c, "install write", am, sent.last, sent.end, f.pkg.required_size) : InstallFault::None;' "DPAPP-2j: a refused write is said with its Result and classified"
+need_line $GR '        const InstallFault fault = NoteFault(c, "install finish", am, finished, f.pkg.required_size, f.pkg.required_size);' "DPAPP-2j: a refused Finish too"
+need_line $GR '            NoteFault(c, "install write again", am, sent.last, sent.end, total); // (DPAPP-2j, R-D: AM'"'"'s own Result)' "DPAPP-2j: ... and the second write of InstallOverHigher"
+need_line $GR '    c.Note(FaultLine(step, am, static_cast<u32>(result), at, total, fault).c_str());' "DPAPP-2j: the line of the Result goes to the log"
+[ "$(tr -d '\r' < $GR | code_of | grep -c -F '*rc_out = kErrSdIo;')" = 2 ] || fail "DPAPP-2j: an error of the SD card (a write, the Finish) is kErrSdIo, never a refusal of the form"
+need_line $GR '        return fault == InstallFault::FormRefused ? Took::Refused : Took::Failed;' "DPAPP-2j: a write refused is the form's only when AM refused it"
+need_line $GR '        return finished == kErrCancel || finished == kErrTemp || fault != InstallFault::FormRefused ? Took::Failed : Took::Refused;' "DPAPP-2j: ... and a Finish"
+need_line $GL '           : rc == kResultShortWrite ? InstallFault::SdIo' "DPAPP-2j: a short write is the SD card's"
+need_line $GL '           : (ResultModule(rc) == kModuleFs || ResultModule(rc) == kModuleFsi || ResultModule(rc) == kModuleSdmc)' "DPAPP-2j: FS, FSI, SDMC are the SD card's"
+need_line $GL '               ? (ResultDescription(rc) == kDescPartitionFull ? InstallFault::NoSpace : InstallFault::SdIo)' "DPAPP-2j: ... FS 210 the full card"
+need_line $GL '           : ResultModule(rc) == kModuleAm ? (ResultDescription(rc) == kDescWrongInstallState ? InstallFault::Busy : InstallFault::FormRefused)' "DPAPP-2j: only AM's own answer (not its state) refuses the form"
+need_line $GL 'constexpr u32 kModuleFs = 17, kModuleFsi = 24, kModuleAm = 32, kModuleSdmc = 61;' "DPAPP-2j: the modules of libctru's result.h"
+need_line $GL 'constexpr int kErrSdIo = 330;' "DPAPP-2j: the result of an error of the SD card"
+need_line $GL '    case kErrSdIo:' "DPAPP-2j: an error of the SD card can be tried again (CanTryAgain: the one case of 330 without its own return)"
+need_line $GL '                                            : InstallFault::Unknown;' "DPAPP-2j: a Result of no module known is never a refusal of the form"
+need_line ConfigApp/source/dlp_guest_am.cpp 'constexpr Result kShortWrite = static_cast<Result>(kResultShortWrite); // (AM took fewer bytes than it was given: dlp_guest_logic.hpp, an error of the SD card)' "DPAPP-2j: the short write is the one the classifier knows"
+need_line $GR '    const bool refused_before = kFallbackToApplicationForm && in.hidden_refused != nullptr && in.hidden_refused->load();' "DPAPP-2j: no memo with the fallback off (a child never put in HOME by another game's refusal)"
+need_after $GR '        if (!kFallbackToApplicationForm) {' '            UndoLeft(undo, g, form, ticket_left);' "DPAPP-2j: a refusal with the fallback off leaves no ticket of ours unsaid (F4)"
+need_after $GR '            UndoLeft(undo, g, form, ticket_left);' '            return kErrCannotHide;' "DPAPP-2j: ... and says kErrCannotHide"
+need_line $GR '            ticket_left = !DropLeftTicket(c, in, g, form, "install not on the SD card: the ticket it left dropped");' "DPAPP-2j: a title not on the SD card after a Finish of 0 drops its ticket"
+need_after $GR '            ticket_left = !DropLeftTicket(c, in, g, form, "install not on the SD card: the ticket it left dropped");' '            took = Took::Failed;' "DPAPP-2j: ... and is no refusal of the form"
+need_line $GRT '    TestSdErrors2j();' "DPAPP-2j: the test of the errors of the SD card runs"
+need_line $GRT '        {static_cast<RunResult>(0xC8804478u), kErrSdIo, "an error of the SD card"},   // FS 120 (not found)' "DPAPP-2j: ... with FS's errors"
+# R-A: the form M3c1 made, jumped to; the system form never installed nor jumped to
+need_line $GS2H '    return form == kFormDlpChild || form == kFormApplication;' "DPAPP-2j: Jumpable: M3c1 and the old form, never the system form"
+need_line $GS2H 'constexpr u8 kComposerVersion = 4;' "DPAPP-2j: every child of before is to update"
+need_line ConfigApp/source/dlp_guest.cpp '    return form == kFormSystem ? "system (build 2h)" : (form == kFormDlpChild ? "hidden, M3c1" : "old");' "DPAPP-2j: the forms' names in the log"
+need_line $GR '                              before.form == kFormSystem ? "old form removed (the system form of the build 2h)" : "old form removed (HOME showed it)");' "DPAPP-2j: the old form's removal says which"
+# R-A: the closed game of M3c1 freed - pm:app opened in ONE file of the app, never in the plugin, for the command 12 alone
+[ "$(grep -r -l -F '"pm:app"' ConfigApp/source Sources Includes | tr '\n' ' ')" = "$ZF " ] || fail "DPAPP-2j: pm:app is opened somewhere else than $ZF"
+! grep -r -n -E 'PMAPP_|pmAppInit|pmapp\.h' ConfigApp/source Sources Includes || fail "DPAPP-2j: libctru's pm:app is used (only $ZF's one raw command 12)"
+[ "$(tr -d '\r' < $ZF | code_of | grep -c -F 'kPmAppUnregisterHeader')" = 1 ] || fail "DPAPP-2j: $ZF sends another command of pm:app than UnregisterProcess"
+! tr -d '\r' < $ZF | code_of | grep -q -E 'IPC_MakeHeader|0x000[0-9A-F]00[0-9A-F]0' || fail "DPAPP-2j: $ZF builds another IPC header"
+need_line $ZP 'constexpr uint32_t kPmAppUnregisterHeader = 0x000C0080u; // IPC_MakeHeader(12, 2, 0)' "DPAPP-2j: pm:app command 12, two words"
+need_line $ZF '    cmdbuf[1] = static_cast<u32>(key);' "DPAPP-2j: UnregisterProcess of the KEY (the ACI's id pm registered), its low word first"
+need_line $ZF '    cmdbuf[2] = static_cast<u32>(key >> 32);' "DPAPP-2j: ... its high word"
+! tr -d '\r' < $ZF | code_of | grep -q -E 'Unregister\([^)]*AmTitle' || fail "DPAPP-2j: pm is asked about the id of AM (never registered: pm knows the ACI's)"
+ZK=$(region $ZF 'void FreeKey(u64 key, u32 self, bool emulator, std::vector<std::string>& lines) {' '}')
+order_in "$ZF FreeKey" "$ZK" '    zombie_plan::FreeVerdict v = zombie_plan::Judge(facts, self, key, dlpguest::IsOwnedGuestTid(key), emulator, &calls);' '    const Result open_rc = OpenPmApp(&pm);' "DPAPP-2j: judged before pm:app is opened"
+order_in "$ZF FreeKey" "$ZK" '    if (v != zombie_plan::FreeVerdict::Free) {' '        const Result rc = Unregister(pm, key, &answer);' "DPAPP-2j: pm is asked only for the verdict Free"
+order_in "$ZF FreeKey" "$ZK" '        if (asked >= calls) {' '        const Result rc = Unregister(pm, key, &answer);' "DPAPP-2j: never more calls than the closed games judged"
+order_in "$ZF FreeKey" "$ZK" '        const Result rc = Unregister(pm, key, &answer);' '    svcCloseHandle(pm); // (never a session kept: pm:app has 4, Rosalina keeps one)' "DPAPP-2j: the session of pm:app closed right after"
+order_in "$ZF FreeKey" "$ZK" '    svcCloseHandle(pm); // (never a session kept: pm:app has 4, Rosalina keeps one)' '    CloseAll(seen);    // (our references gone: the kernel frees a process nobody else holds)' "DPAPP-2j: our handles of the closed games kept open while pm is asked"
+need_line $ZF '    if (!whole && v == zombie_plan::FreeVerdict::Free) {' "DPAPP-2j: a list not read whole never lets pm be asked"
+need_after $ZF 'Result OpenPmApp(Handle* pm) {' '    srvSetBlockingPolicy(true);' "DPAPP-2j: pm:app opened non-blocking (its sessions taken: an answer at once, never a wait)"
+need_after $ZF '    srvSetBlockingPolicy(true);' '    const Result rc = srvGetServiceHandleDirect(pm, "pm:app");' "DPAPP-2j: ..."
+need_after $ZF '    const Result rc = srvGetServiceHandleDirect(pm, "pm:app");' '    srvSetBlockingPolicy(false);' "DPAPP-2j: ... and the policy put back"
+need_line $ZF '        s.fact.signaled = zombie_plan::WaitState(static_cast<uint32_t>(svcWaitSynchronization(h, 0))); // (== 0 exactly: the timeout is positive)' "DPAPP-2j: the state read as the census reads it"
+! grep -n -E 'R_SUCCEEDED\(svcWaitSynchronization' $ZF ConfigApp/source/zombie_census.cpp || fail "DPAPP-2j: R_SUCCEEDED on a wait (the kernel's timeout 0x09401BFE is positive)"
+need_line $ZF '        s.fact.threads = R_SUCCEEDED(svcGetProcessInfo(&v, h, 7)) ? static_cast<int>(v) : -1; // (type 7: balanced, unlike GetThreadList)' "DPAPP-2j: the threads by type 7"
+need_after $ZF 'void FreeAtStart(const std::string& datadir) {' '    static bool done = false; // (one look per start)' "DPAPP-2j: once per start"
+need_line $ZF '    if (envIsHomebrew()) {' "DPAPP-2j: only the installed app (THE running application) frees"
+need_line $ZF '        if (dlpguest::IsOwnedGuestTid(g.prepared)) {' "DPAPP-2j: only the keys of records of ours"
+need_line $ZF '    return any || !whole;' "DPAPP-2j: the Join's gate refuses on a list not read"
+need_after $ZF 'bool Remaining(std::uint64_t key, std::uint32_t* ms, bool* unread) {' '    const u64 t0 = NowMs();' "DPAPP-2j: the gate's look is timed"
+need_after $ZP 'inline FreeVerdict Judge(const std::vector<ProcFact>& all, uint32_t self_pid, uint64_t key, bool registered, bool on_emulator, int* calls) {' '    *calls = 0;' "DPAPP-2j: no call unless Free"
+need_line $ZP '    if (on_emulator) {' "DPAPP-2j: never on an emulator"
+need_line $ZP '    if (!registered || !FreeableKey(key)) {' "DPAPP-2j: only a key of ours, never 3DS Link's"
+need_line $ZP '    return azl::title_rules::IsPreparedId(key) && (key & ~0xFFull) != (azl::title_rules::kAppTid & ~0xFFull);' "DPAPP-2j: a freeable key: the band, never 3DS Link with or without its low byte"
+need_line $ZP '        if (p.pid == self_pid) {' "DPAPP-2j: never 3DS Link's own process"
+need_line $ZP '        if (p.signaled == 0 || p.threads > 0) {' "DPAPP-2j: never a process that runs (pm would forget a live application)"
+need_line $ZP '        if (p.signaled != 1 || p.threads != 0) {' "DPAPP-2j: never a process whose state is not known"
+need_line $ZP '    return (tid & ~0xFFull) == (key & ~0xFFull);' "DPAPP-2j: pm's own comparison (process_data.c:37): EVERY process pm could take for the key is looked at"
+need_line $ZP '    *calls = found < kMaxFreeCalls ? found : kMaxFreeCalls;' "DPAPP-2j: one call per closed game, 8 at most"
+need_after ConfigApp/source/pages_startup.cpp '    dlpguest::StartGuests();' '    zombie_free::FreeAtStart(g.paths.datadir); // (DPAPP-2j, R-A: after the records are read - their keys - and after the census wrote what was there)' "DPAPP-2j: the closed games freed at the start, after the records"
+need_line ConfigApp/source/zombie_census.cpp '    g_notice = false; // (DPAPP-2j: freed by 3DS Link - no restart to ask for)' "DPAPP-2j: no message to restart for a closed game that was freed"
+JN=$(region $JP '    void Join(const dlpjoin::Host& h) {' '    }')
+order_in "$JP Join" "$JN" '        if (c != nullptr && c->prepared != 0 && session_.ClosedGameLeft(c->prepared, &unread)) {' '        core->AskJoin(h.g.host);' "DPAPP-2j: the gate of the closed game before A joins"
+need_after $JC 'bool Session::ClosedGameLeft(u64 prepared, bool* unread) {' '    const bool left = zombie_free::Remaining(prepared, &ms, unread);' "DPAPP-2j: the gate reads the processes of the key"
+need_line ../DlpLink/rsf/3dslink.rsf '   - pm:app' "DPAPP-2j: the rsf of 3DS Link lists pm:app"
+! grep -q -x -F '   - pxi:dev' ../DlpLink/rsf/3dslink.rsf || fail "DPAPP-2j: pxi:dev is back in the rsf (pm:app took its place: 32 services)"
+need_line Tests/settings_test/zombie_plan_test.cpp '    TestFree2j();' "DPAPP-2j: the test of the freeing runs"
+# R-B: the records of THIS console in the folder of its ID0; another console's never read, decided on or deleted
+need_line $GS '    return g_this_id0.empty() ? std::string() : GuestsDir() + "/" + g_this_id0;' "DPAPP-2j: this console's records in the folder of its ID0"
+need_line $GS '    return dir.empty() ? std::string() : dir + "/" + Hex16(prepared) + ".guest";' "DPAPP-2j: a record's path is in this console's folder"
+need_line $GS '    return dir.empty() ? std::string() : dir + "/" + Hex16(prepared) + ".part";' "DPAPP-2j: ... and a work file's"
+need_line $GS '        return {}; // (DPAPP-2j: the ID0 not known - no record is this console'"'"'s)' "DPAPP-2j: the ID0 not known: no record read"
+need_line $GS '    if (!IsSoundGuest(g) || RecordsDir().empty()) {' "DPAPP-2j: ... and none written (so no call to AM after it)"
+need_line $GS '    for (const std::string& name : FileNames(RecordsDir())) {' "DPAPP-2j: the records read from this console's folder only"
+need_line $GS '    for (const std::string& folder : {dir, mine}) {' "DPAPP-2j: the sweep never enters another console's folder"
+need_line $GS '            if (!has_child && !std::binary_search(others.begin(), others.end(), p)) {' "DPAPP-2j: a block another console's record names is kept"
+need_line $GS '        bool ours = g.console != 0 && ThisConsole() != 0 && g.console == ThisConsole();' "DPAPP-2j: a record of the shared folder is moved when this console wrote it"
+need_line $GS '            ours = console.Installed(p, g.form, &version) == Presence::Present && console.Product(p, g.form, product) && product[0] != '"'"'\0'"'"' &&' "DPAPP-2j: ... or, without console=, when AM lists its title with its code"
+need_line $GS '        if (there == text) {' "DPAPP-2j: the shared record goes only when the moved copy is the same"
+need_after $GS 'StartReport SweepAtStart(StartConsole& console) {' '    MoveSharedRecords(console, &r); // (DPAPP-2j, R-B: before the records are read - the moved ones are this console'"'"'s from now)' "DPAPP-2j: the shared records moved before the start reads them"
+MS=$(region $GS 'void MoveSharedRecords(StartConsole& console, StartReport* r) {' '}')
+[ "$(printf '%s\n' "$MS" | code_of | grep -c -E 'std::remove\(')" = 2 ] || fail "DPAPP-2j: the move of the shared records deletes something else than the moved record and its .bak"
+! printf '%s\n' "$MS" | code_of | grep -q -E 'DeleteTitle|DropTicket|DisableFolder|DropGuest|DeletePending' || fail "DPAPP-2j: the move of the shared records asks AM or the folders for something"
+need_line ConfigApp/source/dlp_guest_ids.cpp '    const std::string dir = RecordsDir(); // (DPAPP-2j, R-B: the census is THIS console'"'"'s - in its folder; "" when its ID0 is not known)' "DPAPP-2j: ids.cache in this console's folder"
+need_line $GA '    if (R_FAILED(FSUSER_GetSdmcCtrRootPath(reinterpret_cast<u8*>(root), sizeof(root)))) {' "DPAPP-2j: the ID0 as the system names it (no key, no movable.sed)"
+need_line ConfigApp/source/system.cpp '            id0 = dlpguest::Id0OfRoot(ascii);' "DPAPP-2j: the seeds' check reads the ID0 the system names (not the first folder of the card)"
+need_line $GST '    TestOtherConsole2j();' "DPAPP-2j: the test of a card in another console runs"
+# R-E: Titles Delivery sends only titles of the SD card, never a Download Play guest of any form
+need_line ConfigApp/titleshare_host/recv_filter.h '    if(dl_is_prepared_of_sold(tid)) {' "DPAPP-2j: the guest of a sold game is never received (any console's)"
+need_line ConfigApp/titleshare_host/recv_filter.h '        if(c[i] != 0 && dl_is_sold_tid(game) && prepared != game && prepared != DL_APP_TID && prepared == key) {' "DPAPP-2j: ... PreparedOf of a sold game, as title_rules.hpp"
+need_line ConfigApp/titleshare_host/recv_filter.h '    if(high != 0x00040001u && high != 0x00040010u) {' "DPAPP-2j: ... in a guest's own forms (DPAPP-2j-rev: never by the id alone in the application form - a homebrew of the SD card may have it)"
+need_line ConfigApp/titleshare_host/delivery.c '        if(dl_recv_refusal(gInfo[items[i]].tid) != DL_RECV_OK || (gSendNever != NULL && gSendNever(gInfo[items[i]].tid))) {' "DPAPP-2j: the manifest never holds a title the console never sends"
+need_order ConfigApp/source/pages_delivery.cpp '        dl_set_send_never([](uint64_t tid) { return dlpguest::NeverSent(tid) ? 1 : 0; });' '        const int rc = dl_send_prepare(items.data(), static_cast<int>(items.size()));' "DPAPP-2j: the app's word given before the manifest is made"
+need_line ConfigApp/source/games.cpp 'static_assert(DL_SOLD_ID_FIRST == kSoldIdFirst && DL_SOLD_ID_LAST == kSoldIdLast && DL_SOLD_NEW_ID_FIRST == kSoldNewIdFirst && DL_SOLD_NEW_ID_LAST == kSoldNewIdLast,' "DPAPP-2j: the sold ranges of recv_filter.h are games.hpp's"
+need_line $GS2H 'static_assert(DL_PREPARED_BAND == azl::title_rules::kPreparedBand && DL_PREPARED_BAND_MASK == azl::title_rules::kPreparedBandMask &&' "DPAPP-2j: the band of recv_filter.h is title_rules.hpp's"
+need_line $GST '    TestDelivery2j();' "DPAPP-2j: the test of Titles Delivery runs"
+
+# ---- (DPAPP-2j-rev, 2026-11-20) the review of the build 2j: eight findings confirmed, seven corrections (two findings were the same)
+# 1. the Join's gate: a process that left between the list and the open keeps the list whole; a list not read is read once more, and said as it is
+need_line $ZF '            unopened.push_back(pid); // (a process that left between the list and the open is fine: the list read again below says which)' "DPAPP-2j-rev: a process not opened is not a list not read, yet"
+need_line $ZF '        whole = whole && ListPids(again) && zombie_plan::NoneListed(again, unopened); // (DPAPP-2j-rev: one still listed is not known)' "DPAPP-2j-rev: ... only one still listed is"
+! tr -d '\r' < $ZF | code_of | grep -q -F 'whole = false; // (a process that left' || fail "DPAPP-2j-rev: a process that left between the list and the open taken for a list not read again"
+need_line $ZF '        whole = ReadKey(key, self, seen); // (DPAPP-2j-rev: read once more before the gate refuses on a list not read)' "DPAPP-2j-rev: the gate reads a list not read once more"
+need_line $ZF '    *unread = !any && !whole; // (DPAPP-2j-rev: no closed game seen, the list not read whole - said as it is, never "a closed game")' "DPAPP-2j-rev: the gate says a list not read"
+need_line $JC '    if (*unread) {' "DPAPP-2j-rev: the session's log says a list not read, not a closed game"
+need_line $JP '            g.ShowToast(unread ? std::string("3DS Link could not read which programs are in memory: press A to try again.")' "DPAPP-2j-rev: never 'restart the console' for a list not read"
+need_line $ZP 'inline bool NoneListed(const std::vector<uint32_t>& pids, const std::vector<uint32_t>& left_out) {' "DPAPP-2j-rev: the pids not opened looked for in the list read again"
+need_after $ZP 'inline bool NoneListed(const std::vector<uint32_t>& pids, const std::vector<uint32_t>& left_out) {' '        if (Listed(pids, p)) {' "DPAPP-2j-rev: ... each of them"
+# 2. the freeing: the 500 ms only when pm gave a reference back (else one look - a reference not pm's never costs a wait at every start)
+need_line $ZF '        s.refs_after = s.h != 0 && R_SUCCEEDED(svcGetHandleInfo(&now, s.h, 1)) ? zombie_plan::OthersFromHandleInfo(now) : -1;' "DPAPP-2j-rev: the references read once pm was asked, our handle still open"
+need_line $ZF '        if (left.empty() || !wait || NowMs() - r0 >= kRecheckMaxMs) { // (DPAPP-2j-rev: no reference given back - one look only)' "DPAPP-2j-rev: no wait when pm gave nothing back"
+order_in "$ZF FreeKey" "$(region $ZF 'void FreeKey(u64 key, u32 self, bool emulator, std::vector<std::string>& lines) {' '}')" '        wait = wait || zombie_plan::WaitAfterUnregister(s.refs_others, s.refs_after);' '    CloseAll(seen);    // (our references gone: the kernel frees a process nobody else holds)' "DPAPP-2j-rev: the references read before our handles are closed"
+need_line $ZP '    return before_others < 0 || after_others < 0 || after_others < before_others;' "DPAPP-2j-rev: the wait only when a reference was given back (or a count not read)"
+# 3. the closed game of the guest is freed at the start of 3DS Link only: said before the jump
+need_line $JP '                         "The game starts when the host starts; nothing is downloaded. When you close it, open 3DS Link before another game: it frees "' "DPAPP-2j-rev: the Join says to open 3DS Link before another game"
+# 4+7. Titles Delivery: the application form of the band is never refused by its id alone (a homebrew of the SD card may have it): the record says
+need_order ConfigApp/titleshare_host/recv_filter.h '    if(dl_is_prepared_of_sold(tid)) {' '    if(high != 0x00040000u && high != 0x00040002u && high != 0x0004000Eu && high != 0x0004008Cu) {' "DPAPP-2j-rev: a guest's form said as a guest before 'not of the SD card'"
+! tr -d '\r' < ConfigApp/titleshare_host/recv_filter.h | grep -q -F 'if(high != 0x00040000u && high != 0x00040001u && high != 0x00040010u) {' || fail "DPAPP-2j-rev: the application form of the band refused by its id again (a quarter of the homebrew of the SD card)"
+need_line $GST '    CHECK(homebrew_sent == 0x8000 - 1); // (every unique id of the band but 3DS Link'"'"'s)' "DPAPP-2j-rev: every homebrew of the band is sent but 3DS Link"
+# 5. the Update of a guest HOME shows, refused: the old guest stays, said as it is (kErrShownInHome), never "not installed"
+need_line $GR '        if (!kFallbackToApplicationForm && OldFormStays(undo, fs)) {' "DPAPP-2j-rev: a refused Update of the old form says the old guest stays"
+need_after $GR '        if (!kFallbackToApplicationForm && OldFormStays(undo, fs)) {' '            UndoLeft(undo, g, form, ticket_left);' "DPAPP-2j-rev: ... its record put back"
+need_line $GR '            return kErrShownInHome;' "DPAPP-2j-rev: ... and said with kErrShownInHome"
+need_line $GR '    return before != nullptr && before->state == GuestState::Installed && before->form == kFormApplication && fs.at[kFormApplication] == Presence::Present;' "DPAPP-2j-rev: only an Installed guest of the old form AM lists"
+# 6. Azahar: its one ID0 folder (it does not answer FSUSER_GetSdmcCtrRootPath); a console never guesses
+need_line $GA '    return v != 0 ? Id0OfSdCard("sdmc:/Nintendo 3DS") : std::string();' "DPAPP-2j-rev: the ID0 from the card's folder on an emulator only (DPAPP-2k: v != 0 - Azahar writes 2)"
+need_line $GA '        return Id0OnEmulator();' "DPAPP-2j-rev: ... when the system does not answer"
+need_line $GA '    return id0.empty() ? Id0OnEmulator() : id0; // (an answer with nothing written in it: the emulator'"'"'s)' "DPAPP-2j-rev: ... or answers nothing"
+need_line $GS '                return ""; // (two ID0 folders: never a guess)' "DPAPP-2j-rev: two ID0 folders: none"
+need_after $GS 'std::string Id0OfFolders(const std::vector<std::string>& names) {' '        if (IsHexName(name, 32)) {' "DPAPP-2j-rev: only a folder of 32 hex digits is an ID0"
+# 8. InstallOverHigher's second write: 330 / 311 from its Result, and a code of 3DS Link's own never said as a Result
+need_line $GR '        return again == InstallFault::SdIo ? kErrSdIo : again == InstallFault::NoSpace ? kErrNoSpace : written; // (the caller gives the install up)' "DPAPP-2j-rev: the second write's error of the SD card is 330"
+need_line $GR '        if (finished == kErrSdIo || finished == kErrNoSpace) {' "DPAPP-2j-rev: ... and the caller keeps it"
+need_after $GR 'InstallFault NoteFault(WorkConsole& c, const char* step, u64 am, RunResult result, u64 at, u64 total) {' '    if (result >= kErrFirst && result <= kErrLast) {' "DPAPP-2j-rev: a code of 3DS Link's own never said as AM's Result"
+need_line $GRT '        CHECK_EQ(RunJob(Job(Act::Prepare, 0x11), b.in, b.con, nullptr), k == 0 ? kErrSdIo : kErrNoSpace);' "DPAPP-2j-rev: the test of the second write of InstallOverHigher runs"
+
+# ---- (DPAPP-2k, 2026-11-20) svcGetSystemInfo 0x20000 in the app: 0 on a console's Luma (with the Result 1, positive: k11_extension GetSystemInfo.c),
+# 1 on Citra, 2 on Azahar (EmulatorIDs::AZAHAR_EMULATOR). An emulator is v != 0; never v == 1 (Azahar taken for a console: no ID0, Enable ends in 314
+# - the build 2j in Azahar) and never the Result (R_SUCCEEDED on Luma's 1 says emulator on every console).
+emu_2k() { # $1 = file, $2 = the first line of the function, $3 = its return line, $4 = what it is
+  local r
+  r=$(region "$1" "$2" '}' | code_of)
+  printf '%s\n' "$r" | grep -q -E '^    svcGetSystemInfo\(&v, 0x20000, 0\); *$' || fail "DPAPP-2k: $4: svcGetSystemInfo 0x20000 no longer a statement of its own (its Result taken?)"
+  printf '%s\n' "$r" | grep -q -x -F -- "$3" || fail "DPAPP-2k: $4: no longer '$3' (0 Luma, 1 Citra, 2 Azahar)"
+  ! printf '%s\n' "$r" | grep -q -E 'R_SUCCEEDED|R_FAILED|== *1|>= *1|== *2' || fail "DPAPP-2k: $4: the Result or one emulator's value taken again"
+}
+emu_2k $GA 'static std::string Id0OnEmulator() {' '    return v != 0 ? Id0OfSdCard("sdmc:/Nintendo 3DS") : std::string();' "Id0OnEmulator (dlp_guest_am.cpp)"
+emu_2k $IDA 'bool OnEmulator() {' '    return v != 0;' "OnEmulator of the lists (dlp_guest_ids_am.cpp)"
+emu_2k ConfigApp/source/zombie_census.cpp 'bool OnEmulator() {' '    return v != 0;' "OnEmulator of the census (zombie_census.cpp)"
+emu_2k $ZF 'bool OnEmulator() {' '    return v != 0;' "OnEmulator of the freeing and of the Join's gate (zombie_free.cpp)"
+[ "$(cat ConfigApp/source/*.cpp ConfigApp/source/*.hpp | tr -d '\r' | code_of | grep -c -F 'svcGetSystemInfo(&v, 0x20000, 0)')" = 4 ] || fail "DPAPP-2k: an svcGetSystemInfo 0x20000 of the app outside the four pinned (or one of them gone)"
+
+# ---- (F7, 2026-11-21) AzaharLink.ini whole or not at all in the plugin too: the order of the app's WriteTextFile written once in azl/whole_file.hpp.
+# Until 1.1.4 Plugin::SaveConfig opened the ini with TRUNCATE (CTRPF: OpenFile, SetSize(0), then the write): a cut between them left 0 bytes, and the
+# app then wrote the defaults over them (room, password, nickname lost). Now: the new text in <ini>.tmp, read back; the old file aside as <ini>.bak;
+# the .tmp in its place; the .bak gone. The plugin's reader takes the .bak when the ini is missing, read-only (Tests/whole_file_test.cpp,
+# Tests/settings_test/whole_file_states_test.cpp: the app's fileio.cpp in front of every card a cut save leaves).
+WF=Includes/azl/whole_file.hpp
+need_line $WF 'constexpr const char* kTmpSuffix = ".tmp";' "F7: the work file has the app's name"
+need_line $WF 'constexpr const char* kBakSuffix = ".bak";' "F7: the old file aside has the app's name"
+[ "$(tr -d '\r' < ConfigApp/source/fileio.cpp | grep -c -x -F '    const std::string previous = path + ".bak";')" = 2 ] || fail "F7: the app's reader and writer no longer both call the old file aside <path>.bak (the plugin's name)"
+need_line ConfigApp/source/fileio.cpp '    const std::string temporary = path + ".tmp";' "F7: ... and the app's work file <path>.tmp"
+need_order $WF '    if (!fs.WriteNew(tmp, text)) {' '    const bool had_old = fs.Exists(path);' "F7: the new file is finished before the old one is touched"
+need_order $WF '        fs.Remove(bak);' '        if (!fs.Rename(path, bak)) {' "F7: a stale .bak goes before the old file goes aside (a rename on the card does not replace)"
+need_order $WF '        if (!fs.Rename(path, bak)) {' '    if (!fs.Rename(tmp, path)) {' "F7: the old file aside before the new one takes its place"
+need_line $WF '            fs.Rename(bak, path);' "F7: a failed second rename puts the old file back"
+need_order $WF '    if (fs.Exists(path)) {' '    if (fs.Exists(BakOf(path))) {' "F7: the file wins over its .bak, as ReadTextFile"
+region Sources/ctr/plugin.cpp 'bool Plugin::SaveConfig() {' '}' | grep -q -x -F '    if (!whole::Replace(card, kConfigPath, text)) {' || fail "F7: SaveConfig no longer writes through azl/whole_file.hpp"
+[ "$(tr -d '\r' < Sources/ctr/plugin.cpp | code_of | grep -c -E 'File::Open\([a-z_]*, *kConfigPath, *File::RWC')" = 0 ] || fail "F7: AzaharLink.ini opened for writing in place again"
+need_line Sources/ctr/plugin.cpp '            if (File::Open(file, path, File::RWC | File::TRUNCATE | File::SYNC) != File::SUCCESS) {' "F7: the work file is written with every write flushed"
+need_line Sources/ctr/plugin.cpp '        return Plugin::ReadDataFile(path.c_str(), text.size() + 1, back) && back == text;' "F7: the work file is read back before it takes the ini's place"
+region Sources/ctr/plugin.cpp 'bool Plugin::LoadConfig() {' '}' | grep -q -x -F '    const whole::Source source = whole::Choose(card, kConfigPath);' || fail "F7: LoadConfig no longer reads the .bak a cut save left"
+need_line Sources/ctr/plugin.cpp '    const char* const ini_path = source == whole::Source::Bak ? kConfigBakPath : config_from_old_place_ ? kOldConfigPath : kConfigPath;' "F7: ... and opens the .bak when it chose it"
+[ "$(region Sources/ctr/plugin.cpp 'bool Plugin::LoadConfig() {' '}' | code_of | grep -c -E 'Rename|Remove|RWC|WRITE|TRUNCATE')" = 0 ] || fail "F7: the plugin's reader renames, removes or writes (only the writers put the files in order)"
+need_line Sources/ctr/plugin.cpp 'constexpr const char* kConfigBakPath = "/3ds/3DSLink/AzaharLink.ini.bak";' "F7: the plugin's .bak is the app's (kIniPath + \".bak\")"
+need_line Tests/run.sh 'g++ $CXXFLAGS Tests/whole_file_test.cpp -o "$OUT/whole_file_test"' "F7: the cut model is built"
+need_line Tests/run.sh 'g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/whole_file_states_test.cpp ConfigApp/source/fileio.cpp -o "$OUT/whole_file_states_test"' "F7: the app's reader and writer are built against the model's states"
+need_line Tests/run.sh '  "$OUT/whole_file_test"' "F7: the cut model is run"
+need_line Tests/run.sh '  "$OUT/whole_file_states_test"' "F7: the states test is run"
+need Tests/lane.sh 'app)   echo settings_test whole_file_test whole_file_states_test ' "F7: the lane app builds and runs both"
+need_stmt Tests/settings_test/settings_test.cpp 'TestIniBakAlone();' "F7: the app's settings test reads an AzaharLink.ini.bak left alone"
+# (F7, review of 2026-11-21: "F7 (rev)") the points of the review of F7. A save that found only the .bak of a cut save left it next to the new ini
+# (points 1 and 5): the .bak now goes at the end of every save that ended, in the plugin and in the app alike. CTRPF's File::Exists says 0 for a
+# passing error of the card too (File.o of 0.8.0): the reader looks at the ini once more before it takes the .bak (point 2). An ini or a .bak that
+# is there and could not be read whole is never written over by SaveConfig (point 4). The plugin's own code is run on the PC by
+# Tests/config_file_test.cpp (point 6), which prints the cost of a save (point 3: 14 commands of the card with an ini, 11 without).
+need_line $WF '    fs.Remove(bak);' "F7 (rev): the .bak dropped at the end of every save that ended, an old file or not (points 1 and 5)"
+need_line ConfigApp/source/fileio.cpp '    std::remove(previous.c_str());' "F7 (rev): ... and by the app's writer the same way (one order: whole_file_states_test)"
+need_line $WF '        return fs.Exists(path) ? Source::Path : Source::Bak;' "F7 (rev): the reader looks at the file once more before it takes the .bak (point 2)"
+need_line Sources/ctr/plugin.cpp '    bool Exists(const std::string& path) { return File::Exists(path) == 1; }' "F7 (rev): the card's Exists is CTRPF's 1 (0 for a missing file and for a passing error alike, -1 for a path it cannot make)"
+region Sources/ctr/plugin.cpp 'bool Plugin::LoadConfig() {' '}' | grep -q -x -F '    config_unreadable_ = false;' || fail "F7 (rev): LoadConfig no longer clears the mark of an unreadable ini (a second read that is whole lets the saves through)"
+need_line Sources/ctr/plugin.cpp '    const bool ours = source != whole::Source::None; // (the file a save of the plugin replaces)' "F7 (rev): the ini and the .bak are the files a save replaces (the old place never)"
+[ "$(region Sources/ctr/plugin.cpp 'bool Plugin::LoadConfig() {' '}' | grep -c -x -F '        config_unreadable_ = ours;')" = 2 ] || fail "F7 (rev): an ini or a .bak that does not open, or whose read fails, no longer marked unreadable"
+need_line Sources/ctr/plugin.cpp '        config_unreadable_ = ours && size != 0;' "F7 (rev): ... one over 4096 bytes (or whose size fails) too, and an empty one not (a save writes it)"
+need_after Sources/ctr/plugin.cpp 'bool Plugin::SaveConfig() {' '    if (config_unreadable_) {' "F7 (rev): SaveConfig never writes over a file it could not read (point 4)"
+need_line Includes/ctr/plugin.hpp '    bool config_unreadable_ = false; ///< F7-rev: the last LoadConfig found AzaharLink.ini (or its .bak) and could not read it whole: SaveConfig never writes over it' "F7 (rev): the mark starts clear"
+need_line Tests/whole_file_test.cpp '            CHECK_AT(r.cut || !r.files.count(BakOf(kPath)), st.name, mode, "...and no .bak, the one a cut save left alone too (F7-rev)");' "F7 (rev): the cut model holds that a save that ended leaves no .bak"
+need_line Tests/whole_file_test.cpp '        CHECK(without.ok && without.calls == 4 && without.steps == 8); // (F7-rev: the Remove of a .bak that may be there)' "F7 (rev): ... and the cost of a save without a file"
+need_line Tests/settings_test/whole_file_states_test.cpp '        CHECK(!by_app.count(bak)); // (F7-rev: the writer drops the .bak whether or not it found a file at its place)' "F7 (rev): the app's writer leaves no .bak on any card"
+need_line Tests/run.sh 'python3 Tests/config_file_extract.py Sources/ctr/plugin.cpp Includes/ctr/plugin.hpp "$OUT/config_file_slice.inc"' "F7 (rev): the plugin's code of the ini is cut out for the PC (point 6)"
+need_line Tests/run.sh 'g++ $CXXFLAGS -I"$OUT" Tests/config_file_test.cpp -o "$OUT/config_file_test"' "F7 (rev): ... the test of it is built"
+need_line Tests/run.sh '  "$OUT/config_file_test"' "F7 (rev): ... and run"
+need Tests/lane.sh 'app)   echo settings_test whole_file_test whole_file_states_test config_file_test ' "F7 (rev): the lane app builds and runs it"
+for t in 'TestAdapter();' 'TestBakAlone();' 'TestPassingErrorOfTheLook();' 'TestUnreadable();' 'TestOldPlace();' 'TestCuts();'; do
+  need_stmt Tests/config_file_test.cpp "$t" "F7 (rev): config_file_test runs $t"
+done
+need_line Tests/config_file_test.cpp '    CHECK(save_steps == 14);' "F7 (rev): the cost of a save of the plugin with an ini, in commands of the card (point 3)"
+
+# ---- (2m-diag, 2026-11-21) Tetris with eight, console 63, debug=1 (analysis/piano-1.1.4-2026-11-15/prova-tetris-8-2026-11-21/ANALISI-TETRIS-8.md, proposal (a)):
+# diagnostics only - counters, log lines and the text of a debug notice; no time, pause, queue, ENet, UDS or network changes.
+# D1: the pause after a socket error is not a "slow round" (2.369 lines of the 128 ms pause alone with the lid closed): its own count.
+# D2: the notice "room link silent" by datagrams per second of the REAL window (windows up to 17 s with the SD card stuck), "room/network" at
+#     the shared page's WiFi strength 3; once a minute at most and never with the log off, as before.
+# D3: the timing line of the statistics marks a window the log writer stretched (twice the nominal 5 s or more).
+ST=Includes/azl/stats.hpp
+need_line $ST '    u32 net_pause_rounds;  ///< (2m-diag D1) ... and the rounds longer than 50 ms only by that pause: the loop waiting, not a slow round' "2m-diag D1: the rounds long by the pause alone have a count of their own"
+need_line $ST '    return round_ticks <= kSlowTicks ? RoundKind::Normal' "2m-diag D1: a round is slow over 50 ms, as before"
+need_line $ST '           : round_ticks - (pause_ticks < round_ticks ? pause_ticks : round_ticks) > kSlowTicks ? RoundKind::Slow' "2m-diag D1: ... the pause after a socket error taken off first (never more than the round)"
+need_line Sources/azl/room_client.cpp '        const RoundKind round_kind = ClassifyRound(round_ticks, PauseTakenOff(pause_to_note, pause_asked_ms));' "2m-diag D1: the network loop classifies every round with its pause (2m-rev: at most the one asked for plus the slack)"
+need_line Sources/azl/room_client.cpp '        if (round_kind == RoundKind::PauseOnly) {' "2m-diag D1: a round long by the pause alone ..."
+need_line Sources/azl/room_client.cpp '            ++g_stats.net_pause_rounds;' "2m-diag D1: ... is counted apart, with no line"
+need_line Sources/azl/room_client.cpp '        } else if (round_kind == RoundKind::Slow) {' "2m-diag D1: a slow round is still a slow round (count and line)"
+need_order Sources/azl/room_client.cpp '        } else if (round_kind == RoundKind::Slow) {' '            ++g_stats.net_slow_rounds;' "2m-diag D1: ... counted in its own branch"
+need_line Includes/azl/room_client.hpp '        return in_a_row == 0 ? 0u : in_a_row >= 7 ? 128u : (2u << (in_a_row - 1));' "2m-diag D1: the pause after a socket error and its values are unchanged (2 ... 128 ms)"
+need_line Sources/ctr/plugin.cpp '           " than 50 ms: %lu, %lu more only by the pause after a socket error",' "2m-diag D1: the timing line says the rounds of the pause apart"
+need_line Sources/ctr/plugin.cpp '           static_cast<unsigned long>(s.net_slow_rounds), static_cast<unsigned long>(s.net_pause_rounds));' "2m-diag D1: ... with their count"
+need_stmt Tests/test_main.cpp 'TestSlowRoundsAndErrorPauses();' "2m-diag D1: test_main runs the classification of the rounds"
+need_line Tests/test_main.cpp '    CHECK_EQ(slow, 0u);' "2m-diag D1: socket errors in a row make no slow round"
+need_line Tests/test_main.cpp '    CHECK(ClassifyRound(188 * ms, 128 * ms) == RoundKind::Slow);' "2m-diag D1: ... a round slow besides its pause still does"
+need_line Tests/room_integration.cpp '        CHECK(window.net_slow_rounds <= 1);' "2m-diag D1: the real loop with a failing socket makes no slow rounds of its pauses"
+need_line Tests/room_integration.cpp '        CHECK(window.net_pause_rounds >= 5);' "2m-diag D1: ... and counts them apart"
+need_line $ST 'constexpr u32 kSilenceMinDatagramsPerSecond = 20;' "2m-diag D2: the traffic of the silence notice in datagrams per second (100 in the nominal 5 s)"
+need_line $ST 'constexpr u32 kSilenceMinGaps = 2;' "2m-diag D2: ... and at least two silences, as before"
+need_line $ST '           static_cast<u64>(rx_datagrams) * 1000u >=' "2m-diag D2: ... over the real length of the window ..."
+need_line $ST '               static_cast<u64>(kSilenceMinDatagramsPerSecond) *' "2m-diag D2: ... at that rate ..."
+need_line $ST '                   (window_ms > static_cast<u64>(nominal_ms) + kSilenceWindowSlackMs ? window_ms - kSilenceWindowSlackMs' "2m-rev D2: ... the real length less the writer's second when it is longer than the nominal window and that second ..."
+need_line $ST '                                                                                    : static_cast<u64>(nominal_ms));' "2m-rev D2: ... and the nominal window otherwise (an ordinary 5.0-6.0 s window: the 100 datagrams of before)"
+need_line $ST '    return wifi_strength == 3 ? "room/network" : "WiFi";' "2m-diag D2: at full strength the notice names the room or the network"
+LSIL=$(region Sources/ctr/plugin.cpp 'void Plugin::CheckLinkSilence(const Stats& s, u64 window_ms) {' '}')
+need_nth "Plugin::CheckLinkSilence" "$LSIL" 2 '    if (g_debug_level <= 0) {' "2m-diag D2: the notice stays off with the log off: the gate is the function's first statement"
+printf '%s\n' "$LSIL" | grep -q -x -F '        const u32 now_strength = *reinterpret_cast<volatile const u8*>(kSharedPageWifiStrength);' || fail "2m-diag D2: CheckLinkSilence no longer reads the WiFi strength of the shared page"
+printf '%s\n' "$LSIL" | grep -q -x -F '        std::snprintf(text, sizeof(text), "AzaharLink debug: room link silent %lu times (150+ ms): %s", static_cast<unsigned long>(silent),' || fail "2m-diag D2: the notice's text is not the one of before with its cause"
+printf '%s\n' "$LSIL" | grep -q -x -F '                      LinkSilenceWhere(strength));' || fail "2m-diag D2: the notice's cause is not LinkSilenceWhere"
+printf '%s\n' "$LSIL" | grep -q -x -F '        Warn(kWarnSilence, text);' || fail "2m-diag D2: the notice no longer goes through Warn (once a minute at most)"
+[ "$(printf '%s\n' "$LSIL" | code_of | grep -c -E 'PostNotification|OSD::Notify')" = 0 ] || fail "2m-diag D2: the silence notice goes to the screen around Warn (more than once a minute)"
+need_stmt Tests/log_files_test.cpp 'TestLinkSilenceAndStretchedWindows();' "2m-diag D2/D3: log_files_test runs the notice's rule and the stretched window"
+need_line Tests/log_files_test.cpp '    CHECK(!LinkSilenceWorthANotice(101, 3, 17000, 5000));' "2m-diag D2: a long window with few datagrams a second is no notice"
+need_line Tests/log_files_test.cpp '    CHECK(LinkSilenceWorthANotice(100, 2, 5000, 5000));' "2m-diag D2: ... a normal window with the old bound still is"
+need_line Tests/log_files_test.cpp '    CHECK(std::string(LinkSilenceWhere(3)) == "room/network");' "2m-diag D2: ... and strength 3 is room/network"
+need_line $ST '    return window_ms >= 2u * static_cast<u64>(nominal_ms);' "2m-diag D3: a stretched window is twice the nominal one or more"
+LTIM=$(region Sources/ctr/plugin.cpp 'void Plugin::LogStatsTiming(const Stats& s, u64 dt_ms) {' '}')
+printf '%s\n' "$LTIM" | grep -q -x -F '    const StretchBy stretched_by = WhoStretchedTheWindow(dt_ms, kStatsIntervalMs, card_ms, s.writer_late_max, log_thread_.running());' || fail "2m-diag D3: the timing line no longer looks at the real window against the nominal one (2m-rev: with the writer's card time, its late wake-up and whether it runs)"
+printf '%s\n' "$LTIM" | grep -q -x -F '    if (stretched_by != StretchBy::None) {' || fail "2m-diag D3: the mark is no longer written for a stretched window"
+printf '%s\n' "$LTIM" | grep -q -x -F '        Append(text, sizeof(text), &n, " | WINDOW STRETCHED %s: %lu ms for %lu, per second: averages; counts: all of it",' || fail "2m-diag D3: the mark no longer says who stretched the window and what it does to the figures (2m-rev: the averages stay right, the counts are of all of it)"
+printf '%s\n' "$LTIM" | grep -q -x -F '               StretchedByText(stretched_by), static_cast<unsigned long>(dt_ms), static_cast<unsigned long>(kStatsIntervalMs));' || fail "2m-rev D3: the mark's cause is not StretchedByText"
+printf '%s\n' "$LTIM" | grep -q -F '    char text[1536]; // (2m-diag:' || fail "2m-diag D3: the timing line has no room for every clause (about 1500 characters at the most)"
+LSTATS=$(region Sources/ctr/plugin.cpp 'void Plugin::LogStats(u64 now_ms) {' '}')
+lg=$(printf '%s\n' "$LSTATS" | grep -n -m1 -x -F '    if (g_debug_level <= 0) {' | cut -d: -f1)
+lt=$(printf '%s\n' "$LSTATS" | grep -n -m1 -x -F '    LogStatsTiming(s, dt);' | cut -d: -f1)
+{ [ -n "$lg" ] && [ -n "$lt" ] && [ "$lg" -lt "$lt" ]; } || fail "2m-diag D3: the timing line (and its mark) is written with the log off, or not at all"
+need_line Tests/log_files_test.cpp '    CHECK(WindowStretched(10000, 5000));' "2m-diag D3: twice the nominal window is stretched"
+need_line Tests/log_files_test.cpp '    CHECK(!WindowStretched(9999, 5000));' "2m-diag D3: ... less is not"
+need_line Tests/log_files_test.cpp '    CHECK_EQ(w.net_pause_rounds, 7u);' "2m-diag D1: the count of the pause rounds is a window's (TakeStats)"
+
+# ---- (2m-rev, 2026-11-22) the review of the 2m: still diagnostics only (counters, log lines, the text of a debug notice).
+# D1: the pause taken off a round is at most the one asked for plus 10 ms (a thread woken up late is a slow round again), round_ticks in 64 bits.
+# D2: the strength of the notice is the lowest of the window (SampleLinkState, every 50 ms); the rate is taken over the nominal 5 s up to 6 s.
+# D3: the mark says who stretched the window (the writer, the caller of Tick, something else) and that the figures per second stay right.
+need_line $ST 'constexpr u32 kPauseSlackMs = 10;' "2m-rev D1: the slack of the pause taken off a round is 10 ms"
+need_line $ST '    return measured_ticks < (static_cast<u64>(asked_ms) + kPauseSlackMs) * AZL_TICKS_PER_MS' "2m-rev D1: the pause measured is taken off up to the one asked for plus the slack ..."
+need_line $ST '               : (static_cast<u64>(asked_ms) + kPauseSlackMs) * AZL_TICKS_PER_MS;' "2m-rev D1: ... and never more"
+need_line Sources/azl/room_client.cpp '            pause_asked_ms = ServiceErrorPauseMs(errors_in_a_row);' "2m-rev D1: the loop keeps the pause it asked SleepMs for"
+need_order Sources/azl/room_client.cpp '            platform::SleepMs(ServiceErrorPauseMs(errors_in_a_row));' '            pause_asked_ms = ServiceErrorPauseMs(errors_in_a_row);' "2m-rev D1: ... the same one, after the pause"
+need_line Sources/azl/room_client.cpp '        const u64 round_ticks = done_ticks - round_start;' "2m-rev D1: the round in 64 bits (a round of 16 s no longer wraps to a short one)"
+need_line Tests/test_main.cpp '    CHECK(ClassifyRound(431 * ms, PauseTakenOff(428 * ms, 128)) == RoundKind::Slow); // (300 ms late: the scheduler, not the pause)' "2m-rev D1: a thread woken up 300 ms late is a slow round"
+need_line Tests/test_main.cpp '    CHECK_EQ(late_slow, 0u);' "2m-rev D1: ... a wake-up up to 10 ms late is still the pause"
+need_line Tests/test_main.cpp '    CHECK(ClassifyRound(16100 * ms, PauseTakenOff(128 * ms, 128)) == RoundKind::Slow);' "2m-rev D1: ... a round of 16.1 s is slow"
+need_line Tests/test_main.cpp '// room_client.cpp asks at the end of every round; the real loop with a failing socket is in Tests/room_integration.cpp (TestSocketErrorsAreSpacedOut).' "2m-rev: the test of the real loop is named as it is"
+need_line Tests/room_integration.cpp 'static void TestSocketErrorsAreSpacedOut() {' "2m-rev: ... and it is there"
+need Includes/ctr/plugin.hpp 'std::atomic<u32> link_strength_min_{0xFFu};' "2m-rev D2: the lowest WiFi strength of the window starts above any strength"
+need_line Sources/ctr/plugin.cpp '        link_strength_min_.store(strength, std::memory_order_relaxed); // (2m-rev) the window'"'"'s lowest, for CheckLinkSilence' "2m-rev D2: SampleLinkState keeps the lowest strength of the window ..."
+need_order Sources/ctr/plugin.cpp '    if (strength < link_strength_min_.load(std::memory_order_relaxed)) {' '    if (link_known_ && strength == link_strength_ && state == link_state_) {' "2m-rev D2: ... at every sample, before the return of a sample that changed nothing"
+printf '%s\n' "$LSIL" | grep -q -x -F '    const u32 lowest = link_strength_min_.exchange(0xFFu, std::memory_order_relaxed);' || fail "2m-rev D2: CheckLinkSilence does not take (and start again) the lowest strength of the window"
+printf '%s\n' "$LSIL" | grep -q -x -F '        const u8 strength = static_cast<u8>(now_strength < lowest ? now_strength : lowest); // (2m-rev) the window'"'"'s, this reading included' || fail "2m-rev D2: the notice's cause is not from the lowest strength of the window"
+need_line $ST 'constexpr u32 kSilenceWindowSlackMs = 1000;' "2m-rev D2: the slack of the window is one second (the writer's service, 900-1000 ms)"
+need_line Tests/log_files_test.cpp '    CHECK(LinkSilenceWorthANotice(105, 2, 5600, 5000));' "2m-rev D2: an ordinary window of 5.6 s has the bound of before"
+need_line Tests/log_files_test.cpp '    CHECK(!LinkSilenceWorthANotice(100, 2, 6001, 5000));' "2m-rev D2: ... beyond 6 s the real length counts"
+need_line $ST '           : !writer_thread                         ? StretchBy::TickCaller' "2m-rev D3: with no writer thread the caller of Tick stretched the window"
+need_line $ST '           : 2u * (card_ms + writer_late_max_ms) >= window_ms - nominal_ms ? StretchBy::LogWriter' "2m-rev D3: the writer when its card time and late wake-up cover half of the excess"
+need_line $ST '    return by == StretchBy::LogWriter      ? "by the log writer"' "2m-rev D3: the text of the cause"
+printf '%s\n' "$LTIM" | grep -q -x -F '    const u64 card_ms = azl_ticks_to_ms(s.t_writer_wait);' || fail "2m-rev D3: the mark does not take the writer's time in the SD card"
+need_line Tests/log_files_test.cpp '    CHECK(WhoStretchedTheWindow(18400, 5000, 50, 3, true) == StretchBy::NotTheWriter);   // (HOME: the writer was not in the card)' "2m-rev D3: a window stretched with the writer out of the card is not the writer's"
+need_line Tests/log_files_test.cpp '    CHECK(WhoStretchedTheWindow(18400, 5000, 13400, 0, false) == StretchBy::TickCaller); // (no writer thread: Tick'"'"'s thread closed it)' "2m-rev D3: ... with no writer thread it is the caller of Tick's"
+
+# (NAND-exception, 2026-11-22) The one exception to "the NAND is read only", confirmed by the user: in the NAND only the ticket and the seed of a
+# title of the SD card, always through AM or FS (FBI does the same); a ticket is deleted only for an id of the SD card that passed the guards.
+# What writes them is listed here: a new place that installs a CIA, deletes a ticket or adds a seed fails until it is looked at.
+NANDX_FILES="ConfigApp/source/*.cpp ConfigApp/source/*.hpp ConfigApp/titleshare/source/*.c ConfigApp/titleshare/source/*.h ConfigApp/titleshare/common/*.c ConfigApp/titleshare/common/*.h ConfigApp/titleshare_host/*.c ConfigApp/titleshare_host/*.h ../DlpLink/child/source/*.cpp ../DlpLink/child/source/*.hpp"
+nandx_where() {
+  local f n
+  for f in $NANDX_FILES; do
+    [ -f "$f" ] || continue
+    n=$(tr -d '\r' < "$f" | code_of | grep -o -E -- "$1" | wc -l)
+    [ "$n" = 0 ] || printf '%s:%s ' "$f" "$n"
+  done
+}
+# 1. the CIA installs (each writes its ticket in ticket.db): the children, the updater, the receiver of Titles Delivery, the installer of 3DS Link by Download Play
+sg=$(nandx_where 'AM_StartCiaInstall\([A-Za-z_]+,')
+[ "$sg" = "ConfigApp/source/dlp_guest_am.cpp:1 ConfigApp/source/update_worker.cpp:1 ConfigApp/titleshare/source/amsink.c:1 ../DlpLink/child/source/main.cpp:1 " ] || fail "NAND-exception: a CIA install begins in '$sg', expected the children, the updater, the receiver and the installer of 3DS Link only"
+sg=$(nandx_where 'AM_StartCiaInstall\(MEDIATYPE_SD,')
+[ "$sg" = "ConfigApp/source/dlp_guest_am.cpp:1 ConfigApp/source/update_worker.cpp:1 ../DlpLink/child/source/main.cpp:1 " ] || fail "NAND-exception: the children, the updater and the installer of 3DS Link do not all install on the SD card as a constant ('$sg')"
+need_line ConfigApp/titleshare/source/amsink.c '    return AM_StartCiaInstall(dest, h);' "NAND-exception: the receiver installs on the media of ts_title_dest ..."
+sg=$(nandx_where 'ts_am_begin\(')
+[ "$sg" = "ConfigApp/titleshare/source/amsink.c:1 ConfigApp/titleshare/source/receiver.c:1 ConfigApp/titleshare/source/amsink.h:1 " ] || fail "NAND-exception: ts_am_begin is called in '$sg', expected once, in receiver.c, behind its gate of the SD card"
+need_line ConfigApp/titleshare/source/receiver.c '            Result r = ts_title_dest(m->t[p].tid) == MEDIATYPE_SD ? ts_am_begin(m->t[p].tid, wt->exists[p], &h) : (Result) 0xC8604C04;' "NAND-exception: ... and only when that media is the SD card"
+# 2. the tickets deleted: a child of ours (behind the guards of the ids), the Installation check, the receiver (the sequence of FBI, and the clean-up of a failed title),
+#    the installer of 3DS Link (its own title only)
+sg=$(nandx_where 'AM_DeleteTicket\(')
+[ "$sg" = "ConfigApp/source/dlp_guest_am.cpp:2 ConfigApp/source/titles.cpp:2 ConfigApp/titleshare/source/amsink.c:1 ConfigApp/titleshare/source/receiver.c:1 ../DlpLink/child/source/main.cpp:2 " ] || fail "NAND-exception: a ticket is deleted in '$sg', expected the places of the exception only"
+order_in "ConfigApp/titleshare/source/receiver.c scrub_failed" "$(region ConfigApp/titleshare/source/receiver.c 'static void scrub_failed(writer_t* wt, u64 tid) {' '}')" '    if(dest != MEDIATYPE_SD) {' '    Result rk = AM_DeleteTicket(tid);' "NAND-exception: the clean-up of a failed title never deletes the ticket of a title of the NAND"
+need_order ../DlpLink/child/source/main.cpp 'if (!inst::NamesApp(man)) {' '        rk = AM_DeleteTicket(info.tid);' "NAND-exception: the installer deletes a ticket only after the manifest names 3DS Link"
+# 3. the seed (the seed database is FS's system save data, in the NAND): only in the receiver, only after AM finished an install
+sg=$(nandx_where '0x087A0180|AddSeed\(')
+[ "$sg" = "ConfigApp/titleshare/source/amsink.c:1 " ] || fail "NAND-exception: a seed is added in '$sg', expected the receiver's fs_add_seed only"
+sg=$(nandx_where 'fs_add_seed\(')
+[ "$sg" = "ConfigApp/titleshare/source/amsink.c:2 " ] || fail "NAND-exception: fs_add_seed is called in '$sg', expected once (in ts_am_finish)"
+order_in "ConfigApp/titleshare/source/amsink.c ts_am_finish" "$(region ConfigApp/titleshare/source/amsink.c 'Result ts_am_finish(Handle h, const ts_title* t) {' '}')" '    Result r = AM_FinishCiaInstall(h);' '        return fs_add_seed(t->tid, t->seed);' "NAND-exception: the seed only after AM finished the install"
+sg=$(nandx_where 'ts_am_finish\(')
+[ "$sg" = "ConfigApp/titleshare/source/amsink.c:1 ConfigApp/titleshare/source/receiver.c:1 ConfigApp/titleshare/source/amsink.h:1 " ] || fail "NAND-exception: ts_am_finish is called in '$sg', expected once, in receiver.c"
 
 if [ "$FAILED" = 0 ]; then
   echo "policy check: defaults and switches as intended"

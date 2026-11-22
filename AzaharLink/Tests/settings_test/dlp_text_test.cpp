@@ -139,14 +139,15 @@ static void TestFailures() {
         CHECK(with.back() != ' ' && with.front() != ' ');
     }
     // the ways the package that is handed out can fail to be there: each has a title and a text, and none is silent
-    const dlp::Failure before[] = {dlp::Failure::SwitchedOff, dlp::Failure::NoBoot9, dlp::Failure::NoModel,    dlp::Failure::NoPlugin,
-                                   dlp::Failure::NoSource,    dlp::Failure::NoKeys,  dlp::Failure::BadAppFile, dlp::Failure::Prepare};
+    // (1.1.4, spec 9: no failure says "switched off" any more: the switch of Settings is gone)
+    const dlp::Failure before[] = {dlp::Failure::NoBoot9, dlp::Failure::NoModel,    dlp::Failure::NoPlugin,
+                                   dlp::Failure::NoSource, dlp::Failure::NoKeys, dlp::Failure::BadAppFile, dlp::Failure::Prepare};
     for (const dlp::Failure f : before) {
         CHECK(std::strlen(dlp::FailureTitle(f)) > 0);
         CHECK(dlp::FailureText(f, "the detail of it.").find("the detail of it.") != std::string::npos);
         CHECK(dlp::FailureText(f, "x").back() != ' ' && dlp::FailureText(f, "x").front() != ' ');
+        CHECK(std::string(dlp::FailureTitle(f)).find("switched off") == std::string::npos && dlp::FailureText(f, "").find("Download Play delivery") == std::string::npos);
     }
-    CHECK(dlp::FailureText(dlp::Failure::SwitchedOff, "").find("Settings") != std::string::npos);
     // the plugin is inside the app: a build without it says that, and the way out is the CIA (no file is asked for "next to 3DS Link")
     CHECK(std::string(dlp::FailureTitle(dlp::Failure::NoPlugin)) == "This build has no plugin");
     CHECK(dlp::FailureText(dlp::Failure::NoPlugin, "").find("without the plugin inside") != std::string::npos);
@@ -195,35 +196,29 @@ static void TestSteps() {
     CHECK(dlp::StepText(2, "").find("Luma3DS") != std::string::npos);
 }
 
-// The entry on the main page: open, switched off by Settings > Download Play delivery, or shut for the lack of boot9.bin (as Titles Delivery's Send Titles is).
+// The entry on the main page: open, or shut for the lack of boot9.bin (as Titles Delivery's Send Titles is). Nothing else shuts it (1.1.4, spec 9: the switch
+// Settings > Download Play delivery is gone).
 static void TestGate() {
-    // the decision, for every pair: the switch comes first, then boot9.bin
-    CHECK(dlp::GateOf(true, true) == dlp::Gate::Open);
-    CHECK(dlp::GateOf(true, false) == dlp::Gate::NoBoot9);
-    CHECK(dlp::GateOf(false, true) == dlp::Gate::Off);
-    CHECK(dlp::GateOf(false, false) == dlp::Gate::Off); // (switched off, nothing else about the entry is looked at)
-    // an open entry says nothing at its right and tells what it does; the shut ones say why
+    // the decision: boot9.bin, and nothing else
+    CHECK(dlp::GateOf(true) == dlp::Gate::Open);
+    CHECK(dlp::GateOf(false) == dlp::Gate::NoBoot9);
+    // an open entry says nothing at its right and tells what it does; the shut one says why
     CHECK(std::strlen(dlp::GateValue(dlp::Gate::Open)) == 0);
-    CHECK(std::string(dlp::GateValue(dlp::Gate::Off)) == "switched off" && std::string(dlp::GateValue(dlp::Gate::NoBoot9)) == "needs boot9.bin");
+    CHECK(std::string(dlp::GateValue(dlp::Gate::NoBoot9)) == "needs boot9.bin");
     CHECK(std::string(dlp::GateNoteTitle(dlp::Gate::Open)) == "3DS Link Delivery");
     CHECK(std::string(dlp::GateNoteTitle(dlp::Gate::NoBoot9)) == "boot9.bin is missing"); // (the same words as Send Titles' note)
-    CHECK(std::string(dlp::GateNoteTitle(dlp::Gate::Off)).find("switched off") != std::string::npos);
     // the note without boot9.bin: what the file is for (sharing), that 3DS Link works without it, and the key of the guide
     const std::string no_boot9 = dlp::GateNote(dlp::Gate::NoBoot9);
     CHECK(no_boot9.find("boot9.bin") != std::string::npos && no_boot9.find("Sharing 3DS Link needs boot9.bin") != std::string::npos && no_boot9.find("works without it") != std::string::npos);
     CHECK(no_boot9.find("key file of this console") != std::string::npos && no_boot9.find("Press Y") != std::string::npos);
     CHECK(no_boot9.find("\n\nPress Y") != std::string::npos);  // (the Y sentence is a paragraph of its own, last: the part of the note that must stay in view)
-    // the note when it is switched off: where, and that nothing of it runs
-    const std::string off = dlp::GateNote(dlp::Gate::Off);
-    CHECK(off.find("Settings (Download Play delivery)") != std::string::npos && off.find("Nothing of it runs") != std::string::npos);
-    CHECK(off.find("read or written") != std::string::npos);
     // the note of an open entry is honest about the first time
     const std::string open = dlp::GateNote(dlp::Gate::Open);
     CHECK(open.find("Download Play") != std::string::npos && open.find("One console at a time") != std::string::npos);
     CHECK(open.find("The first time") != std::string::npos && open.find("how long") != std::string::npos);
     // The notes of the main page are shown whole: the note's box has four lines, and a blank line between two paragraphs is one of them. The emulator's stand-in font is the
     // wider one (a line of the note holds 69-70 characters there; the console's holds more): a line of 60 is the margin, and the Y sentence must still be on the screen.
-    for (const dlp::Gate g : {dlp::Gate::Open, dlp::Gate::Off, dlp::Gate::NoBoot9}) {
+    for (const dlp::Gate g : {dlp::Gate::Open, dlp::Gate::NoBoot9}) {
         CHECK(WrapLines(dlp::GateNote(g), 60) <= 4);
     }
     CHECK(WrapLines(no_boot9.substr(0, no_boot9.find("\n\n")), 60) <= 2);       // (the first paragraph takes no more than two lines: then the blank one, then the Y sentence)
@@ -231,14 +226,14 @@ static void TestGate() {
     CHECK(WrapLines(open.substr(0, open.find("\n\n")), 60) <= 2);
     CHECK(WrapLines(open.substr(open.find("\n\n") + 2), 60) == 1);              // (and the second paragraph one: it is the last line of the four)
     // A on a shut entry answers in one line that points the way
-    CHECK(std::string(dlp::GateToast(dlp::Gate::Off)).find("Settings > Download Play delivery") != std::string::npos);
     CHECK(std::string(dlp::GateToast(dlp::Gate::NoBoot9)).find("press Y") != std::string::npos);
+    CHECK(std::string(dlp::GateToast(dlp::Gate::NoBoot9)).find("Settings") == std::string::npos); // (no switch to point to any more)
     CHECK(std::string(dlp::kGuideHint) == "Y guide" && std::string(dlp::kGuideLabel) == "Guide" && std::strlen(dlp::kNoGuideToast) > 10);
-    // Settings: one row, with its explanation
-    CHECK(std::string(dlp::kSwitchLabel) == "Download Play delivery");
-    CHECK(std::string(dlp::kSwitchNote).find("ON:") != std::string::npos && std::string(dlp::kSwitchNote).find("OFF:") != std::string::npos);
-    CHECK(std::string(dlp::kSwitchNote).find("rest of 3DS Link is not affected") != std::string::npos);
-    CHECK(std::string(dlp::SwitchToast(true)) != std::string(dlp::SwitchToast(false)));
+    // no word of the entry names the switch that is gone
+    for (const dlp::Gate g : {dlp::Gate::Open, dlp::Gate::NoBoot9}) {
+        CHECK(dlp::GateNote(g).find("Download Play delivery") == std::string::npos && dlp::GateNote(g).find("switched off") == std::string::npos);
+        CHECK(std::string(dlp::GateValue(g)).find("switched off") == std::string::npos);
+    }
 }
 
 // The preparing screen's words.
@@ -251,7 +246,21 @@ static void TestPrepareWords() {
     CHECK(std::string(dlp::kPrepareWaitScanNote).find("key") != std::string::npos && std::strlen(dlp::kPrepareCopyStage) > 10);
 }
 
+// (the build 2f, B2) who hosts a game's Download Play: a console with 3DS Link only for the rows of RealDlp, Azahar for every game
+static void TestHostsNote() {
+    const std::string real = "Hosts: a console with 3DS Link, or Azahar.";
+    const std::string azahar = "Hosts: Azahar only, not a console with 3DS Link yet.";
+    CHECK(dlp::HostsNote(0x00040000000F8200ull) == real);   // Mario Party: Island Tour (Europe), RealDlp
+    CHECK(dlp::HostsNote(0x00040000001D1A00ull) == real);   // Luigi's Mansion (Europe), RealDlp
+    CHECK(dlp::HostsNote(0x000400000010C000ull) == azahar); // Kirby Triple Deluxe, Lobby
+    CHECK(dlp::HostsNote(0x000400000007C800ull) == azahar); // Mario Tennis Open, Lobby
+    CHECK(dlp::HostsNote(0x0004000000086300ull) == azahar); // a game with no row
+    CHECK(dlp::HostsNote(0x00040001000F8200ull) == azahar); // (a child is no application: DlpOf says nothing)
+    CHECK(real.size() <= 60 && azahar.size() <= 60);         // (one line of the sheet, after "Ready. ")
+}
+
 int main() {
+    TestHostsNote();
     TestGate();
     TestPrepareWords();
     TestVersion();

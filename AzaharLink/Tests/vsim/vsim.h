@@ -35,6 +35,7 @@ typedef struct {
     double s20[SOC_KINDS_N], s100[SOC_KINDS_N];          /* the same by kind of call: recv, recvE, send, pollr, wake; < 0 = the default above */
     double slow_max_ms, slow_scale_ms;
     double handler_us;                                   /* a frame handed to the engine (decode, lock, ring): per packet */
+    double send_kb_us;                                   /* a send costs send_us plus this for every 1024 bytes of its datagram (0: the size does not count) */
     double round_us;                                     /* the tail of a round of the loop (queue, tick) */
 } Profile;
 extern Profile g_prof;
@@ -49,6 +50,7 @@ extern NetCfg g_net;
 extern int g_outage_silent;                       /* 1: the datagrams vanish and the calls succeed (a WiFi that went away unnoticed); 0: the calls fail with ENETDOWN */
 extern uint64_t g_outage_from_us, g_outage_to_us; /* the console's socket fails in [from, to): sendto -> ENETDOWN, the wire drops both ways */
 extern uint32_t g_drop_connects;                  /* the room does not hear the next N CONNECT datagrams of the console */
+extern uint32_t g_rcvbuf_bytes;                   /* the console's receive ring (SO_RCVBUF; a datagram takes its length + 32): one that does not fit when it arrives is lost. 0: no limit */
 
 enum { SOC_RECV = 0, SOC_RECVE, SOC_SEND, SOC_POLLR, SOC_POLLW, SOC_KINDS };
 typedef struct {
@@ -84,12 +86,26 @@ typedef struct {
     uint32_t rx_packets;        /* packets of the console it received */
     uint64_t total_sent_dgrams, total_recv_dgrams;
 } RoomStats;
+/* (plugin-causa, 2026-11-14) the room's side of a hole of the console: what of the console's peer is not acknowledged, how often it went, and the
+   command the console is waiting for (the reliable number after the last it has, channel 0): its sends, its timer, where it is */
+typedef struct {
+    uint32_t unacked;        /* reliable commands sent and not acknowledged */
+    uint32_t resend_waiting; /* timed out, back in the queue, not sent again yet */
+    uint32_t in_transit;     /* reliableDataInTransit, bytes */
+    uint32_t throttle, window;
+    uint32_t max_attempts;   /* the most sends of one command still unacknowledged */
+    uint32_t max_rto_ms;     /* the longest timer of one */
+    int hole_where;          /* the awaited command: 0 not found (acknowledged or not made yet), 1 sent and waiting for its timer, 2 queued to go again */
+    uint32_t hole_attempts, hole_rto_ms, hole_next_ms; /* its sends, its timer, ms until it fires (1) */
+} RoomProbe;
+void room_probe(uint16_t hole_seq, RoomProbe* p);
 void room_init(void);
 int room_connected(void);
 void room_inject(uint32_t id, uint32_t size);
 void room_service(void);
 void room_get_stats(RoomStats* out);
 void room_set_now(uint64_t now_us);   /* the room's clock (its platform layer reads it) */
+void vsim_on_room_rx(uint32_t id);    /* the room was handed a packet of the console whose data starts with this id (the driver's closed-loop game listens) */
 
 /* ---- the driver (vsim_client.c): the room's events in time order ---- */
 void vsim_run_room_until(uint64_t t_us);

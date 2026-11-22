@@ -5,11 +5,15 @@
 #include "ctr/thread_core.hpp"
 
 #include <3ds.h>
+#include <CTRPluginFramework.hpp>
+
+#include "azl/core_plan.hpp"
 
 namespace {
 
 volatile bool g_moving = false; // only the framework's own thread runs between the two wraps (the game's main thread waits for it): no lock needed
 unsigned g_moved = 0;
+bool g_listed = false; // the title is on azl::ctr::coreplan::kCore1WorkerTitles (a New 3DS moves the worker for it)
 
 } // namespace
 
@@ -33,7 +37,10 @@ void __real__ZN18CTRPluginFramework9Scheduler10InitializeEv();
 void __wrap__ZN18CTRPluginFramework9Scheduler10InitializeEv() {
     // The very test of Luma3DS's swap (rosalina's isN3DS): the console, not the game's mode.
     s64 is_new = 0;
-    g_moving = svcGetSystemInfo(&is_new, 0x10001, 0) != 0;
+    const bool old_console = svcGetSystemInfo(&is_new, 0x10001, 0) != 0;
+    // The framework's ProcessImpl::Initialize (KeepThreadMain calls it just before this) has read the title id: a title of the list keeps core 1 free for itself on a New 3DS too.
+    g_listed = !old_console && azl::ctr::coreplan::LeavesCore1ToTheGame(CTRPluginFramework::Process::GetTitleID());
+    g_moving = old_console || g_listed;
     __real__ZN18CTRPluginFramework9Scheduler10InitializeEv();
     g_moving = false;
 }
@@ -46,6 +53,10 @@ namespace threadcore {
 
 unsigned FrameworkThreadsMoved() {
     return g_moved;
+}
+
+bool MovedForListedTitle() {
+    return g_listed;
 }
 
 } // namespace threadcore

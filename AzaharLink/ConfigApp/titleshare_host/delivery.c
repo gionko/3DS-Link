@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "amsink.h"
 #include "catalog.h"
 #include "ciastream.h"
 #include "ctx.h"
@@ -477,6 +478,12 @@ int dl_send_check(int item, uint64_t* size, char* error, size_t error_size) {
 
 static ts_manifest gMan;
 
+static int (*gSendNever)(uint64_t tid) = NULL;
+
+void dl_set_send_never(int (*never)(uint64_t tid)) {
+    gSendNever = never;
+}
+
 int dl_send_prepare(const int* items, int count) {
     if(count < 1 || count > TS_MAX_TITLES) {
         return -1;
@@ -486,6 +493,12 @@ int dl_send_prepare(const int* items, int count) {
     for(int i = 0; i < count; i++) {
         if(gChk == NULL || items[i] < 0 || items[i] >= gChkN || gChk[items[i]] != 1) {
             return -2;
+        }
+
+        // (DPAPP-2j, a second line behind the catalogue's: titles.cpp DropGuestTitles) a title this console never sends - a Download Play guest, a
+        // title a receiver does not take (recv_filter.h) - is never put in a manifest, whatever chose it
+        if(dl_recv_refusal(gInfo[items[i]].tid) != DL_RECV_OK || (gSendNever != NULL && gSendNever(gInfo[items[i]].tid))) {
+            return -3;
         }
 
         list[i] = gInfo[items[i]];
@@ -752,6 +765,34 @@ static void node_name(uint8_t node, char* out, size_t size, int may_ask) {
     snprintf(out, size, "%s", gNodeNames[node]);
 }
 
+static int (*gRecvOwned)(uint64_t tid) = NULL;
+
+void dl_set_recv_owned(int (*owned)(uint64_t tid)) {
+    gRecvOwned = owned;
+}
+
+// (DPAPP-2h-sec) Why the title of the offer is never installed on this console (recv_filter.h), 0 when it may be: the module deletes what it is given
+// before it reads its CIA, on the media of ts_title_dest - a title of the NAND (a system title, a child, a guest) is never given to it.
+static int recv_refusal(uint64_t tid) {
+    const int why = dl_recv_refusal(tid);
+    if(why != DL_RECV_OK) {
+        return why;
+    }
+    if(ts_title_dest(tid) != MEDIATYPE_SD) {
+        return DL_RECV_NOT_SD;
+    }
+    return gRecvOwned != NULL && gRecvOwned(tid) ? DL_RECV_GUEST : DL_RECV_OK;
+}
+
+// The titles the screen may never choose, out of `want` (bit i = title i of the offer).
+static void recv_drop_refused(uint8_t* want, const ts_manifest* m, int count) {
+    for(int i = 0; i < count && i < m->count; i++) {
+        if(recv_refusal(m->t[i].tid) != DL_RECV_OK) {
+            ts_set_bit(want, i, 0);
+        }
+    }
+}
+
 static int recv_adapter(void* arg, ts_recv_stats* st) {
     (void) arg;
     static dl_recv_stats s;
@@ -774,10 +815,14 @@ static int recv_adapter(void* arg, ts_recv_stats* st) {
         s.exists[i] = st->exists[i];
         s.old_size[i] = st->oldSize[i];
         s.n3ds_only[i] = st->n3dsOnly[i];
+        s.refused[i] = (uint8_t) recv_refusal(st->m.t[i].tid);
         s.result[i] = st->result[i];
         s.err[i] = st->err[i];
     }
 
+    if(st->phase == TS_R_CHOOSE && st->haveManifest) {
+        recv_drop_refused(st->want, &st->m, st->m.count); // (the module's own choice - what is missing - never holds one either)
+    }
     memcpy(s.want, st->want, sizeof(s.want));
     s.cur_title = st->curTitle;
     s.mibps = st->mibps;
@@ -808,6 +853,10 @@ static int recv_adapter(void* arg, ts_recv_stats* st) {
     int answer = gRecvTick(gRecvUser, &s);
     if(st->phase == TS_R_CHOOSE) {
         memcpy(st->want, s.want, sizeof(st->want)); // (the choice is the screen's)
+        if(st->haveManifest) {
+            recv_drop_refused(st->want, &st->m, st->m.count); // (DPAPP-2h-sec: and never a title refused here, whatever the screen did - the module
+                                                              // takes `want` right after this answer)
+        }
     }
 
     if(answer == DL_CANCEL && st->phase != TS_R_DONE && st->phase != TS_R_ERROR) {

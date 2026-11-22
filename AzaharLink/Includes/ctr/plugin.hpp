@@ -9,6 +9,9 @@
 #include <string>
 #include <vector>
 
+#include "azl/dlp_children.hpp"
+#include "azl/dlp_clnt_book.hpp"
+#include "azl/dlp_content_notice.hpp"
 #include "azl/dlp_hub.hpp"
 #include "azl/dlp_real_net.hpp"
 #include "azl/ini_values.hpp"
@@ -28,7 +31,7 @@
 namespace azl {
 namespace ctr {
 
-constexpr const char* kVersion = "1.1.3"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.3: Tests/set_version.py writes all of them)
+constexpr const char* kVersion = "1.1.4"; // (the log header and the menu text; the menu's ints and plgInfo say 1.1.4: Tests/set_version.py writes all of them)
 
 /// "Mon DD YYYY HH:MM:SS" of the last build that changed any object: Sources/ctr/build_id.cpp, which the Makefile recompiles
 /// after every other object. The log header prints it instead of plugin.cpp's own __DATE__ / __TIME__, which stay as old as
@@ -52,7 +55,7 @@ struct Config {
     int debug = 0;                        ///< 0 no log at all (no file is written), 1 everything (an old 2 reads as 1)
     int rcvbuf_kb = ini::kRcvbufKbDefault; ///< ini key rcvbuf_kb: 8, 16, 32 or 64; it can only LOWER the receive ring
     int sleep_stop = ini::kSleepStopDefault; ///< ini key sleep_stop: 0 the sleep is only logged, 1 it ends the session of a client, 2 of a host too (see OnSleepEnter)
-    bool chat = true;                     ///< ini key chat: the chat of the room over the title (set at runtime by SetChatOn)
+    bool chat = ini::kChatDefault;        ///< ini key chat: the chat of the room over the title (set at runtime by SetChatOn); OFF without a file or the key (DPAPP-2j, the user: chat, debug and menu off by default)
     std::string chat_key = ini::kDefaultChatKey; ///< ini key chat_key: the chord that opens it
     int chat_pos = ini::kChatPosDefault;  ///< ini key chat_pos: the corner of the chat's lines on the top screen (ini::ChatPos)
 };
@@ -171,6 +174,11 @@ public:
     /// log on). Called on the game's thread inside its APT call, or on the framework's keep-alive thread: a few stores and
     /// one event signal.
     static void NoteSleepEvent(u32 kind, u32 value);
+    /// The plugin's thread (the chat's input mirror, Sources/ctr/input_mirror.cpp, before it holds the game's threads): how many events the
+    /// trail was given so far, and whether those are all on the card (true with the log off or no trail: there is nothing to wait for).
+    /// The caller bounds its own wait and ends it at the gate's close (2026-11-10).
+    static u32 TrailMark();
+    static bool TrailOnCard(u32 mark);
     /// The game's APT session got the HOME button notification (ids 1 and 2; only called with the log on). Called on the
     /// game's thread: it only asks the log writer to put the queued lines on the card at once (an event signal; the
     /// SD card is never written on a game thread). The game may be about to close, and what is in memory then is lost.
@@ -184,7 +192,7 @@ private:
     Plugin() = default;
 
     /// Where the name shown in the room came from (a stronger source is never replaced by a weaker).
-    enum class NameSource { ProcessName = 0, RoomPeer, Icon, Config };
+    enum class NameSource { ProcessName = 0, RoomPeer, Icon, Config, Index /* 1.1.4, G4: a prepared child's game, from the index's row */ };
 
     /// Called by the log writer thread, once a second: the statistics window (at every level: the warnings and the
     /// menu's numbers come from it) and, with the log on, the queued lines and the capture.
@@ -205,9 +213,9 @@ private:
     /// Puts on screen what the counters of the last interval show is wrong (rate limited per kind).
     void CheckStatsWarnings(const Stats& s, u64 now_ms);
     /// With the log on: a notice when the log itself slows the game (the SD card busy, the capture dropping records).
-    void CheckDebugLoad(const Stats& s);
+    void CheckDebugLoad(const Stats& s, u64 window_ms);
     /// With the log on: a notice when the room's datagrams stop for 150 ms or more (the WiFi link, seen at the socket).
-    void CheckLinkSilence(const Stats& s);
+    void CheckLinkSilence(const Stats& s, u64 window_ms);
     /// Shows `message` unless this kind of warning was shown within the last minute; true if it was shown.
     bool Warn(int kind, const std::string& message);
     /// Once a second, from the log writer: notes whether the game made a UDS call since the last look (the counters are
@@ -256,6 +264,26 @@ private:
 
     void ResolveIdentity();
     void ResolveGameName();
+    /// 1.1.4 (G1/G2.3), the system's Download Play application in the room only: the table of the children the app prepared, read once from the
+    /// index (LateInit, the plugin's thread) and published to the adapter; nothing else of a block is read here (ServeDownloadPlayClient).
+    void LoadDlpChildren();
+    /// 1.1.4 (G1), the plugin's thread (Tick): the block of ONE child a heard host announces, when the book asked for it (never on a game's thread,
+    /// never all of them at once), and the notice of a StartSession the book refused.
+    void ServeDownloadPlayClient();
+    /// 1.1.4 (G1, contract K7), the plugin's thread (Tick, beside ServeDownloadPlayClient: it runs with or without the room's link): reads the seam
+    /// of the book to G3 - the prepared title armed, the passphrase ready - and logs its changes. The jump itself is G3's.
+    void NoteClntSeam();
+    /// 1.1.4 (H5/H3), the plugin's thread (Tick), a game that hosts the real Download Play only (the adapter, not the Download Play application):
+    /// the line of how the host's wait for its guests' children ended (H5), and the notice on the screen that names a guest ejected because it
+    /// asked for the content (H3: the room's name of the player, never a MAC; once per guest for the game's run).
+    void NoteRealDlpHost();
+    /// 1.1.4 (G4, contract K8), EarlyInit, a title of the band of the prepared children only: is it the Download Play child the app prepared (the
+    /// index's row whose `prepared` is this title)? If so, its rules and name are that row's game, and the plugin loader's words of this launch
+    /// (the 16 bytes of the jump, G3) are taken and wiped from the header. No row: nothing changes.
+    void NotePreparedChild();
+    /// 1.1.4 (G4), EarlyInit, the prepared child only (JoinsEarly): the room is joined before the game's first instruction - its host's game
+    /// waits 20 s for it - with what LateInit sets before a room starts, set here first with the same values.
+    void EarlyConnect();
     void OnRoomInfo(const room::RoomInfo& info);
 
     /// The room link left Joined (state callback: the network thread, or whoever stopped the client). Returns true if
@@ -276,6 +304,7 @@ private:
 
     bool initialized_ = false;
     bool config_from_old_place_ = false; ///< the settings were read from /luma/plugins/AzaharLink.ini (an older app wrote them there)
+    bool config_unreadable_ = false; ///< F7-rev: the last LoadConfig found AzaharLink.ini (or its .bak) and could not read it whole: SaveConfig never writes over it
     bool late_initialized_ = false;
     bool shut_down_ = false;
     bool active_ = true;
@@ -302,8 +331,11 @@ private:
     /// 1.1.3: the adapter of the real Download Play (azl/dlp_real_net.hpp), the network of the hub's lobby: only for the games in RealDlp mode,
     /// null for every other (Lobby games included). Made with the hub and never replaced; declared before it, so that the hub - which points
     /// to it - would go first (it never goes: the plugin is a leaked singleton).
+    /// 1.1.4 (G1): the book of dlp:CLNT (azl/dlp_clnt_book.hpp), only for the system's Download Play application in the room; made with the adapter
+    /// that feeds it and the hub that serves it, declared before them (they point to it), never replaced.
+    std::unique_ptr<DlpClntBook> dlp_book_;
     std::unique_ptr<RealDlpNet> dlp_real_;
-    /// The fake Download Play lobby (azl/dlp_hub.hpp): only for the games in Lobby mode (kDlpGames in plugin.cpp), null for the others.
+    /// The fake Download Play lobby (azl/dlp_hub.hpp): only for the games in Lobby mode (the Download Play column of azl/title_rules.hpp), null for the others.
     /// Made once in EarlyInit before the room can start and the hooks are installed, and never replaced; stopped at the end of
     /// the plugin (Shutdown) and never destroyed - like the engine and the HLE, which the game's threads keep using. (The members
     /// would be destroyed in the reverse of this order, the hub before the HLE and the engine it points to, but the plugin
@@ -323,6 +355,18 @@ private:
     bool room_members_known_ = false; ///< room_members_ is the room as of the first RoomInfo of this join (no lines for it)
     platform::Thread log_thread_;   ///< runs the statistics window and writes the log out, at low priority, away from the game
     std::atomic<bool> log_stop_{false};
+    bool clnt_local_ = false;  ///< 1.1.4 (G1): the Download Play application with no room to join by itself: the plugin stays out of it
+    bool clnt_room_ = false;   ///< 1.1.4 (G1): dlp:CLNT is the hub's (written once before the hooks; read by NoteProcessEvent and LateInit)
+    std::atomic<dlp_children::Table*> dlp_children_{nullptr};  ///< 1.1.4 (G1/G2.3): the table of the children, also published to dlp_real_
+    u32 clnt_refusals_seen_ = 0;    ///< the book's refusals already noticed (the plugin's thread)
+    u64 clnt_seam_armed_ = 0;       ///< the seam to G3 as NoteClntSeam last logged it (the plugin's thread)
+    bool clnt_seam_pass_ = false;
+    dlp_real::ContentNotices content_notices_;  ///< 1.1.4 (H3): the guests ejected for the content already named on the screen (the plugin's thread)
+    bool prepared_child_ = false;   ///< 1.1.4 (G4): this title is the Download Play child the app prepared (its row is in the index); EarlyInit, once
+    u64 rules_id_ = 0;              ///< the title whose row of azl/title_rules.hpp gives the rules and the name: game_id_, or a prepared child's game
+    bool config_read_early_ = false; ///< the settings were read in EarlyInit (EarlyConnect asks it)
+    bool identity_resolved_ = false; ///< ResolveIdentity ran (the prepared child's early join, then LateInit's call does nothing)
+    std::unique_ptr<u32[]> loader_words_; ///< 1.1.4 (G4): the plugin loader's 32 words of this launch (the 16 bytes of the jump), never logged
     std::atomic<bool> log_flush_requested_{false}; ///< the HOME button: the writer flushes the main log on its next wake
     Handle log_wake_ = 0;           ///< the writer waits on it (1 s, or 250 ms with the log on): stop and shutdown signal it
     // The trail of a sleep: its own thread, its own event, its own file (nothing shared with the log writer, which can sit
@@ -354,6 +398,7 @@ private:
     u8 link_state_ = 0;
     u32 link_changes_ = 0;
     u64 next_link_sample_ms_ = 0;
+    std::atomic<u32> link_strength_min_{0xFFu}; ///< (2m-rev) the lowest WiFi strength sampled in this statistics window (CheckLinkSilence)
     u64 clock_base_os_ms_ = 0;      ///< osGetTime() when the plugin started ...
     u64 clock_base_ms_ = 0;         ///< ... and the system tick then (ms)
     u64 joined_ms_ = 0;             ///< when the room was joined (0 = not joined)
@@ -382,8 +427,8 @@ private:
     bool want_connected_ = false;   ///< "Connect to room" as Tick saw it last (main thread)
     std::atomic<bool> session_dropped_{false}; ///< the game's session was ended by a lost link: say so when the room is back
     // The chat's switch and corner as the other threads read them: the defaults of Config until LoadConfig reads the file, then
-    // what it read, then what the menu sets (SetChatOn, SetChatPos).
-    std::atomic<bool> chat_on_{true};
+    // what it read, then what the menu sets (SetChatOn, SetChatPos). Off until a file says chat=1 (DPAPP-2j: ini::kChatDefault, as Config::chat).
+    std::atomic<bool> chat_on_{ini::kChatDefault};
     std::atomic<int> chat_pos_{ini::kChatPosDefault};
     std::atomic<ChatSink*> chat_sink_{nullptr}; ///< see chat_sink(): one new (std::nothrow) in WireChat, never deleted
     SleepWatch sleep_;              ///< where the console is in a sleep (see OnSleepEnter)

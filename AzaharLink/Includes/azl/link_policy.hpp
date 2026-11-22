@@ -124,7 +124,7 @@ public:
         bool nickname_automatic = true; ///< the name comes from the console: a suffix can tell two of them apart
         u8 wifi_state = kWifiConnected; ///< the byte above, read now (the policy looks at it every kWifiPollMs)
     };
-    enum class Note { None, MacTaken, NameTaken, OldLink };
+    enum class Note { None, MacTaken, NameTaken, OldLink, HeldIdentity };
     /// What the WiFi did since the last call that said so.
     enum class WifiNote { None, Down, Back };
     struct Step {
@@ -177,6 +177,14 @@ public:
             if (!old_link_said_) {
                 old_link_said_ = true;
                 step.note = Note::OldLink;
+            }
+        } else if ((collision || error == RoomClient::Error::RoomIsFull) && hold_ms_ != 0 && in.now_ms - in.launch_ms < hold_ms_) {
+            // (1.1.4, route B: the prepared Download Play child - the 3DS Link app that started it may still be listed for a moment: the same
+            // MAC and name, the usual schedule; past the hold, the rules below. A full room too: Azahar's room looks at its slots before
+            // any collision (HandleJoinRequest), so the app still listed in the last slot is answered RoomIsFull, not a collision)
+            if (!held_said_) {
+                held_said_ = true;
+                step.note = Note::HeldIdentity;
             }
         } else if (error == RoomClient::Error::MacCollision && prefer_real_mac_) {
             // The room still has our MAC from an earlier session (or someone else uses it): take whatever
@@ -249,6 +257,18 @@ public:
         platform::LockGuard<platform::Mutex> lock(m_);
         lost_ms_ = 0;
         old_link_said_ = false;
+    }
+    /// 1.1.4 (route B, spec 8 D-B9): for ms from the launch a name, MAC or console id collision does not change who we are (the MAC of the
+    /// console, the name without a suffix) and a full room is not given up (the room checks its slots first): it is tried again on the
+    /// usual schedule. Only the prepared Download Play child sets it: the 3DS
+    /// Link app that ran its session with the host left the room with the same MAC and name a moment before. 0: off (every other title).
+    void HoldIdentity(u32 ms) {
+        platform::LockGuard<platform::Mutex> lock(m_);
+        hold_ms_ = ms;
+    }
+    u32 hold_ms() const {
+        platform::LockGuard<platform::Mutex> lock(m_);
+        return hold_ms_;
     }
     /// The console woke up: the next attempt is at once (if it has a WiFi), then the schedule starts over, and the WiFi
     /// state is read again right away (it can have changed while the console slept).
@@ -335,6 +355,8 @@ private:
     bool gave_up_ = false;
     bool restart_ = false;
     bool old_link_said_ = false;
+    bool held_said_ = false;         ///< HeldIdentity said (once)
+    u32 hold_ms_ = 0;                ///< HoldIdentity's window from the launch (0: none)
     u32 failures_ = 0;
     u32 attempts_ = 0;
     u64 last_attempt_ms_ = 0;

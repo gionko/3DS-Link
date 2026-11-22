@@ -697,8 +697,9 @@ void TestHelpers() {
     EQ(kServerInfoSize, 664u);
     EQ(kDlpNodeInfoSize, 40u);
     EQ(kNodeInfoSize, 40u);  // the UDS engine's own constant (uds_types.hpp), now able to live beside it
-    EQ(kMaxPlayers, 4u);
-    EQ(kMaxClients, 3u);
+    EQ(kMaxPlayers, 8u);  // (2026-11-13: the capacity of the tables; every lobby of this file is a title that says nothing: four)
+    EQ(kMaxClients, 7u);
+    EQ(kTitlePlayers, 4u);
     EQ(kMaxGroups, 4u);
     EQ(kInvalidState, 0xE0A0AC01u);
     EQ(kNoData, 0xC880AFEFu);
@@ -708,8 +709,8 @@ void TestHelpers() {
     EQ(kInvalidPointer, 0xD8E0AFF6u);
     EQ(kBusy, 0xE0A0AC03u);
     EQ(kBadHeader, 0xD9001830u);
-    // the object sizes the user's rule fixes (x86-64 here; the design says <= 320 / <= 64 on every ABI)
-    OK(sizeof(DlpLobby) <= 320);
+    // the object sizes the user's rule fixes (x86-64 here; <= 400 / <= 64 on every ABI: 320 while the tables held four players)
+    OK(sizeof(DlpLobby) <= 400);
     OK(sizeof(DlpService) <= 64);
     std::printf("  sizeof(DlpLobby)=%zu sizeof(DlpService)=%zu\n", sizeof(DlpLobby), sizeof(DlpService));
 }

@@ -1,6 +1,12 @@
 // Page: Enable Titles for Azahar Emulator Net.
 //
-// It lists the titles installed on this console (the SD card and the card in the slot) with their icon and name and a switch each.
+// It lists the games installed on this console (the SD card and the card in the slot) with their icon and name and a switch each. Only the titles
+// that were sold are games here (setup::IsSoldGameTid, games.hpp): a homebrew or a tool installed as a CIA - 3DS Link itself the first - is not listed,
+// unless a plugin is already in its folder: then it is, so that it can be switched off, and it cannot be switched on (setup::Listing). The switch
+// asks the rule about the title itself every time it is told to go on: a row carries no leave of its own.
+// The rule the page asks is setup::IsEnableTitle, the sold games with one exception (games.hpp, 2026-11-14): a homebrew that is known to carry the id of a sold game
+// (an impostor, told by its id and its name) is a homebrew, not a game. Every title of the page is on the SD card or in the card slot: the Download Play application
+// of the system is not a row any more (1.1.4, spec 9: Download Play is a page of 3DS Link, and its children are not this page's business).
 // Switching a title ON puts a copy of the plugin (AzaharLink.3gx, the file 3DS Link keeps in its own folder: it carries the plugin inside and puts it there by itself)
 // in the title's own plugin folder, sd:/luma/plugins/<TID>/AzaharLink.3gx, which is the folder Luma3DS loads a title's plugin from; OFF removes it (and the folder,
 // when nothing else is in it). The switch is read from the card every time the page opens, so a copy made or removed by hand shows as it is.
@@ -20,6 +26,13 @@ namespace {
 
 constexpr u64 kFlashMs = 2000; // how long "Enabled" stays in place of the name
 
+// A title that is not a sold game and is in the list because a plugin was in its folder (setup::Listing::OffOnly): what its card says while the
+// plugin is there, once it is out, and what A says when the switch is asked to go on. "Not a sold game", not "not a game": it may be a game that
+// was installed under a made-up id, and the user put the plugin in its folder by hand.
+constexpr const char* kNotSoldOnNote = "Not a sold game: it can only be switched off, and then it leaves this list.";
+constexpr const char* kNotSoldOffNote = "Not a sold game: it cannot be switched on, and it leaves this list when the page is opened again.";
+constexpr const char* kNotSoldToast = "Not a sold game: 3DS Link cannot be switched on for it.";
+
 class EnableGamePage : public ListPage {
 public:
     EnableGamePage() : generation_(titles::ScanGeneration()) {
@@ -34,6 +47,7 @@ public:
         // The icon textures are keyed by where the icon data is: the card title (this page's own) goes away with the page, and a
         // later one could be put at the same place.
         gfx::ReleaseIcons();
+        // (Nothing of the Download Play children is asked from here: they are the Download Play page's, 1.1.4 spec 9.)
     }
 
     void Update(const Input& in) override {
@@ -129,6 +143,12 @@ protected:
                 row.value = "other plugin";
                 row.value_color = col::kWarn;
                 row.dim = true;
+            } else if (e.slot == setup::Slot::Off && !setup::IsEnableTitle(e.game->tid, e.game->name)) {
+                // Not a sold game, and switched off on this visit: nothing can be done with it any more (the next visit does not list it).
+                row.kind = Kind::Info;
+                row.value = "not a sold game";
+                row.value_color = col::kDim;
+                row.dim = true;
             } else {
                 row.kind = Kind::Toggle;
                 row.on = e.slot == setup::Slot::On;
@@ -187,6 +207,13 @@ protected:
         if (on) {
             worker.Submit(e.game->tid, setup::CopyKind::Disable, std::string());
         } else {
+            if (!setup::IsEnableTitle(e.game->tid, e.game->name)) {
+                // Not a sold game (3DS Link itself is one, an impostor too): it is here because a plugin was in its folder, and the only way is off. Asked of the TITLE, every time.
+                if (step == 0) {
+                    g.ShowToast(kNotSoldToast, col::kWarn, 5000);
+                }
+                return;
+            }
             if (!source_ok_) {
                 g.ShowToast("AzaharLink.3gx is gone from " + g.paths.appdir + ".", col::kOff, 5000);
                 return;
@@ -270,8 +297,8 @@ private:
                                       "with it they can be read.";
             detail = Fmt("%d titles are installed on the SD card.", report.applications);
         } else {
-            title = "No title found";
-            text = "Titles installed on the SD card and the title in the card slot are listed here.";
+            title = "No game found";
+            text = "Games installed on the SD card and the game in the card slot are listed here. Homebrew and other applications are not.";
             detail = "Only a title with a readable name and icon is listed.";
         }
     }
@@ -309,14 +336,19 @@ private:
         case setup::Slot::Off:
             break;
         }
+        if (!setup::IsEnableTitle(e.game->tid, e.game->name) && e.slot != setup::Slot::Other) {
+            note = e.slot == setup::Slot::On ? kNotSoldOnNote : kNotSoldOffNote;
+        }
         const float state_y = id_y + 22.0f;
         gfx::FillCircle(142, state_y, 5, dot);
         gfx::DrawFitted(154, state_y, 0.52f, 0.4f, 226, col::kText, state);
-        gfx::DrawWrapped(136, state_y + 15.0f, 244, 0.46f, col::kDim, note, 4);
+        // The note has its 4 lines (the Download Play guest of the game is not said here any more: it is the Download Play page's, 1.1.4 spec 9).
+        const float note_y = state_y + 15.0f;
+        gfx::DrawWrapped(136, note_y, 244, 0.46f, col::kDim, note, 4);
     }
 
     // The titles of the scan, the title in the card slot, and what the card says about each: one listing of sd:/luma/plugins, then a
-    // look at the folder of every title that has one.
+    // look at the folder of every title that has one. The title in the card slot goes through the same rule as the others.
     void BuildEntries() {
         built_ = true;
         std::vector<const titles::Game*> games;
@@ -337,19 +369,26 @@ private:
                 games.insert(games.begin() + static_cast<std::ptrdiff_t>(at), card_.get());
             }
         }
-        const std::set<std::string> folders = setup::ListPluginFolders();
-        setup::CopyWorker& worker = setup::CopyWorker::Get();
+        std::vector<u64> tids;
+        std::vector<std::string> names; // (an impostor is told by its id AND its name: the rule is given both)
         for (const titles::Game* game : games) {
+            tids.push_back(game->tid);
+            names.push_back(game->name);
+        }
+        setup::CopyWorker& worker = setup::CopyWorker::Get();
+        // Which of them are rows is setup::EnableRows' (games.cpp, tried on a PC): the sold games, and a homebrew (an impostor too) only while a plugin is in its
+        // folder.
+        // (This is the ONE place a title enters the list; and whatever is in the list, the switch asks the rule again about the title itself.)
+        for (const setup::EnableRow& listed : setup::EnableRows(tids, names)) {
+            const titles::Game* game = games[listed.index];
+            const setup::SlotInfo& info = listed.info;
             Entry e;
             e.game = game;
             e.name = gfx::Clean(game->name);
-            if (folders.count(setup::TidText(game->tid)) != 0) {
-                const setup::SlotInfo info = setup::ReadSlot(game->tid);
-                e.slot = info.slot;
-                if (info.slot == setup::Slot::On && setup::CopyIsStale(info.copy_size, source_.size) && !worker.Pending(game->tid, nullptr)) {
-                    // The plugin file was replaced by a newer one: the copy is made again, in the background like any other.
-                    worker.Submit(game->tid, setup::CopyKind::Update, g.paths.plugin_file);
-                }
+            e.slot = info.slot;
+            if (info.slot == setup::Slot::On && setup::CopyIsStale(info.copy_size, source_.size) && !worker.Pending(game->tid, nullptr)) {
+                // The plugin file was replaced by a newer one: the copy is made again, in the background like any other.
+                worker.Submit(game->tid, setup::CopyKind::Update, g.paths.plugin_file);
             }
             entries_.push_back(e);
         }
@@ -424,7 +463,7 @@ private:
     int generation_;
     unsigned recheck_ = 0;
     std::vector<Entry> entries_;
-    std::unique_ptr<titles::Game> card_; // the title in the card slot, when there is one (the scan only knows the SD card)
+    std::unique_ptr<titles::Game> card_; // the title in the card slot, when there is one (the scan knows the SD card only)
 };
 
 } // namespace

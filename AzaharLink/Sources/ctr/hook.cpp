@@ -7,6 +7,7 @@
 
 #include "azl/apt_sleep.hpp"
 #include "azl/chat_host.hpp"
+#include "azl/game_card_calls.hpp"
 #include "azl/gate_plan.hpp"
 #include "azl/gsp_wrapper.hpp"
 #include "azl/hook_swap.hpp"
@@ -630,6 +631,26 @@ __attribute__((noinline)) void NoteSrvNotification(Result rc, const u32* cmd) {
     }
 }
 
+// The game's calls to the file system, with the log on only: begun (pre) and ended (post), two words and an atomic add each - no line,
+// no call, nothing on the stack. The console has ONE file-system service: a call of the game waits behind the write the log's writer
+// has in it, and with a capture the card could not keep up with the game read one block of its files per pass of the writer (Kirby
+// Battle Royale: the load of the match at 3% of its speed, the session fell). The writer looks at the two words every time it wakes and
+// keeps the capture off the card while a call is under way or one just ended (azl/capture_pace.hpp, LogFiles::NextCaptureTurn).
+// 2026-11-10: the reads alone (FSFILE_Read). 2026-11-11: every command of the file system - opens, writes, closes, sizes, directories,
+// archives (azl/game_card_calls.hpp, IsFileSystemCall: the command id's high byte is 0x08). Tekken 3D Prime Edition on a real console,
+// 1.1.3 with the log on: at the start of a match the game's fs:USER OpenFileDirectly (0x08030204) came back after 26.4 s (1.0 s in the
+// session that held) with the writer in the card 991 ms of every second; the game sent nothing for 17 s and the host closed the session.
+// The call left waiting was an OPEN, which a count of the reads did not see. (Nor would this count have seen THAT open in time: it
+// began 5.7 s after the writer went into the card and 5.9 s after the game's last file call, with the card free of the game all the
+// while. The count keeps the writer from BEGINNING a write while a call of the game is under way or just ended - the calls that follow
+// the first one of a load; the first call after a silence waits for the write the writer has in hand, and only the short pass of
+// azl/capture_pace.hpp bounds that. azl/game_card_calls.hpp says what to read in the log's card line at the next test on a console.)
+// A post that never runs (the swap of the plugin's block on an Old 3DS during the call) leaves `begun` one ahead: the writer puts that
+// right by itself. With the log off neither word is ever written. (The two words keep the names of 2026-11-10, when they counted the
+// reads alone: the plugin hands them to the writer by name.)
+u32 g_game_reads_begun = 0;
+u32 g_game_reads_done = 0;
+
 // What every IPC call of every thread of the game that no service of ours answers goes through, in two halves: this one before the
 // call, a post after it (azl_post32) when there is something to note. The common case - a call to a real service nobody traces - keeps
 // this frame small on purpose: it is the one that runs on the srv-notification thread of Tri Force Heroes (464 bytes), and the branches
@@ -661,6 +682,9 @@ __attribute__((noinline)) u64 PassThroughPre(Handle handle, u32* ctx) {
     ctx[0] = handle;
     ctx[1] = header;
     ctx[2] = cmd[1];
+    if (IsFileSystemCall(header)) {
+        __atomic_fetch_add(&g_game_reads_begun, 1u, __ATOMIC_RELAXED); // (the log's writer keeps off the card while the game is at its files: above)
+    }
     return PreReply(handle, kActPostIpc);
 }
 
@@ -669,6 +693,9 @@ __attribute__((noinline)) Result PassThroughPost(Result rc, const u32* ctx) {
     const Handle handle = ctx[0];
     const u32 header = ctx[1];
     const u32 arg = ctx[2];
+    if (IsFileSystemCall(header)) {
+        __atomic_fetch_add(&g_game_reads_done, 1u, __ATOMIC_RELAXED); // (first: the call is over, whatever the lines below take)
+    }
     if (static_cast<u32>(rc) == kKernelInvalidHandle) {
         NoteGameFailure(kAptNoteBadHandle, handle);
     }
@@ -1125,6 +1152,10 @@ void OpenGate() {
     }
     GateOpen(*g_gate, &g_gate_stats);
     g_gate_last_open_ms = static_cast<u32>(platform::NowMs());
+}
+
+u32 GatePostsSkipped() {
+    return g_gate != nullptr ? __atomic_load_n(&g_gate->post_skipped, __ATOMIC_RELAXED) : 0;
 }
 
 GateStats GetGateStats() {

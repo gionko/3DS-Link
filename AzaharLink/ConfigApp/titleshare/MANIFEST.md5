@@ -48,7 +48,7 @@ a2c0086ed3fe2d687fb7a44a613bd31f  source/main.c
 7e6bd5699d3333bd7f1764215365cbc1  source/net.h
 6e96970a1a515988aa4087d82aa8edfe  source/power.c
 3f7056ff5dfbb107d66d61f5aa8b1551  source/power.h
-985e87c5459acbb9aaf334a0adf3db49  source/receiver.c
+16b248a3072715ad0d48020cb02143b1  source/receiver.c
 0346aa99026722b7ed8a865abcda0212  source/receiver.h
 7d25c28b3b16206da4a16b1fdd32e09d  source/sender.c
 60e87f81e4b3e4c93e74b686f08b8b08  source/sender.h

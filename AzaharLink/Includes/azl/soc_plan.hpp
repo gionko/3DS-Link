@@ -32,6 +32,7 @@
 
 #include "azl/rcvbuf.h"
 #include "azl/screen_text.hpp"
+#include "azl/title_rules.hpp"
 
 namespace azl {
 namespace ctr {
@@ -62,44 +63,26 @@ constexpr uint32_t kSocBlockSize = 0x20000;
 // Sizes tried in this order (the kernel refuses when the commit room or the physical memory is short).
 constexpr uint32_t kBlockSizes[] = {0x20000, 0x10000};
 
-// THE LIST of the games that cannot spare the block while they size their heap: they get it at the first connection, not before their first
-// instruction. A game with the same defect needs its title id here (every region of it) and nothing else. The defect, as Monster Hunter XX has it
+// The games that cannot spare the block while they size their heap: they get it at the first connection, not before their first instruction (the
+// column late_soc_block of azl/title_rules.hpp since 2026-11-15: Monster Hunter XX, Japan and Taiwan). A game with the same defect needs its row there,
+// every region of it, and nothing else. The defect, as Monster Hunter XX has it
 // (2026-11-01): with the plugin off it plays; with the plugin on it dies before its first frame, with a small FAR in its own code
 // (the same in Luma's dumps of two Old 3DS and a New 2DS XL) right after a NULL from its allocator, because its entry point reads the commit
 // (svc 0x3A) and fills what is left:
 //     heap = min(told to the game, 80 MiB) - commit now - 59 MiB of device memory = 8,240 KB, 8,112 KB with the block charged, and that is short
 // Not a rule for every game: one that fills a budget as large as the whole region would leave a late block no room, where it can spare 128 KB today.
 // A game that takes a late block outside its budget (ctr/soc.cpp, a console with nothing left) should not be one that frees and takes back memory at its limit.
-constexpr uint64_t kLateBlockTitles[] = {
-    0x0004000000197100ull, // Monster Hunter XX (Japan: it has no other region)
-};
 
-// THE LIST of the games that open the system's sockets themselves before the plugin's first connection (soc:U InitializeSockets: the
-// module keeps one context per process and the first wins, 0xC8A0700B for the plugin): for these the plugin becomes a guest in the
-// game's context instead of giving up (Sources/ctr/soc.cpp, the guest; REGISTRO phase S). A game with the same symptom ("soc: socInit
-// failed (0xc8a0700b) ... the game initialised the sockets itself first" in AzaharLink.log) needs its title id here, every region of it.
-constexpr uint64_t kSocGuestTitles[] = {
-    0x0004000000113100ull, // Fantasy Life, Europe (seen: InitializeSockets at 1.9 s, Friend-A 2026-11-08)
-    0x0004000000113200ull, // Fantasy Life, USA (3DS Link's catalogue, family AFL)
-    0x000400000006D200ull, // Fantasy Life, Japan (3DS Link's catalogue, family AFL)
-};
-
-inline bool SharesGameSockets(uint64_t title_id) {
-    for (const uint64_t title : kSocGuestTitles) {
-        if (title == title_id) {
-            return true;
-        }
-    }
-    return false;
+// The games that open the system's sockets themselves before the plugin's first connection (soc:U InitializeSockets: the module keeps one context per
+// process and the first wins, 0xC8A0700B for the plugin): for these the plugin becomes a guest in the game's context instead of giving up
+// (Sources/ctr/soc.cpp, the guest; REGISTRO phase S). The column soc_guest of azl/title_rules.hpp since 2026-11-15 (Fantasy Life, its three regions). A game
+// with the same symptom ("soc: socInit failed (0xc8a0700b) ... the game initialised the sockets itself first" in AzaharLink.log) needs its row there.
+constexpr bool SharesGameSockets(uint64_t title_id) {
+    return title_rules::AppRulesFor(title_id).soc_guest;
 }
 
-inline bool TakesBlockLate(uint64_t title_id) {
-    for (const uint64_t title : kLateBlockTitles) {
-        if (title == title_id) {
-            return true;
-        }
-    }
-    return false;
+constexpr bool TakesBlockLate(uint64_t title_id) {
+    return title_rules::AppRulesFor(title_id).late_soc_block;
 }
 
 // What the start-up says on screen about the block that was reserved (the sizes of kBlockSizes); "" = nothing to say.

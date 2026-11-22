@@ -6,7 +6,8 @@
 //   * every other command of the service is refused with "invalid state" (and logged, the first few), an id the
 //     service does not have gets the dispatcher's own answer;
 //   * the session closes like any fake one (and nwm::UDS and ndm:u next to it are not disturbed);
-//   * game threads calling dlp:FKCL while others use nwm::UDS and ndm:u (lock order).
+//   * game threads calling dlp:FKCL while others use nwm::UDS and ndm:u (lock order);
+//   * 1.1.4 (G4): the prepared Download Play child's dlp:SRVR (SetDlpChild): IsChild TRUE, nothing else.
 //
 //   dlp_fkcl_test              (needs no room server; built by Tests/ipc_test/build.sh)
 #include <atomic>
@@ -210,6 +211,88 @@ static void TestHleClassAlone() {
     CHECK_EQ(h.refused(), 0x20u - 3u);
 }
 
+// 1.1.4 (G4): the Download Play child 3DS Link prepared (UdsHle::SetDlpChild, Sources/ctr/plugin.cpp contract K8). By default, and with
+// SetDlpChild(false) or with a hub, dlp:SRVR is the real service. With it: a fake dlp:SRVR session whose IsChild [0x000E0040, pid] answers
+// [0x000E0080, 0, 1] - the one request the child makes of it - and whose every other command is "invalid state" (written, the first few);
+// dlp:FKCL stays the real one (the probe is off for this title); the session closes like any fake one beside nwm::UDS and ndm:u.
+static void TestPreparedChild() {
+    {
+        MockRoom room;
+        HleConsole ds(room, 1);
+        g_test_hle = ds.hle.get();
+        Handle h = 0;
+        CHECK(!ds.hle->dlp_child());
+        CHECK_EQ(static_cast<u32>(srvGetServiceHandle(&h, "dlp:SRVR")), 0xD8E06406u);
+        ds.hle->SetDlpChild(false);
+        CHECK(!ds.hle->dlp_child());
+        CHECK_EQ(static_cast<u32>(srvGetServiceHandle(&h, "dlp:SRVR")), 0xD8E06406u);
+        // a hub never says "child": with one, SetDlpChild makes nothing (the pointer is never followed here: no session is opened)
+        static int not_a_hub = 0;
+        ds.hle->SetDlpHub(reinterpret_cast<DlpHub*>(&not_a_hub));
+        ds.hle->SetDlpChild(true);
+        CHECK(!ds.hle->dlp_child());
+        ds.hle->SetDlpHub(nullptr);
+        CHECK_EQ(static_cast<u32>(h), 0u);
+    }
+    MockRoom room;
+    HleConsole ds(room, 1);
+    ds.hle->SetDlpChild(true);
+    CHECK(ds.hle->dlp_child());
+    ds.hle->SetDlpChild(true);  // (once: a second call changes nothing)
+    CHECK(ds.hle->dlp_child());
+    g_test_hle = ds.hle.get();
+    Handle fkcl = 0;
+    CHECK_EQ(static_cast<u32>(srvGetServiceHandle(&fkcl, "dlp:FKCL")), 0xD8E06406u);  // (the real dlp:FKCL)
+    const int opened_before = LogLines("uds: game opened dlp:SRVR");
+    const Handle srvr = ds.Open("dlp:SRVR");
+    const Handle ndm = ds.Open("ndm:u");
+    const Handle uds = ds.Open("nwm::UDS");
+    CHECK(srvr != 0 && srvr != ndm && srvr != uds && ndm != uds);
+    CHECK_EQ(LogLines("uds: game opened dlp:SRVR") - opened_before, 1);
+    // IsChild, as the child sends it (one normal word: its process id): TRUE
+    std::vector<u32> is_child = req::Make(0x0E, 1, 0);
+    is_child[1] = 0x2A;
+    Reply r = ds.Call(srvr, is_child);
+    CHECK_EQ(r.w[0], 0x000E0080u);
+    CHECK_EQ(r.w[1], 0u);
+    CHECK_EQ(r.w[2], 1u);
+    CHECK_EQ(LogLines("dlp: dlp:SRVR IsChild answered TRUE here"), 1);
+    r = ds.Call(srvr, is_child);  // (asked again: the same answer, the line said once)
+    CHECK_EQ(r.w[2], 1u);
+    CHECK_EQ(LogLines("dlp: dlp:SRVR IsChild answered TRUE here"), 1);
+    // anything else of the service: "invalid state", the first three written; an id it does not have: the dispatcher's own answer
+    const int refused_before = LogLines("dlp: the prepared child called dlp:SRVR command 0x");
+    for (u32 id : {0x01u, 0x0Fu, 0x03u, 0x10u}) {
+        r = ds.Call(srvr, req::Make(id, 0, 0));
+        CHECK_EQ(r.w[0], (id << 16) | 0x40u);
+        CHECK_EQ(r.w[1], 0xE0A0AC01u);
+    }
+    r = ds.Call(srvr, req::Make(0x11, 0, 0));
+    CHECK_EQ(r.w[0], 0x40u);
+    CHECK_EQ(r.w[1], 0xD9001830u);
+    CHECK_EQ(LogLines("dlp: the prepared child called dlp:SRVR command 0x") - refused_before, 3);
+    CHECK_EQ(LogLines("dlp: the prepared child called dlp:SRVR command 0x01 (answered invalid state; 1 so far)"), 1);
+    r = ds.Call(srvr, is_child);  // (and IsChild is still TRUE after them)
+    CHECK_EQ(r.w[2], 1u);
+    CHECK_EQ(LogLines("dlp: dlp:SRVR IsChild answered TRUE here"), 1);
+    // the neighbours are still the plugin's
+    r = ds.Call(ndm, req::Make(0x01, 1, 2));
+    CHECK(r.w[0] != 0);
+    const int closed_before = LogLines("uds: game closed its fake dlp:SRVR session");
+    ds.Close(srvr);
+    CHECK_EQ(LogLines("uds: game closed its fake dlp:SRVR session") - closed_before, 1);
+    CHECK_EQ(LogLines("its role ends with it"), 0);  // (no hub: the child's session has no role to end)
+    r = ds.Call(ndm, req::Make(0x01, 1, 2));
+    CHECK(r.w[0] != 0);
+    // opened again (a game may): served the same
+    const Handle again = ds.Open("dlp:SRVR");
+    r = ds.Call(again, is_child);
+    CHECK_EQ(r.w[2], 1u);
+    ds.Close(again);
+    ds.Close(ndm);
+    ds.Close(uds);
+}
+
 int main() {
     LogOn log_on; // (the tests read the lines of the log)
     SetLogSink([](const char* line) {
@@ -229,6 +312,8 @@ int main() {
     TestSessionCloseAndNeighbours();
     dog.Step("threads");
     TestThreads();
+    dog.Step("prepared child");
+    TestPreparedChild();
     dog.Step("");
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

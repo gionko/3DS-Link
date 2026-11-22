@@ -24,8 +24,12 @@ import sys
 RE_LINE = re.compile(r'^\s*(\d+\.\d+) (\S+)(.*)$')
 RE_CMD = re.compile(r'^ cmd 0x([0-9a-f]+) req ?(.*?) -> rep ?(.*)$')
 RE_PULL = re.compile(r'^ PullPacket bind (\d+): (\d+) bytes from node (\d+) req (.*?) -> rep (.*)$')
-RE_FRAME = re.compile(r'^ (rx|tx|other)\s+(\S+)>(\S+) ch(\d+) (\d+)B: ([0-9a-f]*)$')
+# (since 1.1.4 the delivered plugin keeps the first 32 bytes of a game's frame, "189B (cut): <64 hex digits>", and counts the
+#  PullPacket / SendTo lines past the first of a second: a golden is made from the capture of a study build, which has neither -
+#  make EXTRA_CFLAGS=-DAZL_CAPTURE_WHOLE, Includes/azl/stats.hpp)
+RE_FRAME = re.compile(r'^ (rx|tx|other)\s+(\S+)>(\S+) ch(\d+) (\d+)B( \(cut\))?: ([0-9a-f]*)$')
 RE_BEACON = re.compile(r'^ (rx|tx)\s+([0-9a-f:]+) ch(\d+) (\d+)B: ([0-9a-f]*)$')
+RE_BEACON_SAME = re.compile(r'^ (rx|tx|other|dup|echo)\s+([0-9a-f:]+) ch(\d+) (\d+)B: same x(\d+) from ')
 
 
 def words(s):
@@ -64,8 +68,14 @@ class Capture:
                     if mm:
                         self.recs.append(dict(ln=ln, t=t, k='frame', dir=mm.group(1), src=node(mm.group(2)),
                                               dst=node(mm.group(3)), ch=int(mm.group(4)), n=int(mm.group(5)),
-                                              hex=mm.group(6)))
+                                              cut=bool(mm.group(6)), hex=mm.group(7)))
                 elif kind == 'BEACON':
+                    # (since 2026-11-10 the writer counts the beacons that are the one before of their transmitter instead of writing them,
+                    #  and says so in a line "BEACON rx <mac> ch11 377B: same x19 from 10.402 to 12.340, longest gap 104 ms": it has no
+                    #  bytes and is not a beacon to replay. The whole beacon is still there when it changes, once a minute and as the
+                    #  first of every file, which is what the picks below take)
+                    if RE_BEACON_SAME.match(rest):
+                        continue
                     mm = RE_BEACON.match(rest)
                     if mm:
                         self.recs.append(dict(ln=ln, t=t, k='beacon', dir=mm.group(1), mac=mm.group(2), n=int(mm.group(4)),
@@ -119,6 +129,9 @@ def pair_frames(cap, first, last, bind_line_kind, max_pairs, direction):
         calls = [r for r in cap.recs if r['k'] == 'uds' and r['id'] == 0x17 and first <= r['t'] < last]
     pairs = []
     for f, c in zip(frames, calls):
+        if f['cut']:
+            raise SystemExit('the frame at %.3f is cut (%d of %d bytes): this capture is the delivered plugin\'s, a golden needs '
+                             'the capture of a study build (make EXTRA_CFLAGS=-DAZL_CAPTURE_WHOLE)' % (f['t'], len(f['hex']) // 2, f['n']))
         size = c['n'] if direction == 'rx' else c['req'][4]
         if f['n'] != size or len(f['hex']) != 2 * f['n']:
             raise SystemExit('frame/call mismatch at %.3f: %d vs %d' % (f['t'], f['n'], size))

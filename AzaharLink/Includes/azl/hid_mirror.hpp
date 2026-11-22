@@ -3,7 +3,8 @@
 // says "no key, no Circle Pad, no touch" with the live headers, accelerometer and gyroscope of the real one. The plugin still reads the real
 // input through the framework's own mapping of the page (CTRPluginFramework calls hidInit itself: another address, the same page).
 // The pure parts (Tests/hid_mirror_test.cpp drives them on the PC): the page's layout and its neutral copy, the look at the real page that
-// says whether keys are still held, the wait for the release, the search for the game's addresses of the page, and the switch and its way
+// says whether keys are still held, the wait for the release, the masks of what is still down when that wait ends at its cap, the search
+// for the game's addresses of the page, and the switch and its way
 // back over an abstract kernel (`Ops`): the console's side, with the svcs, is Sources/ctr/input_mirror.cpp.
 //
 // Why each step (AzaharLink/analysis/chat-in-game-2026-11-04: STUDIO-CHAT sections 2, 11 and 12, DECISIONI "Pagina specchio"):
@@ -44,7 +45,7 @@ constexpr u32 kHidBytes = 0x2B0;       ///< what the hid module writes in it
 constexpr u32 kEntries = 8;            ///< every ring of the page
 constexpr u32 kPadIndex = 0x10;        ///< the pad's last entry (its two ticks before it, at 0x00 and 0x08)
 constexpr u32 kPadRaw = 0x1C;          ///< the pad's raw state ...
-constexpr u32 kPadRawCircle = 0x20;    ///< ... and the Circle Pad's raw position (s16 x, s16 y)
+constexpr u32 kPadRawCircle = 0x20;    ///< ... and the Circle Pad's raw position (s16 x, s16 y): neutral in the mirror, not looked at by PageQuiet
 constexpr u32 kPadEntries = 0x28;      ///< 8 entries of 0x10: held, pressed, released, Circle Pad (s16 x, s16 y)
 constexpr u32 kPadEntryStep = 0x10;
 constexpr u32 kPadHeld = 0x0, kPadPressed = 0x4, kPadReleased = 0x8, kPadCircle = 0xC;
@@ -142,33 +143,59 @@ private:
     u32 left_ = 0;
 };
 
-/// The real page says nothing is held: no key and the Circle Pad at rest in any of the 8 pad entries (the last ~34 ms at the hid module's
-/// 234 Hz), the raw state too, and no finger in any touch entry nor in the raw touch.
-inline bool PageQuiet(const u8* real) {
+/// What keeps the real page from being quiet (Unquiet), one bit a condition: PageQuiet is "none of them", and the debug log's line of a
+/// wait for the release that ended at its cap says which (Sources/ctr/input_mirror.cpp).
+constexpr u32 kUnquietKey = 1;      ///< a key held in one of the 8 pad entries
+constexpr u32 kUnquietCircle = 2;   ///< the Circle Pad off its rest in one of them
+constexpr u32 kUnquietTouch = 4;    ///< a finger in one of the 8 touch entries
+constexpr u32 kUnquietRawTouch = 8; ///< the raw touch's flag (at 0xC4)
+
+/// The conditions of PageQuiet that the real page does not meet (0: quiet): the 8 pad entries (the last ~34 ms at the hid module's 234 Hz)
+/// for a key or a Circle Pad off its rest, the 8 touch entries and the raw touch for a finger.
+/// The pad's raw words at 0x1C and 0x20 are NOT looked at (2026-11-10): with them the page was never quiet on a console - of 144 closes of the
+/// keyboard in the logs of console 63, 121 gave the game its input back only at the 1 s cap and none by the 50 ms of quiet - and what those
+/// two words hold at rest on hardware is not known (0x20 is the Circle Pad before its calibration; an emulator leaves both at 0, which is
+/// why the PC never saw it). The entries are the hid module's own decoded state, the one the game reads.
+inline u32 Unquiet(const u8* real) {
     const auto rest = [](s32 v) { return v <= kCircleRest && v >= -kCircleRest; };
-    if (Load32(real, kPadRaw) != 0 || !rest(LoadS16(real, kPadRawCircle)) || !rest(LoadS16(real, kPadRawCircle + 2))) {
-        return false;
-    }
+    u32 why = 0;
     for (u32 i = 0; i < kEntries; ++i) {
         const u32 e = kPadEntries + i * kPadEntryStep;
-        if (Load32(real, e + kPadHeld) != 0 || !rest(LoadS16(real, e + kPadCircle)) || !rest(LoadS16(real, e + kPadCircle + 2))) {
-            return false;
+        if (Load32(real, e + kPadHeld) != 0) {
+            why |= kUnquietKey;
+        }
+        if (!rest(LoadS16(real, e + kPadCircle)) || !rest(LoadS16(real, e + kPadCircle + 2))) {
+            why |= kUnquietCircle;
         }
         if (Load32(real, kTouchEntries + i * kTouchEntryStep + kTouchFlag) != 0) {
-            return false;
+            why |= kUnquietTouch;
         }
     }
-    return Load32(real, kTouchRaw + kTouchFlag) == 0;
+    if (Load32(real, kTouchRaw + kTouchFlag) != 0) {
+        why |= kUnquietRawTouch;
+    }
+    return why;
+}
+
+/// The real page says nothing is held: no key and the Circle Pad at rest in any of the 8 pad entries, and no finger in any touch entry
+/// nor in the raw touch.
+inline bool PageQuiet(const u8* real) {
+    return Unquiet(real) == 0;
 }
 
 /// The keyboard closed: the game gets its page back once the real page was quiet for kQuietMs (looked at every frame), or kMaxWaitMs
-/// after the close whatever is held. A clock that wraps is fine (differences only).
+/// after the close whatever is held. A clock that wraps is fine (differences only), and so is a `now_ms` a little OLDER than the one of
+/// Start or of the look before (2026-11-10: the close took the clock again while the frame's look still had its own, read 1-2 ms earlier:
+/// the difference without a sign was 0xFFFFFFFF, "over the cap", and the page went back in the same frame with the key that closed the
+/// keyboard still held - 23 closes of 144 on console 63). Both differences are compared WITH their sign, on both sides: kMaxWaitMs and
+/// kQuietMs are u32, and a signed difference against an unsigned constant is an unsigned comparison again.
 class ReleaseWait {
 public:
     void Start(u32 now_ms) {
         on_ = true;
         start_ = now_ms;
         quiet_ = false;
+        capped_ = false;
     }
     void Cancel() {
         on_ = false;
@@ -187,18 +214,194 @@ public:
             quiet_ = true;
             quiet_since_ = now_ms;
         }
-        if ((quiet_ && now_ms - quiet_since_ >= kQuietMs) || now_ms - start_ >= kMaxWaitMs) {
+        const bool rested = quiet_ && static_cast<s32>(now_ms - quiet_since_) >= static_cast<s32>(kQuietMs);
+        const bool capped = static_cast<s32>(now_ms - start_) >= static_cast<s32>(kMaxWaitMs);
+        if (rested || capped) {
             on_ = false;
+            capped_ = !rested;
             return true;
         }
         return false;
+    }
+    /// The wait that just ended (Update said true) ended at its cap, the page never quiet for kQuietMs: what the debug log tells apart.
+    bool capped() const {
+        return capped_;
     }
 
 private:
     bool on_ = false;
     bool quiet_ = false;
+    bool capped_ = false;
     u32 start_ = 0;
     u32 quiet_since_ = 0;
+};
+
+// ---- What is still down when the wait ends at its cap (2026-11-13) --------------------------------------------------------------
+// Console 63, Final Fantasy Explorers with four: the keyboard closed with B, and 1 s later - B still held, the Circle Pad pushed - the
+// page went back at the cap; the game took that B and left the mission. A wait that ends at its cap with something down no longer gives
+// the page back: the mirror stays, and from then on it is the REAL page without what is still down from the close -
+// - each key (held, pressed and released, in the 8 entries and in the raw word) until the 8 entries no longer mention it;
+// - the Circle Pad, centred, and its four direction keys, until it is at rest in the 8 entries (or kCircleMaskMaxMs: a pad that never
+//   comes back to its centre is not centred for ever);
+// - the touch, absent, until no entry and no raw flag has the pen down.
+// Everything else is the real page's: a key pressed AFTER the cap is in the mirror at the plugin's next frame. A mask only shrinks. The
+// page goes back when the last one falls (Sources/ctr/input_mirror.cpp, MaskFrame); until then the mirror is written with the masked
+// values directly, never with the real ones first: the game may read it between any two stores.
+constexpr u32 kCirclePadKeys = 0xF0000000u; ///< the Circle Pad as four keys (bits 28-31: right, left, up, down): masked with it
+constexpr u32 kCircleMaskMaxMs = 10000;     ///< the Circle Pad's mask falls after this long even off its rest
+constexpr u32 kMaskCircle = 1;              ///< HeldMask::what(): the Circle Pad is centred for the game
+constexpr u32 kMaskTouch = 2;               ///< ... the touch is absent
+
+class HeldMask {
+public:
+    /// The wait ended at its cap: everything the real page's entries still mention is masked, and the mirror `m` is written without it.
+    /// False (and off, `m` untouched) when they mention nothing.
+    bool Start(u8* m, const u8* real, u32 now_ms) {
+        const Seen s = Look(real);
+        keys_ = s.circle ? s.keys & ~kCirclePadKeys : s.keys; // (the pad's direction keys are its mask's while it is on)
+        what_ = (s.circle ? kMaskCircle : 0u) | (s.touch ? kMaskTouch : 0u);
+        circle_capped_ = false;
+        start_ = now_ms;
+        last_ms_ = now_ms;
+        frames_ = 0;
+        gap_max_ = 0;
+        on_ = any();
+        if (on_) {
+            Write(m, real);
+        }
+        return on_;
+    }
+    /// The keyboard opened again, or the page went back by another way (HOME, sleep, the menu, the exit): nothing is masked.
+    void Clear() {
+        on_ = false;
+        keys_ = 0;
+        what_ = 0;
+    }
+    /// On from Start to Clear - also with nothing left to mask, while the page could not go back yet: the mirror is then the real
+    /// page's copy, frame after frame.
+    bool on() const {
+        return on_;
+    }
+    u32 keys() const {
+        return keys_;
+    }
+    u32 what() const {
+        return what_;
+    }
+    bool any() const {
+        return keys_ != 0 || what_ != 0;
+    }
+    /// The Circle Pad's mask fell at kCircleMaskMaxMs, the pad still off its rest (the log's line says so).
+    bool circle_capped() const {
+        return circle_capped_;
+    }
+    u32 since(u32 now_ms) const {
+        return now_ms - start_;
+    }
+    /// How the mirror was kept since Start (the debug log's line): the frames that wrote it, and the longest time between two - what a
+    /// key pressed or let go meanwhile waited for the plugin's thread before the game could see it.
+    u32 frames() const {
+        return frames_;
+    }
+    u32 longest_gap_ms() const {
+        return gap_max_;
+    }
+    /// A frame: what was let go since the last look leaves the mask, then the mirror is written. False: nothing is masked any more.
+    bool Frame(u8* m, const u8* real, u32 now_ms) {
+        const s32 gap = static_cast<s32>(now_ms - last_ms_);
+        if (gap > static_cast<s32>(gap_max_)) {
+            gap_max_ = static_cast<u32>(gap);
+        }
+        last_ms_ = now_ms;
+        ++frames_;
+        const Seen s = Look(real);
+        if ((what_ & kMaskCircle) != 0) {
+            if (!s.circle) {
+                what_ &= ~kMaskCircle;
+                keys_ |= s.keys & kCirclePadKeys; // (a direction key the entries still mention - its release - waits for them as any key)
+            } else if (static_cast<s32>(now_ms - start_) >= static_cast<s32>(kCircleMaskMaxMs)) {
+                what_ &= ~kMaskCircle; // (given up whole: the pad and its direction keys are the real page's from here)
+                circle_capped_ = true;
+            }
+        }
+        if (!s.touch) {
+            what_ &= ~kMaskTouch;
+        }
+        keys_ &= s.keys;
+        Write(m, real);
+        return any();
+    }
+
+private:
+    struct Seen {
+        u32 keys = 0;        ///< every key an entry mentions: held, pressed or released
+        bool circle = false; ///< the Circle Pad off its rest in an entry
+        bool touch = false;  ///< the pen down in an entry or in the raw touch
+    };
+    static Seen Look(const u8* real) {
+        const auto rest = [](s32 v) { return v <= kCircleRest && v >= -kCircleRest; };
+        Seen s;
+        for (u32 i = 0; i < kEntries; ++i) {
+            const u32 e = kPadEntries + i * kPadEntryStep;
+            s.keys |= Load32(real, e + kPadHeld) | Load32(real, e + kPadPressed) | Load32(real, e + kPadReleased);
+            if (!rest(LoadS16(real, e + kPadCircle)) || !rest(LoadS16(real, e + kPadCircle + 2))) {
+                s.circle = true;
+            }
+            if (Load32(real, kTouchEntries + i * kTouchEntryStep + kTouchFlag) != 0) {
+                s.touch = true;
+            }
+        }
+        if (Load32(real, kTouchRaw + kTouchFlag) != 0) {
+            s.touch = true;
+        }
+        return s;
+    }
+    // The mirror from the real page. The keys, the Circle Pad and the touch are written a word at a time, already without what is masked;
+    // `live` copies what is never masked. The two headers (the ticks and the index of the pad's ring and of the touch's) are TAKEN first
+    // and written last (the review, 2026-11-13): the hid module adds a sample every 4.3 ms whenever it likes, and this thread - the lowest
+    // of the process - can be taken off the CPU for longer than that anywhere in here. Read from the real page AFTER the entries, as the
+    // neutral refresh does (there every entry says the same), an index that moved meanwhile points at an entry of the mirror copied
+    // before its sample: the oldest of the ring, 34 ms old, shown to the game as the newest until the next frame - a key let go 30 ms ago
+    // held again, one pressed since up again (Tests/hid_mirror_test.cpp, TestMaskSampleMidWrite). Taken first, the index is never newer
+    // than the entries copied after it; written last, the game never reads a new index over the entries of the frame before. The barrier
+    // keeps the two reads where they are written, whatever the compiler knows about `real`.
+    void Write(u8* m, const u8* real) const {
+        const auto live = [m, real](u32 from, u32 to) { std::memcpy(m + from, real + from, to - from); };
+        u8 pad_head[kPadRaw], touch_head[kTouchRaw - kTouchHeader];
+        std::memcpy(pad_head, real, sizeof(pad_head));
+        std::memcpy(touch_head, real + kTouchHeader, sizeof(touch_head));
+        __asm__ __volatile__("" ::: "memory");
+        const bool circle = (what_ & kMaskCircle) != 0;
+        const u32 keep = ~(keys_ | (circle ? kCirclePadKeys : 0u));
+        const u32 touch_bytes = kTouchEnd - kTouchRaw;
+        live(kAccel, kHidBytes);
+        live(kPadRawCircle + 4, kPadEntries);
+        Store32(m, kPadRaw, Load32(real, kPadRaw) & keep);
+        Store32(m, kPadRawCircle, circle ? 0u : Load32(real, kPadRawCircle));
+        for (u32 i = 0; i < kEntries; ++i) {
+            const u32 e = kPadEntries + i * kPadEntryStep;
+            Store32(m, e + kPadHeld, Load32(real, e + kPadHeld) & keep);
+            Store32(m, e + kPadPressed, Load32(real, e + kPadPressed) & keep);
+            Store32(m, e + kPadReleased, Load32(real, e + kPadReleased) & keep);
+            Store32(m, e + kPadCircle, circle ? 0u : Load32(real, e + kPadCircle));
+        }
+        if ((what_ & kMaskTouch) != 0) {
+            std::memset(m + kTouchRaw, 0, touch_bytes);
+        } else {
+            live(kTouchRaw, kTouchEnd);
+        }
+        std::memcpy(m, pad_head, sizeof(pad_head));
+        std::memcpy(m + kTouchHeader, touch_head, sizeof(touch_head));
+    }
+
+    bool on_ = false;
+    bool circle_capped_ = false;
+    u32 keys_ = 0;
+    u32 what_ = 0;
+    u32 start_ = 0;
+    u32 last_ms_ = 0;
+    u32 frames_ = 0;
+    u32 gap_max_ = 0;
 };
 
 // ---- The address space (svcQueryMemory's MemInfo; libctru's MemState and MemPerm values) --------------------------------------

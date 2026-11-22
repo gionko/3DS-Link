@@ -380,7 +380,8 @@ static void TestMarker() {
     // what the question says: one run, then several in a row (and the way out)
     CHECK(dlp::DiedQuestion(1).find("did not finish") != std::string::npos && dlp::DiedQuestion(1).find("Try again?") != std::string::npos);
     CHECK(dlp::DiedQuestion(1).find("in a row") == std::string::npos);
-    CHECK(dlp::DiedQuestion(3).find("3 preparations in a row") != std::string::npos && dlp::DiedQuestion(3).find("switch Download Play delivery off") != std::string::npos);
+    CHECK(dlp::DiedQuestion(3).find("3 preparations in a row") != std::string::npos && dlp::DiedQuestion(3).find("leave 3DS Link Delivery alone") != std::string::npos);
+    CHECK(dlp::DiedQuestion(3).find("Download Play delivery") == std::string::npos && dlp::DiedQuestion(3).find("Settings") == std::string::npos); // (the switch is gone, 1.1.4)
     CHECK(dlp::DiedQuestion(3).find("works without it") != std::string::npos);
 }
 

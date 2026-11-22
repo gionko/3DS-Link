@@ -5,6 +5,7 @@
 
 #include "copyworker.hpp"
 #include "delivery.hpp"
+#include "dlp_guest.hpp"
 #include "dlp_text.hpp"
 #include "pages.hpp"
 #include "plugin_resource.hpp"
@@ -134,6 +135,7 @@ public:
     // Back from another page (the Installation check, a popup, the Enable page...): what is on the card may have changed.
     void OnResume() override {
         g.RefreshInstall();
+        guests_ready_ = -1; // (the Download Play guests too: counted again at the next frame)
     }
 
     // The quiet look at the copies of the plugin (once a start, in the thread of the copies) says so when it made one. What the app did about its own plugin at the start
@@ -142,6 +144,8 @@ public:
         if (pages::PollUpdateAtStart(in)) {
             return;
         }
+        // (1.1.4, spec 9: nothing of the Download Play children is done from here: it is all the Download Play page's, Games reads the games when it is
+        // opened, with its bar)
         ListPage::Update(in);
         if (zombie_census::TakeNotice()) {
             // (zombie_census.cpp: a closed game is still in memory; a game that sizes its heap to the byte would panic at its next launch)
@@ -255,9 +259,30 @@ protected:
         enable.note_title = g.luma_too_old ? "Enable Titles for Azahar Emulator Net: Luma3DS is too old" : "Enable Titles for Azahar Emulator Net";
         enable.note_color = g.luma_too_old ? col::kOff : 0;
         enable.note = (g.luma_too_old ? too_old : std::string()) +
-                      "Lets your titles connect to an Azahar emulator network room: the one in Azahar Emulator Room. Your installed titles are listed, "
-                      "each with a switch; a title that is switched off never notices 3DS Link.";
+                      "Lets your titles connect to an Azahar emulator network room: the one in Azahar Emulator Room. Your games (not homebrew) are listed, each with a "
+                      "switch; a title that is switched off never notices 3DS Link.";
         rows.push_back(enable);
+
+        // 1.1.4, route B and spec 9 (specifiche/8-INGRESSO-DA-3DSLINK.md, 9-DOWNLOAD-PLAY-APP.md): Download Play, its page with Join and Games. Only in the
+        // installed app (the jump to the guest is libctru's way out through the HOME Menu, not proven from the Homebrew Launcher): a .3dsx has no row.
+        if (!envIsHomebrew()) {
+            if (guests_ready_ < 0) {
+                guests_ready_ = CountGuests();
+            }
+            Row join;
+            join.id = kDlpJoin;
+            join.kind = Kind::Link;
+            join.label = "Download Play";
+            join.value = guests_ready_ > 0 ? Fmt("%d game%s ready", guests_ready_, guests_ready_ == 1 ? "" : "s") : std::string();
+            join.value_color = g.luma_too_old ? col::kDim : 0;
+            join.dim = g.luma_too_old;
+            join.note_title = g.luma_too_old ? "Download Play: Luma3DS is too old" : "Download Play";
+            join.note_color = g.luma_too_old ? col::kOff : 0;
+            join.note = (g.luma_too_old ? too_old : std::string()) +
+                        "Join a console or an Azahar emulator that hosts Download Play in your room. You need your own copy of the game, to join too: the "
+                        "room carries no game data.";
+            rows.push_back(join);
+        }
 
         Row delivery;
         delivery.id = kGameDelivery;
@@ -269,9 +294,9 @@ protected:
                         "wireless: no internet, no media.";
         rows.push_back(delivery);
 
-        // 3DS Link Delivery needs neither the Plugin Loader nor the scan of the titles: an old Luma3DS does not shut it, like Titles Delivery and Settings. It is shut
-        // by its own switch (Settings > Download Play delivery: nothing of it then runs) and, as Titles Delivery's Send Titles is, by a missing boot9.bin: sharing needs
-        // that file, 3DS Link does not. A shut entry is faint, says why at the right of its row and in its note, and A answers with a line; Y opens the guide.
+        // 3DS Link Delivery needs neither the Plugin Loader nor the scan of the titles: an old Luma3DS does not shut it, like Titles Delivery and Settings. It is shut,
+        // as Titles Delivery's Send Titles is, by a missing boot9.bin and by nothing else (1.1.4, spec 9: its switch in Settings is gone): sharing needs that file,
+        // 3DS Link does not. A shut entry is faint, says why at the right of its row and in its note, and A answers with a line; Y opens the guide.
         const dlp::Gate gate = EntryGate();
         Row dlp;
         dlp.id = kDlpDelivery;
@@ -332,6 +357,15 @@ protected:
                 PushPage(pages::NewEnableGamePage());
             }
             break;
+        case kDlpJoin:
+            // (with Luma3DS too old the page opens only while guests are there: Games removes them - the space they take is not left with no way out,
+            // the review of spec 9 -, and Join and A on a game that is off say why nothing else works)
+            if (step == 0 && g.luma_too_old && dlpguest::LoadGuests().empty()) {
+                g.ShowToast("This Luma is not supported", col::kWarn, 4500);
+            } else if (step == 0) {
+                PushPage(pages::NewDlpPage()); // (Join and Games; the page of Join checks the rest itself: dlpjoin::JoinGate)
+            }
+            break;
         case kGameDelivery:
             if (step == 0) {
                 PushPage(pages::NewDeliveryPage());
@@ -360,8 +394,20 @@ protected:
 
 private:
     enum Id { kPower = 1, kRoom, kEnableGame, kGameDelivery, kDlpDelivery, kSettings };
+    static constexpr int kDlpJoin = kSettings + 1; // (1.1.4, route B and spec 9: the row Download Play, after Enable Titles)
+
+    int guests_ready_ = -1; // the Download Play guests ready (Installed and ours), -1 = to count again (the records are read once, not every frame)
 
     int pass_left_shown_ = 0; // the number of folders of the pass of quiet looks the toast last said (so that it is said again only when it changes)
+
+    // The guests the app's records say are whole and its own (the page counts them again from the index file the plugin reads).
+    static int CountGuests() {
+        int n = 0;
+        for (const dlpguest::Guest& guest : dlpguest::LoadGuests()) {
+            n += guest.state == dlpguest::GuestState::Installed && dlpguest::IsOwnedGuestTid(guest.prepared) ? 1 : 0;
+        }
+        return n;
+    }
 
     static setup::SwitchLock SwitchLockNow() {
         return setup::LockOfSwitch(g.luma_too_old, g.plugin_ready);
@@ -369,7 +415,7 @@ private:
 
     // Whether the entry is open, from what the app already knows (no file is read: the key file was looked for when the main page came back into view).
     static dlp::Gate EntryGate() {
-        return dlp::GateOf(g.app_cfg.dlp_delivery, g.boot9.found);
+        return dlp::GateOf(g.boot9.found);
     }
 
     // The guide's key is offered on the entry that is shut for the lack of boot9.bin, and only while the cursor is on it.

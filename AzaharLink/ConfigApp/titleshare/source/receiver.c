@@ -324,9 +324,14 @@ static int wanted_pending(const writer_t* wt) {
 // ticket and a pending install, of THAT title only (never the game it belongs to, never another title). Without it a failed DLC stayed on the console (0.4 GiB) and the app
 // then called it "already installed".
 static void scrub_failed(writer_t* wt, u64 tid) {
+    FS_MediaType dest = ts_title_dest(tid);
+    if(dest != MEDIATYPE_SD) {
+        // (3DS Link) never a title of the NAND: nothing is asked of AM (the app gives none: titleshare_host/recv_filter.h)
+        ts_log("pulizia dopo l'errore di %016llx: titolo della NAND, nulla chiesto ad AM", (unsigned long long) tid);
+        return;
+    }
     ts_wd_beat(wt->wd, 6);
     ts_amgate_begin(&wt->gate, (uint32_t) ts_now_ms(), TS_AM_STUCK_MS);
-    FS_MediaType dest = ts_title_dest(tid);
     Result rt = AM_DeleteTitle(dest, tid);
     Result rk = AM_DeleteTicket(tid);
     Result rp = AM_DeletePendingTitle(dest, tid);
@@ -397,7 +402,8 @@ static void writer_fn(void* arg) {
             sdBefore = sd_free_gib();
             ts_wd_beat(wt->wd, 2);
             ts_amgate_begin(&wt->gate, (uint32_t) ts_now_ms(), TS_AM_STUCK_MS);
-            Result r = ts_am_begin(m->t[p].tid, wt->exists[p], &h);
+            // (3DS Link) never a title of the NAND: ts_am_begin deletes the title and its ticket before it reads the CIA (titleshare_host/recv_filter.h)
+            Result r = ts_title_dest(m->t[p].tid) == MEDIATYPE_SD ? ts_am_begin(m->t[p].tid, wt->exists[p], &h) : (Result) 0xC8604C04;
             // con la coda di 150 ms: fra la fine di ts_am_begin e la raccolta del primo gruppo il thread scrive due righe di registro e legge lo spazio libero
             // della SD, e il parcheggio non deve infilarsi proprio li' (la prima scrittura AM e' la piu' delicata)
             ts_amgate_end(&wt->gate, (uint32_t) ts_now_ms(), TS_AM_TAIL_MS);

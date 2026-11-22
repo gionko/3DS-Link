@@ -3,7 +3,8 @@
 //
 // Who does what:
 // - the plugin's thread (ChatFrame -> MirrorFrame) makes the switch when the keyboard opens, refreshes the mirror's live parts every frame,
-//   waits for the release when the keyboard closes and gives the page back; it is the only one that allocates, frees and logs;
+//   waits for the release when the keyboard closes and gives the page back - or, with something still down at the wait's cap, keeps the
+//   mirror as the real input without it until it is let go (MaskFrame); it is the only one that allocates, frees and logs;
 // - the framework's keep-alive thread (MirrorProcessEvent) gives the page back at HOME_ENTER, SWAP_ENTER, SLEEP_ENTER and EXIT, before the
 //   plugin takes its hooks out (Old 3DS: the mirror's page is in the plugin's block, which Luma3DS frees right after the answer). The
 //   mirror is an alias of the plugin's memory, and an alias left mapped outlives the game (console 63, 2026-11-06): at the game's last
@@ -26,9 +27,12 @@
 #include "azl/hid_mirror.hpp"
 #include "azl/log.hpp"
 #include "azl/platform.hpp"
+#include "azl/sleep_crumbs.hpp"
 #include "azl/stats.hpp"
 #include "azl/ticks.h"
 #include "csvc.h"
+#include "ctr/gate_flag.hpp"
+#include "ctr/plugin.hpp"
 #include "ctr/zombie_probe.hpp"
 #include "ctr/swap_gate.hpp"
 
@@ -78,6 +82,10 @@ constexpr s64 kEventLockStepNs = 1000000;
 constexpr u64 kPauseLockTicks = SYSCLOCK_ARM11 / 10; // the in-game menu's wait for the lock, at most 100 ms (MirrorBeforePause)
 constexpr s64 kPauseLockStepNs = 200000;
 constexpr u32 kRetryMs = 500;                // a way back that left the mirror is tried again this often
+// The plugin's thread, with the log on, right before it holds the game's threads to give the page back: how long it gives the trail
+// (AzaharLink.sleep.log) to put "about to hold" on the card, looking every 2 ms (2026-11-10; GiveTrailTime).
+constexpr u64 kTrailWaitTicks = SYSCLOCK_ARM11 / 10;
+constexpr s64 kTrailStepNs = 2000000;
 
 // svc 0xA0 (Luma3DS's MapProcessMemoryEx) in its first form, five arguments: r0 the destination process, r4 the size. libctrpf's stub is
 // the later six-argument form, which puts a magic number in r0 and the flags in r5 (Includes/csvc.h): a Luma3DS from before that form takes
@@ -109,7 +117,10 @@ struct Shared {
 };
 Shared g_m;
 
-enum Where : u32 { kWherePlugin = 99, kWhereNotification = 100 }; // (or the framework's event number; the plugin's thread logs its own)
+// (or the framework's event number; the plugin's thread logs its own. The trail's lines say who by the same numbers.)
+enum Where : u32 { kWherePlugin = SleepCrumbs::kMirrorByPlugin, kWhereNotification = SleepCrumbs::kMirrorByNotification };
+static_assert(chat::kEventExit == 0 && chat::kEventSleepEnter == 1 && chat::kEventHomeEnter == 3 && chat::kEventSwapEnter == 5,
+              "the trail names the framework's events that give the page back by these numbers (azl/sleep_crumbs.hpp, MirrorWhoText)");
 std::atomic<u32> g_last{kMirrorLastNone}; // what became of the mirror at the game's last event (MirrorLastState)
 
 // >>> game-thread code (Tests/policy_check.sh: the way back runs on the game's thread that got a notification: no heap, no line, no sleep)
@@ -182,6 +193,23 @@ struct CtrOps {
     }
 };
 
+// The trail's two lines of a way back (AzaharLink.sleep.log, debug=1 only: at debug=0 one load and out), from whichever thread makes it:
+// "about to hold the game's threads" BEFORE the hold and "the page is back" AFTER the let-go, each with the number of the game's
+// threads (2026-11-10: a console stopped 1.6-4.6 s after the keyboard closed, RR3D on a test build, exactly when the way back was due, and
+// neither log could say whether the plugin was inside it; the main log's lines come out after the let-go and go through the writer's
+// queue). A few stores and an event signal (Plugin::NoteSleepEvent, what the hook's APT observer calls on a game's thread too): no wait
+// here - only the plugin's thread gives the trail time to reach the card (GiveTrailTime).
+// `low`: who gives it back (kChatMirrorBackBegins) or the outcome (the other kinds); `ticks`: how long the game was held.
+__attribute__((noinline)) void BackCrumb(u32 kind, u32 low, u32 ticks) {
+    if (g_debug_level <= 0) {
+        return;
+    }
+    CtrOps ops;
+    const s32 threads = ops.Threads();
+    Plugin::NoteSleepEvent(kind, SleepCrumbs::PackMirror(low, threads > 0 ? static_cast<u32>(threads) : 0,
+                                                         static_cast<u32>(static_cast<u64>(ticks) * 1000 / AZL_TICKS_PER_MS)));
+}
+
 // Under the lock: the way back; what another thread did is kept for the plugin's thread's log. `ticks`: how long the game was held.
 // (One function, not a clone per caller: Tests/stack_usage.sh holds its frame by name.)
 __attribute__((noinline, noclone)) Outcome RestoreLocked(bool spin, bool may_fall_back, u32 where, u32* ticks) {
@@ -217,7 +245,9 @@ void MirrorRestoreFromGame() {
     }
     if (g_m.sw.active()) {
         u32 ticks = 0;
+        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWhereNotification, 0); // (pushed, never waited for: this is a game's thread)
         RestoreLocked(true, true, kWhereNotification, &ticks);
+        BackCrumb(SleepCrumbs::kChatMirrorBackDone, g_m.report_outcome, ticks); // (the outcome RestoreLocked left, under the lock)
     }
     g_m.lock.Unlock();
 }
@@ -237,6 +267,8 @@ u32 g_retry_ms = 0;
 bool g_retry = false;
 hidmirror::Released g_released;
 hidmirror::ReleaseWait g_release_wait;
+u32 g_unquiet_seen = 0;            // hidmirror::Unquiet's bits of every look of this wait for the release (the line of a capped wait)
+hidmirror::HeldMask g_held;        // what was still down when a wait ended at its cap: masked for the game until let go (MaskFrame)
 
 u8* RealPage() {
     return reinterpret_cast<u8*>(const_cast<u32*>(hidSharedMem));
@@ -302,20 +334,71 @@ bool Supported() {
     return g_supported == 1;
 }
 
+// The plugin's thread, with the log on, between the trail's "about to hold" and the hold: the trail's thread (priority 0x20, one write and
+// one flush) gets kTrailWaitTicks at most to put that line on the card, so that a console that stops inside the way back leaves it
+// written. The scheme of Plugin::WaitForCloseTrail, with the same end at the gate's close (an Old 3DS's swap: never a wait there), and
+// ended at once by anything that wants the page back now: an event of the framework waiting for the lock, a game's thread that found it
+// taken, a closing counted since the frame's look. With the log off there is no trail: no wait at all. NEVER under the mirror's lock
+// (2026-11-11, RestoreHere): this thread is the lowest of the process and one of these sleeps can last a second under a busy game.
+void GiveTrailTime() {
+    const u32 mark = Plugin::TrailMark();
+    const u64 deadline = svcGetSystemTick() + kTrailWaitTicks;
+    while (!Plugin::TrailOnCard(mark) && !GateClosing() && g_m.event_waiting.load(std::memory_order_seq_cst) == 0 &&
+           g_m.want_restore.load(std::memory_order_acquire) == 0 && g_m.closing.load(std::memory_order_seq_cst) == g_look_closing &&
+           svcGetSystemTick() < deadline) {
+        svcSleepThread(kTrailStepNs);
+    }
+}
+
 // The plugin's thread: the page back now. False when the lock was taken (by a game's thread giving it back itself: the next frame looks).
-bool RestoreHere(const char* why) {
+// `trail_wait`: the way back is the keyboard's own (closed by the user, or no longer shown), not one a HOME, a sleep or the menu asked for:
+// with the log on the trail's "about to hold" is given time to reach the card first (GiveTrailTime).
+bool RestoreHere(const char* why, bool trail_wait = false) {
     if (g_m.active.load(std::memory_order_acquire) == 0) {
         g_m.want_restore.store(0, std::memory_order_relaxed);
         return true;
     }
+    // The trail first (debug only), BEFORE the hold. Not for a way back tried again every kRetryMs (a mirror that stays): the trail has
+    // its limit of lines a launch, and the first try said it.
+    const bool trail = !g_retry;
+    // The keyboard's own way back, with the log on: the line and the time it is given to reach the card come BEFORE the lock, not under
+    // it (2026-11-11). Under it, as on 2026-11-10, the lock was held for the whole wait - up to 100 ms of sleeps of 2 ms on the lowest
+    // thread of the process, each of which a game that fills the CPU (RR3D's film) stretches to a second - where 1.1.3 held it about 1 ms
+    // for the svcs alone; and for that long a game's thread that got HOME, sleep or power found the lock taken and could not give the
+    // page back itself before the game acted on the notification (Sources/ctr/hook.cpp), and the keep-alive waited for it at an event.
+    // Without the lock they do it themselves, and the wait ends at once (GiveTrailTime looks at the closing count and at the event).
+    // What it costs the trail's reader (the second review, the same day): between this "about to hold" and the hold there is that wait,
+    // with the game's threads running and nothing of the way back called yet, so this thread's "about to hold" with no line after it is
+    // a console that stopped in the wait OR in the hold. The line says so itself (azl/sleep_crumbs.hpp, kMirrorPluginWaitsText).
+    bool said = false;
+    if (trail && trail_wait && g_debug_level > 0 && g_m.event_waiting.load(std::memory_order_seq_cst) == 0) {
+        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWherePlugin, 0);
+        GiveTrailTime(); // (NOT under the lock)
+        said = true;
+        if (g_m.active.load(std::memory_order_acquire) == 0) {
+            // Another thread gave the page back meanwhile (its own two lines are in the trail): this one held nothing, and says so.
+            BackCrumb(SleepCrumbs::kChatMirrorBackDone, static_cast<u32>(Outcome::kBusy), 0);
+            g_m.want_restore.store(0, std::memory_order_relaxed);
+            return true;
+        }
+    }
     if (g_m.event_waiting.load(std::memory_order_seq_cst) != 0 || !g_m.lock.TryLock()) {
+        if (said) {
+            BackCrumb(SleepCrumbs::kChatMirrorBackDone, static_cast<u32>(Outcome::kBusy), 0); // ("about to hold" was said, and it did not)
+        }
         return false; // (an event waits for the lock: it gives the page back itself)
     }
     g_m.want_restore.store(0, std::memory_order_relaxed);
     u32 ticks = 0;
+    if (trail && !said) {
+        BackCrumb(SleepCrumbs::kChatMirrorBackBegins, kWherePlugin, 0); // (under the lock: only for a way back that is made here)
+    }
     const Outcome out = RestoreOffGameThread(true, kWherePlugin, &ticks);
     const u32 us = TicksToUs(ticks);
     g_m.lock.Unlock();
+    if (trail) {
+        BackCrumb(SleepCrumbs::kChatMirrorBackDone, static_cast<u32>(out), ticks); // (AFTER the let-go: the game's threads run again)
+    }
     g_retry = g_m.active.load(std::memory_order_acquire) != 0;
     g_retry_ms = static_cast<u32>(platform::NowMs()) + kRetryMs;
     if (out == Outcome::kDone) {
@@ -345,6 +428,70 @@ void LogReport() {
     if (active) {
         g_retry = true;
         g_retry_ms = static_cast<u32>(platform::NowMs()) + kRetryMs;
+    }
+}
+
+// The debug log's line of a wait for the release that ended at its cap and not by the quiet (debug=1 only; the plugin's thread, never a
+// hook). 2026-11-10: on console 63 the 50 ms of quiet had never ended a wait, and the two raw words of the pad (0x1C, 0x20), which
+// hidmirror::PageQuiet looked at until then, were the suspects with no dump of the page to prove it. They are printed here with the raw
+// touch's flag (0xC4) and the conditions that were not met, at the last look and at any look of the wait: a cap with the keys let go
+// names the condition to look into, a cap with a key held all along is the cap doing its job.
+void LogCappedWait(const u8* real, u32 last) {
+    if (g_debug_level <= 0) {
+        return;
+    }
+    const auto bit = [](u32 bits, u32 one, const char* text) { return (bits & one) != 0 ? text : ""; };
+    Log("chat: the wait for the release ended at its cap (%lu ms), the page never quiet for %lu ms | not met at the last look:%s%s%s%s%s | at "
+        "any look: 0x%lx (1 key, 2 Circle Pad, 4 touch, 8 raw touch) | raw pad 0x%08lx, raw Circle Pad 0x%08lx, raw touch flag 0x%08lx",
+        static_cast<unsigned long>(hidmirror::kMaxWaitMs), static_cast<unsigned long>(hidmirror::kQuietMs),
+        bit(last, hidmirror::kUnquietKey, " a key held,"), bit(last, hidmirror::kUnquietCircle, " the Circle Pad off its rest,"),
+        bit(last, hidmirror::kUnquietTouch, " a finger in a touch entry,"), bit(last, hidmirror::kUnquietRawTouch, " the raw touch's flag,"),
+        last == 0 ? " none (quiet, not yet for long enough)" : "", static_cast<unsigned long>(g_unquiet_seen),
+        static_cast<unsigned long>(hidmirror::Load32(real, hidmirror::kPadRaw)),
+        static_cast<unsigned long>(hidmirror::Load32(real, hidmirror::kPadRawCircle)),
+        static_cast<unsigned long>(hidmirror::Load32(real, hidmirror::kTouchRaw + hidmirror::kTouchFlag)));
+}
+
+// The debug log's lines of the masks (debug=1 only; the plugin's thread, never a hook): what the game still does not see, said when the
+// masks start, each time one falls and when the last one does, with the time since the wait's cap, and how the mirror was kept meanwhile:
+// the frames that wrote it and the longest time between two, which is what a key the user pressed or let go with the masks on waited for
+// this thread - the lowest of the process - before the game could see it (hidmirror::HeldMask). 2026-11-13.
+__attribute__((noinline)) void LogMask(const char* what_happened, u32 now_ms) {
+    if (g_debug_level <= 0) {
+        return;
+    }
+    const u32 what = g_held.what();
+    Log("chat: %s | masked for the game now: keys 0x%08lx%s%s%s | %lu ms after the wait's cap, the mirror written %lu times, %lu ms at most "
+        "between two",
+        what_happened, static_cast<unsigned long>(g_held.keys()), (what & hidmirror::kMaskCircle) != 0 ? ", the Circle Pad (centred)" : "",
+        (what & hidmirror::kMaskTouch) != 0 ? ", the touch (absent)" : "", g_held.any() ? "" : " - nothing",
+        static_cast<unsigned long>(g_held.since(now_ms)), static_cast<unsigned long>(g_held.frames()),
+        static_cast<unsigned long>(g_held.longest_gap_ms()));
+}
+
+// A frame of the mirror with the masks on (the keyboard closed, its wait for the release ended at the cap with something still down): what
+// was let go leaves the mask, the mirror is the real page without the rest, and once nothing is left the page goes back. With no wait for
+// the trail before the hold: while this thread sleeps the mirror is not written, and now it carries the game's own input. A way back that
+// cannot be made yet (the lock taken, the real page not mapped) leaves the masks on with nothing in them: the mirror stays the real page's
+// copy, never the neutral one again, and the way back is tried as for any mirror that stays.
+__attribute__((noinline)) void MaskFrame(const u8* real, u32 now_ms) {
+    const u32 keys = g_held.keys(), what = g_held.what();
+    const bool left = g_held.Frame(g_page, real, now_ms);
+    const bool pad_capped = (what & ~g_held.what() & hidmirror::kMaskCircle) != 0 && g_held.circle_capped();
+    if (left) {
+        if (g_held.keys() != keys || g_held.what() != what) {
+            LogMask(pad_capped ? "the Circle Pad is still off its rest 10 s after the cap: its mask is lifted" : "let go since the last look", now_ms);
+        }
+        return;
+    }
+    if (keys != 0 || what != 0) {
+        LogMask(pad_capped ? "the Circle Pad is still off its rest 10 s after the cap, its mask is lifted: the game's page goes back"
+                           : "the last mask fell: the game's page goes back",
+                now_ms);
+    }
+    if ((!g_retry || static_cast<s32>(now_ms - g_retry_ms) >= 0) && RestoreHere(g_retry ? "once more, after the masks" : "the last mask fell") &&
+        g_m.active.load(std::memory_order_acquire) == 0) {
+        g_held.Clear();
     }
 }
 
@@ -404,6 +551,9 @@ void Engage() {
         g_m.active.store(g_m.sw.active() ? 1u : 0u, std::memory_order_release);
     }
     g_m.lock.Unlock();
+    if (out != Outcome::kCancelled) {
+        BackCrumb(SleepCrumbs::kChatMirrorOn, static_cast<u32>(out), ticks); // (the trail, debug only: the switch was tried, and how it went)
+    }
     if (out == Outcome::kDone) {
         Log("chat: the game's input is the mirror's now (the game's HID page at 0x%08lx%s, the framework's own at 0x%08lx left alone; the game's "
             "threads held %lu us)",
@@ -450,21 +600,41 @@ void MirrorWant() {
     g_tried = false;
     g_want_closing = g_look_closing; // (not the count now: one that came after the look would be taken as seen)
     g_release_wait.Cancel(); // (opened again while the page was still waiting for the release: the mirror stays)
+    if (g_held.on()) {
+        // Opened again with the masks on: they are dropped, and the mirror is the neutral one again from this frame's refresh - the keys
+        // the game was seeing held through it "released" in its entries, as at a switch. (No mirror any more - the page went back by
+        // another way and this thread has not looked yet: nothing to release, the switch is made anew.)
+        LogMask("the keyboard opened again: the masks are dropped, the mirror is the neutral one again", static_cast<u32>(platform::NowMs()));
+        if (g_page && g_m.active.load(std::memory_order_acquire) != 0) {
+            g_released.Start(hidmirror::HeldNow(g_page));
+        }
+        g_held.Clear();
+    }
 }
 
 void MirrorRelease(u32 now_ms) {
     g_want = false;
     if (g_m.active.load(std::memory_order_acquire) != 0) {
         g_release_wait.Start(now_ms);
+        g_unquiet_seen = 0;
     }
 }
 
-void MirrorRestoreNow(const char* why) {
+void MirrorRestoreNow(const char* why, bool trail_wait) {
     g_want = false;
     g_release_wait.Cancel();
-    if (!RestoreHere(why)) {
+    if (!RestoreHere(why, trail_wait)) {
         g_m.want_restore.store(1, std::memory_order_release);
     }
+}
+
+bool MirrorActive() {
+    return g_m.active.load(std::memory_order_acquire) != 0;
+}
+
+bool MirrorInputQuiet() {
+    // (no mirror, nothing to give back: quiet, and the page is not read - where the switch was never possible it may not be there at all)
+    return g_m.active.load(std::memory_order_acquire) == 0 || hidmirror::PageQuiet(RealPage());
 }
 
 bool MirrorBeforePause() {
@@ -489,11 +659,25 @@ void MirrorFrame(u32 now_ms) {
     if (g_m.active.load(std::memory_order_acquire) != 0) {
         // The live parts every frame (the page is ours to write: only this thread frees it).
         const u8* real = RealPage();
+        if (g_held.on()) {
+            MaskFrame(real, now_ms); // (the masks on: the real input without what is still down from the close, never the neutral page)
+            return;
+        }
         hidmirror::RefreshMirror(g_page, real, g_released.Next());
         if (!g_want) {
             if (g_release_wait.waiting()) {
-                if (g_release_wait.Update(hidmirror::PageQuiet(real), now_ms)) {
-                    RestoreHere("the keyboard closed");
+                const u32 unquiet = hidmirror::Unquiet(real); // (0: hidmirror::PageQuiet)
+                g_unquiet_seen |= unquiet;
+                if (g_release_wait.Update(unquiet == 0, now_ms)) {
+                    if (g_release_wait.capped()) {
+                        LogCappedWait(real, unquiet);
+                    }
+                    if (unquiet != 0 && g_held.Start(g_page, real, now_ms)) {
+                        // Something is still down at the cap: the page stays the mirror's, from now the real input without it (MaskFrame).
+                        LogMask("still down at the wait's cap: the page stays the mirror's, the real input without it, until it is let go", now_ms);
+                        return;
+                    }
+                    RestoreHere("the keyboard closed", true);
                 }
             } else if (!g_retry || static_cast<s32>(now_ms - g_retry_ms) >= 0) {
                 RestoreHere(g_retry ? "once more" : "the keyboard closed");
@@ -508,6 +692,11 @@ void MirrorFrame(u32 now_ms) {
             g_retry = false;
         }
         g_m.lock.Unlock();
+        if (g_held.on()) {
+            // The page went back by another way with the masks on (HOME, sleep, power, the in-game menu, the exit): they went with it.
+            LogMask("the page went back by another way (HOME, sleep, the menu, the exit): the masks went with it", now_ms);
+            g_held.Clear();
+        }
     }
 }
 
@@ -547,7 +736,9 @@ void MirrorProcessEvent(int event) {
             // At the swap and at the exit the mirror never stays: its page goes with the plugin's block, and an alias left mapped outlives
             // the game (the next start of the game finds the plugin's memory a page short until a reboot).
             u32 ticks = 0;
+            BackCrumb(SleepCrumbs::kChatMirrorBackBegins, static_cast<u32>(event), 0); // (the trail, debug only: stores and a signal, no wait)
             state = LastState(RestoreOffGameThread(!last, static_cast<u32>(event), &ticks), kMirrorLastGivenBack);
+            BackCrumb(SleepCrumbs::kChatMirrorBackDone, g_m.report_outcome, ticks);
         }
         g_m.lock.Unlock();
     } else {

@@ -18,11 +18,24 @@ void MirrorBeforeLook();
 void MirrorWant();
 
 /// The plugin's thread: the keyboard closed by the user (Cancel, Send). The game gets its page back once the keys are let go (50 ms with
-/// nothing held, at most 1 s).
+/// nothing held). After 1 s with something still down the mirror stays, as the real input without it - each key until it is let go, the
+/// Circle Pad centred until it is at rest, the touch absent until the pen lifts - and the page goes back when the last of them does
+/// (hidmirror::HeldMask). `now_ms` is the FRAME's clock, the one MirrorFrame is then given: a clock read again at the close was 1-2 ms
+/// ahead of it, and the wait took the difference for "over the cap" (2026-11-10, azl/hid_mirror.hpp, ReleaseWait).
 void MirrorRelease(u32 now_ms);
 
-/// The plugin's thread: the page back now (the chat off, the room left, a close a notification or an event asked for).
-void MirrorRestoreNow(const char* why);
+/// The plugin's thread: the page back now (the chat off, the room left, a close a notification or an event asked for, a keyboard the game
+/// no longer shows). `trail_wait`: with the log on, the trail's line "about to hold the game's threads" gets up to 100 ms to reach the card
+/// before the hold (only for a close that is the keyboard's own: never at HOME, power, sleep or exit, where the game is going away).
+void MirrorRestoreNow(const char* why, bool trail_wait = false);
+
+/// The plugin's thread: the game's HID page is the mirror's now (for the trail's line of the keyboard's close).
+bool MirrorActive();
+
+/// The plugin's thread: nothing is held on the REAL input page right now - no key, the Circle Pad at rest, no finger (hidmirror::PageQuiet,
+/// the look of the wait for the release). A page given back at once while this is false shows the game a fresh press of what is held.
+/// True without reading anything while the game's page is not the mirror's (there is nothing to give back).
+bool MirrorInputQuiet();
 
 /// The plugin's thread, right before the in-game menu's Process::Pause: the page back first, waiting for the lock at most 100 ms (a game's
 /// thread or the keep-alive giving it back). False: the mirror is still there, the menu is not opened (the chord is pressed again). The
@@ -30,8 +43,8 @@ void MirrorRestoreNow(const char* why);
 /// the page given back before the pause, and no switch while the menu is open, there is none.
 bool MirrorBeforePause();
 
-/// The plugin's thread, once a frame after the chat's work: the switch, the mirror's live parts, the wait for the release, a way back
-/// another thread could not finish, and the log's lines of what the other threads did.
+/// The plugin's thread, once a frame after the chat's work: the switch, the mirror's live parts, the wait for the release, the masks of
+/// what is still down at its cap, a way back another thread could not finish, and the log's lines of what the other threads did.
 void MirrorFrame(u32 now_ms);
 
 /// The framework's keep-alive thread, in the chat's look at the process events right after its signals, before any of the plugin's work

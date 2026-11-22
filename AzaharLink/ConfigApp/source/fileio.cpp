@@ -73,9 +73,9 @@ bool WriteTextFile(const std::string& path, const std::string& content) {
         std::remove(temporary.c_str());
         return false;
     }
-    if (had_old) {
-        std::remove(previous.c_str());
-    }
+    // (F7-rev: the old one dropped whether or not there was an old file: a .bak met here without a file at its place is one a cut write left,
+    // older than the new file - azl/whole_file.hpp does the same, Tests/settings_test/whole_file_states_test.cpp holds the two to the same files)
+    std::remove(previous.c_str());
     return true;
 }
 

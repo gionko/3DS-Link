@@ -750,22 +750,25 @@ struct Rig {
 // =====================================================================================================================
 // 1. Constants, sizes, helpers.
 
-static_assert(kMaxPlayers == 4 && kMaxClients == 3 && kMaxGroups == 4, "the caps of the product");
+// (2026-11-13: the tables hold eight players; a title that says nothing - every lobby of this file - still has four)
+static_assert(kMaxPlayers == 8 && kMaxClients == 7 && kMaxGroups == 4 && kTitlePlayers == 4, "the caps of the product");
 static_assert(kAnnounceSize == 29 && kMaxMessage == 16 && kPassphraseSize == 9, "wire sizes");
 static_assert(sizeof(Group) == 40, "Group is 40 bytes");
 static_assert(sizeof(NodeEntry) == 32, "NodeEntry is 32 bytes");
 static_assert(sizeof(HeardGroup) <= 40, "HeardGroup is a local of a game thread");
-static_assert(sizeof(DlpLobby) <= 320, "DlpLobby memory budget");
+static_assert(sizeof(DlpLobby) <= 400, "DlpLobby memory budget");
 static_assert(sizeof(DlpLobby::ScanTable::g) / sizeof(Group) == kMaxGroups, "scan table = kMaxGroups");
 static_assert(sizeof(DlpLobby::SessionTable::roster) / sizeof(NodeEntry) == kMaxPlayers, "roster = kMaxPlayers");
 static_assert(sizeof(DlpLobby::HostTable::t) / sizeof(DlpLobby::Track) == kMaxClients, "host table = kMaxClients");
 static_assert(sizeof(DlpLobby::Track) <= 8, "Track is 8 bytes");
-static_assert(sizeof(DlpLobby::Tables) <= 168, "tables are one of three shapes");
+static_assert(sizeof(DlpLobby::Tables) <= 296, "tables are one of three shapes");
 
 void T_constants() {
     SECTION("constants");
-    CHECK_EQ(kMaxPlayers, 4);
-    CHECK_EQ(kMaxClients, 3);
+    CHECK_EQ(kMaxPlayers, 8);
+    CHECK_EQ(kMaxClients, 7);
+    CHECK_EQ(kTitlePlayers, 4);
+    CHECK_EQ(TitlePlayers(0), 4);
     CHECK_EQ(kMaxGroups, 4);
     CHECK_EQ(kNameUnits, 10);
     CHECK_EQ(kAnnounceSize, 29);
@@ -843,9 +846,8 @@ void T_sizes() {
                 "HostAnnounce=%zu (ptr=%zu)\n",
                 sizeof(DlpLobby), sizeof(Group), sizeof(NodeEntry), sizeof(DlpLobby::Track), sizeof(DlpLobby::Tables),
                 sizeof(HeardGroup), sizeof(Identity), sizeof(HostAnnounce), sizeof(void*));
-    CHECK(sizeof(DlpLobby) <= 320);
-    if (sizeof(DlpLobby) > 288) std::printf("  NOTE: sizeof(DlpLobby)=%zu is above the 288 target of the design\n", sizeof(DlpLobby));
-    CHECK(sizeof(DlpLobby::Tables) <= 168);
+    CHECK(sizeof(DlpLobby) <= 400);  // (272 while the tables held four players: the design's target of 288 was for those)
+    CHECK(sizeof(DlpLobby::Tables) <= 296);
     CHECK_EQ(sizeof(Group), 40);
     CHECK_EQ(sizeof(NodeEntry), 32);
     CHECK(sizeof(DlpLobby::Track) <= 8);
@@ -968,7 +970,8 @@ void T_codec_announce() {
         std::memset(&z, 0x77, sizeof z);
         HostAnnounce z0 = z;
         const bool ok = DecodeAnnounce(s, 29, &z);
-        CHECK(ok == (mn >= 2 && mn <= 4));
+        // (2026-11-13: the codec takes what the format can say, 2..8; the ceiling of the title is the lobby's: Tests/dlp_cap_guard_test.cpp, Tests/dlp_eight_test.cpp)
+        CHECK(ok == (mn >= 2 && mn <= 8));
         if (!ok) CHECK(std::memcmp(&z, &z0, sizeof z) == 0);
         else CHECK_EQ(z.max_nodes, mn);
         delete[] s;
@@ -1347,17 +1350,17 @@ void T_searcher_matrix() {
         SECTIONF("searcher/connecting nodes, passphrase in state 0x%x", st);
         {
             auto f = mk();
-            u16 ids[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+            u8 ids[4] = {0xFF, 0xFF, 0xFF, 0xFF};
             u32 total = 77;
             CHECK_EQ(f->L().ClientConnectingNodes(ids, 4, &total), 0);
             if (in_session) {
                 CHECK_EQ(total, 2);
                 CHECK_EQ(ids[0], 1);
                 CHECK_EQ(ids[1], 2);
-                CHECK_EQ(ids[2], 0xFFFF);
+                CHECK_EQ(ids[2], 0xFF);
             } else {
                 CHECK_EQ(total, 0);
-                CHECK_EQ(ids[0], 0xFFFF);
+                CHECK_EQ(ids[0], 0xFF);
             }
             u8 pp[9];
             std::memset(pp, 0x55, sizeof pp);
@@ -2173,21 +2176,21 @@ void T_session() {
         Reach(f, S5);
         CHECK_EQ(f.L().ClientStatusWord(), (5u << 24) | (1u << 16) | 2);
         // already filled right after the join
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         CHECK_EQ(f.L().ClientConnectingNodes(ids, 4, &total), 0);
         CHECK_EQ(total, 2);
         // capacity smaller than the total: min(total, capacity) ids written, the total stays whole
-        u16 one[1] = {0xFFFF};
+        u8 one[1] = {0xFF};
         total = 0;
         CHECK_EQ(f.L().ClientConnectingNodes(one, 1, &total), 0);
         CHECK_EQ(total, 2);
         CHECK_EQ(one[0], 1);
-        u16 canary[2] = {0xABCD, 0xABCD};
+        u8 canary[2] = {0xAB, 0xAB};
         total = 0;
         CHECK_EQ(f.L().ClientConnectingNodes(canary, 0, &total), 0);
         CHECK_EQ(total, 2);
-        CHECK_EQ(canary[0], 0xABCD);
+        CHECK_EQ(canary[0], 0xAB);
         // ids above 0xFF are never the node 2 / 1
         NodeEntry ne;
         std::memset(&ne, 0, sizeof ne);
@@ -2240,7 +2243,7 @@ void T_session() {
         f.W().GhostClient(f.h, 3, 0x777, "Late");
         f.P().fail_read[3] = true;
         f.Poll(400);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ClientConnectingNodes(ids, 4, &total);
         CHECK_EQ(total, 3);
@@ -2258,7 +2261,7 @@ void T_session() {
         Tx(f.W(), f.h, 1, 2, MsgType::Go, kPass1);
         f.Poll(10);
         CHECK_EQ(f.L().client_state(), 9);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ClientConnectingNodes(ids, 4, &total);
         CHECK_EQ(total, 3);  // the final re-read at GO
@@ -2522,7 +2525,7 @@ void T_host_gone() {
         u8 pp[9];
         f.L().ClientPassphrase(pp);
         CHECK(std::memcmp(pp, kPass1, 9) == 0);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ClientConnectingNodes(ids, 4, &total);
         CHECK_EQ(total, 2);
@@ -2606,7 +2609,7 @@ void T_events_searcher() {
             CHECK_EQ(f.L().client_state(), 1);
         }
         if (st == S5 || st == S6) {
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 5;
             f.L().ClientConnectingNodes(ids, 4, &total);
             CHECK_EQ(total, 0);
@@ -2617,7 +2620,7 @@ void T_events_searcher() {
             u8 pp[9];
             f.L().ClientPassphrase(pp);
             CHECK(std::memcmp(pp, kPass1, 9) == 0);
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 0;
             f.L().ClientConnectingNodes(ids, 4, &total);
             CHECK_EQ(total, 2);
@@ -2741,7 +2744,7 @@ void T_creator_matrix() {
             CHECK_EQ(f->L().ServerInitialize(3, 0, nullptr), 0);
             CHECK_EQ(f->L().ServerState(), 1);
             CHECK_EQ(f->P().Calls(kHostClose) - hc, has_client ? 1 : 0);
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 9;
             CHECK_EQ(f->L().ServerConnectingClients(ids, 4, &total), 0);
             CHECK_EQ(total, 0);
@@ -2771,7 +2774,7 @@ void T_creator_matrix() {
             CHECK_EQ(f->P().Calls(kHostUpdate) - hu, st == C2 ? 1 : 0);
             if (st == C2) {
                 CHECK_EQ(f->P().update_acc.back(), 0);
-                u16 ids[4];
+                u8 ids[4];
                 u32 total = 0;
                 CHECK_EQ(f->L().ServerConnectingClients(ids, 4, &total), 0);
                 CHECK_EQ(total, 1);  // the client stays
@@ -2801,14 +2804,14 @@ void T_creator_matrix() {
         SECTIONF("creator/matrix state %d: clients lists", st);
         {
             auto f = mk();
-            u16 ids[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+            u8 ids[4] = {0xFF, 0xFF, 0xFF, 0xFF};
             u32 total = 77;
             const u32 r = f->L().ServerConnectingClients(ids, 4, &total);
             CHECK_EQ(r, st == C0 ? kInvalidState : 0);
             if (st != C0) {
                 CHECK_EQ(total, has_client ? 1 : 0);  // in 9 it is 0
-                CHECK_EQ(ids[0], has_client ? 2 : 0xFFFF);
-                CHECK_EQ(ids[1], 0xFFFF);
+                CHECK_EQ(ids[0], has_client ? 2 : 0xFF);
+                CHECK_EQ(ids[1], 0xFF);
             }
         }
         {
@@ -3010,7 +3013,7 @@ void T_creator_open() {
             CHECK_EQ(f.P().update_acc[0], 0);
             CHECK_EQ(f.P().update_acc[1], 1);
         }
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, 1);
@@ -3044,28 +3047,28 @@ void T_creator_tracking() {
         f.Cli(4, "Dan");
         f.Cli(2, "Bob");
         f.Poll(20);
-        u16 ids[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+        u8 ids[4] = {0xFF, 0xFF, 0xFF, 0xFF};
         u32 total = 0;
         CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
         CHECK_EQ(total, 2);
         CHECK(ids[0] == 2 && ids[1] == 4);  // ascending, host excluded
         f.Cli(3, "Cid");
         f.Poll(20);
-        ids[0] = ids[1] = ids[2] = ids[3] = 0xFFFF;
+        ids[0] = ids[1] = ids[2] = ids[3] = 0xFF;
         CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
         CHECK_EQ(total, 3);
-        CHECK(ids[0] == 2 && ids[1] == 3 && ids[2] == 4 && ids[3] == 0xFFFF);
+        CHECK(ids[0] == 2 && ids[1] == 3 && ids[2] == 4 && ids[3] == 0xFF);
         // capacity limits what is written, not the total
-        u16 two[2] = {0xFFFF, 0xFFFF};
+        u8 two[2] = {0xFF, 0xFF};
         CHECK_EQ(f.L().ServerConnectingClients(two, 2, &total), 0);
         CHECK_EQ(total, 3);
         CHECK(two[0] == 2 && two[1] == 3);
-        u16 none[1] = {0xBEEF};
+        u8 none[1] = {0xBE};
         CHECK_EQ(f.L().ServerConnectingClients(none, 0, &total), 0);
         CHECK_EQ(total, 3);
-        CHECK_EQ(none[0], 0xBEEF);
+        CHECK_EQ(none[0], 0xBE);
         // exact-size heap buffers (ASan)
-        u16* heap3 = new u16[3];
+        u8* heap3 = new u8[3];
         CHECK_EQ(f.L().ServerConnectingClients(heap3, 3, &total), 0);
         CHECK_EQ(total, 3);
         delete[] heap3;
@@ -3103,7 +3106,7 @@ void T_creator_tracking() {
         f.L().ServerStartAccepting(false, 6);
         for (int n = 2; n <= 4; ++n) f.Cli(n);  // the engine would not admit more than maxc: the test forces it
         f.Poll(20);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, maxc);
@@ -3123,7 +3126,7 @@ void T_creator_tracking() {
         f.Cli(3, "Late");
         f.Poll(20);
         CHECK(f.N()->ghost_kicked[3]);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, 1);
@@ -3149,7 +3152,7 @@ void T_creator_tracking() {
         CHECK_EQ(w, Word(0x40, 0, 2));
         CHECK_EQ(f.L().ServerClientState(3, &w), 0);
         CHECK_EQ(w, Word(0x40, 0, 3));
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, 2);  // waiting clients are listed too
@@ -3214,7 +3217,7 @@ void T_creator_tracking() {
         f.Poll(20);
         u32 w;
         CHECK_EQ(f.L().ServerClientState(2, &w), kNoData);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 9;
         f.L().ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, 0);
@@ -3279,7 +3282,7 @@ void ScenarioStartGrace(u64 base) {
     CHECK_EQ(f.P().Calls(kKick), 1);
     CHECK(f.N()->ghost_kicked[3]);
     CHECK_EQ(f.L().ServerState(), 8);
-    u16 ids[4];
+    u8 ids[4];
     u32 total = 0;
     f.W().now += 20;
     f.L().Poll(true);
@@ -3346,7 +3349,7 @@ void ScenarioGoGrace(u64 base) {
     f.L().Poll(true);
     CHECK_EQ(f.L().ServerState(), 9);
     CHECK_EQ(f.P().Calls(kHostClose), 1);
-    u16 ids[4];
+    u8 ids[4];
     u32 total = 9;
     CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
     CHECK_EQ(total, 0);
@@ -3377,7 +3380,7 @@ void T_creator_phases() {
         CHECK_EQ(f.L().ServerState(), 9);
         CHECK_EQ(f.P().Calls(kHostClose), 1);
         CHECK_EQ(f.Sent(3), 0);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 5;
         CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
         CHECK_EQ(total, 0);
@@ -3536,7 +3539,7 @@ void T_creator_phases() {
             CHECK(end <= 2060);
             CHECK_EQ(f.P().Calls(kHostClose), 1);
             CHECK(!f.L().active());
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 9;
             CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
             CHECK_EQ(total, 0);
@@ -3561,7 +3564,7 @@ void T_creator_phases() {
         for (int i = 0; i < 20; ++i) f.Poll(20);
         CHECK_EQ(f.P().Calls(kKick), 0);
         CHECK_EQ(f.L().ServerState(), 6);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, 3);
@@ -3788,7 +3791,7 @@ void T_ownership() {
         CHECK_EQ(f.L().ServerState(), 2);
         CHECK(f.L().active());
         CHECK(f.N() != nullptr);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         f.L().ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, 1);
@@ -3929,7 +3932,7 @@ void T_events_creator() {
         CHECK(!f.L().active());
         if (held) {
             CHECK_EQ(f.L().ServerState(), 1);
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 9;
             CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
             CHECK_EQ(total, 0);
@@ -4003,7 +4006,7 @@ struct E2E {
         r.Run(100);
     }
     void AcceptAll() {
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         h->lobby.ServerConnectingClients(ids, 4, &total);
         for (u32 i = 0; i < total && i < 4; ++i) {
@@ -4013,7 +4016,7 @@ struct E2E {
         }
     }
     u32 HostClients() {
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 99;
         CHECK_EQ(h->lobby.ServerConnectingClients(ids, 4, &total), 0);
         return total;
@@ -4050,7 +4053,7 @@ bool HostFrame(E2E& e, HostGame& g) {
         }
     }
     if (st == 9) {
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 99;
         CHECK_EQ(e.h->lobby.ServerConnectingClients(ids, 4, &total), 0);
         return total == 0;
@@ -4069,7 +4072,7 @@ void RunNominal(int n, bool br, bool manual) {
     HostGame g;
     CHECK_EQ(e.HostClients(), n);
     // the host sees the right clients with the right names
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 0;
     e.h->lobby.ServerConnectingClients(ids, 4, &total);
     for (int i = 0; i < n; ++i) {
@@ -4084,7 +4087,7 @@ void RunNominal(int n, bool br, bool manual) {
     }
     for (Con* x : e.c) {
         CHECK_EQ(x->lobby.ClientStatusWord() >> 24, 5);
-        u16 cn[4];
+        u8 cn[4];
         u32 t = 0;
         CHECK_EQ(x->lobby.ClientConnectingNodes(cn, 4, &t), 0);
         CHECK_EQ(t, n + 1);
@@ -4116,7 +4119,7 @@ void RunNominal(int n, bool br, bool manual) {
         CHECK_EQ(x->lobby.ClientPassphrase(pp), 0);
         CHECK(std::memcmp(pp, g.first, 9) == 0);  // the FIRST passphrase the game generated
         CHECK_EQ(x->lobby.bad_messages(), 0);
-        u16 cn[4];
+        u8 cn[4];
         u32 t = 0;
         x->lobby.ClientConnectingNodes(cn, 4, &t);
         CHECK_EQ(t, n + 1);
@@ -4457,7 +4460,7 @@ void T_e2e_misc() {
         c.lobby.ClientJoinBegin(h.port.mac, &res);
         r.Run(10000, 50);
         CHECK_EQ(c.lobby.client_state(), 5);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         h.lobby.ServerConnectingClients(ids, 4, &total);
         CHECK_EQ(total, 1);
@@ -4552,7 +4555,7 @@ void T_extra_buffers() {
     CHECK_EQ(f.P().last_connect_id.name[9], 0x41 + 9);
     CHECK_EQ(f.P().last_connect_id.name[0], 0x41);
     for (u32 cap = 0; cap <= 4; ++cap) {
-        u16* ids = new u16[cap];
+        u8* ids = new u8[cap];
         u32 total = 99;
         CHECK_EQ(f.L().ClientConnectingNodes(ids, cap, &total), 0);
         CHECK_EQ(total, 2);
@@ -4581,7 +4584,7 @@ void T_extra_buffers() {
     for (int n = 2; n <= 4; ++n) c.Cli(n);
     c.Poll(20);
     for (u32 cap = 0; cap <= 4; ++cap) {
-        u16* ids = new u16[cap];
+        u8* ids = new u8[cap];
         u32 total = 99;
         CHECK_EQ(c.L().ServerConnectingClients(ids, cap, &total), 0);
         CHECK_EQ(total, 3);
@@ -4611,7 +4614,7 @@ void T_extra_faulty_engine() {
         const u32 kicks = p.Calls(kKick) - k0;
         CHECK(kicks >= 1 && kicks <= 6);  // DESIGN sez. 16.3: the id 7 is kicked, every 200 ms at most; the id 0 never
         for (size_t i = static_cast<size_t>(k0); i < p.kicks.size(); ++i) CHECK_EQ(p.kicks[i], 7);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
         CHECK_EQ(total, 1);
@@ -4626,17 +4629,17 @@ void T_extra_faulty_engine() {
         CReach(f, C2);
         f.P().lie_extra = 9;
         for (int i = 0; i < 20; ++i) f.Poll(20);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         CHECK_EQ(f.L().ServerConnectingClients(ids, 4, &total), 0);
-        CHECK(total <= kMaxClients);
+        CHECK(total <= kTitlePlayers - 1);  // (a title of four: 3 clients, whatever the tables hold)
         SF s;
         Reach(s, S5);
         s.P().lie_extra = 9;
         for (int i = 0; i < 40; ++i) s.Poll(300);
         total = 0;
         s.L().ClientConnectingNodes(ids, 4, &total);
-        CHECK(total <= kMaxPlayers);
+        CHECK(total <= kTitlePlayers);  // (a title of four, whatever the tables hold)
         f.P().bad_kick = 0;
         s.P().bad_kick = 0;
     }
@@ -5160,7 +5163,7 @@ void T_external_poll() {
                 f.Adv(60);
                 f.L().Pump();
                 f.L().Poll(true);
-                u16 ids[4];
+                u8 ids[4];
                 u32 total = 0, word = 0;
                 f.L().ServerConnectingClients(ids, 4, &total);
                 f.L().ServerClientState(2, &word);
@@ -5181,7 +5184,14 @@ void T_external_poll() {
                 CHECK_EQ(p.Total(), total0);  // (9: the network is closed and the table dropped, nothing to read)
             }
             if (st == C6) {
-                CHECK_EQ(f.L().server_state(), 8);  // the grace ran out in that one pump: the client without START_ACK was thrown out
+                // the grace ran out, but that pump came 2.4 s after the last one: a stall (2026-11-15, D5), so the acks that waited are read first and
+                // the client without START_ACK is thrown out by the next pump
+                CHECK_EQ(f.L().server_state(), 6);
+                f.Adv(60);
+                f.L().SetOnNet(true);
+                f.L().Pump();
+                f.L().SetOnNet(false);
+                CHECK_EQ(f.L().server_state(), 8);
             }
         }
     }
@@ -5202,7 +5212,7 @@ void T_external_poll() {
                 f.L().Poll(true);
                 GroupView g;
                 Mac any = M(1);
-                u16 ids[4];
+                u8 ids[4];
                 u32 total = 0;
                 NodeEntry ne;
                 u8 pass[kPassphraseSize];
@@ -5568,11 +5578,11 @@ struct Fuzz {
         const u32 ss = L.ServerState();
         CHECK(ss == 0 || ss == 1 || ss == 2 || ss == 6 || ss == 8 || ss == 9);
         CHECK_EQ(ss, L.server_state());
-        u16 ids[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+        u8 ids[4] = {0xFF, 0xFF, 0xFF, 0xFF};
         u32 total = 99;
         CHECK_EQ(L.ClientConnectingNodes(ids, 4, &total), 0);
         if (sess) {
-            CHECK(total <= kMaxPlayers);
+            CHECK(total <= kTitlePlayers);  // (a title of four, whatever the tables hold)
         } else {
             CHECK_EQ(total, 0);
         }
@@ -5580,14 +5590,14 @@ struct Fuzz {
             CHECK(ids[i] >= 1 && ids[i] <= 4);
             if (i) CHECK(ids[i] > ids[i - 1]);
         }
-        u16 cid[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+        u8 cid[4] = {0xFF, 0xFF, 0xFF, 0xFF};
         total = 99;
         const u32 rc = L.ServerConnectingClients(cid, 4, &total);
         if (ss == 0) {
             CHECK_EQ(rc, kInvalidState);
         } else {
             CHECK_EQ(rc, 0);
-            CHECK(total <= kMaxClients);
+            CHECK(total <= kTitlePlayers - 1);  // (a title of four: 3 clients, whatever the tables hold)
             if (ss == 9) CHECK_EQ(total, 0);
             for (u32 i = 0; i < total && i < 3; ++i) {
                 CHECK(cid[i] >= 2 && cid[i] <= 4);
@@ -5620,7 +5630,7 @@ struct Fuzz {
         GroupView gv{};
         NodeEntry ne;
         std::memset(&ne, 0, sizeof ne);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         u8 pp[9];
         switch (R() % 28) {

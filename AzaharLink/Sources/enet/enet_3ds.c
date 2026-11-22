@@ -54,6 +54,7 @@ int azl_enet_rcvbuf_bytes = AZL_RCVBUF_MAX;
 
 void azl_c_log (const char * fmt, ...) __attribute__ ((format (printf, 1, 2)));
 void azl_c_soc_call (int kind, unsigned long long ticks); /* kinds: 0 recv with data, 1 recv empty, 2 send, 3 poll */
+void azl_c_soc_send (unsigned bytes, int outcome); /* outcomes: 0 taken whole, 1 refused (EWOULDBLOCK), 2 failed, 3 short (azl/stats.hpp) */
 void azl_c_room_datagram (unsigned bytes, unsigned long long gapTicks);
 void azl_c_rcvbuf_result (int asked, int got);
 /* Around every socket call that moves bytes through the plugin's memory, so that none is under way when an Old 3DS swaps the plugin's block out (azl/swap_gate.hpp):
@@ -480,14 +481,26 @@ enet_socket_send (ENetSocket socket,
     azl_c_soc_call (2, svcGetSystemTick () - startTick);
     errno = savedErrno;
 
+    /* AzaharLink: what the socket did with the datagram is counted (azl/stats.hpp). A refused send comes back as "0 bytes sent":
+       ENet goes on, and only a reliable command is sent again -- a fragment of an unreliable frame is lost without a trace. */
     if (sentLength == -1)
     {
-       if (errno == EWOULDBLOCK)
-         return 0;
+       if (savedErrno == EWOULDBLOCK)
+       {
+          azl_c_soc_send ((unsigned) total, 1);
+          errno = savedErrno;
+          return 0;
+       }
 
+       azl_c_soc_send ((unsigned) total, 2);
+       errno = savedErrno;
        return -1;
     }
 
+    /* (libctru's sendto and send answer the kernel's raw result, not -1, when the request to the soc service itself fails - errno ENODEV:
+       a negative value too, and a failure for the count as it is for ENet; what is returned is what it was before the count) */
+    azl_c_soc_send ((unsigned) total, sentLength < 0 ? 2 : (size_t) sentLength < total ? 3 : 0);
+    errno = savedErrno;
     return sentLength;
 }
 

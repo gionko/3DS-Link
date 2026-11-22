@@ -36,7 +36,7 @@ void EngineLobbyNet::Release() {
 
 bool EngineLobbyNet::HostOpen(const HostAnnounce& a, u8 channel, const Identity& me) {
     if (a.max_nodes > kMaxPlayers) {
-        return false; // (a lobby of more than 4 players is never announced)
+        return false; // (a lobby of more players than the tables hold is never announced; the lobby asks for its title's ceiling at most)
     }
     const bool took = !held_;
     if (!Acquire(me)) {

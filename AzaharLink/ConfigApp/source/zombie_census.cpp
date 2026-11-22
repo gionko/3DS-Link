@@ -66,8 +66,8 @@ void Append(const std::string& datadir, const std::vector<std::string>& lines) {
 
 bool OnEmulator() {
     s64 v = 0;
-    svcGetSystemInfo(&v, 0x20000, 0); // (1 on Citra and Azahar; a console's Luma answers with 0 in it)
-    return v == 1;
+    svcGetSystemInfo(&v, 0x20000, 0); // (DPAPP-2k: 0 on a console's Luma, 1 on Citra, 2 on Azahar - never its Result: Luma's is 1, positive)
+    return v != 0;
 }
 
 // False when the list could not be read (nothing is decided on a failed read).
@@ -191,6 +191,23 @@ void Run(const std::string& datadir) {
         g_tracked.last_check_ms = g_tracked.start_ms;
         g_notice = true;
     }
+}
+
+void Write(const std::string& datadir, const std::vector<std::string>& lines) {
+    Append(datadir, lines);
+}
+
+void Recheck(const std::string& datadir) {
+    if (!g_tracked.on) {
+        return;
+    }
+    std::vector<u32> pids;
+    if (!ListPids(pids) || zombie_plan::Listed(pids, g_tracked.pid)) {
+        return; // (still there, or not read: the message stays)
+    }
+    g_tracked.on = false;
+    g_notice = false; // (DPAPP-2j: freed by 3DS Link - no restart to ask for)
+    Append(datadir, {zombie_plan::GoneLine(g_tracked.pid, (NowMs() - g_tracked.start_ms) / 1000)});
 }
 
 bool TakeNotice() {

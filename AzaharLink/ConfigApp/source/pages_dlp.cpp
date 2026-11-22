@@ -6,9 +6,9 @@
 //     version of the app it goes straight to the room; otherwise it builds it with the composer (ConfigApp/dlpc) from the app's own CIA and the plugin that is a
 //     resource of the app (never a file of the card), in a thread of its own, with a screen that says what it does and how long it takes (dlp_prepare.hpp; DlpLink/docs/COMPOSITORE.md). The room is never open
 //     while the package is built;
-//   * the whole feature is behind Settings > Download Play delivery (the emergency switch, in 3DSLink.cfg) and behind boot9.bin: sharing needs it, 3DS Link
-//     does not. The main page does not push this page when either is missing; the page looks again before it does anything (a second lock), and with the
-//     switch off nothing of the library or the composer runs, and nothing is read or written for them;
+//   * the whole feature is behind boot9.bin: sharing needs it, 3DS Link does not. The main page does not push this page without it; the page looks again
+//     before it does anything (a second lock), and without it nothing of the library or the composer runs, and nothing is read or written for them (1.1.4,
+//     spec 9: the emergency switch Settings > Download Play delivery is gone);
 //   * the library runs in a thread of its own (dlph_poll blocks for up to 0.6 s while it sends a block and 1-4 s while it makes the room again, which a
 //     screen must not wait for); the page reads the library's snapshot (dlph_get_stats, dlph_history) and only asks it things (dlph_request_kick);
 //   * the local wireless is the app's Wireless (the sockets are put away while the room lives), sleep and HOME are off for as long as it is up, and
@@ -30,6 +30,7 @@
 #include "../titleshare_host/builtin_keys.h"
 #include "../guide/guide.hpp"
 #include "delivery.hpp"
+#include "dlp_guest.hpp"
 #include "dlp_prepare.hpp"
 #include "dlp_text.hpp"
 #include "pages.hpp"
@@ -504,19 +505,15 @@ private:
     // Before the room: the locks, the package, the work of making it
     // ---------------------------------------------------------------------------------------------
 
-    // The start, and the start again of "Try again" (`force`: make the package even though the file looks good, because the library refused it). The two locks come
-    // first and touch nothing; then the package: good where it lies, the room opens; otherwise it is made.
+    // The start, and the start again of "Try again" (`force`: make the package even though the file looks good, because the library refused it). The lock comes
+    // first and touches nothing; then the package: good where it lies, the room opens; otherwise it is made.
     void Begin(bool force) {
         failed_ = false;
         failure_detail_.clear();
         step_ = Step::Room;
-        if (!g.app_cfg.dlp_delivery) {
-            Fail(dlp::Failure::SwitchedOff, std::string()); // (the main page does not push this page when the switch is off: this is the second lock)
-            return;
-        }
         g.RefreshBoot9();
         if (!g.boot9.found) {
-            Fail(dlp::Failure::NoBoot9, std::string()); // (sharing needs boot9.bin; 3DS Link does not)
+            Fail(dlp::Failure::NoBoot9, std::string()); // (sharing needs boot9.bin; 3DS Link does not. The main page does not push this page without it: this is the second lock)
             return;
         }
         if (!log_open_) {
@@ -552,7 +549,9 @@ private:
         u64 app_bytes = 0;
         const dlp::Verdict app_file = dlp::CheckAppCiaFile(g.paths.dlp_app_cia, version16, &app_bytes, &app_found_);
         app_file_ = app_file;
-        const bool scan_done = titles::Scan().done();
+        // (a game read in the background by the worker of the Download Play children uses the module's one virtual CIA: the work waits for it, as for the
+        // scan - one game, seconds; 1.1.4 spec 9)
+        const bool scan_done = titles::Scan().done() && !dlpguest::Running();
         const bool keys = scan_done && delivery::AttachModule() && dl_have_keys() != 0;
         const dlp::Source source = dlp::ChooseSource(app_file, scan_done, keys);
         Log("sources: dlp/3dslink.cia is %d, scan %s, keys %s -> %d", static_cast<int>(app_file), scan_done ? "done" : "running", keys ? "there" : "not there",
@@ -647,7 +646,7 @@ private:
             }
             break;
         case Step::WaitScan:
-            if (titles::Scan().done()) {
+            if (titles::Scan().done() && !dlpguest::Running()) {
                 BeginPrepare();
             } else if (back) {
                 Leave(false);

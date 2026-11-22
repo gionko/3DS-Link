@@ -46,6 +46,12 @@ is a chain with CUTS, and every cut is a statement that something else proves:
     Tests/chain_sim on the compiled code). EVERYTHING ELSE is STATIC: the proof section lists what the cut graph still reaches and
     FAILS if that is a LobbyNet method other than NowMs / NowTicks, a function of the engine, or a Log() / DebugEvent() with a format.
   * "posted" rows: the handlers are cut (the network thread runs them), the chain is the wait for the network thread.
+  * the dlp:CLNT rows (1.1.4, G1: the system's Download Play application) are the same kinds, on their own path: RunDlp > RunDlpClnt (its
+    trace, its first-command and trouble lines, the join wait WaitForClntJoin) > Serve > Dispatch > DispatchClnt > Clnt (its own switch, whose
+    cases are split by clnt::IsInline: the ids of kPosted in azl/dlp_clnt_map.hpp go to the network thread, every other one is served inline).
+    Their cuts: RunDlp reaches only RunDlpClnt and Dispatch only DispatchClnt (the kind is Clnt: the first statement of Dispatch), and in the
+    switch the other cases. They are held to CLNT_CEILING of Tests/chain_sim/chain_sim.py at BOTH levels (520, 1-G1.md 4.6: the service is
+    the Download Play application's, whose threads are not a game's 464 bytes). The FKCL / SRVR rows are as they were.
   * the OnGameUdsStarting rows come in three flavours, because DlpHub runs it on the CALLING thread when no network thread is alive
     (RunHere): the normal one (the request is posted), the dead-network one with a room joined (the whole LobbyNet side down to the
     transport and the room client: the worst a stalled network thread can make a game thread pay) and the dead-network one with no
@@ -76,6 +82,7 @@ sys.setrecursionlimit(50000)
 # 0. What the tool knows about the plugin (everything plugin-specific is in this section)
 # ======================================================================================================================
 HLE_CEILING = {0: 320, 1: 520}   # Tests/chain_sim/chain_sim.py: the HLE proper, bytes below the SP at azl_gate_32
+CLNT_CEILING = 520                # ... dlp:CLNT at both levels (1-G1.md 4.6: the Download Play application's threads, not a game's)
 BUDGET_LOG = 340                  # ... the paths that write a log line (the close path of a fake session)
 THREAD_FREE = 464                 # the smallest game thread seen (Tri Force Heroes' srv thread): bytes below its call
 ABOVE_ENTRY = 20                  # of those 464: the game's wrapper frame (16) and the push of the site's stub (4), above the entry SP
@@ -83,6 +90,8 @@ BUDGET_THREAD = THREAD_FREE - ABOVE_ENTRY   # 444
 ASM_ENTRY = 44                    # azl_gate_32 / azl_gate_23: 20 + 4 (flags) + 16 (the context) + up to 4 of alignment (Sources/ctr/gate.s)
 ASSUMED_RESOLVER_MAP = 76         # the game's address mapper when it cannot be resolved to MapGameAddress (DESIGN-FASE3 sez. 5.3: 76)
 CLOCK_METHODS = ('NowMs', 'NowTicks')   # the only LobbyNet methods a game thread may call
+BOOK_METHODS = ('ClntBook',)             # 1.1.4 (G1): ... and the pointer of the book of dlp:CLNT (a getter: the Download Play application's adapter only)
+AWAITED_METHODS = ('ChildrenAwaited',)   # 1.1.4 (H5): ... and the mask of the clients the host still waits for in its state 9 (a getter: LobbyNet's default 0, the adapter's a load)
 
 # Who makes the std::function call that the compiler inlined (the call edge says only "std_function.h:581 _M_invoker"):
 # a regex on the demangled name of the CALLER -> the signature of the std::function it calls, as the demangler prints it.
@@ -96,6 +105,9 @@ VIRTUAL_RECEIVERS = {
     'net_': 'azl::EngineLobbyNet::',        # DlpLobby -> LobbyNet
     'kernel_': 'azl::ctr::CtrKernelOps::',  # UdsEngine / DlpHub -> KernelOps
 }
+# 1.1.4 (G1): DlpService's handlers of dlp:CLNT read the clock through the lobby, `lobby_->net()->NowTicks()`, inside the arguments of another call: the
+# compiler puts the indirect call at the column of the OUTER call. A line that has exactly one such call is that call (LobbyNet's X of EngineLobbyNet).
+NET_GETTER_CALL = re.compile(r'\blobby_->net\(\)->(\w+)\(')
 # Function pointers: the identifier before the '(' of the call -> the demangled name of the only function that is ever stored there
 FUNCTION_POINTERS = {
     'map': r'^azl::ctr::\(anonymous namespace\)::MapGameAddress\(',     # IpcResolver::map (Sources/ctr/plugin.cpp)
@@ -353,6 +365,19 @@ class Graph:
                 targets = [k for k, n in self.nodes.items() if n.defined and n.name.startswith(prefix) and '::_M_invoke(' in n.name]
                 if targets:
                     return Edge(caller, 'stdfn', targets, loc, sig, text)
+        net_calls = NET_GETTER_CALL.findall(text) if not text.lstrip().startswith(('//', '*')) else []
+        if len(net_calls) == 1:
+            targets = self.method_nodes(VIRTUAL_RECEIVERS['net_'], net_calls[0])
+            if targets:
+                return Edge(caller, 'virtual', targets, loc, net_calls[0], text)
+        if ident in BOOK_METHODS:
+            # (1.1.4, G1: lobby_->net()->ClntBook(), the getter of the book of dlp:CLNT - LobbyNet's default answers null, the adapter of the real
+            #  Download Play its member: no call below it, nothing of the network)
+            return Edge(caller, 'book', [], loc, ident, text)
+        if ident in AWAITED_METHODS:
+            # (1.1.4, H5: net_->ChildrenAwaited(), read by the lobby in its state 9 - LobbyNet's default answers 0, the adapter of the real Download
+            #  Play the mask of its wait, wait_.Awaited(): no call below it, nothing of the network)
+            return Edge(caller, 'awaited', [], loc, ident, text)
         self.unresolved.append((caller, loc, text))
         return Edge(caller, 'unresolved', [], loc, ident, text)
 
@@ -690,8 +715,47 @@ def dispatch_groups(src):
     return groups
 
 
+def clnt_dispatch_groups(src):
+    """[(service 'CLNT', [case names], first line, last line)] of the switch of DlpService::Clnt in dlp_ipc.hpp (1.1.4, G1): from its
+    signature to the comment that opens its handlers (dispatch_groups, which the FKCL / SRVR rows use, is left as it was)"""
+    lines = src.lines('Includes/azl/dlp_ipc.hpp') or []
+    groups, inside, cur = [], False, None
+    for i, text in enumerate(lines, 1):
+        if re.search(r'DlpOutcome Clnt\(u32 id, ', text):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if re.search(r'^\s*// ---- dlp:CLNT handlers', text):
+            break
+        m = re.match(r'^\s*(?:case\s+clnt::(k\w+)|default)\s*:', text)
+        if m:
+            name = m.group(1) or 'default'
+            if cur is not None and cur['empty'] and cur['end'] == i - 1:
+                cur['names'].append(name)        # case A: case B: share a body
+            else:
+                cur = {'service': 'CLNT', 'names': [name], 'start': i, 'end': i, 'empty': True}
+                groups.append(cur)
+        elif cur is not None:
+            cur['end'] = i
+            if text.strip():
+                cur['empty'] = False
+    return groups
+
+
+def clnt_posted_names(src):
+    """The ids of dlp:CLNT that go to the network thread: kPosted of azl/dlp_clnt_map.hpp, which DlpHub::IsInline asks through clnt::IsInline
+    (both statements are checked: a hub that decides otherwise makes the split meaningless). None when either is not there."""
+    text = ' '.join(src.lines('Includes/azl/dlp_clnt_map.hpp') or [])
+    hub = ' '.join(src.lines('Sources/azl/dlp_hub.cpp') or [])
+    m = re.search(r'inline constexpr u32 kPosted = ([^;]*);', text)
+    if not m or 'return !In(id, kPosted);' not in text or 'return clnt::IsInline(id);' not in hub:
+        return None
+    return set(re.findall(r'Bit\((k\w+)\)', m.group(1)))
+
+
 def case_label(gr):
-    names = [re.sub(r'^k(?:Fk|Sv)', '', n) for n in gr['names']]
+    names = [re.sub(r'^k(?:Fk|Sv)?', '', n) for n in gr['names']]
     return '%s %s' % (gr['service'], '/'.join(names))
 
 
@@ -727,6 +791,14 @@ SPEC = collections.OrderedDict([
     ('pollclient', r'^azl::DlpLobby::PollClient\('),
     ('pollserver', r'^azl::DlpLobby::PollServer\('),
     ('sendwifi', r'^azl::RoomClient::SendWifiPacket\('),
+    # 1.1.4 (G1): the path of dlp:CLNT
+    ('runclnt', r'^azl::ctr::\(anonymous namespace\)::RunDlpClnt\('),
+    ('waitclnt', r'^azl::ctr::\(anonymous namespace\)::WaitForClntJoin\('),
+    ('clntfirst', r'^azl::ctr::\(anonymous namespace\)::NoteClntFirst\('),
+    ('clnttrouble', r'^azl::ctr::\(anonymous namespace\)::NoteClntTrouble\('),
+    ('clnttracereq', r'^azl::ctr::\(anonymous namespace\)::ClntTraceRequest\('),
+    ('clnttracerep', r'^azl::ctr::\(anonymous namespace\)::ClntTraceReply\('),
+    ('dispatchclnt', r'^azl::DlpService::DispatchClnt\('),
 ])
 # The prefixes: where the chain of a row starts in the hook, and the function it enters (the row's own chain begins there)
 PREFIXES = {
@@ -736,7 +808,7 @@ PREFIXES = {
     'close': ('close_hook', 'note_closed'),   # CloseHandle of a fake session
     'hsr': ('hook', 'handle'),            # the call that finds a fake session dead (HandleSendSyncRequest itself)
 }
-LIMIT_NAMES = {'hle': 'HLE proper', 'log': 'path that logs'}
+LIMIT_NAMES = {'hle': 'HLE proper', 'log': 'path that logs', 'clnt': 'ceiling of dlp:CLNT'}
 # nwm::UDS InitializeWithVersion (libctru: header 0x001B0302 = 12 normal words + 2 translate): RunTraced keeps a copy of the 14 words of the
 # request in a frame that is dynamic (a variable length array); the compiler's 64 bytes are the fixed part
 UDS_INIT_REQUEST_WORDS = 14
@@ -789,6 +861,12 @@ class TreeReport:
             self.problems.append('no switch of DlpService::Fkcl / Srvr found in Includes/azl/dlp_ipc.hpp: nothing to split the commands by')
         if not self.inline_names:
             self.problems.append('no inline command found in DlpHub::IsInline (Sources/azl/dlp_hub.cpp)')
+        self.clnt_groups = clnt_dispatch_groups(g.src)
+        self.clnt_posted = clnt_posted_names(g.src)
+        if not [gr for gr in self.clnt_groups if gr['names'] != ['default']]:
+            self.problems.append('no switch of DlpService::Clnt found in Includes/azl/dlp_ipc.hpp: nothing to split the commands of dlp:CLNT by')
+        if not self.clnt_posted:
+            self.problems.append('no kPosted in Includes/azl/dlp_clnt_map.hpp, or DlpHub::IsInline does not ask clnt::IsInline for dlp:CLNT (!In(id, kPosted))')
         self.rows = []
         self.chains = {}      # (level, id of the cut set) -> Chain, kept so that the memo of a row is reused by its twin
         self.limits = ceilings_from(repo)
@@ -822,6 +900,14 @@ class TreeReport:
 
     def is_inline(self, gr):
         return all(nm in self.inline_names for nm in gr['names'])
+
+    def limit_of(self, row, level):
+        if row.limit == 'hle':
+            return self.limits['hle'][level]
+        return self.limits['clnt'] if row.limit == 'clnt' else self.limits['log']
+
+    def clnt_is_inline(self, gr):
+        return all(nm not in (self.clnt_posted or ()) for nm in gr['names'])
 
     # --- the rows -------------------------------------------------------------------------------------------------------------
     def build_rows(self):
@@ -874,10 +960,48 @@ class TreeReport:
             R.append(Row('RunDlp > ' + what, 'dlp', 'rundlp', self.only_via(['rundlp'], [nm]), 'hle', True,
                          'the HLE proper writes its lines; the hub is not in this chain', 'log'))
 
+        self.build_clnt_rows()
+
         # CALIBRATION: the path Tests/chain_sim measures in the emulator ("HLE: a command of the fake ndm:u"): the numbers of this row
         # and the emulator's differ by what the static sum over-counts (the entry's alignment, a libc branch that is not taken)
         R.append(Row('calibration: ndm:u command (RunNdm, every branch); chain_sim measures 176 / 480', 'ndm', 'runndm',
                      lambda e: False, 'hle', False, 'the path of chain_sim\'s "HLE: a command of the fake ndm:u" scenario', 'calib'))
+
+    def build_clnt_rows(self):
+        """1.1.4 (G1): the rows of dlp:CLNT, the system's Download Play application. RunDlp reaches only RunDlpClnt and Dispatch only
+        DispatchClnt (the kind is Clnt: the first statement of Dispatch); then the same kinds of row as the games' services."""
+        R = self.rows
+        to_clnt = self.only_via(['rundlp'], ['runclnt'])
+        to_serve = self.only_via(['runclnt'], ['serve'])
+        clnt_only = self.only_via(['dispatch'], ['dispatchclnt'])
+        no_poll = self.to('pollclient', 'pollserver')
+        cond = ('inline (dlp:CLNT): the lobby\'s tables and the book only; Poll > PollClient / PollServer cut (external-poll flag, dynamic); '
+                'Serve > Post cut (another row)')
+        cmds = [gr for gr in self.clnt_groups if gr['names'] != ['default']]
+        for gr in [g for g in cmds if self.clnt_is_inline(g)]:
+            others = [self.in_group(h) for h in self.clnt_groups if h is not gr]
+            cut = self.any_of(to_clnt, to_serve, clnt_only, self.to('post'), no_poll, *others)
+            R.append(Row(case_label(gr), 'dlp', 'rundlp', cut, 'clnt', True, cond, 'inline'))
+        posted = [g for g in cmds if not self.clnt_is_inline(g)]
+        if posted:
+            R.append(Row('posted command of dlp:CLNT (' + ', '.join(case_label(gr) for gr in posted[:3]) + ' ... %d in all)' % len(posted),
+                         'dlp', 'rundlp', self.any_of(to_clnt, to_serve, self.to('dispatch')), 'clnt', True,
+                         'posted: the application\'s thread leaves the request and waits on the kernel event (the handler runs on the network thread)',
+                         'posted'))
+        to_wait = self.only_via(['runclnt'], ['waitclnt'])
+        R.append(Row('CLNT StartSession: the wait for the join (WaitForClntJoin > PollPending)', 'dlp', 'rundlp',
+                     self.any_of(to_clnt, to_wait, self.only_via(['waitclnt'], ['pollpending']), no_poll), 'clnt', True,
+                     'the join loop: PollPending reads flags (ClientJoinPoll); Poll cut as above', 'join'))
+        R.append(Row('CLNT StartSession: the cap (WaitForClntJoin > OnSessionClosed)', 'dlp', 'rundlp',
+                     self.any_of(to_clnt, to_wait, self.only_via(['waitclnt'], ['onclosed'])), 'clnt', True,
+                     'the request is posted, or the close is left for the next Tick', 'join'))
+        for nm, what in (('notecommand', 'NoteCommand (the first call of a command: Log() with a format)'),
+                         ('clntfirst', 'NoteClntFirst (the first command of dlp:CLNT: LogLine)'),
+                         ('clnttrouble', 'NoteClntTrouble (a refused request: LogLine)'),
+                         ('clnttracereq', 'ClntTraceRequest (the trace of a request, the MAC zeroed; at debug 0 it leaves at once)'),
+                         ('clnttracerep', 'ClntTraceReply (the trace line of a command; at debug 0 it leaves at once)')):
+            R.append(Row('RunDlp > RunDlpClnt > ' + what, 'dlp', 'rundlp', self.any_of(to_clnt, self.only_via(['runclnt'], [nm])), 'clnt', True,
+                         'the HLE proper writes its lines; the hub is not in this chain', 'log'))
 
     def dead_flavours(self):
         """(label, extra cuts, condition) of the rows that run the lobby on the CALLING thread (DlpHub::RunHere: no network thread alive)"""
@@ -924,7 +1048,7 @@ class TreeReport:
                 extra = ((4 * row.req_words + 7) & ~7) if (level == 1 and row.req_words and row.prefix in ('uds', 'ndm')) else 0
                 row.prefix_bytes[level] = ASM_ENTRY + pre[0] + extra
                 row.total[level] = ASM_ENTRY + pre[0] + extra + d
-                limit = self.limits['hle'][level] if row.limit == 'hle' else self.limits['log']
+                limit = self.limit_of(row, level)
                 row.room[level] = limit - row.total[level]
                 row.path[level] = fmt_path(self.g, ch, start)
                 row.prefix_path = ' > '.join('%s=%d' % (display(self.g, k), self.g.nodes[k].frame) for k in pre[1])
@@ -933,7 +1057,7 @@ class TreeReport:
                     if row.room[level] < 0:
                         self.problems.append('%s: %d bytes at debug %d, over the %d of the %s (by %d)' % (
                             row.label, row.total[level], level,
-                            self.limits['hle'][level] if row.limit == 'hle' else self.limits['log'],
+                            self.limit_of(row, level),
                             LIMIT_NAMES[row.limit], -row.room[level]))
             if row.problem:
                 self.problems.append('%s: %s' % (row.label, row.problem))
@@ -1079,7 +1203,8 @@ class TreeReport:
             p('   machine-code estimator checked against the compiler on %d functions of the plugin: %d equal, mean absolute error %.1f '
               'bytes, worst %d' % (len(both), exact, sum(abs(a - b) for a, b in both) / max(len(both), 1), max([abs(a - b) for a, b in both] or [0])))
         p('   ceilings (Tests/chain_sim/chain_sim.py): HLE proper %d / %d, a path that logs %d, anything on the smallest thread %d; '
-          'the gate (azl_gate_32) costs up to %d' % (self.limits['hle'][0], self.limits['hle'][1], self.limits['log'], BUDGET_THREAD, ASM_ENTRY))
+          'the gate (azl_gate_32) costs up to %d; dlp:CLNT %d at both levels' % (self.limits['hle'][0], self.limits['hle'][1], self.limits['log'], BUDGET_THREAD,
+                                                                                  ASM_ENTRY, self.limits['clnt']))
         if self.problems and any(pr.startswith('SPEC') for pr in self.problems):
             for pr in self.problems:
                 p('  PROBLEM: ' + pr)
@@ -1112,7 +1237,7 @@ class TreeReport:
             r = rs[0]
             label = r.label if r.group != 'inline' else ('inline: ' + rs[0].label + (' (+%d like it)' % (len(rs) - 1) if len(rs) > 1 else ''))
             p('  %-92s %5d %5d | %6d %6d | %6d %6d | %s%s' % (label[:92], r.chain[0], r.chain[1], r.total[0], r.total[1], r.room[0], r.room[1],
-                                                         '%d / %d' % tuple(self.limits['hle']) if r.limit == 'hle' else str(self.limits['log']),
+                                                         '%d / %d' % tuple(self.limits['hle']) if r.limit == 'hle' else str(self.limit_of(r, 0)),
                                                          '' if r.gated else ' *'))
             if len(rs) > 1 and not gate:
                 p('        like it: ' + ', '.join(x.label for x in rs[1:]))
@@ -1191,7 +1316,7 @@ class TreeReport:
 
 def ceilings_from(repo):
     """HLE_CEILING and BUDGET_LOG of Tests/chain_sim/chain_sim.py when the repository is given (the numbers live in ONE place)"""
-    limits = {'hle': [HLE_CEILING[0], HLE_CEILING[1]], 'log': BUDGET_LOG}
+    limits = {'hle': [HLE_CEILING[0], HLE_CEILING[1]], 'log': BUDGET_LOG, 'clnt': CLNT_CEILING}
     if repo:
         path = os.path.join(repo, 'Tests', 'chain_sim', 'chain_sim.py')
         try:
@@ -1205,6 +1330,9 @@ def ceilings_from(repo):
         m = re.search(r'^BUDGET_LOG = (\d+)', text, re.M)
         if m:
             limits['log'] = int(m.group(1))
+        m = re.search(r'^CLNT_CEILING = (\d+)', text, re.M)
+        if m:
+            limits['clnt'] = int(m.group(1))
     return limits
 
 def selftest_core():
@@ -1319,14 +1447,31 @@ def selftest_tree():
            '            break;',
            '        }',
            '    }',
+           '    DlpOutcome Clnt(u32 id, u32* cmd, const u32* sbuf, const IpcResolver& r, DlpClntBook& book) {',   # 24 (1.1.4: dlp:CLNT)
+           '        switch (id) {',
+           '        case clnt::kGetServerInfo:',                             # 26 (inline)
+           '            ClntServerInfo(cmd);',                               # 27
+           '            break;',
+           '        case clnt::kStartSession:',                              # 29 (posted: kPosted)
+           '            return ClntStartSession(cmd);',                      # 30
+           '        default:',
+           '            Unknown(cmd);',
+           '            break;',
+           '        }',
+           '    }',
+           '    // ---- dlp:CLNT handlers ----',
            '    // ---- dlp:FKCL handlers ----']
-    hub = ['bool DlpHub::IsInline(DlpKind kind, u32 id) {', '    switch (id) {', '    case DlpService::kFkGetServerInfo:',
+    hub = ['bool DlpHub::IsInline(DlpKind kind, u32 id) {', '    if (kind == DlpKind::Clnt) {', '        return clnt::IsInline(id);', '    }',
+           '    switch (id) {', '    case DlpService::kFkGetServerInfo:',
            '    case DlpService::kSvGetServerState:', '        return true;', '    }', '    return false;', '}']
     lobby = ['// fake', '    void Poll(bool force) {',
              '        if (use_ == kUseNone || (flags2_ & (kF2External | kF2OnNet)) == kF2External || !Due(force)) {',
              '            return;', '        }', '        net_->ScanRead(1, nullptr);', '        net_->HostOpen(1);', '        net_->NowMs();',
              '        kernel_->WaitEvent(1, 2);']
-    for rel, lines in (('Includes/azl/dlp_ipc.hpp', ipc), ('Sources/azl/dlp_hub.cpp', hub), ('Includes/azl/dlp_lobby.hpp', lobby)):
+    clnt_map = ['inline constexpr u32 kPosted = Bit(kInitialize) |', '                               Bit(kStartSession);',
+                'constexpr bool IsInline(u32 id) {', '    return !In(id, kPosted);', '}']
+    for rel, lines in (('Includes/azl/dlp_ipc.hpp', ipc), ('Sources/azl/dlp_hub.cpp', hub), ('Includes/azl/dlp_lobby.hpp', lobby),
+                       ('Includes/azl/dlp_clnt_map.hpp', clnt_map)):
         os.makedirs(os.path.dirname(os.path.join(src, rel)), exist_ok=True)
         with open(os.path.join(src, rel), 'w') as f:
             f.write('\n'.join(lines) + '\n')
@@ -1355,10 +1500,20 @@ def selftest_tree():
         'scan': 'azl::EngineLobbyNet::ScanRead(unsigned long, azl::HeardGroup*)', 'open': 'azl::EngineLobbyNet::HostOpen(unsigned long)',
         'wait': 'azl::ctr::CtrKernelOps::WaitEvent(unsigned long, long long)', 'clr': 'azl::ctr::CtrKernelOps::ClearEvent(unsigned long)',
         'eng': 'azl::UdsEngine::Shutdown()',
+        # 1.1.4 (G1): the path of dlp:CLNT
+        'rc': 'azl::ctr::(anonymous namespace)::RunDlpClnt(azl::DlpHub&, unsigned long, unsigned long*)',
+        'wc': 'azl::ctr::(anonymous namespace)::WaitForClntJoin(azl::DlpHub&, unsigned long*)',
+        'cf': 'azl::ctr::(anonymous namespace)::NoteClntFirst(unsigned long)',
+        'ct': 'azl::ctr::(anonymous namespace)::NoteClntTrouble(azl::DlpHub const&, unsigned long)',
+        'cq': 'azl::ctr::(anonymous namespace)::ClntTraceRequest(unsigned long, unsigned long const*)',
+        'cp': 'azl::ctr::(anonymous namespace)::ClntTraceReply(unsigned long, unsigned long const*)',
+        'dc': 'azl::DlpService::DispatchClnt(unsigned long*, unsigned long const*, azl::IpcResolver const&)',
+        'cs': 'azl::DlpService::Clnt(unsigned long, unsigned long*, unsigned long const*, azl::IpcResolver const&, azl::DlpClntBook&)',
+        'hsi': 'azl::DlpService::ClntServerInfo(unsigned long*)', 'hss': 'azl::DlpService::ClntStartSession(unsigned long*)',
     }
     frames = {'hook': 16, 'hsr': 48, 'run': 32, 'serve': 40, 'post': 32, 'disp': 24, 'hinfo': 48, 'hinit': 16, 'poll': 8, 'pc': 24, 'lob': 16,
               'now': 8, 'scan': 80, 'open': 40, 'wait': 8, 'clr': 8, 'wj': 40, 'oc': 32, 'rh': 24, 'eng': 56, 'sw': 96, 'nhc': 56, 'endi': 0,
-              'trq': 16, 'trp': 64}
+              'trq': 16, 'trp': 64, 'rc': 24, 'wc': 40, 'dc': 16, 'cs': 16, 'hsi': 24, 'hss': 24, 'cq': 48, 'cp': 72}
 
     def program(defect=None):
         ci = ['graph: { title: "t.cpp"', 'node: { title: "__indirect_call" label: "Indirect Call Placeholder" shape : ellipse }']
@@ -1384,6 +1539,15 @@ def selftest_tree():
         call('wj', 'pp'); call('wj', 'oc'); call('oc', 'post'); call('rh', 'eng'); call('eng', 'sw')
         call('hsr', 'udsd'); call('udsd', 'og'); call('og', 'post'); call('og', 'rh')
         call('nhc', 'endi'); call('endi', 'oc'); call('hsr', 'endi')
+        # dlp:CLNT: RunDlp > RunDlpClnt > Serve > Dispatch > DispatchClnt > Clnt (the call of Clnt is on a line of the games' last switch group, as in
+        # the real header, where the groups of SRVR run on to the handlers of FKCL: the FKCL / SRVR rows cut it)
+        call('run', 'rc'); call('rc', 'cf'); call('rc', 'cq'); call('rc', 'serve'); call('rc', 'ct'); call('rc', 'wc'); call('rc', 'cp'); call('rc', 'nc')
+        call('wc', 'pp'); call('wc', 'oc')
+        call('disp', 'dc', IPC + ':1:1'); call('dc', 'cs', IPC + ':24:5')
+        call('cs', 'hsi', IPC + ':27:13'); call('cs', 'hss', IPC + ':30:20')
+        call('hsi', 'lob', IPC + ':27:13')
+        if defect == 'clnt_virtual':  # an inline command of dlp:CLNT asks the network
+            via_ptr('hsi', 6, '(')
         if defect == 'closed_inline':     # the end of a session runs the lobby's network side on the calling thread again
             call('oc', 'rh')
         if defect == 'virtual':       # an inline command asks the network
@@ -1424,7 +1588,7 @@ def selftest_tree():
         finally:
             globals()['demangle'] = real
         rep = TreeReport(g, None, 'selftest')
-        rep.limits = {'hle': list(with_ceiling or HLE_CEILING.values()), 'log': BUDGET_LOG}
+        rep.limits = {'hle': list(with_ceiling or HLE_CEILING.values()), 'log': BUDGET_LOG, 'clnt': with_ceiling[1] if with_ceiling else CLNT_CEILING}
         out = []
         rep.run(out)
         return rep, out
@@ -1434,7 +1598,8 @@ def selftest_tree():
     info = by['FKCL GetServerInfo']
     expect('the commands are split by IsInline: an inline row for GetServerInfo', info.group, 'inline')
     expect('... and one for the SRVR GetServerState', by['SRVR GetServerState'].group, 'inline')
-    expect('... and the others are posted', [r.group for r in rep.rows if r.group == 'posted'], ['posted'])
+    expect('... and the others are posted: one row for the games\' services, one for dlp:CLNT', [r.label.split(' (')[0] for r in rep.rows if r.group == 'posted'],
+           ['posted command', 'posted command of dlp:CLNT'])
     # chain of an inline command: RunDlp 32 + Serve 40 + Dispatch 24 + FkServerInfo 48 + ClientServerInfo 16 + NowMs 8 = 168
     expect('an inline chain is the sum of the frames down to the clock', info.chain[0], 168)
     expect('... and its total is the entry + the hook\'s frames + the chain', info.total[0], ASM_ENTRY + 16 + 48 + 168)
@@ -1445,6 +1610,21 @@ def selftest_tree():
     alive = by['FKCL StartFakeSession: the 8 s cap (WaitForJoin > OnSessionClosed)']
     expect('the cap goes through Post: RunDlp + WaitForJoin + OnSessionClosed + Post + the kernel call (the lobby is not reached)',
            alive.chain[0], 32 + 40 + 32 + 32 + 8)
+    # 1.1.4 (G1): dlp:CLNT - its switch split by kPosted, its own path, the games' rows untouched by it
+    clnt = by.get('CLNT GetServerInfo')
+    expect('dlp:CLNT: an inline row for GetServerInfo (not in kPosted)', clnt.group if clnt else None, 'inline')
+    expect('... RunDlp + RunDlpClnt + Serve + Dispatch + DispatchClnt + Clnt + ClntServerInfo + ClientServerInfo + NowMs',
+           clnt.chain[0] if clnt else None, 32 + 24 + 40 + 24 + 16 + 16 + 24 + 16 + 8)
+    expect('... StartSession is not an inline row (kPosted)', 'CLNT StartSession' in by, False)
+    cposted = [r for r in rep.rows if r.label.startswith('posted command of dlp:CLNT')]
+    expect('... the posted row of dlp:CLNT: RunDlp + RunDlpClnt + Serve + Post + the kernel call', cposted[0].chain[0] if cposted else None, 32 + 24 + 40 + 32 + 8)
+    expect('... its join wait: RunDlp + RunDlpClnt + WaitForClntJoin + PollPending',
+           by['CLNT StartSession: the wait for the join (WaitForClntJoin > PollPending)'].chain[0], 32 + 24 + 40 + 8)
+    expect('... its cap through Post', by['CLNT StartSession: the cap (WaitForClntJoin > OnSessionClosed)'].chain[0], 32 + 24 + 40 + 32 + 32 + 8)
+    expect('... its trace line', by['RunDlp > RunDlpClnt > ClntTraceReply (the trace line of a command; at debug 0 it leaves at once)'].chain[0], 32 + 24 + 72)
+    expect('the games\' inline row does not take the path of dlp:CLNT (still 168)', info.chain[0], 168)
+    expect('the rows of dlp:CLNT are held to its own ceiling at both levels', {r.limit for r in rep.rows if 'CLNT' in r.label}, {'clnt'})
+    expect('... 520 at debug 0 too', rep.limit_of(clnt, 0) if clnt else None, CLNT_CEILING)
     dead = [r for r in rep.rows if r.group == 'dead']
     expect('dead-network rows exist for OnGameUdsStarting only (the end of a session is deferred): joined and no room', len(dead), 2)
     expect('the dead-network row goes through RunHere into the engine and the room client: 8 + 8 + 24 + 56 + 96',
@@ -1455,12 +1635,13 @@ def selftest_tree():
     expect('the close paths are gated rows with a posted request', all(r.gated for r in rep.rows if r.group == 'closed'), True)
     expect('a healthy tree has no problem', rep.problems, [])
     for defect, needle in (('virtual', 'ScanRead'), ('engine', 'engine'), ('log', 'Log()'), ('runtraced', 'RunTraced'), ('closed_inline', 'OnSessionClosed'),
-                           ('poll_flag', 'external-poll')):
+                           ('poll_flag', 'external-poll'), ('clnt_virtual', 'ScanRead')):
         rep2, _ = run(defect)
         expect('proof 1 refuses a defect (%s)' % defect, any(needle in pr for pr in rep2.problems), True)
     # a ceiling that is too low refuses the gated rows and not the others
     rep3, _ = run(None, (100, 100))
     expect('a ceiling the chains do not fit is a problem for the gated rows', any('over the 100' in pr for pr in rep3.problems), True)
+    expect('... the rows of dlp:CLNT too, against their own ceiling', any(pr.startswith('CLNT GetServerInfo') and 'ceiling of dlp:CLNT' in pr for pr in rep3.problems), True)
     expect('... and the dead-network rows (not gated) are not named in it', any('network thread dead' in pr for pr in rep3.problems), False)
     # a renamed function is an error, not a silent pass
     names['serve'] = 'azl::DlpHub::Renamed(azl::DlpKind)'

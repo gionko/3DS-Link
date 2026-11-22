@@ -888,7 +888,7 @@
      volatile uint32_t amLastMs, amMaxMs;
      volatile uint32_t amTotalMs, amWrites; // tempo totale e numero delle scritture verso AM
      volatile uint64_t amBytes;             // byte scritti in AM (per la velocita' di AM mentre scrive)
-@@ -271,6 +320,21 @@
+@@ -271,6 +320,26 @@
  // Blocchi per scrittura verso AM (massimo): 128 = 186 KB. Una scrittura costa ~12 ms fissi + ~0,45 ms per blocco; FBI usa 256 KiB.
  #define TS_AM_AGG 128
  
@@ -896,9 +896,14 @@
 +// ticket and a pending install, of THAT title only (never the game it belongs to, never another title). Without it a failed DLC stayed on the console (0.4 GiB) and the app
 +// then called it "already installed".
 +static void scrub_failed(writer_t* wt, u64 tid) {
++    FS_MediaType dest = ts_title_dest(tid);
++    if(dest != MEDIATYPE_SD) {
++        // (3DS Link) never a title of the NAND: nothing is asked of AM (the app gives none: titleshare_host/recv_filter.h)
++        ts_log("pulizia dopo l'errore di %016llx: titolo della NAND, nulla chiesto ad AM", (unsigned long long) tid);
++        return;
++    }
 +    ts_wd_beat(wt->wd, 6);
 +    ts_amgate_begin(&wt->gate, (uint32_t) ts_now_ms(), TS_AM_STUCK_MS);
-+    FS_MediaType dest = ts_title_dest(tid);
 +    Result rt = AM_DeleteTitle(dest, tid);
 +    Result rk = AM_DeleteTicket(tid);
 +    Result rp = AM_DeletePendingTitle(dest, tid);
@@ -910,7 +915,7 @@
  static void writer_fn(void* arg) {
      writer_t* wt = (writer_t*) arg;
      ts_store* S = wt->store;
-@@ -326,6 +390,7 @@
+@@ -326,13 +395,15 @@
              winT0 = 0;
              waitAcc = 0;
              starvedFlag = 0;
@@ -918,7 +923,16 @@
              wt->curTitle = p;
              uint64_t b0 = ts_now_ms();
              tTitle0 = b0;
-@@ -348,6 +413,7 @@
+             sdBefore = sd_free_gib();
+             ts_wd_beat(wt->wd, 2);
+             ts_amgate_begin(&wt->gate, (uint32_t) ts_now_ms(), TS_AM_STUCK_MS);
+-            Result r = ts_am_begin(m->t[p].tid, wt->exists[p], &h);
++            // (3DS Link) never a title of the NAND: ts_am_begin deletes the title and its ticket before it reads the CIA (titleshare_host/recv_filter.h)
++            Result r = ts_title_dest(m->t[p].tid) == MEDIATYPE_SD ? ts_am_begin(m->t[p].tid, wt->exists[p], &h) : (Result) 0xC8604C04;
+             // con la coda di 150 ms: fra la fine di ts_am_begin e la raccolta del primo gruppo il thread scrive due righe di registro e legge lo spazio libero
+             // della SD, e il parcheggio non deve infilarsi proprio li' (la prima scrittura AM e' la piu' delicata)
+             ts_amgate_end(&wt->gate, (uint32_t) ts_now_ms(), TS_AM_TAIL_MS);
+@@ -348,6 +419,7 @@
  
              cur = p;
              instOff = 0;
@@ -926,7 +940,7 @@
              firstWrite = 1;
              ts_log("titolo %d: SD libera %.2f GiB prima dell'installazione (il titolo occupa %.2f GiB)", p, sdBefore, (double) m->t[p].size / 1073741824.0);
          }
-@@ -414,6 +480,7 @@
+@@ -414,6 +486,7 @@
          if(nb == 0 && rdErr) {
              ts_log("titolo %d: lettura del file di parcheggio fallita: l'installazione si annulla", cur);
              ts_am_cancel(h);
@@ -934,7 +948,7 @@
              wt->result[cur] = TS_RES_ERROR;
              wt->err[cur] = 0xC8604C02;
              store_finish(S, cur, 0);
-@@ -462,6 +529,7 @@
+@@ -462,6 +535,7 @@
              if(R_FAILED(r)) {
                  ts_log("scrittura AM fallita 0x%08x (titolo %d, offset %llu)", (unsigned int) r, cur, (unsigned long long) instOff);
                  ts_am_cancel(h);
@@ -942,7 +956,7 @@
                  wt->result[cur] = TS_RES_ERROR;
                  wt->err[cur] = (uint32_t) r;
                  store_finish(S, cur, 0);
-@@ -471,6 +539,7 @@
+@@ -471,6 +545,7 @@
              }
  
              instOff += bytes;
@@ -950,7 +964,7 @@
              wt->bytes += bytes;
              wt->fileBytes += fileB;
              wt->winBytes += winB;
-@@ -478,6 +547,7 @@
+@@ -478,6 +553,7 @@
                  // le corse gia' consegnate sono state scritte; il file non si legge piu': l'installazione non puo' continuare
                  ts_log("titolo %d: lettura del file di parcheggio fallita dopo %d blocchi: l'installazione si annulla", cur, nb);
                  ts_am_cancel(h);
@@ -958,7 +972,7 @@
                  wt->result[cur] = TS_RES_ERROR;
                  wt->err[cur] = 0xC8604C02;
                  store_finish(S, cur, 0);
-@@ -502,6 +572,12 @@
+@@ -502,6 +578,12 @@
              }
  
              if(R_FAILED(r)) {
@@ -971,7 +985,7 @@
                  wt->result[cur] = TS_RES_ERROR;
                  wt->err[cur] = (uint32_t) r;
              } else {
-@@ -515,7 +591,15 @@
+@@ -515,7 +597,15 @@
      }
  
      if(cur >= 0) {
@@ -987,7 +1001,7 @@
      }
  
      free(stage);
-@@ -671,6 +755,9 @@
+@@ -671,6 +761,9 @@
      volatile int linkFailed;
      char failMsg[64];
      volatile int reconnecting;
@@ -997,7 +1011,7 @@
      volatile int sessionLost;   // il mittente e' ripartito con una sessione nuova: questa non esiste piu'
      uint32_t otherSessN, otherSessAt;
      volatile int unbound; // 1 se la riconnessione ha sganciato il collegamento e non e' ancora tornata
-@@ -694,6 +781,7 @@
+@@ -694,6 +787,7 @@
      volatile int senderHears;
      volatile int nOthers;
      volatile uint32_t otherCursor[16];
@@ -1005,7 +1019,7 @@
      volatile int lastStateGen;
  } net_t;
  
-@@ -850,6 +938,9 @@
+@@ -850,6 +944,9 @@
                      age = ro.ageDs[i];
                  } else if(n->nOthers < 16) {
                      n->otherCursor[n->nOthers] = ro.cursor[i];
@@ -1015,7 +1029,7 @@
                      n->nOthers++;
                  }
              }
-@@ -910,7 +1001,17 @@
+@@ -910,7 +1007,17 @@
              uint32_t fm = n->pk->freeMiB;
              a->freeMiB = fm;
              a->installed = (uint32_t) (rd64(&wt->bytes) / TS_BLOCK);
@@ -1034,7 +1048,7 @@
              uint32_t ams = (uint32_t) ((svcGetSystemTick() - tkA) * 1000ULL / SYSCLOCK_ARM11);
              n->tkAck += svcGetSystemTick() - tkA;
              if(ams > n->maxAckMs) {
-@@ -957,28 +1058,38 @@
+@@ -957,28 +1064,38 @@
  
              if((lostSince != 0 && now - lostSince > 1500) || forceRe) {
                  forceRe = 0;
@@ -1077,7 +1091,7 @@
                      }
  
                      free(nets);
-@@ -988,6 +1099,7 @@
+@@ -988,6 +1105,7 @@
                  }
  
                  n->reconnecting = 0;
@@ -1085,7 +1099,7 @@
                  if(!back) {
                      snprintf(n->failMsg, sizeof(n->failMsg), "%s", n->stop ? "annullato" : "mittente non ritrovato");
                      n->reconnTotalMs += (uint32_t) (ts_now_ms() - tr);
-@@ -996,7 +1108,8 @@
+@@ -996,7 +1114,8 @@
                      break;
                  }
  
@@ -1095,7 +1109,7 @@
                  n->reconnTotalMs += (uint32_t) (ts_now_ms() - tr);
                  lastFrame = 0;
                  lostSince = 0;
-@@ -1038,6 +1151,7 @@
+@@ -1038,6 +1157,7 @@
      memset(&st, 0, sizeof(st));
      st.phase = TS_R_CONNECT;
      st.curTitle = -1;
@@ -1103,7 +1117,7 @@
      st.senderHears = -1;
      st.etaSec = -1;
      st.senderEtaSec = -1;
-@@ -1065,6 +1179,7 @@
+@@ -1065,6 +1185,7 @@
          return -1;
      }
  
@@ -1111,7 +1125,7 @@
      ts_power_begin_transfer();
      uint8_t* rx = malloc(UDS_DATAFRAME_MAXSIZE);
      uint8_t* frame = malloc(UDS_DATAFRAME_MAXSIZE);
-@@ -1403,6 +1518,9 @@
+@@ -1403,6 +1524,9 @@
              st.nOthers = nt.nOthers;
              for(int i = 0; i < st.nOthers && i < 16; i++) {
                  st.otherCursor[i] = nt.otherCursor[i];
@@ -1121,7 +1135,7 @@
              }
  
              ts_store_stats ss;
-@@ -1435,6 +1553,12 @@
+@@ -1435,6 +1559,12 @@
  
              st.instBlocks = instBlocks;
              st.cursor = instBlocks;
@@ -1134,7 +1148,7 @@
              st.recv = ss.win + ss.parked;
              st.dups = ss.dup;
              st.outOfWindow = ss.dropFull + ss.dropNoAccept;
-@@ -1453,7 +1577,14 @@
+@@ -1453,7 +1583,14 @@
              }
  
              if(nt.reconnecting) {
@@ -1150,7 +1164,7 @@
              } else if(!wt.finished && age_ms(now, nt.lastUseful) > 3000 && now - startedAtMs > 3000) {
                  snprintf(st.msg, sizeof(st.msg), "in attesa: il mittente sta servendo altri");
              } else if(nt.reconnects > 0) {
-@@ -1522,7 +1653,7 @@
+@@ -1522,7 +1659,7 @@
          log_misure(&ss, &pio, &pk, 1);
      }
  

@@ -21,7 +21,7 @@ extern "C" const char* __ubsan_default_options() {
 
 /// The roster a client's lobby reads, as "Name1,Name2,..." in node order.
 static std::string RosterOf(Player& p) {
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 0;
     p.lobby.ClientConnectingNodes(ids, 4, &total);
     std::string s;
@@ -39,7 +39,7 @@ static std::string RosterOf(Player& p) {
     return s;
 }
 static u32 ClientsOf(Player& host) {
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 0;
     host.lobby.ServerConnectingClients(ids, 4, &total);
     return total;
@@ -106,10 +106,18 @@ static void XFailures() {
     const Identity me = Me(0xF001, "Alice");
     CHECK(!a.net.HostOpen(Ann(1), 6, me));  // BeginHostingLobby refuses one node: the engine goes back
     CHECK(EngineClean(a));
-    CHECK(!a.net.HostOpen(Ann(17), 6, me));  // ... and no lobby is ever announced for more than four players
+    CHECK(!a.net.HostOpen(Ann(17), 6, me));  // ... and no lobby is ever announced for more players than the tables hold (2026-11-13: eight)
     CHECK(EngineClean(a));
-    CHECK(!a.net.HostOpen(Ann(5), 6, me));
+    CHECK(!a.net.HostOpen(Ann(9), 6, me));
     CHECK(EngineClean(a));
+    // (the adapter carries what the lobby asks up to the tables' eight: five and eight are networks now - that a title of FOUR never asks for
+    // them is the lobby's, Tests/dlp_cap_guard_test.cpp and Tests/dlp_eight_test.cpp)
+    for (const u32 nodes : {5u, 8u}) {
+        CHECK(a.net.HostOpen(Ann(nodes), 6, me));
+        CHECK_EQ(a.e().GetConnectionStatus().max_nodes, nodes);  // the network the room carries has the nodes the lobby asked for
+        a.net.HostClose();
+        CHECK(EngineClean(a));
+    }
     CHECK_EQ(c.net.MyNode(), 0u);
     CHECK(c.net.ScanOpen());
     u8 app[kAnnounceSize];
@@ -229,20 +237,22 @@ static void XRejoin() {
     CHECK_EQ(b.net.MyNode(), 2u);
 }
 
-/// X5: a creator that admits more than four (a hostile or newer one): the adapter keeps to four everywhere.
+/// X5: a creator that admits more than the tables hold (a hostile or newer one): the adapter keeps to eight everywhere (four, while the tables held four:
+/// 2026-11-13. The lobby above keeps a title to its own ceiling: Tests/dlp_cap_guard_test.cpp S4, Tests/dlp_eight_test.cpp).
 static void XHostile() {
-    std::printf("x5: a creator with six nodes\n");
+    std::printf("x5: a creator with ten nodes\n");
     g_rules.Reset();
     MockRoom room;
-    Player h(room, 1, "Host"), c1(room, 2, "C1"), c2(room, 3, "C2"), c3(room, 4, "C3"), c4(room, 5, "C4"), c5(room, 6, "C5");
-    Player* cs[5] = {&c1, &c2, &c3, &c4, &c5};
-    const Players ps = {&h, &c1, &c2, &c3, &c4, &c5};
+    Player h(room, 1, "Host"), c1(room, 2, "C1"), c2(room, 3, "C2"), c3(room, 4, "C3"), c4(room, 5, "C4"), c5(room, 6, "C5"), c6(room, 7, "C6"),
+        c7(room, 8, "C7"), c8(room, 9, "C8"), c9(room, 10, "C9");
+    Player* cs[9] = {&c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9};
+    const Players ps = {&h, &c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9};
     Ticker ticker(Engines(ps));
     u8 app[kAnnounceSize];
     EncodeAnnounce(Ann(4), app);
     const u16 who[10] = {u16('H')};
     CHECK_EQ(h.e().InitializeForLobby(0xF001, who), 0u);
-    CHECK_EQ(h.e().BeginHostingLobby(UdsEngine::kLobbyWlanCommId, UdsEngine::kLobbyId8, 6, 8, app, kAnnounceSize), 0u);
+    CHECK_EQ(h.e().BeginHostingLobby(UdsEngine::kLobbyWlanCommId, UdsEngine::kLobbyId8, 6, 12, app, kAnnounceSize), 0u);
     for (Player* c : cs) {
         CHECK(c->net.ScanOpen());
         UdsEngine::HeardLobby heard;
@@ -252,13 +262,20 @@ static void XHostile() {
     }
     CHECK(WaitFor(4000, [&] {
         u16 n = 0, m = 0;
-        return c1.e().NodeSnapshot(&n, &m) && m == 0x3F;
+        return c1.e().NodeSnapshot(&n, &m) && m == 0x3FF;
     }));
-    u8 nodes[kMaxPlayers];
-    CHECK_EQ(c1.net.Members(nodes), 4u);  // the bound
+    u8 nodes[kMaxPlayers + 2];
+    std::memset(nodes, 0xEE, sizeof(nodes));
+    CHECK_EQ(c1.net.Members(reinterpret_cast<u8 (&)[kMaxPlayers]>(nodes)), 8u);  // the bound
     CHECK_EQ(nodes[3], 4u);
-    CHECK_EQ(h.net.Members(nodes), 4u);
-    CHECK(!h.net.Send(5, kMsg, 2));  // node 5 is there, and no lobby message goes to it
+    CHECK_EQ(nodes[7], 8u);
+    CHECK(nodes[8] == 0xEE && nodes[9] == 0xEE);  // nothing is written past the array
+    CHECK_EQ(h.net.Members(reinterpret_cast<u8 (&)[kMaxPlayers]>(nodes)), 8u);
+    CHECK(nodes[8] == 0xEE && nodes[9] == 0xEE);
+    CHECK(!h.net.Send(9, kMsg, 2));  // node 9 is there, and no lobby message goes to it
+    CHECK(!h.net.Send(10, kMsg, 2));
+    CHECK(h.net.Send(5, kMsg, 2));   // (a node of the tables: a title of eight has clients there)
+    CHECK(h.net.Send(8, kMsg, 2));
     CHECK(!h.net.Send(2, kMsg, 0));
     u8 big[17] = {};
     CHECK(!h.net.Send(2, big, 17));

@@ -10,6 +10,8 @@
 
 #include "../titleshare_host/delivery.h"
 #include "copyworker.hpp"
+#include "dlp_guest.hpp"
+#include "dlp_join.hpp"
 #include "heap_alloc.hpp"
 #include "lobby_scan.hpp"
 #include "pages.hpp"
@@ -194,6 +196,7 @@ int main(int argc, char** argv) {
     if (!g.save_ok && g.settings_loaded != setup::LoadResult::Unreadable) {
         setup::SaveSettings(g.cfg);
     }
+    dlpguest::Shutdown(); // (a run of the Download Play children stops where it is: it leaves nothing half done; before the copies, it may wait on one)
     FinishCopies();
     lobbies::Scanner::Get().Shutdown(3000); // (the asking of the public rooms: before the sockets go)
     update::Worker::Get().Shutdown(); // (before the sockets go; an install that has begun is finished, a request is stopped)
@@ -204,8 +207,21 @@ int main(int argc, char** argv) {
     session::Stop();
     // The update was installed: the system starts the title again when the app has ended (aptExit), from its new files. On a console the HOME Menu makes that jump. Without it (an
     // emulator that was given the title directly) libctru's way out needs Luma3DS and leaves a black screen: a plain exit then, and the words already said to open it by hand.
+    // 1.1.4, route B (specifiche/8-INGRESSO-DA-3DSLINK.md D-B3): the Download Play page handed a game over - ns:s holds its 16 bytes - and the app
+    // ends into the hidden prepared child, the same jump of libctru's way out as the relaunch below (aptExit: PrepareToDoApplicationJump +
+    // DoApplicationJump, what dlplay does). Only a prepared title of ours on the SD card, only from the installed app and with the HOME Menu there.
     bool home_menu = false;
-    if (g.relaunch && R_SUCCEEDED(APT_IsRegistered(aptGetMenuAppID(), &home_menu)) && home_menu) {
+    if (azl::title_rules::IsPreparedId(g.child_jump) && g.child_jump != azl::title_rules::kAppTid && dlpguest::IsOwnedGuestTid(g.child_jump) &&
+        dlpguest::Jumpable(dlpguest::FormOf(g.child_jump)) && !envIsHomebrew() && R_SUCCEEDED(APT_IsRegistered(aptGetMenuAppID(), &home_menu)) &&
+        home_menu) {
+        // (the build 2f) the id AM has the child by (AmTitleOf: 000400010F8... in the form M3c1, DPAPP-2j): the registry only, no I/O. g.child_jump
+        // stays the key - the guards above. Never a child of the system form of the build 2h (no console has it; Azahar falls on it). The closed game
+        // pm keeps of an M3c1 child is freed at the next start of 3DS Link (zombie_free.cpp), and the Join's gate refuses the jump while one is there
+        aptSetChainloader(dlpguest::AmTitleOf(g.child_jump), MEDIATYPE_SD);  // (1.1.4, route B: the prepared Download Play child; ns:s holds its 16 bytes)
+        dlpjoin::AppendLog(g.paths.datadir, ui::Fmt("dlp: from the room exit to the jump %lu ms (title %016llX on the SD card)",
+                                                    static_cast<unsigned long>(g.child_jump_left_ms != 0 ? azl::platform::NowMs() - g.child_jump_left_ms : 0),
+                                                    static_cast<unsigned long long>(dlpguest::AmTitleOf(g.child_jump))));
+    } else if (g.relaunch && R_SUCCEEDED(APT_IsRegistered(aptGetMenuAppID(), &home_menu)) && home_menu) {
         aptSetChainloaderToSelf();
     }
     return 0;

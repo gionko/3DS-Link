@@ -130,14 +130,17 @@ private:
 };
 
 struct Player {
-    Player(MockRoom& room, u8 last, const char* name, u32 tid_low = kTidLow)
-        : con(room, last), net(con.engine.get()), lobby(&net, Cfg(tid_low, last, name)) {}
-    static LobbyConfig Cfg(u32 tid_low, u8 last, const char* name) {
+    /// `max_players` is the ceiling of the title (LobbyConfig::max_players): 0, the default of every scenario written before the lobby held eight, is
+    /// a title that says nothing - four players.
+    Player(MockRoom& room, u8 last, const char* name, u32 tid_low = kTidLow, u8 max_players = 0)
+        : con(room, last), net(con.engine.get()), lobby(&net, Cfg(tid_low, last, name, max_players)) {}
+    static LobbyConfig Cfg(u32 tid_low, u8 last, const char* name, u8 max_players = 0) {
         LobbyConfig c;
         std::memset(&c, 0, sizeof(c));
         c.game_tid = tid_low;
         c.friend_seed = 0xF000u + last;
         Put(c.name, name);
+        c.max_players = max_players;
         return c;
     }
     UdsEngine& e() {

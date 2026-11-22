@@ -1,19 +1,22 @@
 #!/bin/bash
 # Runs the integration tests against real azahar-room containers:
-#   - the unit tests are only BUILT here (Tests/run.sh with BUILD_ONLY=1; run it without to run them),
+#   - only the probes it runs are BUILT here (Tests/lane.sh room with BUILD_ONLY=1: the policy check first, then the g++ lines of
+#     Tests/run.sh for those binaries; since 2026-11-15, before that the whole run.sh was built again: the unit tests are run.sh's step),
 #   - room_integration: engines over the real room server, then the bounded TX queue and the ENet packet
 #     limit against an in-process room server that stalls or sends oversized messages; the room link and the
 #     game's session: a link that is cut and opened again (through a UDP gate), a member the room still
 #     lists, pauses of the network thread of 3 to 12 s, players who leave the room, the goodbye that is sent
 #     before a quick stop (and its deadline), and a room that closes or kicks (in-process room server),
 #   - room_integration again, linked with the plugin's own ENet platform layer (Sources/enet/enet_3ds.c):
-#     the in-process part only (Tests/enet3ds/build.sh), and enet_path_test (the data path of ENet) against the same layer,
+#     the in-process part only (Tests/enet3ds/build.sh), and enet_path_test (the data path of ENet) and soc_send_test (the count of
+#     the datagrams handed to the socket) against the same layer,
 #   - room_routing_probe: how the real room routes a frame (broadcast MAC, a member's MAC, an unknown MAC),
 #   - chat_room_probe: the chat through RoomClient (azl/chat_core.hpp): A sends and B keeps it with the nick, no echo to A, 20 in
 #     0.2 s -> 2 decoded (one member's share) and one of A amid them kept, 5000 characters -> the room's 500 bytes -> 128 with "...",
 #     one of ours a second, a chat switched off,
 #   - dlp_room_probe: the fake Download Play lobby over the real room (the whole lobby then the game's UDS, four players, a client that leaves and a creator that goes),
-#   - dlp_real_room_probe: the REAL Download Play of 1.1.3 over the real room (I1 our host and our searcher, I2 our host and a model of Azahar's client, I3 20 rounds),
+#   - dlp_real_room_probe: the REAL Download Play of 1.1.3 over the real room (I1 our host and our searcher, I2 our host and a model of Azahar's client, I3 20 rounds, I4 the host's wait for the children, 1.1.4,
+#     I5 route B of 1.1.4: the 3DS Link app's Download Play page joins our host, leaves politely, and the prepared child's plugin comes back with its MAC and name),
 #   - ipc_test: libctru's real uds.c / ndm.c -> UdsHle -> the room (32-bit, fake kernel),
 #   - ffe_replay_test: the FFE golden replay through UdsHle against an Azahar host model and two Azahar client models,
 #   - trace_replay_test: the real traces of the console (FFE and TFH as host, the lid episode with a second lobby in the
@@ -51,12 +54,12 @@ docker run -d --rm --name $R2 --network $NET $ROOM_IMAGE azahar-room \
 sleep 2
 
 RC=0
-# (the whole repository is mounted: the policy check, run first by Tests/run.sh, reads the neighbour DlpLink through ../DlpLink)
+# (the whole repository is mounted: the policy check, run first by Tests/lane.sh as by Tests/run.sh, reads the neighbour DlpLink through ../DlpLink)
 MSYS_NO_PATHCONV=1 docker run --rm --network $NET -v "$(cd .. && (pwd -W 2>/dev/null || pwd)):/src" -w /src/AzaharLink \
     -e BUILD_ONLY=1 -e R1=$R1 -e R2=$R2 $BUILD_IMAGE bash -c '
-      bash Tests/run.sh && /tmp/azl_tests/room_integration $R1 24872 $R2 24872 &&
+      bash Tests/lane.sh room && /tmp/azl_tests/room_integration $R1 24872 $R2 24872 &&
       /tmp/azl_tests/lobby_probe_test $R1 24872 $R2 24872 &&
-      bash Tests/enet3ds/build.sh && /tmp/azl_e3ds/room_integration_3ds --tx-queue && /tmp/azl_e3ds/enet_path_test_3ds &&
+      bash Tests/enet3ds/build.sh && /tmp/azl_e3ds/room_integration_3ds --tx-queue && /tmp/azl_e3ds/enet_path_test_3ds && /tmp/azl_e3ds/soc_send_test_3ds &&
       /tmp/azl_tests/room_routing_probe $R1 24872 &&
       /tmp/azl_tests/chat_room_probe $R1 24872 &&
       /tmp/azl_tests/dlp_room_probe $R1 24872 &&

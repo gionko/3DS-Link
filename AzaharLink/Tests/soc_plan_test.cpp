@@ -1,4 +1,5 @@
 #include "azl/soc_plan.hpp"
+#include "azl/core_plan.hpp"
 
 // Host test of the socket buffer placement arithmetic and of the receive-ring policy (rcvbuf.h), run by
 // Tests/run.sh.
@@ -361,17 +362,71 @@ int main() {
     // The list of the games that get their block when the sockets start. By then Monster Hunter XX holds 80 MiB (13,264 KB of code and stack, 8,240 KB of
     // heap up to 0x0880C000, 59 MiB of device memory): on a New 3DS 44 MiB of budget are left, on an Old 3DS none, and in both cases the plan must offer places
     // above its heap (on the Old 3DS the block then comes from outside the budget).
-    CHECK(sizeof(kLateBlockTitles) / sizeof(kLateBlockTitles[0]) >= 1);
-    for (const uint64_t title : kLateBlockTitles) {
-        CHECK(TakesBlockLate(title));
-        CHECK((title >> 32) == 0x00040000u); // an application, base title: the id the plugin reads from the process
+    // (2026-11-15: the three start-up lists are columns of azl/title_rules.hpp; every row, every region, the application's id only)
+    {
+        int late = 0, guest = 0, core0 = 0;
+        for (std::size_t r = 0; r < azl::title_rules::kRowCount; ++r) {
+            const azl::title_rules::Row& row = azl::title_rules::kRows[r];
+            for (const uint32_t low : row.low) {
+                if (low == 0) {
+                    continue;
+                }
+                const uint64_t app = 0x0004000000000000ull | low;
+                CHECK((TakesBlockLate(app)) == (row.rules.late_soc_block));
+                CHECK((SharesGameSockets(app)) == (row.rules.soc_guest));
+                CHECK((azl::ctr::coreplan::LeavesCore1ToTheGame(app)) == (row.rules.worker_off_core1));
+                late += row.rules.late_soc_block ? 1 : 0;
+                guest += row.rules.soc_guest ? 1 : 0;
+                core0 += row.rules.worker_off_core1 ? 1 : 0;
+                // the Download Play child, the update, a DLC: not the application's id, no start-up rule
+                for (const uint64_t other : {uint64_t{0x0004000100000000ull | low}, uint64_t{0x0004000E00000000ull | low}, uint64_t{0x0004008C00000000ull | low}}) {
+                    CHECK(!TakesBlockLate(other));
+                    CHECK(!SharesGameSockets(other));
+                    CHECK(!azl::ctr::coreplan::LeavesCore1ToTheGame(other));
+                }
+            }
+        }
+        CHECK((late) == (2));   // Monster Hunter XX: Japan, Taiwan
+        CHECK((guest) == (3));  // Fantasy Life: Europe, USA, Japan
+        CHECK((core0) == (15)); // Ridge Racer 3D 3, Pac-Man & Galaga Dimensions 3, Ocarina of Time 3D 9
     }
     CHECK(TakesBlockLate(0x0004000000197100ull));
+    CHECK(TakesBlockLate(0x00040000001B8100ull)); // (Taiwan)
+    CHECK(SharesGameSockets(0x0004000000113100ull));
+    CHECK(SharesGameSockets(0x000400000006D200ull));
+    CHECK(!SharesGameSockets(0x0004000000197100ull));
+    CHECK(!SharesGameSockets(0x00040000000F8200ull)); // Island Tour
     CHECK(!TakesBlockLate(0x0004000E00197100ull)); // (its update: not the id of the process)
     CHECK(!TakesBlockLate(0x0004000000197000ull));
     CHECK(!TakesBlockLate(0x00040000001C2100ull)); // Kirby Battle Royale
     CHECK(!TakesBlockLate(0x000400000F83D100ull)); // the app
     CHECK(!TakesBlockLate(0));
+
+    // The list of the games whose own thread on core 1 the kernel refuses while the framework's worker holds it (azl/core_plan.hpp, ErrDisp 0xE0A01839).
+    {
+        using namespace azl::ctr::coreplan;
+        static_assert(LeavesCore1ToTheGame(0x0004000000033B00ull), "Ridge Racer 3D");
+        // the six ids the lists had before the table (2026-11-15) keep their answer
+        for (const uint64_t title : {0x0004000000033B00ull, 0x0004000000036300ull, 0x0004000000045D00ull, 0x0004000000033600ull, 0x0004000000033500ull,
+                                     0x0004000000033400ull}) {
+            CHECK(LeavesCore1ToTheGame(title));
+        }
+        CHECK(LeavesCore1ToTheGame(0x0004000000033B00ull));  // Ridge Racer 3D (Europe)
+        CHECK(LeavesCore1ToTheGame(0x0004000000032800ull));  // ... Japan
+        CHECK(LeavesCore1ToTheGame(0x0004000000035800ull));  // ... USA
+        CHECK(LeavesCore1ToTheGame(0x0004000000036300ull));  // Pac-Man & Galaga Dimensions (USA)
+        CHECK(LeavesCore1ToTheGame(0x0004000000045D00ull));  // ... Europe
+        CHECK(LeavesCore1ToTheGame(0x0004000000039900ull));  // ... Japan
+        CHECK(LeavesCore1ToTheGame(0x0004000000033600ull));  // Ocarina of Time 3D (Europe)
+        CHECK(LeavesCore1ToTheGame(0x000400000008F900ull));  // ... Taiwan
+        CHECK(!LeavesCore1ToTheGame(0x00040000000F8200ull)); // Island Tour
+        CHECK(!LeavesCore1ToTheGame(0x0004000E00033B00ull)); // (its update: not the id of the process)
+        CHECK(!LeavesCore1ToTheGame(0x0004000000033C00ull)); // Super Street Fighter IV: it starts with the worker on core 1
+        CHECK(!LeavesCore1ToTheGame(0x000400000007E900ull)); // CTRPATKP: the same
+        CHECK(!LeavesCore1ToTheGame(0x0004000000197100ull)); // Monster Hunter XX
+        CHECK(!LeavesCore1ToTheGame(0x000400000F83D100ull)); // the app
+        CHECK(!LeavesCore1ToTheGame(0));
+    }
     {
         const uint32_t heap_end = 0x0880C000;
         const Inputs late_new{0x7C00000, 0x5000000, 0x0FFE8000, 0x7C00000};

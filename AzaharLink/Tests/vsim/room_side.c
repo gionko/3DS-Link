@@ -23,7 +23,7 @@ void room_init(void) {
 int room_connected(void) { return console != NULL && console->state == ENET_PEER_STATE_CONNECTED; }
 
 void room_inject(uint32_t id, uint32_t size) {
-    uint8_t buf[1600];
+    uint8_t buf[4096]; /* (plugin-causa: frames of the minigames, up to 2.9 KB, go in 2-3 fragments) */
     if (size < 8) size = 8;
     if (size > sizeof buf) size = sizeof buf;
     memset(buf, 0xA5, size);
@@ -48,6 +48,11 @@ void room_service(void) {
             break;
         case ENET_EVENT_TYPE_RECEIVE:
             ++st.rx_packets;
+            if (ev.packet->dataLength >= 4) {
+                uint32_t id;
+                memcpy(&id, ev.packet->data, 4);
+                vsim_on_room_rx(id);
+            }
             enet_packet_destroy(ev.packet);
             break;
         case ENET_EVENT_TYPE_DISCONNECT:
@@ -64,6 +69,42 @@ void room_service(void) {
             const uint32_t rto = p->roundTripTime + 4 * p->roundTripTimeVariance;
             if (p->roundTripTimeVariance > st.rtt_var_max) st.rtt_var_max = p->roundTripTimeVariance;
             if (rto > st.rto_max) st.rto_max = rto;
+        }
+    }
+}
+
+void room_probe(uint16_t hole_seq, RoomProbe* p) {
+    ENetListIterator it;
+    memset(p, 0, sizeof *p);
+    if (!room_connected()) return;
+    p->in_transit = (uint32_t)console->reliableDataInTransit;
+    p->throttle = console->packetThrottle;
+    p->window = console->windowSize;
+    for (it = enet_list_begin(&console->sentReliableCommands); it != enet_list_end(&console->sentReliableCommands); it = enet_list_next(it)) {
+        const ENetOutgoingCommand* c = (const ENetOutgoingCommand*)it;
+        if (c->command.header.channelID != 0) continue;
+        ++p->unacked;
+        if (c->sendAttempts > p->max_attempts) p->max_attempts = c->sendAttempts;
+        if (c->roundTripTimeout > p->max_rto_ms) p->max_rto_ms = c->roundTripTimeout;
+        if (c->reliableSequenceNumber == hole_seq) {
+            const uint32_t gone = server->serviceTime - c->sentTime;
+            p->hole_where = 1;
+            p->hole_attempts = c->sendAttempts;
+            p->hole_rto_ms = c->roundTripTimeout;
+            p->hole_next_ms = gone < c->roundTripTimeout ? c->roundTripTimeout - gone : 0;
+        }
+    }
+    for (it = enet_list_begin(&console->outgoingSendReliableCommands); it != enet_list_end(&console->outgoingSendReliableCommands); it = enet_list_next(it)) {
+        const ENetOutgoingCommand* c = (const ENetOutgoingCommand*)it;
+        if (c->sendAttempts == 0) continue;
+        ++p->resend_waiting;
+        ++p->unacked;
+        if (c->sendAttempts > p->max_attempts) p->max_attempts = c->sendAttempts;
+        if (c->roundTripTimeout > p->max_rto_ms) p->max_rto_ms = c->roundTripTimeout;
+        if (c->reliableSequenceNumber == hole_seq) {
+            p->hole_where = 2;
+            p->hole_attempts = c->sendAttempts;
+            p->hole_rto_ms = c->roundTripTimeout;
         }
     }
 }

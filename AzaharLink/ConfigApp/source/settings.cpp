@@ -205,7 +205,7 @@ LoadResult LoadSettings(Settings& cfg) {
         } else if (key == "menu_key") {
             if (!value.empty()) {
                 cfg.menu_key = azl::ini::MenuKeyFromFile(value); // (a chord, or off/none: carried as it is; the old default is the new one)
-                if (!azl::ini::MenuKeyIsOff(value)) {
+                if (!azl::ini::MenuKeyIsOff(cfg.menu_key)) { // (DPAPP-2j: a value with no key read is off, and no chord to keep)
                     cfg.menu_chord = cfg.menu_key;
                 }
             }
@@ -218,7 +218,7 @@ LoadResult LoadSettings(Settings& cfg) {
         } else if (key == "sleep_stop") {
             cfg.sleep_stop = azl::ini::SleepStop(value);
         } else if (key == "chat") {
-            cfg.chat = azl::ini::ParseBool(value, true);
+            cfg.chat = azl::ini::ParseBool(value, azl::ini::kChatDefault);
         } else if (key == "chat_key") {
             if (!value.empty()) {
                 cfg.chat_key = value;

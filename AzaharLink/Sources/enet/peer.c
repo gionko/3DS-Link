@@ -246,6 +246,16 @@ enet_peer_receive (ENetPeer * peer, enet_uint8 * channelID)
 
    -- packet -> referenceCount;
 
+   {
+      /* AzaharLink: how late this packet reaches the caller (ENetAzlCounters::streamLagMaxMs): the lag of its datagram and the time it waited here since.
+         The clock is the call's (no read of its own): a packet handed over at the start of a service call is timed with the previous call's clock, so the
+         figure is short by one round of the caller at the most, never long. */
+      const enet_uint32 waited = peer -> host -> serviceTime - incomingCommand -> azlArrived;
+
+      if (waited < 0x7FFFFFFFu && incomingCommand -> azlLagMs + waited > peer -> host -> azlCounters.streamLagMaxMs)
+        peer -> host -> azlCounters.streamLagMaxMs = incomingCommand -> azlLagMs + waited;
+   }
+
    if (incomingCommand -> fragments != NULL)
      enet_free (incomingCommand -> fragments);
 
@@ -292,6 +302,9 @@ enet_peer_remove_incoming_commands (ENetPeer * peer, ENetList * queue, ENetListI
          continue;
 
        enet_list_remove (& incomingCommand -> incomingCommandList);
+
+       if (incomingCommand -> azlDispatched == 2 && peer -> host -> azlCapDropHeld > 0)
+         -- peer -> host -> azlCapDropHeld;
  
        if (incomingCommand -> packet != NULL)
        {
@@ -821,6 +834,7 @@ enet_peer_dispatch_incoming_reliable_commands (ENetPeer * peer, ENetChannel * ch
 {
     ENetListIterator currentCommand;
     int early = 0;
+    int advanced = 0; /* (AzaharLink: the reliable sequence advanced in this call; see the end) */
 
     /* AzaharLink: with azlDeliverOutOfOrder a complete command is handed over as soon as it is here, whatever is still missing
        before it. A placeholder (no packet, azlDispatched) keeps its sequence number in the list: the in-order pass below still
@@ -896,6 +910,7 @@ enet_peer_dispatch_incoming_reliable_commands (ENetPeer * peer, ENetChannel * ch
     {
        ENetListIterator inOrder;
 
+       advanced = 1;
        channel -> incomingUnreliableSequenceNumber = 0;
 
        /* (the in-order run goes to the dispatch queue as before; a placeholder is freed instead: its packet went already) */
@@ -906,7 +921,10 @@ enet_peer_dispatch_incoming_reliable_commands (ENetPeer * peer, ENetChannel * ch
           inOrder = enet_list_next (inOrder);
           enet_list_remove (& incomingCommand -> incomingCommandList);
           if (incomingCommand -> azlDispatched)
+          {
+            peer -> host -> azlCapDropHeld -= (incomingCommand -> azlDispatched == 2 && peer -> host -> azlCapDropHeld > 0) ? 1u : 0u; /* (a dropped one's place) */
             enet_free (incomingCommand);
+          }
           else
           {
             if (incomingCommand -> azlHoleSince != 0)
@@ -928,15 +946,50 @@ enet_peer_dispatch_incoming_reliable_commands (ENetPeer * peer, ENetChannel * ch
        peer -> flags |= ENET_PEER_FLAG_NEEDS_DISPATCH;
     }
 
-    if (currentCommand != enet_list_begin (& channel -> incomingReliableCommands) &&
-        ! enet_list_empty (& channel -> incomingUnreliableCommands))
+    /* AzaharLink (2026-11-15): as upstream ENet, the unreliable commands that waited for the reliable sequence go now that it advanced. The
+       test was `currentCommand != enet_list_begin (...)`, upstream's, but the loop above has unlinked the in-order run already, so the list
+       begins at currentCommand and that test was always false (since the rework of 2026-10-25): they stayed until the next unreliable command */
+    if (advanced && ! enet_list_empty (& channel -> incomingUnreliableCommands))
        enet_peer_dispatch_incoming_unreliable_commands (peer, channel, queuedCommand);
 }
+
+/* AzaharLink: with the waiting data at the host's limit, is this the command that is taken all the same? A reliable one (or the first fragment seen of a
+   reliable packet: `sequence` is then the packet's first number), the next of its channel's sequence (16 bits: it wraps), with reliable commands of the
+   channel waiting (behind it, or itself, a large packet whose fragments are still coming), and the waiting data less than one packet of the largest size
+   over the limit. The reliable list only: the room's stream is all reliable. Unreliable commands that wait for a missing reliable one are NOT a way out
+   here: the room sends none, and a rule for them could not be tried against it (the reliable command that closes the hole hands them over
+   after it since 2026-11-15, as upstream ENet: see the end of enet_peer_dispatch_incoming_reliable_commands). */
+#define ENET_AZL_HOLE_CLOSER(peer, channel, reliable, sequence) \
+   ((reliable) && \
+    (sequence) == (enet_uint16) ((channel) -> incomingReliableSequenceNumber + 1) && \
+    ! enet_list_empty (& (channel) -> incomingReliableCommands) && \
+    (peer) -> totalWaitingData - (peer) -> host -> maximumWaitingData < (peer) -> host -> maximumPacketSize)
+
+/* AzaharLink: at the limit, is this command dropped (acknowledged, its place kept) instead of refused? A reliable one, the host has a filter of game frames and
+   room for one more placeholder, and the filter says yes for the packet's first bytes: the command's data, or for a fragment the data of the fragment that
+   holds them (ENetHost::azlFragmentHead; a later fragment seen first cannot be told, and is refused). See ENetHost::azlCapDrop. */
+#define ENET_AZL_CAP_DROPS(peer, reliable, fragmentCount, data, dataLength) \
+   ((reliable) && (peer) -> host -> azlCapDrop != NULL && \
+    (peer) -> host -> azlCapDropHeld < ((peer) -> host -> azlCapDropMax != 0 ? (peer) -> host -> azlCapDropMax : ENET_AZL_CAP_DROP_MAX) && \
+    ((fragmentCount) > 0 ? ((peer) -> host -> azlFragmentHead != NULL && \
+                            (peer) -> host -> azlCapDrop ((peer) -> host -> azlFragmentHead, (peer) -> host -> azlFragmentHeadLength)) \
+                         : (peer) -> host -> azlCapDrop ((const enet_uint8 *) (data), (dataLength))))
+
+/* AzaharLink: ... and one that is refused only because the placeholders are at the maximum (ENetAzlCounters::capDropFull): the same, at the bound. */
+#define ENET_AZL_CAP_DROP_FULL(peer, reliable, fragmentCount, data, dataLength) \
+   ((reliable) && (peer) -> host -> azlCapDrop != NULL && \
+    (peer) -> host -> azlCapDropHeld >= ((peer) -> host -> azlCapDropMax != 0 ? (peer) -> host -> azlCapDropMax : ENET_AZL_CAP_DROP_MAX) && \
+    ((fragmentCount) > 0 ? ((peer) -> host -> azlFragmentHead != NULL && \
+                            (peer) -> host -> azlCapDrop ((peer) -> host -> azlFragmentHead, (peer) -> host -> azlFragmentHeadLength)) \
+                         : (peer) -> host -> azlCapDrop ((const enet_uint8 *) (data), (dataLength))))
 
 ENetIncomingCommand *
 enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command, const void * data, size_t dataLength, enet_uint32 flags, enet_uint32 fragmentCount)
 {
     static ENetIncomingCommand dummyCommand;
+    /* AzaharLink: what the drop at the limit returns (see dropCommand): its placeholder may be freed by the dispatch that follows it, so the caller is
+       given this one, which says "dropped" (azlDispatched = 2) and holds nothing: enet_protocol_handle_send_fragment acknowledges on it and writes nothing */
+    static ENetIncomingCommand azlDroppedCommand;
 
     ENetChannel * channel = & peer -> channels [command -> header.channelID];
     enet_uint32 unreliableSequenceNumber = 0, reliableSequenceNumber = 0;
@@ -963,7 +1016,7 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
         if (reliableWindow < currentWindow || reliableWindow >= currentWindow + ENET_PEER_FREE_RELIABLE_WINDOWS - 1)
         {
           if (azlReliable)
-            ++ peer -> host -> azlCounters.dupCommands;
+            ENET_AZL_NOTE_DUP (peer -> host);
           goto discardCommand;
         }
     }
@@ -974,7 +1027,7 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
     case ENET_PROTOCOL_COMMAND_SEND_RELIABLE:
        if (reliableSequenceNumber == channel -> incomingReliableSequenceNumber)
        {
-         ++ peer -> host -> azlCounters.dupCommands;
+         ENET_AZL_NOTE_DUP (peer -> host);
          goto discardCommand;
        }
        
@@ -998,7 +1051,7 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
              if (incomingCommand -> reliableSequenceNumber < reliableSequenceNumber)
                break;
 
-             ++ peer -> host -> azlCounters.dupCommands;
+             ENET_AZL_NOTE_DUP (peer -> host);
              goto discardCommand;
           }
        }
@@ -1055,7 +1108,24 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
     }
 
     if (peer -> totalWaitingData >= peer -> host -> maximumWaitingData)
-      goto notifyError;
+    {
+       /* AzaharLink: the limit is reached. A command is refused (not acknowledged: the sender sends it again) and counted - except the one reliable
+          command that is the next of this channel's sequence while other reliable ones wait behind it: it is what turns the waiting data into
+          packets the caller can take, and refusing it with the rest left the connection with no way out (see ENetHost::azlCapRefused for the rule
+          and its bound). */
+       /* AzaharLink: for the titles whose room client gives a filter (ENetHost::azlCapDrop), a game frame is acknowledged and dropped instead */
+       if (! ENET_AZL_HOLE_CLOSER (peer, channel, azlReliable, reliableSequenceNumber) && ENET_AZL_CAP_DROPS (peer, azlReliable, fragmentCount, data, dataLength))
+         goto dropCommand;
+       if (! ENET_AZL_HOLE_CLOSER (peer, channel, azlReliable, reliableSequenceNumber))
+       {
+          ++ peer -> host -> azlCounters.capRefused;
+          peer -> host -> azlCapRefused = 1;
+          peer -> host -> azlCounters.capDropFull += ENET_AZL_CAP_DROP_FULL (peer, azlReliable, fragmentCount, data, dataLength) ? 1u : 0u;
+          goto notifyError;
+       }
+
+       ++ peer -> host -> azlCounters.capAdmitted;
+    }
 
     packet = enet_packet_create (data, dataLength, flags);
     if (packet == NULL)
@@ -1074,6 +1144,8 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
     incomingCommand -> fragments = NULL;
     incomingCommand -> azlDispatched = 0;
     incomingCommand -> azlHoleSince = 0;
+    incomingCommand -> azlArrived = peer -> host -> serviceTime;
+    incomingCommand -> azlLagMs = peer -> host -> azlDatagramLag;
     if (azlReliable && reliableSequenceNumber != (enet_uint16) (channel -> incomingReliableSequenceNumber + 1))
     {
        /* AzaharLink: not the next one in the sequence: it waits behind a hole (or goes out ahead of it, azlDeliverOutOfOrder) */
@@ -1099,6 +1171,8 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
        ++ packet -> referenceCount;
       
        peer -> totalWaitingData += packet -> dataLength;
+       if (peer -> totalWaitingData > peer -> host -> azlCounters.waitingMaxBytes)
+         peer -> host -> azlCounters.waitingMaxBytes = (enet_uint32) peer -> totalWaitingData;
     }
 
     enet_list_insert (enet_list_next (currentCommand), incomingCommand);
@@ -1116,6 +1190,42 @@ enet_peer_queue_incoming_command (ENetPeer * peer, const ENetProtocol * command,
     }
 
     return incomingCommand;
+
+dropCommand:
+    /* AzaharLink: acknowledged (the handler returns 0) and dropped: its place in the sequence, no packet (see ENetHost::azlCapDrop) */
+    incomingCommand = (ENetIncomingCommand *) enet_malloc (sizeof (ENetIncomingCommand));
+    if (incomingCommand == NULL)
+    {
+       ++ peer -> host -> azlCounters.capRefused;
+       peer -> host -> azlCapRefused = 1;
+       goto notifyError;
+    }
+
+    incomingCommand -> reliableSequenceNumber = command -> header.reliableSequenceNumber;
+    incomingCommand -> unreliableSequenceNumber = 0;
+    incomingCommand -> command = * command;
+    incomingCommand -> fragmentCount = fragmentCount;
+    incomingCommand -> fragmentsRemaining = 0;
+    incomingCommand -> packet = NULL;
+    incomingCommand -> fragments = NULL;
+    incomingCommand -> azlDispatched = 2;
+    incomingCommand -> azlHoleSince = 0;
+    incomingCommand -> azlArrived = peer -> host -> serviceTime;
+    incomingCommand -> azlLagMs = 0;
+
+    enet_list_insert (enet_list_next (currentCommand), incomingCommand);
+    ++ peer -> host -> azlCapDropHeld;
+    ++ peer -> host -> azlCounters.capDropped;
+    if (peer -> host -> azlCapDropHeld > peer -> host -> azlCounters.capDropHeldMax)
+      peer -> host -> azlCounters.capDropHeldMax = peer -> host -> azlCapDropHeld;
+
+    /* (the dispatch frees the placeholder at once when it is in order - the next of the sequence with nothing before it - so it is not read after this) */
+    enet_peer_dispatch_incoming_reliable_commands (peer, channel, incomingCommand);
+
+    azlDroppedCommand.azlDispatched = 2;
+    azlDroppedCommand.packet = NULL;
+    azlDroppedCommand.fragments = NULL;
+    return & azlDroppedCommand;
 
 discardCommand:
     if (fragmentCount > 0)

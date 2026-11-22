@@ -395,6 +395,25 @@ void App::RefreshInstall() {
     QueuePluginCopyRefresh();
 }
 
+namespace {
+
+// The folder of the system's Download Play application, once a row of Enable Titles (1.1.4 builds before spec 9): it is not any more, and a copy of ours
+// there would start the plugin in the application with no row to switch it off. Taken away ONLY when the folder holds our plugin and nothing else, never
+// another .3gx of the user's, never another title's folder; it is never brought up to date. Looked for at every start, in its six folders only: a console
+// that had such a build with the plugin of now never sees the plugin change, and the look at the copies below never runs there (the review of spec 9).
+int DropDownloadPlayLeftovers(setup::CopyWorker& worker) {
+    int submitted = 0;
+    for (const u64 tid : setup::kDownloadPlayTids) {
+        if (setup::IsDownloadPlayLeftover(tid, setup::ReadSlot(tid).slot)) {
+            worker.Submit(tid, setup::CopyKind::Disable, std::string());
+            ++submitted;
+        }
+    }
+    return submitted;
+}
+
+} // namespace
+
 void App::QueuePluginCopyRefresh() {
     if (plugin_copies_checked || !plugin_ready) {
         // (it does NOT wait for the scan of the titles any more: whoever has just installed an update waits for THIS, and the scan of a big library takes minutes; the thread of
@@ -402,21 +421,26 @@ void App::QueuePluginCopyRefresh() {
         return;
     }
     plugin_copies_checked = true;
+    setup::CopyWorker& worker = setup::CopyWorker::Get();
+    int submitted = DropDownloadPlayLeftovers(worker); // (at every start, before the stamp: counted in the pass the main page tells about)
     // The copies were brought up to this very plugin (its size and its bytes: PluginContentStamp) on an earlier start, and 3DSLink.cfg says so: nothing to read. A plugin that was
     // replaced has another stamp, and the look is made (and the new stamp written when it is done: main.cpp). The plugin file on the card is, byte for byte, the plugin inside the
     // app here (plugin_ready), so the stamp is made from the bytes in memory.
     const std::string stamp = setup::PluginContentStamp(setup::EmbeddedPluginData(), setup::EmbeddedPluginSize());
     if (!stamp.empty() && stamp == app_cfg.plugin_stamp) {
+        plugin_pass_total = submitted;
+        plugin_pass_open = submitted > 0;
         return;
     }
     plugin_stamp_pending = stamp;
-    setup::CopyWorker& worker = setup::CopyWorker::Get();
-    int submitted = 0;
     for (const std::string& name : setup::ListPluginFolders()) {
         char* end = nullptr;
         const u64 tid = std::strtoull(name.c_str(), &end, 16);
         if (end == name.c_str() || *end != '\0') {
             continue;
+        }
+        if (setup::IsDownloadPlayTid(tid)) {
+            continue; // (the folder of the Download Play application is never brought up to date: its leftover was taken away above)
         }
         worker.SubmitRefresh(tid, paths.plugin_file); // (the work, reading the folder and the two files, is the thread's)
         ++submitted;
@@ -1114,6 +1138,15 @@ void DrawProgressBar(float x, float y, float w, float h, float fraction) {
         gfx::FillGradient(x + 1.0f, y + 1.0f, filled, h - 2.0f, gfx::Mix(col::kAccent, col::kText, 0.35f),
                           gfx::Mix(col::kAccent, col::kText, 0.35f), col::kAccent, col::kAccent);
     }
+    gfx::StrokeRect(x, y, w, h, 1.0f, col::kBorder);
+}
+
+void DrawSpaceBar(float x, float y, float w, float h, double used, double added) {
+    gfx::FillRect(x, y, w, h, col::kTrack);
+    const float used_w = static_cast<float>(Clamp(used, 0.0, 1.0)) * w;
+    const float add_w = static_cast<float>(Clamp(used + added, 0.0, 1.0)) * w - used_w;
+    gfx::FillRect(x, y, used_w, h, col::kOn);
+    gfx::FillRect(x + used_w, y, add_w, h, col::kOff);
     gfx::StrokeRect(x, y, w, h, 1.0f, col::kBorder);
 }
 

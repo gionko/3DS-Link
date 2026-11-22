@@ -137,6 +137,30 @@ public:
         }
         return s;
     }
+    /// A string of which at most `keep` bytes are kept (2026-11-10): the length is read, the first `keep` bytes are taken - less the tail
+    /// of a UTF-8 letter the cut would leave half (up to 3 bytes) - and the rest is skipped. `keep` 0: a field nobody reads, only skipped,
+    /// nothing allocated. A length past the end of the packet is a bad packet as before: ok() false, nothing kept.
+    /// The strings of the room's information are the members' own (the game's name is whatever each member's client sends, the room's name
+    /// its host's): without a limit a packet of 64 KB became 64 KB of strings on the plugin's heap at every change of the room, and the
+    /// in-game menu measured them a byte at a time on every frame.
+    std::string String(std::size_t keep) {
+        const u32 len = U32();
+        std::string s;
+        if (len > 0 && Check(len)) {
+            std::size_t n = len < keep ? len : keep;
+            if (n < len) {
+                // (the first byte left out is a continuation byte: the letter it belongs to goes too)
+                for (int back = 0; back < 3 && n > 0 && (data_[pos_ + n] & 0xC0) == 0x80; ++back) {
+                    --n;
+                }
+            }
+            if (n > 0) {
+                s.assign(reinterpret_cast<const char*>(data_ + pos_), n);
+            }
+            pos_ += len;
+        }
+        return s;
+    }
     Mac MacAddress() {
         Mac m{};
         if (Check(6)) {
@@ -165,6 +189,16 @@ private:
     std::size_t pos_ = 0;
     bool ok_ = true;
 };
+
+/// How much of each string of the room's information is kept (DecodeRoomInformation; PacketReader::String(keep)). The fields nobody reads -
+/// a member's username, display name and avatar URL, in the plugin and in the 3DS Link app alike - are skipped, kept at 0.
+constexpr std::size_t kKeepRoomName = 128;    ///< the room accepts far less; the menu and the notifications cut it to the screen
+constexpr std::size_t kKeepDescription = 512; ///< shown by the app only, on two lines
+constexpr std::size_t kKeepGameName = 255;    ///< NOT less: the plugin learns its own title from its member entry, cuts it at 80 bytes on a
+                                              ///< letter's edge (SanitizeTitle) and sends it back to the room - a shorter cut here would
+                                              ///< change what the Azahar clients are told
+constexpr std::size_t kKeepHostUsername = 64; ///< shown by the app only
+constexpr std::size_t kKeepNickname = 32;     ///< the room accepts 4 to 20 characters
 
 struct MemberInfo {
     std::string nickname;

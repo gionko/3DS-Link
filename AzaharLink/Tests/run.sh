@@ -17,7 +17,10 @@
 # the rules of the attempts to join again, the screen messages and the sleep notification, and the log lines for the
 # players that come into the room and leave it (azl/room_members.hpp). soc_plan_test covers
 # the socket block placement and the SO_RCVBUF policy (hard limit, ring budget, ini key, retry ladder against a
-# model of the soc service). log_files_test covers the log and what it costs when it is off: the ini values (debug 0
+# model of the soc service). soc_send_test covers the count of the datagrams handed to the room socket (azl/stats.hpp, soc_send_*:
+# taken whole, refused with EWOULDBLOCK, failed, taken short) against the plugin's OWN ENet platform layer, Sources/enet/enet_3ds.c,
+# with the socket call under it answered by the test: what enet_socket_send returns, the errno it leaves, what TakeStats() gives.
+# log_files_test covers the log and what it costs when it is off: the ini values (debug 0
 # or 1, menu_key off), Log() and the capture doing nothing and allocating nothing at debug 0, the log's files on a
 # directory (none created at 0, 0 -> 1 -> 0 -> 1 with the writer running, rotation), the first line of every capture file
 # (the console's clock), the bounded passes of the capture's drain and the diet's and the LOST lines in the file, the
@@ -86,7 +89,7 @@
 # real room server (Tests/integration.sh). Tests/dlp_net_stack_check.sh builds the adapter and the engine for the plugin's target and holds the frames and the static storage.
 # Tests/dlp_stack_check.sh (with Tests/dlp_stack_probe.cpp) builds the same three headers for the plugin's own target, with arm-none-eabi-g++ and the flags of the Makefile, and holds what the x86-64
 # tests cannot see: the frame of every function (48 bytes, PollScan and Dispatch 64), the frames added up from each function down to its deepest call out of the module (160), no recursion, no dynamic
-# frame, the sizes on ARM32 (the lobby 272 bytes, the service 40) and a wrapper for every public function. It looks for the compiler in /opt/devkitpro/devkitARM/bin too, and is skipped aloud where there is none.
+# frame, the sizes on ARM32 (the lobby 400 bytes, the service 40) and a wrapper for every public function. It looks for the compiler in /opt/devkitpro/devkitARM/bin too, and is skipped aloud where there is none.
 # Tests/policy_check.sh (run first) reads the sources for the defaults and switches that must not change by accident:
 # sleep_stop off, debug 0, rcvbuf_kb 64, the ini keys the plugin knows, the scan filter that only counts, the one
 # place where a log file is opened and the level check in front of it.
@@ -111,9 +114,34 @@ g++ $CXXFLAGS Tests/test_main.cpp $CORE "$OUT"/enet_*.o -o "$OUT/test_main"
 g++ $CXXFLAGS Tests/ring_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/ring_test"
 g++ $CXXFLAGS Tests/dedupe_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/dedupe_test"
 g++ $CXXFLAGS Tests/link_policy_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/link_policy_test"
+# beacon_cache_test (2026-11-10): the host's beacon is made again only when its network changed (UdsEngine::BeaconFrameLocked), byte for byte against
+# GenerateBeaconFrame in a game's network, the fake lobby's and the real Download Play's; it counts the SHA-1 calls through the linker's --wrap
+g++ $CXXFLAGS -DAZL_HAS_BEACON_CACHE -Wl,--wrap=_ZN3azl4Sha1EPKhmPh Tests/beacon_cache_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/beacon_cache_test"
+# uds_eight_test (2026-11-13): the game's OWN nwm::UDS network with EIGHT nodes (Tetris; Mario Kart 7 after its lobby), which no console session has shown yet: a host and
+# seven clients over the in-memory room - the tables of every node after every join (and the host's beacon, whose node list needs two tags), the ninth, every frame once and
+# only where it must, who leaves and comes back, the host's end, seven joins in one round trip, the guests that say goodbye twice, and what 8 x 60 frames a second cost the
+# room and a bind's ring. Its KNOWN_GAP_EQ lines hold the open points as the engine has them today (GB-01, a full host's answer, the table of who left: analysis/lobby-otto-2026-11-13/revisione-uds-normale-a-otto)
+g++ $CXXFLAGS Tests/uds_eight_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/uds_eight_test"
 # enet_path_test: the ENet client's data path (what a service call reads, when the acknowledgements go, the counters); the link wraps
 # the platform layer's three socket calls so that the test can count them, and ENet's clock so that it can hold it
 g++ $CXXFLAGS Tests/enet_path_test.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_wait -Wl,--wrap=enet_time_get -o "$OUT/enet_path_test"
+# enet_cap_test and flow_relief_test (2026-11-14, Mario Party: Island Tour hosted by a console): ENet's limit of waiting data and its dead end - the state made by hand with
+# datagrams written byte by byte, the way out, the bound, the counters, the lag of the stream - and the relief of a dense broadcast stream for the listed titles
+# (azl/flow_relief.hpp: the list, the same-frame filter alone and in UdsEngine::SendTo, the hand-over burst of RoomClient::Run, the statistics line). The model's part
+# is Tests/vsim/island_dice.sh (it needs ENet 1.3.18 for the room's side: not run from here).
+# (2026-11-15) enet_cap_test links an ENet of its own built with the address sanitizer too: the C objects above are not, so a read of a placeholder of the
+# drop at the limit after the dispatch freed it (enet_protocol_handle_send_fragment) passed unseen there; with these it stops the test (TestTheDropInOrder)
+for f in callbacks compress host list packet peer protocol; do
+  gcc $CFLAGS -fsanitize=address,undefined -c Sources/enet/$f.c -o "$OUT/asan_enet_$f.o"
+done
+gcc $CFLAGS -fsanitize=address,undefined -c third_party/enet/unix.c -o "$OUT/asan_enet_unix.o"
+g++ $CXXFLAGS Tests/enet_cap_test.cpp $CORE "$OUT"/asan_enet_*.o -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_time_get -o "$OUT/enet_cap_test"
+g++ $CXXFLAGS Tests/flow_relief_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/flow_relief_test"
+# soc_send_test (2026-11-11): the count of the datagrams handed to the room socket, against the plugin's own ENet platform layer (Sources/enet/enet_3ds.c with the shim of
+# Tests/enet3ds for the one libctru call it makes; its object is NOT an enet_*.o: every other test here links the PC's layer). The link wraps the socket calls under the
+# layer (the test decides what the socket answers) and the layer's two hooks (the test sees what they are told, and leaves another errno behind)
+gcc $CFLAGS -ITests/enet3ds/shim -c Sources/enet/enet_3ds.c -o "$OUT/plat_3ds.o"
+g++ $CXXFLAGS Tests/soc_send_test.cpp Sources/azl/log.cpp Sources/azl/platform.cpp "$OUT/plat_3ds.o" -Wl,--wrap=sendto -Wl,--wrap=send -Wl,--wrap=azl_c_soc_send -Wl,--wrap=azl_c_soc_call -o "$OUT/soc_send_test"
 # hook_swap_test: the plugin's side of the svc hook's persistent gate around the swap of the plugin's memory on an Old 3DS (azl/hook_swap.hpp: the gate's close and open, with real
 # threads through a model of gate.s, and no word of the game's text written after the installation); the same source with ThreadSanitizer (the gate's count and flag)
 g++ $CXXFLAGS Tests/hook_swap_test.cpp -o "$OUT/hook_swap_test"
@@ -161,11 +189,17 @@ g++ $CXXFLAGS Tests/plg_guard_test.cpp -o "$OUT/plg_guard_test"
 # Rosalina's whole-word store and == on the events): cases A, B, SSF4, the exit during a wait, normal.
 g++ $CXXFLAGS Tests/exit_guard_test.cpp -o "$OUT/exit_guard_test"
 g++ $CXXFLAGS Tests/capture_test.cpp $CORE "$OUT"/enet_*.o -o "$OUT/capture_test"
+# game_card_calls_test (2026-11-11): which IPC calls of the game the hook counts as calls to the file system (azl/game_card_calls.hpp, a pure
+# header: every fs command, not the reads alone - Tekken 3D's open that waited 26 s behind the log's writer), over the fs headers of two real
+# captures, the calls a game makes to the other services, the whole command space, and the hook's two lines around the writer's watch
+g++ $CXXFLAGS Tests/game_card_calls_test.cpp -o "$OUT/game_card_calls_test"
 # The fake Download Play lobby: header-only modules (Includes/azl/dlp_*.hpp) and the in-memory network of the tests (Tests/dlp_fakenet.hpp, found beside the
 # tests), so there is nothing to link. ASan/UBSan like the rest: each of these tests defines __ubsan_default_options (halt_on_error=1) and so stops at the
 # first undefined behaviour. dlp_lobby_sim_test takes about 35 s.
 g++ $CXXFLAGS Tests/dlp_lobby_test.cpp -o "$OUT/dlp_lobby_test"
 g++ $CXXFLAGS Tests/dlp_ipc_test.cpp -o "$OUT/dlp_ipc_test"
+# dlp_ipc_test_joins (1.1.4, route B): the dlp:CLNT tests of the same file with G1's join path built (AZL_CLNT_SYSTEM_JOINS=1, azl/dlp_clnt_map.hpp: the plugin never has it)
+g++ $CXXFLAGS -DAZL_CLNT_SYSTEM_JOINS=1 Tests/dlp_ipc_test.cpp -o "$OUT/dlp_ipc_test_joins"
 g++ $CXXFLAGS Tests/dlp_lobby_sim_test.cpp -o "$OUT/dlp_lobby_sim_test"
 g++ $CXXFLAGS Tests/dlp_adv_lobby_test.cpp -o "$OUT/dlp_adv_lobby_test"
 g++ $CXXFLAGS Tests/dlp_adv_ipc_test.cpp -o "$OUT/dlp_adv_ipc_test"
@@ -199,6 +233,23 @@ python3 Tests/plugin_dlp_extract.py Sources/ctr/plugin.cpp "$OUT/plugin_dlp_slic
 # Download Play host library the plugin builds, ConfigApp/dlph/dlph_wire.c, compiled with the sanitizers.
 gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire.o"
 g++ $CXXFLAGS Tests/dlp_real_wire_test.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" -o "$OUT/dlp_real_wire_test"
+# dlp_title_block_test (2026-11-14, the TITLE in the announcement of the real Download Play: azl/dlp_title_block.hpp, for the games whose guests are the system's Download Play
+# application - Mario Party: Island Tour): an SMDH into the block (language, byte order), the five frames with a block against the capture of two Azahar (every byte the capture
+# kept, the ranges it does not carry, what Azahar's client reads back) and without one against the frames of before (Luigi's Mansion, Mario Kart 7), the child's package in a
+# RomFS made here (its sizes, every lie refused, 20,000 damaged images), the adapter on the wire with and without a title, and the list of the games against the plugin's table.
+g++ $CXXFLAGS -I"$OUT" Tests/dlp_title_block_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_title_block_test"
+# dlp_children_test and dlp_clnt_test (1.1.4, piece BASE of the Download Play from the console: contract K1-K4 of analysis/piano-1.1.4-2026-11-15/specifiche/7-CONTRATTO.md),
+# pure: the prepared child of every sold game of the catalogue (azl/title_rules.hpp PreparedOf / IsPreparedId), the index and the blocks the app writes and the
+# plugin reads (azl/dlp_children.hpp: parser, round trips, sixteen rows, bad lines, the verdicts, the small line in ten units with the name shortened and never
+# the mark, the writers into the records of dlp:CLNT), the app's paths of them (ConfigApp/source/dlp_guest_paths.cpp, built as it is), and the map of dlp:CLNT
+# (azl/dlp_clnt_map.hpp).
+g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/dlp_children_test.cpp ConfigApp/source/dlp_guest_paths.cpp -o "$OUT/dlp_children_test"
+g++ $CXXFLAGS Tests/dlp_clnt_test.cpp -o "$OUT/dlp_clnt_test"
+# dlp_child_wait_test and dlp_content_notice_test (1.1.4, H5 and H3 of analysis/piano-1.1.4-2026-11-15/specifiche/3-G2.md), pure: the host of the real Download
+# Play waits in its state 9 for the guests that went to start their child (azl/dlp_child_wait.hpp: the caps 15 s, 10 s with an Azahar, 6 s after the first
+# one back, on a clock of the test), and names on its screen a guest it ejected for the content (azl/dlp_content_notice.hpp: once, never a MAC).
+g++ $CXXFLAGS Tests/dlp_child_wait_test.cpp -o "$OUT/dlp_child_wait_test"
+g++ $CXXFLAGS Tests/dlp_content_notice_test.cpp -o "$OUT/dlp_content_notice_test"
 # dlp_real_net_test (1.1.3, phase F3): the HOST of the real Download Play (azl/dlp_real_net.hpp, RealDlpNet under the lobby) in front of a model of Azahar's
 # Download Play client (Tests/azahar_dlp_peer.hpp): the announcement, the dialogue A1..A9, round trips up to 700 ms, losses, a game's session in the room,
 # a quick rejoin, malformed packets, a full network, the lobby's resends and the game's BeginGame storm, the releases (R1, R1b, R4, R5, R6b, R7, R9, R12, R14;
@@ -208,14 +259,65 @@ g++ $CXXFLAGS Tests/dlp_real_net_test.cpp Sources/azl/dlp_real_net.cpp Sources/a
 # (Tests/azahar_dlp_host.hpp, with the capture's bytes): the probe as a spectator and its cache, the join and the answers A2/A4/A6/A9, the statuses 5-6-9,
 # the host's silent end, losses, three hosts in a room, malformed / silent hosts, a full host, our own host, the releases on the game's thread (R2, R2c,
 # R5b, R5c, R6, R6f, R9c, R12c, R3a; real time, about 2 minutes).
-g++ $CXXFLAGS Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test"
+# (1.1.4, route B: dlp_real_client_test is built with G1's join path - RC1, RC3, RC4, RC8 join - and dlp_real_client_test_default as the plugin has dlp:CLNT: RC1b, RC2, RC5, RC6)
+g++ $CXXFLAGS -DAZL_CLNT_SYSTEM_JOINS=1 Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test"
+g++ $CXXFLAGS Tests/dlp_real_client_test.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_client_test_default"
 g++ $CXXFLAGS -I"$OUT" Tests/plugin_dlp_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/plugin_dlp_test"
 # dlp_real_hub_test (1.1.3, phase F5): the real Download Play as the plugin has it, behind the hub (DlpHub with the adapter RealDlpNet as the lobby's network), driven by
 # the IPC words of the games on game threads with a network thread per console: 3DS - 3DS with 1 and 3 clients in both modes, the external states of the two compared
 # (R3), the engine given back at the game's nwm::UDS with and without a network thread in every state (R8), the ends of every role in every state (R10), a quick rejoin and
 # a spectator in the lobby (R11b), the two modes in one room (R13). Real time, about 2 minutes.
 g++ $CXXFLAGS Tests/dlp_real_hub_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_hub_test"
+# dlp_cap_guard_test (2026-11-13): the guard of the titles of four players, written BEFORE the lobby holds eight (what it holds and what it cannot: analysis/lobby-otto-2026-11-13/guardia).
+# The 29 bytes of the announcement for what a game asks of dlp:SRVR Initialize, whole sessions of four driven through the IPC words as the hub runs them, recorded as lines (what the
+# lobby asks of the network, every answer to the game) and held by their SHA-1 over the in-memory air and its simulated clock, the answers that depend on the number of players,
+# Luigi's Mansion's golden bytes out of the codec, the host and the searcher of the real Download Play, and the dialect over the real engine (those parts in real time, about 15 s).
+# Its literals are the output of the code of that day: they are not edited to make it pass. With a folder as its argument it writes the lines of the sessions there.
+g++ $CXXFLAGS Tests/dlp_cap_guard_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_cap_guard_test"
+# dlp_eight_test (2026-11-13): the lobby with EIGHT players - the tables hold host + 7 clients, the ceiling of a title is four unless its Download Play column of azl/title_rules.hpp says more (Mario Kart 7) - and
+# the titles of four beside it: the ceiling as a value (0 is four), what a game gets for the clients it asks for, what a searcher lists, a whole evening of a title of four line by line
+# as the code of before gave it (the fifth player, two nodes above the ceiling), the session of eight over the in-memory air with the words of the games, and over the real engine with
+# the ring of the lobby's messages counted frame by frame, also with the creator or the seven clients stalled (those parts in real time, about 10 s). Since the reviews of that day
+# also the count of its own lobby that every client in a session of eight reads, and the lobby and its service on a hostile network and under a hostile game for every ceiling of a
+# title (a fixed seed and a fixed number of commands, about 20 s).
+g++ $CXXFLAGS Tests/dlp_eight_test.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_eight_test"
+# dlp_eight_hub_test (2026-11-13, the review of the lobby of eight): the same lobby as a console runs it - a DlpHub per console with the configuration of Mario Kart 7, a network thread
+# each, real engines on the in-memory room - driven with the words Mario Kart 7 sent on a console, by the game threads of eight consoles at once: seven enter in the same instant, the
+# ninth and the tenth, two leave while two enter and one comes back, START with a silent client and one whose answers come after the grace, the creator that goes, and after state 9
+# the game's own nwm::UDS network of eight nodes (real time, about 25 s).
+g++ $CXXFLAGS Tests/dlp_eight_hub_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_eight_hub_test"
+# dlp_real_mk7_test (2026-11-13): Mario Kart 7 on the REAL Download Play with eight players (its Download Play column of azl/title_rules.hpp is RealDlp with a ceiling of eight; the adapter RealDlpNet holds
+# host + 7 clients), held to the capture of eight Azahar that played it (Tests/dlp_real_mk7_golden.inc, made by Tests/make_dlp_real_mk7_goldens.py): the capture's seventy packets, beacon,
+# node map and Logoff against the codec and the engine; a console that hosts with SEVEN models of Azahar's client, every frame it sends compared with the capture's form; a console that
+# searches and joins a model of Azahar's host of 8 nodes (the unique id 0x307, the tick of GetServerInfo never older than 5 s) among Azahar clients; a client that leaves before the start
+# (the host and the clients that remain know: the engine's refresh for the real Download Play's network); and Luigi's Mansion as before (ceiling four, one client, its own capture's bytes,
+# not one frame more). Real time, about 60 s.
+g++ $CXXFLAGS Tests/dlp_real_mk7_test.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_mk7_test"
+# dlp_real_island_test (2026-11-14, Mario Party: Island Tour as the HOST of the real Download Play: its Download Play column of azl/title_rules.hpp is RealDlp, four players, the hash of the MAC): the hub as
+# the plugin has it for that row - DlpHub on the adapter RealDlpNet, a network thread, the IPC words of the game as its code sends them (Initialize with no name for 3 clients,
+# StartAccepting by hand, AcceptClient for every client and StartDistribution in the SAME frame, the passphrase once) - in front of models of Azahar's Download Play client, held to
+# the capture of two Azahar that played it (Tests/dlp_real_island_golden.inc, made by Tests/make_dlp_real_island_goldens.py; the name, the icon, the passphrase and the nodes' names
+# and addresses are not in it): the capture against the codec field by field, every frame the host sends compared with the capture's form, the game's own network from the same
+# address with the three back in, a client that asks for the child's content (ejected: the child never travels), and the limits of the row held as they are (a command of the game
+# the hub refuses with its network thread held up; the game's back-while-distributing). Real time, about 70 s.
+g++ $CXXFLAGS Tests/dlp_real_island_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_island_test"
+# dlp_real_lobby_games_test (1.1.4, D6): Kirby Triple Deluxe, Kirby Planet Robobot and Mario Tennis Open on the REAL Download Play, each held to the capture of
+# Azahar emulators that played IT (Tests/dlp_real_<game>_golden.inc, made by Tests/make_dlp_real_lobby_games_goldens.py: no title, icon, passphrase, name or address in
+# them): the capture against the codec (G), a console hosting the capture's Azahar clients (A), a console searching an Azahar host (B), four nodes and one that leaves
+# before the start (C), Kirby's Finalize and StopSession with the network thread gone (F), the console's seed for the rows that have it (S). A game without its golden
+# is SKIPPED, loudly, and its row must not be RealDlp (the rule: a row moves with its own capture). Real time.
+g++ $CXXFLAGS Tests/dlp_real_lobby_games_test.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -o "$OUT/dlp_real_lobby_games_test"
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/settings_test.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp -o "$OUT/settings_test"
+# whole_file_test and whole_file_states_test (F7, 2026-11-21): AzaharLink.ini written whole or not at all by the plugin too (Includes/azl/whole_file.hpp,
+# the order of the app's fileio.cpp): the model of the card (Tests/whole_file_model.hpp) cut at every step of a save, every prefix of its write and three
+# ways of renaming; then the app's own fileio.cpp in front of every card those cuts leave (it reads what the plugin reads, and writes the same files).
+g++ $CXXFLAGS Tests/whole_file_test.cpp -o "$OUT/whole_file_test"
+g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/whole_file_states_test.cpp ConfigApp/source/fileio.cpp -o "$OUT/whole_file_states_test"
+# config_file_test (F7-rev, 2026-11-21): the plugin's own code of AzaharLink.ini (LoadConfig, SaveConfig, ReadDataFile and the card CtrWhole, cut out of
+# plugin.cpp unchanged by Tests/config_file_extract.py) in front of a stand-in of CTRPF 0.8.0's File that answers as File.o does: the .bak of a cut save, a
+# passing error of a look, an ini that cannot be read (never written over), the old place, every cut and every failing command of a save.
+python3 Tests/config_file_extract.py Sources/ctr/plugin.cpp Includes/ctr/plugin.hpp "$OUT/config_file_slice.inc"
+g++ $CXXFLAGS -I"$OUT" Tests/config_file_test.cpp -o "$OUT/config_file_test"
 # TitleShare's own C files (the vendored copies): the app's keyed reading of a game's icon (ncch_icon_test) and its SHA-256 (paths.cpp) use them
 for f in aes sdcrypt sha256 contentpath ncchname; do
   gcc -O1 -g -w -c ConfigApp/titleshare/common/$f.c -o "$OUT/ts_$f.o"
@@ -223,6 +325,24 @@ done
 # the two values 3DS Link carries (the key generator's constant and the IV of the Download Play checksum): builtin_keys.c, which sdcrypt.c asks
 gcc -O1 -g -w -c ConfigApp/titleshare_host/builtin_keys.c -o "$OUT/ts_builtin_keys.o"
 g++ $CXXFLAGS -pthread Tests/settings_test/builtin_keys_test.cpp "$OUT"/ts_aes.o "$OUT"/ts_sdcrypt.o "$OUT"/ts_sha256.o "$OUT"/ts_builtin_keys.o -o "$OUT/builtin_keys_test"
+# dlp_guest_test (1.1.4, piece APP-CORE of the Download Play child the app prepares with boot9.bin: analysis/piano-1.1.4-2026-11-15/specifiche/6-APP-boot9.md):
+# the app's own aes_cbc.cpp and dlp_guest_compose.cpp (with dlp_guest_logic.hpp) on made-up children (Tests/settings_test/dlp_guest_synth.hpp) and, when the
+# working tree has them, on the child of Island Tour against the PC's P2a and P2n by their md5. DLPGUEST_TEST_VISIBLE is defined on this line alone: only here may a child be made visible.
+g++ $CXXFLAGS -DDLPGUEST_TEST_VISIBLE -IConfigApp/source Tests/settings_test/dlp_guest_test.cpp ConfigApp/source/aes_cbc.cpp ConfigApp/source/dlp_guest_compose.cpp "$OUT"/ts_aes.o "$OUT"/ts_sha256.o "$OUT"/ts_sdcrypt.o "$OUT"/ts_builtin_keys.o -o "$OUT/dlp_guest_test"
+# dlp_guest_store_test (1.1.4, piece APP-STORE of the same child): the app's own dlp_guest_store.cpp (the .guest records, which titles are ours, children.cache, the
+# index and the blocks the plugin reads, the leftovers, the start), dlp_guest_decide.hpp, dlp_guest_exclude.hpp and games.cpp's DisableGuestFolder, against a folder "sdmc:"
+g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/dlp_guest_store_test.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_sha256.o -o "$OUT/dlp_guest_store_test"
+# dlp_guest_run_test (1.1.4, piece APP-WORKER of the same child): the app's own dlp_guest_run.cpp (the jobs: prepare, remove, disown, probe, check, adopt,
+# repair, in the order that survives a cut), dlp_guest_route.hpp (route K: content 2 in the module's virtual CIA) and dlp_guest_reconcile.hpp, on made-up
+# children and a made-up console, against a folder "sdmc:"
+g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/dlp_guest_run_test.cpp ConfigApp/source/dlp_guest_run.cpp ConfigApp/source/dlp_guest_ids.cpp ConfigApp/source/dlp_guest_compose.cpp ConfigApp/source/aes_cbc.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_aes.o "$OUT"/ts_sha256.o "$OUT"/ts_sdcrypt.o "$OUT"/ts_builtin_keys.o -o "$OUT/dlp_guest_run_test"
+# dlp_guest_ids_test (1.1.4, the build 2h: the guard of the ids of the prepared children): the app's own dlp_guest_ids.cpp (the census of the console's ids,
+# ids.cache with its seal, the refresh of the sources that changed, the judgment of an install and of a delete, R0-R8) on a made-up console, against a folder "sdmc:"
+g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/dlp_guest_ids_test.cpp ConfigApp/source/dlp_guest_ids.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_sha256.o -o "$OUT/dlp_guest_ids_test"
+# dlp_join_test (1.1.4, route B, pieces B2/B3 of specifiche/8-INGRESSO-DA-3DSLINK.md): the app's Download Play page, its engine (ConfigApp/source/dlp_join.cpp:
+# the Core on the adapter of the real Download Play, the polite leave of D-B10, the hand-over to ns:s) and its pure part (dlp_join_logic.hpp: JoinGate,
+# BuildTable from the index file the plugin reads), in front of the model of Azahar's host and of our host with H5 (AwaitsChildOf from the slice of plugin.cpp)
+g++ $CXXFLAGS -I"$OUT" -ITests/settings_test/shim -IConfigApp/source Tests/dlp_join_test.cpp ConfigApp/source/dlp_join.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" "$OUT"/ts_sha256.o $CORE "$OUT"/enet_*.o -o "$OUT/dlp_join_test"
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/games_test.cpp ConfigApp/source/games.cpp ConfigApp/source/status.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp "$OUT"/ts_sha256.o -o "$OUT/games_test"
 g++ $CXXFLAGS -ITests/settings_test/shim -IConfigApp/source Tests/settings_test/paths_test.cpp ConfigApp/source/paths.cpp ConfigApp/source/appcfg.cpp ConfigApp/source/fileio.cpp ConfigApp/source/search.cpp ConfigApp/source/games.cpp "$OUT"/ts_sha256.o -o "$OUT/paths_test"
 # plugin_install_test: the plugin that 3DS Link carries and puts on the card by itself (plugin_install.hpp with its .cpp, plain C++; paths.cpp makes the folders): what the file on the card
@@ -281,8 +401,10 @@ g++ $CXXFLAGS -IConfigApp/source Tests/lobby_probe_test.cpp ConfigApp/source/lob
 # dlp_room_probe: the fake lobby over a real room (Tests/integration.sh runs it; it needs the monotonic clock like room_integration)
 g++ $CXXFLAGS Tests/dlp_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_lobby_net.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_room_probe"
 # dlp_real_room_probe (1.1.3, design 7.5, I1-I3): the REAL Download Play (RealDlpNet under the lobby) over a real room, our host with our searcher and with a model of
-# Azahar's Download Play client behind its own ENet member, then 20 rounds in a row (Tests/integration.sh runs it; the monotonic clock like the other room probes)
-g++ $CXXFLAGS Tests/dlp_real_room_probe.cpp Tests/mono_clock.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_real_room_probe"
+# Azahar's Download Play client behind its own ENet member, then 20 rounds in a row (Tests/integration.sh runs it; the monotonic clock like the other room probes);
+# I4 the host's wait for the children (1.1.4, H5); I5 (1.1.4, route B) the 3DS Link app's page - its own Core, ConfigApp/source/dlp_join.cpp, built here as
+# dlp_join_test builds it - and the prepared child's plugin (RejoinPolicy, HoldIdentity) in front of our host, H5 filtered by the plugin's AwaitsChildOf
+g++ $CXXFLAGS -I"$OUT" -ITests/settings_test/shim -IConfigApp/source Tests/dlp_real_room_probe.cpp Tests/mono_clock.cpp ConfigApp/source/dlp_join.cpp ConfigApp/source/dlp_guest_store.cpp ConfigApp/source/dlp_guest_paths.cpp ConfigApp/source/games.cpp ConfigApp/source/settings.cpp ConfigApp/source/fileio.cpp ConfigApp/source/paths.cpp Sources/azl/dlp_hub.cpp Sources/azl/dlp_lobby_net.cpp Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire.o" "$OUT"/ts_sha256.o $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_time_get -o "$OUT/dlp_real_room_probe"
 g++ $CXXFLAGS Tests/room_routing_probe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_routing_probe"
 g++ $CXXFLAGS Tests/room_observe.cpp $CORE "$OUT"/enet_*.o -o "$OUT/room_observe"
 # room_ack_probe: the data path against the real room with a LAN-like wire (Tests/room_ack.sh runs it); the link wraps the send to classify the datagrams and the receive to count the empty ones
@@ -293,7 +415,12 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/ring_test"
   "$OUT/dedupe_test" $DEDUPE_TRACES
   "$OUT/link_policy_test"
+  "$OUT/beacon_cache_test"
+  "$OUT/uds_eight_test"
   "$OUT/enet_path_test"
+  "$OUT/enet_cap_test"
+  "$OUT/flow_relief_test"
+  "$OUT/soc_send_test"
   "$OUT/soc_plan_test"
   "$OUT/text_search_guard_test"
   "$OUT/plugin_compare_test"
@@ -314,8 +441,10 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/plg_guard_test"
   "$OUT/exit_guard_test"
   "$OUT/capture_test"
+  "$OUT/game_card_calls_test"
   timeout 1200 "$OUT/dlp_lobby_test"
   timeout 1200 "$OUT/dlp_ipc_test"
+  timeout 1200 "$OUT/dlp_ipc_test_joins"
   timeout 1200 "$OUT/dlp_lobby_sim_test"
   timeout 1200 "$OUT/dlp_adv_lobby_test"
   timeout 1200 "$OUT/dlp_adv_ipc_test"
@@ -328,13 +457,29 @@ if [ -z "$BUILD_ONLY" ]; then
   timeout 1200 "$OUT/dlp_hub_test_tsan"
   timeout 1200 "$OUT/plugin_dlp_test"
   timeout 1200 "$OUT/dlp_real_wire_test"
+  timeout 1200 "$OUT/dlp_title_block_test"
+  "$OUT/dlp_children_test"
+  "$OUT/dlp_clnt_test"
+  "$OUT/dlp_child_wait_test"
+  "$OUT/dlp_content_notice_test"
   timeout 1200 "$OUT/dlp_real_net_test"
   timeout 1200 "$OUT/dlp_real_client_test"
+  timeout 1200 "$OUT/dlp_real_client_test_default"
   timeout 1200 "$OUT/dlp_real_hub_test"
+  timeout 1200 "$OUT/dlp_cap_guard_test"
+  timeout 1200 "$OUT/dlp_eight_test"
+  timeout 1200 "$OUT/dlp_eight_hub_test"
+  timeout 1200 "$OUT/dlp_real_mk7_test"
+  timeout 1200 "$OUT/dlp_real_island_test"
+  timeout 1200 "$OUT/dlp_real_lobby_games_test"
+  python3 Tests/make_dlp_real_lobby_games_goldens.py --selftest
   python3 Tests/dlp_chain_report.py --selftest
   bash Tests/dlp_stack_check.sh
   bash Tests/dlp_net_stack_check.sh
   "$OUT/settings_test"
+  "$OUT/whole_file_test"
+  "$OUT/whole_file_states_test"
+  "$OUT/config_file_test"
   "$OUT/games_test"
   "$OUT/paths_test"
   "$OUT/plugin_install_test"
@@ -352,6 +497,11 @@ if [ -z "$BUILD_ONLY" ]; then
   "$OUT/log_module_test"
   "$OUT/ncch_icon_test"
   "$OUT/builtin_keys_test"
+  "$OUT/dlp_guest_test"
+  "$OUT/dlp_guest_store_test"
+  "$OUT/dlp_guest_run_test"
+  "$OUT/dlp_guest_ids_test"
+  timeout 1200 "$OUT/dlp_join_test"
   "$OUT/hook_swap_test"
   "$OUT/hook_swap_test_tsan"
   "$OUT/gate_plan_test"

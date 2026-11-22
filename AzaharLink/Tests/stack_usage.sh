@@ -154,6 +154,9 @@ budget log "azl::DebugCommand" 48
 budget log "azl::DebugServiceCommand" 64
 budget log "azl::DebugPullPacket" 56
 budget log "azl::{anonymous}::PushCommand" 48
+# (1.1.4, the diet of the polled commands: the kind and the slot of a PullPacket / SendTo / status read, under the ring's lock, in a
+#  frame of its own, beside PushCommand's and not in it)
+budget log "azl::{anonymous}::CommandDietLocked" 40
 budget log "azl::{anonymous}::PushLocked" 56
 # (PushAggregateLocked: 80 since 2026-11-08, the count line of a traced service carries its name, PushLocked with two parts; the writer
 #  thread's own: the game threads only hand their counts over in the slot)
@@ -196,6 +199,21 @@ budget dlp_hub "azl::DlpHub::AnswerUnserved" 32
 budget dlp_hub "azl::DlpHub::RequestInFlight" 24
 budget dlp_hub "azl::DlpHub::OnSessionClosed" 40
 budget dlp_hub "azl::DlpHub::RunHere" 32
+# 1.1.4 (G1): dlp:CLNT of the system's Download Play application - the same shape as the games' path, in functions of their own (RunDlp gained one
+# branch and kept its 32): the command (RunDlpClnt, NoteCommand its tail call as in RunDlpHub), its first line and its trouble line, the trace of
+# its request (the MAC zeroed in a copy of the words) and of its reply (the passphrase zeroed; DlpTraceReply's frame), the join's wait, and the hub's
+# answer to a posted command nobody served (deferred, or "wireless off"). Tests/chain_sim's scenario_hub_clnt holds the chains.
+budget uds_hle "azl::ctr::{anonymous}::RunDlpClnt" 32
+budget uds_hle "azl::ctr::{anonymous}::ClntTraceRequest" 48
+budget uds_hle "azl::ctr::{anonymous}::ClntTraceReply" 72
+budget uds_hle "azl::ctr::{anonymous}::WaitForClntJoin" 48
+budget uds_hle "azl::ctr::{anonymous}::NoteClntFirst" 48
+budget uds_hle "azl::ctr::{anonymous}::NoteClntTrouble" 40
+# 1.1.4 (G4): dlp:SRVR of the prepared Download Play child (its IsChild, TRUE): the probe's shape - the lock for the call, its lines after it, NoteCommand
+# last. Tests/chain_sim's scenario_prepared_child holds the chain (the HLE's ceiling, 520 at debug 1).
+budget uds_hle "azl::ctr::UdsHle::RunDlpChild" 32
+budget uds_hle "azl::ctr::{anonymous}::NoteChildSrvr" 40
+budget dlp_hub "azl::DlpHub::AnswerUnservedClnt" 32
 # The small functions behind them. AlwaysSucceeds and EndsRole are the two tables of the Serve branch above (a game thread calls them), Stamp is the
 # network thread's liveness stamp (Tick, at its start and at its end: a long Tick must not make the next requester find the thread dead), and
 # SetPlayerName is the plugin's own call at start (the console's profile name for every list): none of the four may grow a frame.
@@ -242,6 +260,12 @@ budget input_mirror "azl::ctr::{anonymous}::RestoreLocked" 48
 budget input_mirror "azl::hidmirror::Switcher::GiveBack" 48
 budget input_mirror "azl::hidmirror::Switcher::PutBack" 64
 budget input_mirror "azl::hidmirror::Switcher::Hold" 32
+# The trail's two crumbs around a way back (2026-11-10; AzaharLink.sleep.log, debug=1 only: at debug=0 BackCrumb is one load and out), pushed
+# by whichever thread gives the page back, a game's thread at a notification too: BackCrumb -> CtrOps::Threads (GetProcessInfo 7) and
+# Plugin::NoteSleepEvent (its budget above). Measured 24 / 16 / 16: 40 bytes under MirrorRestoreFromGame (now 24, was 16), next to
+# RestoreLocked's own chain of about 180 and never on top of it.
+budget input_mirror "azl::ctr::{anonymous}::BackCrumb" 32
+budget input_mirror "azl::ctr::{anonymous}::CtrOps::Threads" 24
 # The keep-alive thread's way back at the framework's events (4 KB of stack, no line, no format)
 budget input_mirror "azl::ctr::MirrorProcessEvent" 48
 # The zombie probe's reads at the framework's events (debug=1 only): EXIT and HOME on the keep-alive thread (4 KB, under KeepThreadMain's 304

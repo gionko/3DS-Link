@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #include "azl/dlp_hub.hpp"
 #include "azl/log.hpp"
@@ -297,6 +298,7 @@ void UdsHle::NoteHandleClosed(Handle handle) {
         const char* const label = kind == kKindUds       ? "nwm::UDS"
                                   : kind == kKindNdm     ? "ndm:u"
                                   : kind == kKindDlpSrvr ? "dlp:SRVR"
+                                  : kind == kKindDlpClnt ? "dlp:CLNT"
                                                          : "dlp:FKCL";
         const SessionNote note = kind == kKindNdm ? SessionNote::Own : SessionNote::None;
         {
@@ -354,6 +356,14 @@ bool UdsHle::InterceptGetServiceHandle(Result* svc_result) {
         // infrastructure WiFi connection that carries our room traffic.
         kind = kKindNdm;
         label = "ndm:u";
+    } else if (dlp_clnt_ && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:", 4) == 0) {
+        // 1.1.4 (G1), the system's Download Play application: its dlp:CLNT is served by the hub (a client of the real Download Play over the
+        // room); any other dlp service of this process (the application opens none) stays the real one.
+        if (std::memcmp(&cmd[1], "dlp:CLNT", 8) != 0) {
+            return false;
+        }
+        kind = kKindDlpClnt;
+        label = "dlp:CLNT";
     } else if ((dlp_hub_ != nullptr || dlp_probe_fake_) && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:FKCL", 8) == 0) {
         // The wireless check of a game that plays over UDS (azl/dlp_fkcl_hle.hpp): the real module would answer
         // "wireless off" because the console stays on its access point. With a hub (Kirby Triple Deluxe, Planet Robobot)
@@ -363,6 +373,10 @@ bool UdsHle::InterceptGetServiceHandle(Result* svc_result) {
     } else if (dlp_hub_ != nullptr && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:SRVR", 8) == 0) {
         // The Download Play host of the same games. Without a hub (every other game, Battle Royale included) the REAL
         // dlp:SRVR answers.
+        kind = kKindDlpSrvr;
+        label = "dlp:SRVR";
+    } else if (dlp_child_ != nullptr && cmd[3] == 8 && std::memcmp(&cmd[1], "dlp:SRVR", 8) == 0) {
+        // 1.1.4 (G4): the Download Play child 3DS Link prepared (no hub): its one dlp:SRVR request is IsChild, answered true here (RunDlpChild).
         kind = kKindDlpSrvr;
         label = "dlp:SRVR";
     } else {
@@ -614,7 +628,7 @@ __attribute__((noinline)) void NoteDlpFirst(bool srvr, u32 id) {
     svcGetThreadId(&thread_id, CUR_THREAD_HANDLE);
     LogLine line;
     line.Str("dlp: the first command of ").Str(DlpServiceName(srvr)).Str(" is 0x").Hex(id, 2)
-        .Str(": the Download Play lobby is carried by the room (thread ").Dec(thread_id).Str(", priority 0x")
+        .Str(": Download Play is served by the plugin over the room (thread ").Dec(thread_id).Str(", priority 0x")
         .Hex(static_cast<u32>(priority)).Str(")");
 }
 
@@ -659,15 +673,47 @@ struct DlpTraceSlot {
 };
 DlpTraceSlot g_dlp_trace[2][kDlpTraceIds];
 
+// The words of a request and of a reply of dlp:FKCL / dlp:SRVR that carry a host's MAC, a passphrase or a friend code seed (the layouts of
+// DlpService's handlers): the LINE writes zeros in their place (1.1.4, as ClntTraceRequest / ClntTraceReply do for dlp:CLNT). Bits 0-5: the request's
+// words 1-6 as the line shows them; bit 8 + n: the reply's word n + 1 (n = 1..5; word 1 is the result, always shown). Only the line: the
+// replies the games get are untouched, and the window's signature still hashes the real words (two seeds are two replies, written as alike).
+constexpr u32 kTraceMac12 = 0x03u;         // request [1][2]: a host's MAC
+constexpr u32 kTraceMacFilter45 = 0x18u;   // request [4][5]: StartScan's MAC filter
+constexpr u32 kTracePass123 = 0x07u;       // request [1..3]: SendPassphrase's nine bytes
+constexpr u32 kTraceSeedReply = 0x0600u;   // reply [2][3]: +0 of a DLPNodeInfo, the node's friend code seed
+constexpr u32 kTracePassReply = 0x0E00u;   // reply [2..4]: GetPassphrase's nine bytes
+constexpr u32 DlpTraceHidden(bool srvr, u32 id) {
+    if (srvr) {
+        return id == DlpService::kSvSendPassphrase ? kTracePass123 : (id == DlpService::kSvGetClientInfo ? kTraceSeedReply : 0u);
+    }
+    switch (id) {
+    case DlpService::kFkStartScan:
+        return kTraceMacFilter45;
+    case DlpService::kFkGetServerInfo:
+    case DlpService::kFkGetTitleInfo:
+    case DlpService::kFkDeleteScanInfo:
+    case DlpService::kFkStartFakeSession:
+        return kTraceMac12;
+    case DlpService::kFkGetNodeInfo:
+        return kTraceSeedReply;
+    case DlpService::kFkGetPassphrase:
+        return kTracePassReply;
+    }
+    return 0u;
+}
+
 __attribute__((noinline)) void DlpTraceRequest(bool srvr, const u32* cmd) {
     if (g_debug_level <= 0) {
         return; // debug 0: no trace, and nothing remembered for the day the level is 1
     }
     const u32 s = srvr ? 1 : 0;
     const u32 words = std::min<u32>(DeclaredWords(cmd[0]), kDlpTraceWords);
+    // (blanked as it is kept, by the request's own id: the slot is the service's, and the line of another thread's call of the same service may print
+    // it - the final review of 1.1.4: a GetServerState's line with a SendPassphrase's words)
+    const u32 hidden = DlpTraceHidden(srvr, cmd[0] >> 16);
     g_dlp_trace_req[s][0] = cmd[0];
     for (u32 i = 0; i < kDlpTraceWords; ++i) {
-        g_dlp_trace_req[s][1 + i] = i < words ? cmd[1 + i] : 0;
+        g_dlp_trace_req[s][1 + i] = i < words && ((hidden >> i) & 1u) == 0 ? cmd[1 + i] : 0;
     }
     g_dlp_trace_started_ms[s] = static_cast<u32>(platform::NowMs());
 }
@@ -694,14 +740,15 @@ __attribute__((noinline)) void DlpTraceReply(bool srvr, u32 id, const u32* cmd) 
             return;
         }
     }
+    const u32 hidden = DlpTraceHidden(srvr, id); // (the line only: never a MAC, a passphrase or a seed)
     LogLine line;
     line.Str("dlpc: ").Str(DlpServiceName(srvr)).Str(" 0x").Hex(id, 2).Str(" req");
     for (u32 i = 0; i < kDlpTraceWords; ++i) {
-        line.Str(" ").Hex(g_dlp_trace_req[s][1 + i], 8);
+        line.Str(" ").Hex(((hidden >> i) & 1u) != 0 ? 0u : g_dlp_trace_req[s][1 + i], 8);
     }
     line.Str(" -> 0x").Hex(cmd[1], 8).Str(" rep");
     for (u32 i = 1; i < words; ++i) {
-        line.Str(" ").Hex(cmd[1 + i], 8);
+        line.Str(" ").Hex(((hidden >> (8 + i)) & 1u) != 0 ? 0u : cmd[1 + i], 8);
     }
     line.Str(" (").Dec(now - g_dlp_trace_started_ms[s]).Str(" ms");
     if (slot.skipped != 0) {
@@ -770,15 +817,161 @@ void RunDlpHub(DlpHub& hub, bool srvr, u32 id, u32* cmd) {
     NoteCommand(DlpServiceName(srvr), id, cmd[1]);
 }
 
+// ---- dlp:CLNT (1.1.4, G1 of analysis/piano-1.1.4-2026-11-15/specifiche/1-G1.md section 2.5): the system's Download Play application ----------------------
+// The same shape as RunDlpHub and its helpers, in functions of their own so that no line of the games' path changes. A host's MAC (the words 1-2 of
+// the requests that carry one) and the passphrase (the reply of 0x11) never reach the log: the trace writes zeros in their place. No handle of the
+// application is ever read or closed here (Initialize's [5] [6] are its shared memory and its event).
+
+// The first command of dlp:CLNT: the application has begun to use the room's Download Play.
+__attribute__((noinline)) void NoteClntFirst(u32 id) {
+    static bool said; // (once in the life of the plugin)
+    if (said) {
+        return;
+    }
+    said = true;
+    s32 priority = 0;
+    u32 thread_id = 0;
+    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+    svcGetThreadId(&thread_id, CUR_THREAD_HANDLE);
+    LogLine line;
+    line.Str("dlp: the first command of dlp:CLNT is 0x").Hex(id, 2)
+        .Str(": the Download Play application is served by the plugin as a client of the room's Download Play (thread ").Dec(thread_id)
+        .Str(", priority 0x").Hex(static_cast<u32>(priority)).Str(")");
+}
+
+// A command of dlp:CLNT that no network thread ran and that could not wait: the first lines, then one in kDlpTroubleEvery (NoteDlpTrouble's pace).
+__attribute__((noinline)) void NoteClntTrouble(const DlpHub& hub, u32 id) {
+    static u32 times;
+    ++times;
+    if (times > kMaxDlpTroubleLogs && times % kDlpTroubleEvery != 0) {
+        return;
+    }
+    LogLine line;
+    line.Str("dlp: dlp:CLNT command 0x").Hex(id, 2).Str(" answered \"wireless off\": no network thread ran it (so far ").Dec(hub.failed_fast())
+        .Str(" refused at once, ").Dec(hub.cancelled()).Str(" not taken in time; the commands that can wait are left to the room's first round)");
+}
+
+// The trace of a request of dlp:CLNT (debug only): FKCL's slot of the request (the application opens no dlp:FKCL), the MAC zeroed.
+__attribute__((noinline)) void ClntTraceRequest(u32 id, const u32* cmd) {
+    if (g_debug_level <= 0) {
+        return;
+    }
+    u32 w[1 + kDlpTraceWords];
+    const u32 declared = std::min<u32>(DeclaredWords(cmd[0]), kDlpTraceWords);
+    w[0] = cmd[0];
+    for (u32 i = 0; i < kDlpTraceWords; ++i) {
+        w[1 + i] = i < declared ? cmd[1 + i] : 0;
+    }
+    if (clnt::CarriesMac(id)) {
+        w[1] = 0; // (a host's MAC: never in the log)
+        w[2] = 0;
+    }
+    DlpTraceRequest(false, w);
+}
+
+// The trace of a reply of dlp:CLNT (debug only): DlpTraceReply's rule (a reply already written in the window is counted, not written), FKCL's slots
+// (0x12 in slot 0; 0x13 and 0x14 are not traced), the passphrase of 0x11 and the node of 0x10 (its whole friend code seed) zeroed before the
+// signature and the line.
+__attribute__((noinline)) void ClntTraceReply(u32 id, const u32* cmd) {
+    const u32 at = id < kDlpTraceIds ? id : (id == clnt::kStopSession ? 0u : kDlpTraceIds);
+    if (g_debug_level <= 0 || at >= kDlpTraceIds) {
+        return;
+    }
+    const u32 n = std::min<u32>(DeclaredWords(cmd[0]), kDlpTraceWords);
+    const u32 shown = id == clnt::kGetWirelessRebootPassphrase || id == clnt::kGetNodeInfo ? 1u : n; // (the words the line shows: never the passphrase, never a seed)
+    u32 sum = 17;
+    for (u32 i = 0; i < n; ++i) {
+        sum = sum * 31 + (i < shown ? cmd[1 + i] : 0u);
+    }
+    const u16 sig = static_cast<u16>(sum ^ (sum >> 16));
+    const u32 now = static_cast<u32>(platform::NowMs());
+    DlpTraceSlot& seen = g_dlp_trace[0][at];
+    if (seen.count != 0 && now - seen.window_ms >= kDlpTraceEveryMs) {
+        seen.count = 0;
+    }
+    for (u32 i = 0; i < seen.count; ++i) {
+        if (seen.sig[i] == sig) {
+            ++seen.skipped;
+            return;
+        }
+    }
+    LogLine line;
+    line.Str("dlpc: dlp:CLNT 0x").Hex(id, 2).Str(" req");
+    for (u32 i = 0; i < kDlpTraceWords; ++i) {
+        line.Str(" ").Hex(g_dlp_trace_req[0][1 + i], 8);
+    }
+    line.Str(" -> 0x").Hex(n != 0 ? cmd[1] : 0u, 8).Str(" rep");
+    for (u32 i = 1; i < n; ++i) {
+        line.Str(" ").Hex(i < shown ? cmd[1 + i] : 0u, 8);
+    }
+    line.Str(" (").Dec(now - g_dlp_trace_started_ms[0]).Str(" ms");
+    if (seen.skipped != 0) {
+        line.Str(", ").Dec(seen.skipped).Str(" alike since the line before");
+    }
+    line.Str(")");
+    if (seen.count == 0) {
+        seen.window_ms = now;
+    }
+    if (seen.count < kDlpTraceSigs) {
+        seen.sig[seen.count++] = sig;
+    }
+    seen.skipped = 0;
+}
+
+// StartSession of dlp:CLNT began a join: WaitForJoin's wait (kDlpJoinCapMs at the most, in slices, no lock; at once when the gate closes), with the
+// reply under 0x0D. A join that does not end is answered "server not found" and the end of the client role is asked of the hub.
+constexpr u32 kClntJoinRefused = kNotFound; // (0xC880AC05: what a join that never ended is answered)
+__attribute__((noinline)) void WaitForClntJoin(DlpHub& hub, u32* cmd) {
+    const u64 until = platform::NowMs() + kDlpJoinCapMs;
+    bool swapping = false;
+    while (!hub.PollPending(cmd)) {
+        swapping = GateClosing();
+        if (swapping || platform::NowMs() >= until) {
+            hub.OnSessionClosed(DlpKind::Fkcl); // (the client role of the lobby is dlp:CLNT's too)
+            cmd[0] = (clnt::kStartSession << 16) | 0x40;
+            cmd[1] = kClntJoinRefused;
+            LogLine line;
+            line.Str("dlp: dlp:CLNT StartSession: ")
+                .Str(swapping ? "the plugin's memory is being swapped out during the join (HOME, power, an applet): answered \"server not found\" at once"
+                              : "the join did not end in time (the network thread is not running it): answered \"server not found\"")
+                .Str(", the end of the client role is left to the network thread");
+            return;
+        }
+        svcSleepThread(kDlpJoinSleepNs);
+    }
+}
+
+// One request of dlp:CLNT: RunDlpHub's order (the trace of the request before the reply replaces it, the line of a refusal decided before the wait,
+// the trace of the reply, then NoteCommand last).
+__attribute__((noinline)) void RunDlpClnt(DlpHub& hub, u32 id, u32* cmd) {
+    NoteClntFirst(id);
+    ClntTraceRequest(id, cmd); // (debug only)
+    const u32 before = hub.failed_fast() + hub.cancelled();
+    const DlpOutcome outcome = hub.Serve(DlpKind::Clnt, cmd, getThreadStaticBuffers());
+    const bool refused = cmd[1] == DlpHub::kResultWirelessOff && hub.failed_fast() + hub.cancelled() != before;
+    if (refused) {
+        NoteClntTrouble(hub, id);
+    }
+    if (outcome == DlpOutcome::JoinPending) {
+        WaitForClntJoin(hub, cmd);
+    }
+    ClntTraceReply(id, cmd); // (debug only)
+    NoteCommand("dlp:CLNT", id, cmd[1]);
+}
+
 } // namespace
 
 // One dlp:FKCL / dlp:SRVR request of a fake session. With a hub (a game in Lobby mode) the hub serves both services; without one
 // the only fake dlp session is the probe's dlp:FKCL (Battle Royale), served as it always was.
 void UdsHle::RunDlp(u8 kind, u32 id, u32* cmd) {
-    if (dlp_hub_ != nullptr) {
+    if (kind == kKindDlpClnt && dlp_hub_ != nullptr) {
+        RunDlpClnt(*dlp_hub_, id, cmd);  // (1.1.4, G1: the Download Play application's dlp:CLNT)
+    } else if (dlp_hub_ != nullptr) {
         RunDlpHub(*dlp_hub_, kind == kKindDlpSrvr, id, cmd);
     } else if (kind == kKindDlp) {
         RunDlpProbe(id, cmd);
+    } else if (dlp_child_ != nullptr) {
+        RunDlpChild(id, cmd);  // (1.1.4, G4: dlp:SRVR of the prepared child, no hub)
     } else {
         // (a dlp:SRVR session whose hub was taken away: not a case the plugin makes, but a request is never left with garbage)
         cmd[0] = (id << 16) | 0x40;
@@ -810,6 +1003,55 @@ void UdsHle::RunDlpProbe(u32 id, u32* cmd) {
                  "beyond the wireless check (").Dec(refused).Str(" so far)");
     }
     NoteCommand("dlp", id, cmd[1]);
+}
+
+// 1.1.4 (G4): the plugin's thread, in EarlyInit, before the hooks (contract K8). The service of the prepared child's dlp:SRVR is the probe's kind
+// (ProbeOnly: no lobby, no buffer, no hub) with IsChild true; never with a hub, made once, never freed (the game's threads keep using it).
+void UdsHle::SetDlpChild(bool on) {
+    if (!on || dlp_hub_ != nullptr || dlp_child_ != nullptr) {
+        return;
+    }
+    DlpService* const child = new (std::nothrow) DlpService();
+    if (child != nullptr) {
+        child->SetChild(true);
+    }
+    dlp_child_ = child;
+}
+
+namespace {
+
+const IpcResolver kChildNoResolver = {nullptr, nullptr};  // (the child's service maps no buffer of the game: ProbeOnly)
+
+// The lines of the prepared child's dlp:SRVR, out of RunDlpChild's frame: its first IsChild (TRUE), and the first few commands refused.
+__attribute__((noinline)) void NoteChildSrvr(u32 id, u32 refused, bool refused_now) {
+    LogLine line;
+    if (!refused_now) {
+        line.Str("dlp: dlp:SRVR IsChild answered TRUE here: this title is the Download Play child that 3DS Link prepared");
+    } else {
+        line.Str("dlp: the prepared child called dlp:SRVR command 0x").Hex(id, 2).Str(" (answered invalid state; ").Dec(refused).Str(" so far)");
+    }
+}
+
+} // namespace
+
+// One dlp:SRVR request of the prepared child (figlio/RAPPORTO.md section 2: IsChild is the one it makes; another one is answered "invalid state"
+// and the first few are written). The lock is held for the call only, as the probe's; NoteCommand last.
+void UdsHle::RunDlpChild(u32 id, u32* cmd) {
+    u32 before;
+    u32 refused;
+    u32 answered;
+    {
+        platform::LockGuard lock(mutex_);
+        before = dlp_child_->refused();
+        dlp_child_->Dispatch(DlpKind::Srvr, cmd, nullptr, kChildNoResolver);
+        refused = dlp_child_->refused();
+        answered = dlp_child_->commands() - refused;  // (ProbeOnly's one success on dlp:SRVR is IsChild)
+    }
+    const bool refused_now = refused != before;
+    if (refused_now ? refused <= kMaxDlpRefusedLogs : id == DlpService::kSvIsChild && answered == 1) {
+        NoteChildSrvr(id, refused, refused_now);
+    }
+    NoteCommand("dlp:SRVR", id, cmd[1]);
 }
 
 // Debug capture of one command: the reply overwrites the request words, so they are kept first
@@ -925,8 +1167,8 @@ void UdsHle::Dispatch(u32* cmd) {
         for (int i = 0; i < 10 && node.username[i]; ++i) {
             name[i] = node.username[i] < 0x80 ? static_cast<char>(node.username[i]) : '?';
         }
-        Log("uds: own node info: friend code seed %08lx%08lx, name '%s', bytes 0x1C-0x1F %08lx%s",
-            static_cast<unsigned long>(node.friend_code_seed >> 32), static_cast<unsigned long>(node.friend_code_seed),
+        Log("uds: own node info: friend code seed %04lx... (cut: the log is shared), name '%s', bytes 0x1C-0x1F %08lx%s",
+            static_cast<unsigned long>(node.friend_code_seed >> 48),
             name, static_cast<unsigned long>(cmd[9]), node.friend_code_seed == 0 ? " (WARNING: the seed is zero)" : "");
         cmd[0] = Hdr(id, 1, 2);
         cmd[1] = r;

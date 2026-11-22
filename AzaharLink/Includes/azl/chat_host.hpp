@@ -487,6 +487,81 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
+// The open keyboard is still on the screen
+// ---------------------------------------------------------------------------------------------
+
+constexpr u32 kBottomLostTops = 60; ///< top screens presented with no copy of the keyboard on the bottom one: the keyboard closes by itself
+constexpr u32 kBottomLostMs = 1000; ///< ... once the plugin's thread has seen it that way at every look for this long
+constexpr u32 kBottomLostMoreTops = kBottomLostTops / 2; ///< ... in which the game went on presenting its top screen, this many times more
+
+/// Whether the game still shows the open keyboard (2026-11-10). The keyboard is copied onto the bottom framebuffer only when the game
+/// presents its bottom screen (DrawOverlayBottom), and while it is open the game's keys are the mirror's, neutral. A game that stops
+/// presenting the bottom screen (a movie, a loading: Ridge Racer 3D's on console 63, two windows of 5 s with 139-155 presents of the top
+/// screen and no copy), or whose bottom framebuffer no longer takes the picture, left a keyboard that was frozen or not there with the
+/// game's keys dead until the user found the way to close it; the look at the opening (kShowWaitMs) was all there was.
+/// No clock: the game's thread counts the top screens it presents with the keyboard open and clears the count at every copy of the
+/// keyboard, the plugin's thread closes the keyboard at kBottomLostTops (2 s at 30 fps, 1 s at 60). A clock would close it wrongly after
+/// a hitch of the game - the plugin's thread wakes on the TOP screen's present and could look before the bottom one's copy, and the logs
+/// hold hitches of up to 3 s - while a game that presents nothing counts nothing. An add and a store on the game's thread, both atomic.
+/// 2026-11-11: the count is presents, not time - 60 of them are one second at 60 fps and half a second of a game that swaps its top
+/// screen twice a frame, and a change of scene that presents only the top screen for a little over a second closed the keyboard under
+/// the user's fingers. So the plugin's thread also wants to have seen the keyboard lost at EVERY look for kBottomLostMs of its own
+/// clock (LostFor): the count still decides whether it is lost (a hitch counts nothing, a copy clears it), the clock only makes the
+/// close wait - never sooner than before, about a second later.
+/// The same day, the second review: that second was the clock between two looks, and the plugin's thread looks when the game presents.
+/// A fade of 60 presents and then a load of 1.1 s that presents nothing left ONE look that had found it lost, and the first present of
+/// the new scene was a look "lost for over a second": closed, with the bottom screen back in that very frame. The second counts only
+/// if the game went on presenting its top screen through it (kBottomLostMoreTops more since the look that first found it lost): a film
+/// does, a game that stands still does not. It can only make the close wait longer.
+class BottomWatch {
+public:
+    // >>> game-thread code (Tests/policy_check.sh: the OSD callback: one atomic add, one atomic store)
+    /// The game presented its top screen with the keyboard open.
+    void NoteTop() {
+        tops_.fetch_add(1, std::memory_order_relaxed);
+    }
+    /// The keyboard was copied onto the bottom screen.
+    void NoteCopy() {
+        tops_.store(0, std::memory_order_relaxed);
+    }
+    // <<< game-thread code
+    /// The plugin's thread: a keyboard opens, or a new picture of it is published (it has kBottomLostTops presents to be copied).
+    void Reset() {
+        tops_.store(0, std::memory_order_relaxed);
+        lost_seen_ = false;
+    }
+    u32 tops() const {
+        return tops_.load(std::memory_order_relaxed);
+    }
+    /// True: kBottomLostTops top screens were presented since the keyboard was last copied.
+    bool Lost() const {
+        return tops() >= kBottomLostTops;
+    }
+    /// The plugin's thread, every frame of a keyboard that was shown, with the frame's clock: true, the game no longer shows it - Lost()
+    /// at this look and at every look for the last kBottomLostMs (a look that finds a copy made starts the time again), in which the
+    /// game presented its top screen kBottomLostMoreTops times more (a count lower than at the last look is a copy made in between).
+    bool LostFor(u32 now_ms) {
+        if (!Lost()) {
+            lost_seen_ = false;
+            return false;
+        }
+        const u32 now_tops = tops();
+        if (!lost_seen_ || now_tops < lost_tops_) {
+            lost_seen_ = true;
+            lost_since_ms_ = now_ms;
+            lost_tops_ = now_tops;
+        }
+        return now_ms - lost_since_ms_ >= kBottomLostMs && now_tops - lost_tops_ >= kBottomLostMoreTops;
+    }
+
+private:
+    std::atomic<u32> tops_{0};
+    bool lost_seen_ = false; ///< the plugin's thread only: Lost() at its last look, and at every look since lost_since_ms_
+    u32 lost_since_ms_ = 0;
+    u32 lost_tops_ = 0; ///< ... and the count of the presents at that first look
+};
+
+// ---------------------------------------------------------------------------------------------
 // The game's thread: what the OSD callback draws
 // ---------------------------------------------------------------------------------------------
 
@@ -497,6 +572,8 @@ struct Overlay {
     std::atomic<u32> corner{kBottomLeft}; ///< chat_pos
     std::atomic<u32> keyboard{0};         ///< the keyboard is open: all the lines stay, and the bottom screen gets the Image
     std::atomic<u32> bottom_geometry{0};  ///< GeometryOf the bottom framebuffer, written by the game's thread while the keyboard is open
+                                          ///< (0 again at every opening: the plugin's thread waits for the first present of each)
+    BottomWatch bottom_watch;             ///< the top screens presented since the keyboard was last copied onto the bottom one
     ImageSlot image;
     NoticeClock notices;                  ///< the framework's notifications on screen (OSD::Notify: the bottom-right corner climbs above them)
     NoticeBoard board;                    ///< the plugin's own, drawn in the corner opposite the chat
@@ -591,6 +668,9 @@ __attribute__((noinline, optimize("no-tree-loop-distribute-patterns"))) inline v
 /// stack stops where the notifications' begins. Whether this screen could be drawn on is told to the plugin's thread (top_seen: it sends
 /// its notifications to the framework when not). Out of line: the callback's own frame stays small.
 __attribute__((noinline)) inline u32 DrawOverlayTop(Overlay& o, const gfx::Surface& fb, u32 now_ms) {
+    if (o.keyboard.load(std::memory_order_relaxed) != 0) {
+        o.bottom_watch.NoteTop(); // (a present of the top screen, drawn on or not: BottomWatch)
+    }
     if (!TopUsable(fb)) {
         o.top_seen.store(0, std::memory_order_relaxed);
         return kDrewNothing;
@@ -636,6 +716,7 @@ __attribute__((noinline)) inline u32 DrawOverlayBottom(Overlay& o, const gfx::Su
     const Image* im = o.image.Enter();
     if (im != nullptr && ImageFits(*im, fb)) {
         CopyImage(*im, fb);
+        o.bottom_watch.NoteCopy(); // (the keyboard is on the screen the game presents now)
         drew = kDrewKeyboard;
     }
     o.image.Leave();

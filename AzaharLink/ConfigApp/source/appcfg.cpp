@@ -45,8 +45,6 @@ AppConfig ParseAppConfig(const std::string& text) {
             cfg.boot9_path = value;
         } else if (key == "plugin_stamp") {
             cfg.plugin_stamp = value;
-        } else if (key == "dlp_delivery") {
-            cfg.dlp_delivery = azl::ini::ParseBool(value, true); // the plugin's words (0/off/false/no shut it); a slip is the default, on
         } else if (key == "update_check") {
             cfg.update_check = azl::ini::ParseBool(value, true);
         } else if (key == "update_not_now") {
@@ -67,7 +65,6 @@ std::string SerialiseAppConfig(const AppConfig& cfg) {
     if (!cfg.plugin_stamp.empty()) {
         out += "plugin_stamp=" + cfg.plugin_stamp + "\n";
     }
-    out += std::string("dlp_delivery=") + (cfg.dlp_delivery ? "1" : "0") + "\n";
     out += std::string("update_check=") + (cfg.update_check ? "1" : "0") + "\n";
     if (!cfg.update_not_now.empty()) {
         out += "update_not_now=" + cfg.update_not_now + "\n";

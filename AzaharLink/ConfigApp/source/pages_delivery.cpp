@@ -4,6 +4,8 @@
 #include <cstring>
 
 #include "delivery.hpp"
+#include "dlp_guest.hpp"
+#include "dlp_guest_store.hpp"
 #include "dlp_text.hpp"
 #include "pages.hpp"
 #include "titles.hpp"
@@ -162,7 +164,7 @@ public:
     explicit ScanWaitPage(MakeFn make) : make_(std::move(make)) {}
 
     void Update(const Input& in) override {
-        if (titles::Scan().done() && delivery::AttachModule()) {
+        if (titles::Scan().done() && !dlpguest::Running() && delivery::AttachModule()) { // (a game read in the background uses the module: seconds)
             PopPage();
             PushPage(new LoadingPage(make_));
             return;
@@ -254,7 +256,7 @@ protected:
 
     void BuildRows(std::vector<Row>& rows) override {
         rows.clear();
-        ready_ = titles::Scan().done() && delivery::AttachModule();
+        ready_ = titles::Scan().done() && !dlpguest::Running() && delivery::AttachModule(); // (the worker of the children reads with the module: it ends first)
         const bool keys = ready_ && dl_have_keys();
         const titles::Scanner& scan = titles::Scan();
         const std::string reading = Fmt("reading %d%%", static_cast<int>(setup::ProgressFraction(scan.progress_done(), scan.progress_total()) * 100.0f));
@@ -688,9 +690,14 @@ private:
             }
             size_[static_cast<std::size_t>(item)] = size;
         }
+        // (DPAPP-2j, the user: only titles of the SD card are sent, never a Download Play guest) the module refuses one in the manifest too
+        dl_set_send_never([](uint64_t tid) { return dlpguest::NeverSent(tid) ? 1 : 0; });
         const int rc = dl_send_prepare(items.data(), static_cast<int>(items.size()));
         if (rc != 0) {
-            g.ShowToast(rc == -1 ? "Choose between 1 and 16 titles." : "A chosen title has not been checked.", col::kWarn, 4000);
+            g.ShowToast(rc == -1   ? "Choose between 1 and 16 titles."
+                        : rc == -3 ? "A chosen title is never sent (a Download Play guest, or not a title of the SD card)."
+                                   : "A chosen title has not been checked.",
+                        col::kWarn, 4000);
             return;
         }
         delivery::RunSend();

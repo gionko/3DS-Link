@@ -276,7 +276,7 @@ PY
 "$PY" "$W/check.py" --selftest
 
 # (the probe is compiled from the root of AzaharLink so that the listings name the files as the sources do)
-echo "dlp stack: $("$ARM_GXX" --version | head -1), the flags of the Makefile; the probe holds the ARM32 sizes (DlpLobby <= 272, DlpService <= 40) as assertions"
+echo "dlp stack: $("$ARM_GXX" --version | head -1), the flags of the Makefile; the probe holds the ARM32 sizes (DlpLobby <= 400, DlpService <= 40) as assertions"
 WRAPPERS=$(grep -c '^PROBE_NOINLINE' Tests/dlp_stack_probe.cpp || true)
 for pass in A B; do
   extra=""
@@ -346,6 +346,6 @@ else
   else
     echo "dlp stack [H]: no arm-none-eabi-size beside the compiler: the static storage was NOT measured"
   fi
-  echo "dlp stack [H]: the hub's sizes (DlpHub <= 408, EngineLobbyNet <= 12) are held, $HUB_WRAPPERS wrappers list its public functions, no frame over $FRAME_MAX, no static storage"
+  echo "dlp stack [H]: the hub's sizes (DlpHub <= 536, EngineLobbyNet <= 12) are held, $HUB_WRAPPERS wrappers list its public functions, no frame over $FRAME_MAX, no static storage"
 fi
 echo "dlp stack: every frame of the fake lobby within its budget on ARM32 (frames <= $FRAME_MAX, Dispatch <= $FRAME_DISPATCH, PollScan <= $FRAME_POLLSCAN, chains <= $CHAIN_MAX)"

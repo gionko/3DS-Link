@@ -22,7 +22,10 @@
 // than its structure (768 / 1448), a Finish shorter than 0x18 or a final shorter than 0x20 (GetPacketBody returns null, nobody
 // checks), node 1 without information while the probe reads its name.
 // Options for the scenarios: `rtt_ms` (an answer leaves that long after its packet was taken: the round trip of a far room),
-// `answer_*` false (that answer is never sent), `want_content` (the ack of StartDistribution asks for the content: a download).
+// `answer_*` false (that answer is never sent), `want_content` (the ack of StartDistribution asks for the content: a download),
+// `leave_at_final` (2026-11-13: the session ends - Unbind, Disconnect, ONE Deauthentication - as soon as the final is in, from the session's
+// own thread: what Mario Kart 7 does on Azahar, whose seven clients left 16 ms after the final in the capture of eight; false, the
+// default, is every test written before).
 #pragma once
 
 #include <atomic>
@@ -208,6 +211,8 @@ public:
     std::atomic<u32> timeouts{0};
     std::atomic<u32> probe_frames{0};
     std::atomic<bool> session_broken{false};  // a packet whose size field was not its length ended the session
+    std::atomic<bool> leave_at_final{false};  // the game stops the session at the final (Mario Kart 7)
+    std::atomic<bool> left{false};            // ... and it did: the session's thread has disconnected
 
 private:
     static u16 Be16(const u8* p) {
@@ -334,15 +339,21 @@ private:
                         Violation("session: a final shorter than 0x20 (Azahar reads a null body)");
                         continue;
                     }
-                    std::lock_guard<std::mutex> l(m_);
-                    state_ = kComplete;
-                    pass_.assign(pk.begin() + 0x14, pk.begin() + 0x14 + 9);
+                    {
+                        std::lock_guard<std::mutex> l(m_);
+                        state_ = kComplete;
+                        pass_.assign(pk.begin() + 0x14, pk.begin() + 0x14 + 9);
+                    }
+                    if (leave_at_final) {
+                        break;
+                    }
                 }
             }
         }
         Flush();
         e().Unbind(1);
         e().DisconnectNetwork();
+        left = true;
     }
 
     u8 channel_;

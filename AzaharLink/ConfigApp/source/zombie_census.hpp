@@ -3,6 +3,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace zombie_census {
 
@@ -18,5 +19,10 @@ bool TakeNotice();
 // Every frame: cheap. While a closed game was found, every 5 s the process list is read again (nothing is opened) and the line that says when it
 // left memory, or that it is still there (at 1, 5, 15 minutes, then every 30), is written.
 void Tick(const std::string& datadir);
+
+// (DPAPP-2j, R-A: zombie_free.cpp) lines of the freeing appended to the same file, with the same stamp.
+void Write(const std::string& datadir, const std::vector<std::string>& lines);
+// (DPAPP-2j) right after the freeing: the closed game Run follows read again - gone, its line now (GoneLine) and no message asking to restart.
+void Recheck(const std::string& datadir);
 
 } // namespace zombie_census

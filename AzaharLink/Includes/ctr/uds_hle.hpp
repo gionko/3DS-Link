@@ -12,6 +12,7 @@
 namespace azl {
 
 class DlpHub; // azl/dlp_hub.hpp: the fake Download Play lobby (only the games in Lobby mode have one)
+class DlpService; // the lobby's IPC front-end, here as dlp:SRVR of the prepared Download Play child (1.1.4, G4: that title only)
 
 namespace ctr {
 
@@ -52,6 +53,16 @@ public:
     void SetDlpHub(DlpHub* hub) {
         dlp_hub_ = hub;
     }
+    /// 1.1.4 (G1): the system's Download Play application, whose dlp:CLNT the hub serves (a client of the real Download Play over the room); every
+    /// other dlp service of that process stays the real one. Only with a hub: set AFTER SetDlpHub and before the hooks, once, as it.
+    void SetDlpClnt(bool on) { dlp_clnt_ = on && dlp_hub_ != nullptr; }
+    /// 1.1.4 (G4, contract K8): the Download Play child 3DS Link prepared (Sources/ctr/plugin.cpp: a title of the band whose row the index has). Its
+    /// dlp:SRVR is answered here by a service of the probe's kind whose IsChild says true (DlpService::SetChild): the one request
+    /// the child makes of it. Never with a hub (a hub never says "child"): set after SetDlpHub and before the hooks, once, as it. The service is
+    /// made here (40 bytes, that title only); every other title has none, and its dlp:SRVR stays the real one.
+    void SetDlpChild(bool on);
+    /// Does this process answer dlp:SRVR as the prepared child (SetDlpChild took, and the service was made)?
+    bool dlp_child() const { return dlp_child_ != nullptr; }
 
 private:
     // Two fake sessions per UDS use (the game opens nwm::UDS twice) plus ndm:u: with only 8 slots
@@ -59,8 +70,9 @@ private:
     static constexpr int kMaxFakeHandles = 32;
 
     // kKindDlp is dlp:FKCL (the client: Kirby Triple Deluxe / Planet Robobot's searcher, Battle Royale's wireless check),
-    // kKindDlpSrvr is dlp:SRVR (the host); the latter exists only with a hub. Both are >= kKindDlp.
-    enum Kind : u8 { kKindUds = 1, kKindNdm = 2, kKindDlp = 3, kKindDlpSrvr = 4 };
+    // kKindDlpSrvr is dlp:SRVR (the host); the latter exists only with a hub. kKindDlpClnt (1.1.4, G1) is dlp:CLNT of the system's Download Play
+    // application, only with a hub and SetDlpClnt. All three are >= kKindDlp.
+    enum Kind : u8 { kKindUds = 1, kKindNdm = 2, kKindDlp = 3, kKindDlpSrvr = 4, kKindDlpClnt = 5 };
 
     /// Returns the kind of fake session `handle` is (0 if it is not one of ours); for an ndm:u one
     /// `*ndm_session` (if given) is its NdmHle session.
@@ -84,6 +96,8 @@ private:
     void RunDlp(u8 kind, u32 id, u32* cmd);
     /// The probe of Battle Royale (azl/dlp_fkcl_hle.hpp), dlp:FKCL only: the code RunDlp had before the hub.
     void RunDlpProbe(u32 id, u32* cmd);
+    /// 1.1.4 (G4): one dlp:SRVR request of the prepared child (IsChild: true), under mutex_ as the probe's.
+    void RunDlpChild(u32 id, u32* cmd);
     void Dispatch(u32* cmd);
     /// A game thread that calls a command in a tight loop while we keep answering it with an error (FFE polls PullPacket
     /// at 8,000 calls a second when the service has been stopped by a sleep, and our answer takes no time): past a number
@@ -103,6 +117,8 @@ private:
     DlpFkclHle dlp_; // under mutex_ like ndm_
     volatile bool dlp_probe_fake_ = false;
     DlpHub* dlp_hub_ = nullptr; // set once before the hooks (SetDlpHub); the hub has locks of its own, mutex_ is never held in a call into it
+    volatile bool dlp_clnt_ = false; // 1.1.4 (G1): dlp:CLNT is the hub's (SetDlpClnt), the Download Play application only
+    DlpService* dlp_child_ = nullptr; // 1.1.4 (G4): dlp:SRVR of the prepared child (SetDlpChild, once before the hooks, never freed), under mutex_
     platform::Mutex mutex_; // guards writes to fake_ and everything in ndm_
     volatile Handle fake_[kMaxFakeHandles];
     volatile u8 fake_kind_[kMaxFakeHandles];

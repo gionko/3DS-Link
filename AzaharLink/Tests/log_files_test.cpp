@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "azl/game_card_calls.hpp"
 #include "azl/ini_values.hpp"
 #include "azl/log.hpp"
 #include "azl/log_files.hpp"
@@ -276,7 +277,7 @@ static void TestIniValues() {
         CHECK_EQ(text,
                  std::string("enabled=1\nhost=\nport=24872\nnickname=\npassword=\ntunnel=1\nautoconnect=1\nradio_like=1\n"
                              "socket_buffers=1\nnet_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\n"
-                             "sleep_stop=0\nchat=1\nchat_key=L+Left+Select\nchat_pos=bottom-left\n"));
+                             "sleep_stop=0\nchat=0\nchat_key=L+Left+Select\nchat_pos=bottom-left\n")); // (the chat off in a new file: 2026-11-19)
         CHECK_EQ(text.size(), 228u);
         CHECK(text.find('\r') == std::string::npos);
         std::size_t at = 0;
@@ -293,7 +294,7 @@ static void TestIniValues() {
         f.chat_pos = ini::kChatPosTopRight;
         const std::string two = ini::Render(f, {"# note", "future=7"});
         CHECK(two.find("host=a b\n") != std::string::npos); // a stray line break would corrupt the file
-        CHECK(two.find("rcvbuf_kb=32\nsleep_stop=2\nchat=1\nchat_key=L+Left+Select\nchat_pos=top-right\n# note\nfuture=7\n") != std::string::npos);
+        CHECK(two.find("rcvbuf_kb=32\nsleep_stop=2\nchat=0\nchat_key=L+Left+Select\nchat_pos=top-right\n# note\nfuture=7\n") != std::string::npos);
         // what does not fit under the limit is left out, whole lines only
         const std::string small = ini::Render(ini::Fields(), {"aaaaaaaaaa", "bbbbbbbbbb"}, text.size() + 12);
         CHECK(small.find("aaaaaaaaaa\n") != std::string::npos && small.find("bbbbbbbbbb") == std::string::npos);
@@ -319,6 +320,12 @@ static void TestIniValues() {
     // the old default (any case, blanks around) becomes the new one; a chord the user wrote, and off, stay as they are
     CHECK(ini::MenuKeyFromFile("L+R+Select") == "L+Right+Select" && ini::MenuKeyFromFile(" l+r+select\r") == "L+Right+Select");
     CHECK(ini::MenuKeyFromFile("L+R+Start") == "L+R+Start" && ini::MenuKeyFromFile("off") == "off" && ini::MenuKeyFromFile("L+Right+Select") == "L+Right+Select");
+    // (DPAPP-2j, the user: chat, debug and menu off by default) a value with no key the plugin knows besides Select is OFF - the plugin's ParseKeys gave
+    // 0 for it and opened the menu on Select | the default chord; "none" stays itself (off), a real chord with Select stays
+    CHECK(ini::MenuKeyFromFile("xyz") == "off" && ini::MenuKeyFromFile("Select") == "off" && ini::MenuKeyFromFile(" select \r") == "off" &&
+          ini::MenuKeyFromFile("+,") == "off" && ini::MenuKeyFromFile("none") == "none" && ini::MenuKeyFromFile("L+Select") == "L+Select" &&
+          ini::MenuKeyFromFile("Start") == "Start");
+    CHECK(ini::MenuKeyIsOff(ini::MenuKeyFromFile("xyz")) && !ini::MenuKeyIsOff(ini::MenuKeyFromFile("x+L")));
     CHECK(ini::MenuKeyIsOff(ini::kMenuKeyOff));
     CHECK(!ini::MenuKeyIsOff(ini::kDefaultMenuKey));
     // the menu's chord and the chat's (review of the chat, defect 47): Select always in, the words of ParseKeys in any case, and a pair
@@ -1041,43 +1048,51 @@ static void TestCaptureFileHeader() {
 }
 
 static void TestDrainIsBounded() {
-    std::printf("a pass of the drain is bounded (256 KB, 200 ms) and says when it stopped with records left\n");
+    std::printf("a pass of the drain that is not the last is ONE write of 64 KB and one flush, and says when it left records\n");
     const fs::path dir = MakeTempDir("bounds");
     DirFiles files;
     LogFiles log(&files, dir.string() + "/", platform::NowMs());
     CHECK(log.SetLevel(1, true));
     DebugReset();
     const std::vector<u8> payload(1500, 7);
-    // 250 frames of 1500 bytes: 760 KB of text, three passes of 256 KB
+    // 250 frames of 1500 bytes: 760 KB of text, twelve writes of 64 KB
     for (int i = 0; i < 250; ++i) {
         DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
     }
     CHECK_EQ(DebugCaptureTotals().lost_full[1], 0u);
     const u64 before = fs::file_size(dir / "AzaharLink.debug.log");
-    const int writes_before = files.writes;
-    CHECK(log.DrainDebug(false)); // stopped at its bound, records left
+    const int writes_before = files.writes, flushes_before = files.flushes;
+    CHECK(log.DrainDebug(false)); // one write, records left
     const u64 pass = fs::file_size(dir / "AzaharLink.debug.log") - before;
-    CHECK(pass >= 256 * 1024 && pass <= 256 * 1024 + 72 * 1024);
-    CHECK(files.writes - writes_before >= 4 && files.writes - writes_before <= 5); // in writes of 64 KB (+ one record)
+    CHECK(pass >= 64 * 1024 && pass <= 64 * 1024 + 4 * 1024); // (64 KB and the record that crossed it)
+    CHECK_EQ(files.writes - writes_before, 1);                // ONE call the game's read can be behind, not two and more
+    CHECK_EQ(files.flushes - flushes_before, 1);
     CHECK(DebugBytesQueued() > 0);
     int passes = 1;
     while (log.DrainDebug(false)) {
         ++passes;
-        CHECK(passes < 6);
+        CHECK(passes < 16);
     }
-    CHECK_EQ(passes, 2); // two passes cut at their bound, the third finds the end of the ring and says so
+    ++passes; // (the one that found the end of the ring)
+    std::printf("  760 KB of text in %d passes, %d writes, %d flushes\n", passes, files.writes - writes_before, files.flushes - flushes_before);
+    CHECK(passes >= 11 && passes <= 13);
+    CHECK_EQ(files.writes - writes_before, passes); // a write a pass
+    CHECK_EQ(files.flushes - flushes_before, passes); // ... and a flush
     CHECK_EQ(DebugBytesQueued(), 0u);
     CHECK(!log.DrainDebug(false)); // nothing left: no reason to come back soon
-    // the end of the launch takes everything in one pass
+    // the end of the launch takes everything in one pass, write after write, flushed once
     for (int i = 0; i < 250; ++i) {
         DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
     }
+    const int writes_final = files.writes, flushes_final = files.flushes;
     CHECK(!log.DrainDebug(true));
     CHECK_EQ(DebugBytesQueued(), 0u);
+    CHECK(files.writes - writes_final >= 11 && files.writes - writes_final <= 13);
+    CHECK_EQ(files.flushes - flushes_final, 1);
     CHECK(log.SetLevel(0, false));
     fs::remove_all(dir);
 
-    // a slow card: the pass stops after 200 ms whatever it has written (each write takes 60 ms here)
+    // a slow card: the pass is still one write (60 ms here), not write after write for as long as the bound of a pass allowed
     const fs::path dir2 = MakeTempDir("bounds2");
     SlowFiles slow(60);
     LogFiles slow_log(&slow, dir2.string() + "/", platform::NowMs());
@@ -1088,8 +1103,8 @@ static void TestDrainIsBounded() {
     const auto begin = std::chrono::steady_clock::now();
     CHECK(slow_log.DrainDebug(false));
     const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
-    CHECK(spent >= 150 && spent < 450); // (about 4 writes: it looks at the clock after each 64 KB)
-    CHECK(fs::file_size(dir2 / "AzaharLink.debug.log") < 5 * 64 * 1024); // (four writes of 64 KB, not a whole pass of 256 KB + more)
+    CHECK(spent >= 50 && spent < 200); // (one write)
+    CHECK(fs::file_size(dir2 / "AzaharLink.debug.log") < 64 * 1024 + 8 * 1024);
     CHECK(DebugBytesQueued() > 0);
     CHECK(slow_log.SetLevel(0, false)); // (the final drain empties the ring)
     CHECK_EQ(DebugBytesQueued(), 0u);
@@ -1097,7 +1112,7 @@ static void TestDrainIsBounded() {
 }
 
 // The card is the game's too: the main log is flushed at every write (its last lines are what a post-mortem needs), the
-// capture once a pass of the writer, not at every 64 KB write of it (2026-10-20).
+// capture once a pass of the writer (2026-10-20), and a pass that is not the last is one write (2026-11-10).
 static void TestFlushes() {
     std::printf("the main log is flushed at every write, the capture once a pass\n");
     const fs::path dir = MakeTempDir("flushes");
@@ -1112,13 +1127,17 @@ static void TestFlushes() {
     CHECK_EQ(files.writes - writes0, 1);
     CHECK_EQ(files.flushes - flushes0, 1);
     const std::vector<u8> payload(1500, 7);
-    for (int i = 0; i < 60; ++i) { // ~180 KB of text: three writes of 64 KB in one pass
+    for (int i = 0; i < 60; ++i) { // ~180 KB of text: three passes, a write of 64 KB and a flush each
         DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
     }
     const int writes1 = files.writes, flushes1 = files.flushes;
-    CHECK(!log.DrainDebug(false));
-    CHECK(files.writes - writes1 >= 3 && files.writes - writes1 <= 4);
+    CHECK(log.DrainDebug(false));
+    CHECK_EQ(files.writes - writes1, 1);
     CHECK_EQ(files.flushes - flushes1, 1);
+    CHECK(log.DrainDebug(false));
+    CHECK(!log.DrainDebug(false));
+    CHECK_EQ(files.writes - writes1, 3);
+    CHECK_EQ(files.flushes - flushes1, 3);
     // the hex of a frame, formatted in one go, is the same text as before: 1500 bytes of 0x07 after the header
     const std::string text = ReadAll(dir / "AzaharLink.debug.log");
     std::string hex;
@@ -1128,7 +1147,7 @@ static void TestFlushes() {
     CHECK(Contains(text, (hex + "\n").c_str()));
     // nothing to write: nothing flushed
     CHECK(!log.DrainDebug(false));
-    CHECK_EQ(files.flushes - flushes1, 1);
+    CHECK_EQ(files.flushes - flushes1, 3);
     CHECK(log.SetLevel(0, false));
     SetLogSink([](const char*) {});
     fs::remove_all(dir);
@@ -1173,6 +1192,1003 @@ static void TestCaptureCadence() {
     CHECK(log.SetLevel(0, false));
     SetLogSink([](const char*) {});
     fs::remove_all(dir);
+}
+
+// ---- the capture leaves the card to the game (2026-11-10) -------------------------------------------------------------
+// The console has one file-system service: a file read of the game waits behind the call the writer has in it. The pieces below are
+// what keeps the writer out of the game's way with the log on: one write a pass, a slice that shrinks on a slow card, a rest as long
+// as the pass kept the card, the game's reads first, the beacons that say nothing new counted, the core given up while formatting,
+// the main log before the capture - and the numbers that say, call by call, where the card's time went.
+
+/// A card whose calls can be made slow one kind at a time, and which remembers the order of the calls: M / m a write / a flush of the
+/// main log, C / c of the capture.
+class PaceFiles : public DirFiles {
+public:
+    void* OpenAppend(const std::string& path) override {
+        void* file = DirFiles::OpenAppend(path);
+        if (file && path.size() >= 14 && path.compare(path.size() - 14, 14, "AzaharLink.log") == 0) {
+            main_log = file;
+        }
+        if (file && path.size() >= 20 && path.compare(path.size() - 20, 20, "AzaharLink.debug.log") == 0) {
+            capture = file;
+        }
+        return file;
+    }
+    void Write(void* file, const char* data, std::size_t size) override {
+        if (file == capture) {
+            trace += 'C';
+            last_capture_write = size;
+            if (on_capture_write) {
+                on_capture_write();
+            }
+            if (capture_write_ms) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(capture_write_ms));
+            }
+        } else if (file == main_log) {
+            trace += 'M';
+        }
+        DirFiles::Write(file, data, size);
+    }
+    void Flush(void* file) override {
+        if (file == capture) {
+            trace += 'c';
+            if (capture_flush_ms) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(capture_flush_ms));
+            }
+        } else if (file == main_log) {
+            trace += 'm';
+        }
+        DirFiles::Flush(file);
+    }
+    std::string trace;
+    void* main_log = nullptr;
+    void* capture = nullptr;
+    int capture_write_ms = 0;
+    int capture_flush_ms = 0;
+    std::size_t last_capture_write = 0;
+    void (*on_capture_write)() = nullptr;
+};
+
+static void FillFrames(int count) {
+    static const std::vector<u8> payload(1500, 7);
+    for (int i = 0; i < count; ++i) {
+        DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
+    }
+}
+
+static void TestCapturePace() {
+    std::printf("the pace of the capture: the rest after a pass, the share of the card, the size of the slice, the game's reads\n");
+    using namespace pace;
+    // the rest: as long as the pass kept the card, 20 ms at least, 5 s at most (250 ms is no longer the ceiling)
+    CHECK_EQ(RestAfterPass(0), 20u);
+    CHECK_EQ(RestAfterPass(19), 20u);
+    CHECK_EQ(RestAfterPass(21), 21u);
+    CHECK_EQ(RestAfterPass(250), 250u);
+    CHECK_EQ(RestAfterPass(251), 251u);
+    CHECK_EQ(RestAfterPass(4800), 4800u);
+    CHECK_EQ(RestAfterPass(5000), 5000u);
+    CHECK_EQ(RestAfterPass(9300), 5000u);
+    CHECK_EQ(RestAfterPass(0xFFFFFFFFFFull), 5000u);
+    // the share of the card: over the real length of the window, never more than 100
+    CHECK_EQ(CardBusyPercent(2500, 5000), 50u);
+    CHECK_EQ(CardBusyPercent(2499, 5000), 49u);
+    CHECK_EQ(CardBusyPercent(0, 5000), 0u);
+    CHECK_EQ(CardBusyPercent(9300, 9600), 96u);   // (console 63, Kirby Battle Royale: the notice said 185%, by a fixed 5 s)
+    CHECK_EQ(CardBusyPercent(43400, 43700), 99u); // (Fantasy Life: "868%")
+    CHECK_EQ(CardBusyPercent(2880, 9600), 30u);   // (30% of a long window is not "58%": no notice)
+    CHECK_EQ(CardBusyPercent(9300, 5000), 100u);  // (the ceiling)
+    CHECK_EQ(CardBusyPercent(1234, 0), 0u);       // (no window: no division)
+    // the slice: 64 KB while the card answers, 8 KB after a slow call, 64 KB again after 8 fast ones in a row
+    SliceSize slice;
+    CHECK_EQ(slice.Bytes(), 64u * 1024);
+    slice.NoteCall(250); // (250 ms is not "longer than 250")
+    CHECK_EQ(slice.Bytes(), 64u * 1024);
+    slice.NoteCall(251);
+    CHECK_EQ(slice.Bytes(), 8u * 1024);
+    for (int i = 0; i < 7; ++i) {
+        slice.NoteCall(10);
+        CHECK_EQ(slice.Bytes(), 8u * 1024);
+    }
+    slice.NoteCall(4810); // (a slow one before the eighth: the count starts again)
+    for (int i = 0; i < 7; ++i) {
+        slice.NoteCall(10);
+        CHECK_EQ(slice.Bytes(), 8u * 1024);
+    }
+    slice.NoteCall(10);
+    CHECK_EQ(slice.Bytes(), 64u * 1024);
+    for (int i = 0; i < 20; ++i) { // (fast calls on a card that answers change nothing)
+        slice.NoteCall(10);
+    }
+    CHECK_EQ(slice.Bytes(), 64u * 1024);
+
+    // the game's reads
+    typedef GameReadWatch W;
+    {
+        W w;
+        CHECK_EQ(int(w.Look(0, 0, 1000, true)), int(W::kPass)); // (the game reads nothing: the card is the capture's)
+        CHECK_EQ(int(w.Look(1, 0, 1050, true)), int(W::kSkip)); // a read under way
+        CHECK_EQ(int(w.Look(1, 1, 1100, true)), int(W::kSkip)); // ... which ended since the last look
+        CHECK_EQ(int(w.Look(1, 1, 1150, true)), int(W::kPass)); // quiet since
+        // a look that wants nothing never skips, and keeps the count fresh: what ended then is not "since the last look" later
+        CHECK_EQ(int(w.Look(2, 2, 1200, false)), int(W::kPass));
+        CHECK_EQ(int(w.Look(2, 2, 1250, true)), int(W::kPass));
+        CHECK_EQ(w.reads, 2u);
+        // a read that begins and ends between two looks is seen all the same
+        CHECK_EQ(int(w.Look(3, 3, 1300, true)), int(W::kSkip));
+        CHECK_EQ(int(w.Look(3, 3, 1350, true)), int(W::kPass));
+    }
+    {
+        // a game that reads without a pause: 10 s of looks that step aside, then ONE forced slice, and the count starts again
+        W w;
+        u32 n = 0;
+        int skips = 0;
+        u64 t = 5000;
+        for (; t < 5000 + 10000; t += 50) {
+            ++n;
+            CHECK_EQ(int(w.Look(n, n, t, true)), int(t == 5000 ? W::kPass : W::kSkip)); // (the first look has nothing to compare with)
+            ++skips;
+        }
+        ++n;
+        CHECK_EQ(int(w.Look(n, n, t, true)), int(W::kSkip)); // (9950 ms after the first skip: not yet)
+        t += 50;
+        ++n;
+        CHECK_EQ(int(w.Look(n, n, t, true)), int(W::kForced));
+        for (int i = 0; i < 199; ++i) {
+            t += 50;
+            ++n;
+            CHECK_EQ(int(w.Look(n, n, t, true)), int(W::kSkip));
+        }
+        t += 100;
+        ++n;
+        CHECK_EQ(int(w.Look(n, n, t, true)), int(W::kForced)); // ... every 10 s, not once
+        // a pass in between ends the streak: 9 s of skips, a quiet look, 9 s more - no forced slice
+        W v;
+        u32 m = 1;
+        (void)v.Look(m, m, 0, true);
+        for (u64 at = 50; at <= 9000; at += 50) {
+            ++m;
+            CHECK_EQ(int(v.Look(m, m, at, true)), int(W::kSkip));
+        }
+        CHECK_EQ(int(v.Look(m, m, 9050, true)), int(W::kPass));
+        for (u64 at = 9100; at <= 18000; at += 50) {
+            ++m;
+            CHECK_EQ(int(v.Look(m, m, at, true)), int(W::kSkip));
+        }
+        // PassedAnyway (the HOME button) ends it too
+        v.PassedAnyway();
+        ++m;
+        CHECK_EQ(int(v.Look(m, m, 18050, true)), int(W::kSkip));
+        ++m;
+        CHECK_EQ(int(v.Look(m, m, 27000, true)), int(W::kSkip)); // (8950 ms into the new streak, not 18 s into the old)
+    }
+    {
+        // a read whose end is never counted (the post of the call skipped by an Old 3DS's swap): 3 s of "under way", then put right
+        W w;
+        (void)w.Look(4, 4, 0, true);
+        for (u64 at = 50; at < 3050; at += 50) {
+            CHECK_EQ(int(w.Look(5, 4, at, true)), int(W::kSkip));
+        }
+        CHECK_EQ(int(w.Look(5, 4, 3050, true)), int(W::kPass)); // (under way and still for 3 s: it is not coming)
+        CHECK_EQ(w.lost_posts, 1u);
+        CHECK_EQ(w.realigned, 1u);
+        // the reads after it count as before
+        CHECK_EQ(int(w.Look(6, 4, 3100, true)), int(W::kSkip)); // one really under way
+        CHECK_EQ(int(w.Look(6, 5, 3150, true)), int(W::kSkip)); // ended since
+        CHECK_EQ(int(w.Look(6, 5, 3200, true)), int(W::kPass));
+        // ... and if the end thought lost comes after all (a read that really lasted that long), the count goes back
+        CHECK_EQ(int(w.Look(6, 6, 3250, true)), int(W::kSkip));
+        CHECK_EQ(w.lost_posts, 0u);
+        CHECK_EQ(int(w.Look(6, 6, 3300, true)), int(W::kPass));
+        CHECK_EQ(int(w.Look(7, 6, 3350, true)), int(W::kSkip));
+    }
+    {
+        // a lost end with reads going on around it (music streamed from the card every 400 ms): the count would stay one too many
+        // for good. The gate skipped a post (the swap of an Old 3DS): the fewest open over 3 s is what never ended
+        W w;
+        (void)w.Look(0, 0, 0, true, 7); // (7 posts skipped before the first look: old news)
+        u32 begun = 1, done = 0;        // (the read whose end is lost: the gate's count goes to 8)
+        int passes = 0;
+        u64 at = 50;
+        for (; at <= 8000; at += 50) {
+            if (at % 400 == 0) {
+                ++begun; // a read under way at this look ...
+            } else if (at % 400 == 50 && at > 50) {
+                ++done; // ... over at the next
+            }
+            if (w.Look(begun, done, at, true, 8) == W::kPass) {
+                ++passes;
+            }
+            if (at < 3050) {
+                CHECK_EQ(w.realigned, 0u); // (3 s from the look that saw the skipped post, not before)
+            }
+        }
+        CHECK_EQ(w.lost_posts, 1u);
+        CHECK_EQ(w.realigned, 1u);
+        CHECK(passes > 50); // (from 3 s on, the six quiet looks of every eight pass: without the correction none would)
+        // one skipped post puts the count right ONCE: the game then reads on end for 10 s (a read under way at every look, around
+        // the lost one) and nothing more is taken for lost - no pass in the middle of its reads
+        passes = 0;
+        for (; at <= 18000; at += 50) {
+            if (at % 200 == 0) {
+                ++begun;
+                ++done; // (one ends and the next begins between two looks)
+            }
+            if (w.Look(begun + 1, done, at, true, 8) == W::kPass) {
+                ++passes;
+            }
+        }
+        CHECK_EQ(w.lost_posts, 1u);
+        CHECK_EQ(w.realigned, 1u);
+        CHECK_EQ(passes, 0);
+    }
+    {
+        // ... and when no look finds the count right in between: the lost end alone for 3 s (the plain rule puts it right), and from
+        // the very next look a load, a read under way at every look for 10 s. The one skipped post was accounted for: no second time
+        W w;
+        (void)w.Look(0, 0, 0, true, 0);
+        for (u64 at = 50; at <= 3050; at += 50) {
+            (void)w.Look(1, 0, at, true, 1);
+        }
+        CHECK_EQ(w.lost_posts, 1u);
+        CHECK_EQ(w.realigned, 1u);
+        int passes = 0;
+        for (u64 at = 3100; at <= 13000; at += 50) {
+            const u32 n = static_cast<u32>(at / 200);
+            passes += w.Look(n + 2, n, at, true, 1) == W::kPass;
+        }
+        CHECK_EQ(w.lost_posts, 1u);
+        CHECK_EQ(w.realigned, 1u);
+        CHECK_EQ(passes, 0);
+    }
+    {
+        // 2026-11-11, the review's case: NO post skipped (a New 3DS never skips one) and a game that reads on end, a read under way
+        // at every look - reads of 200 ms one after the other, for a minute. Nothing was lost: the count stays, and the capture never
+        // passes (10 s of stepping aside, one forced slice, and again). The rule of 2026-11-10 took the read for lost after 3 s and
+        // wrote in the middle of the load.
+        for (const u32 read_ms : {200u, 400u, 5u}) {
+            W w;
+            (void)w.Look(0, 0, 0, true);
+            int passes = 0, forced = 0;
+            for (u64 at = 50; at <= 60000; at += 50) {
+                const u32 n = static_cast<u32>(at / read_ms);
+                const W::Verdict v = w.Look(n + 1, n, at, true);
+                passes += v == W::kPass;
+                forced += v == W::kForced;
+            }
+            CHECK_EQ(passes, 0);
+            CHECK_EQ(forced, 5); // (at 10.05 s, 20.1 s, ...)
+            CHECK_EQ(w.lost_posts, 0u);
+            CHECK_EQ(w.realigned, 0u);
+        }
+        // two threads of the game reading at once (300 ms and 120 ms): the same
+        {
+            W w;
+            (void)w.Look(0, 0, 0, true);
+            int passes = 0;
+            for (u64 at = 50; at <= 60000; at += 50) {
+                const u32 n = static_cast<u32>(at / 300 + at / 120);
+                passes += w.Look(n + 2, n, at, true) == W::kPass;
+            }
+            CHECK_EQ(passes, 0);
+            CHECK_EQ(w.lost_posts, 0u);
+            CHECK_EQ(w.realigned, 0u);
+        }
+        // a post skipped that was seen while no read was under way lost no end of a read: it proves nothing about the reads after it
+        {
+            W w;
+            (void)w.Look(0, 0, 0, true, 0);
+            CHECK_EQ(int(w.Look(0, 0, 50, true, 3)), int(W::kPass)); // (three calls of the game came back during a swap; none a read)
+            int passes = 0;
+            for (u64 at = 100; at <= 20000; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                passes += w.Look(n + 1, n, at, true, 3) == W::kPass;
+            }
+            CHECK_EQ(passes, 0);
+            CHECK_EQ(w.realigned, 0u);
+        }
+        // the last resort, an end lost with no skipped post to show for it: reads under way at every look for five minutes
+        {
+            W w;
+            (void)w.Look(0, 0, 0, true);
+            u64 at = 50;
+            for (; at < 50 + kReadLostMs; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                (void)w.Look(n + 2, n, at, true); // (one that never ends, and reads of 200 ms around it)
+            }
+            CHECK_EQ(w.realigned, 0u);
+            const u32 n = static_cast<u32>(at / 200);
+            (void)w.Look(n + 2, n, at, true);
+            CHECK_EQ(w.realigned, 1u);
+            CHECK_EQ(w.lost_posts, 2u); // (the fewest seen open: at no look was the second thread between two reads)
+            // ... and what was not lost after all comes back by itself at the first look that sees fewer open
+            CHECK_EQ(int(w.Look(n + 2, n + 1, at + 50, true)), int(W::kSkip));
+            CHECK_EQ(w.lost_posts, 1u);
+        }
+    }
+    {
+        // 2026-11-11, the second review. (1) The posts the gate skipped BEFORE the first look are no proof (the capture switched on
+        // from the menu in a game that went through a swap already): the first look finds a read under way and the game reads on end
+        // for 10 s - nothing is taken for lost
+        {
+            W w;
+            CHECK_EQ(int(w.Look(1, 0, 0, true, 7)), int(W::kSkip));
+            int passes = 0;
+            for (u64 at = 50; at <= 10000; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                passes += w.Look(n + 1, n, at, true, 7) == W::kPass;
+            }
+            CHECK_EQ(passes, 0);
+            CHECK_EQ(w.lost_posts, 0u);
+            CHECK_EQ(w.realigned, 0u);
+        }
+        // (2) a game that reads on end for 10 s, nothing lost; then a swap during which TWO reads lose their end (two threads at the
+        // card) and the load goes on. The 3 s run from the look that SEES the skipped posts, and the fewest open is counted from that
+        // look - not from the 10 s before it, when one read was under way at every look
+        {
+            W w;
+            (void)w.Look(0, 0, 0, true, 0);
+            u64 at = 50;
+            for (; at <= 10000; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                (void)w.Look(n + 1, n, at, true, 0);
+            }
+            CHECK_EQ(w.realigned, 0u);
+            const u64 seen = at; // the first look after the swap: two posts skipped, two ends lost, and the load goes on
+            for (; at < seen + kReadStuckMs; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                (void)w.Look(n + 3, n, at, true, 2);
+                CHECK_EQ(w.realigned, 0u); // (not before 3 s from that look, although reads were under way for 10 s before it)
+            }
+            const u32 n = static_cast<u32>(at / 200);
+            (void)w.Look(n + 3, n, at, true, 2);
+            CHECK_EQ(w.realigned, 1u);
+            CHECK_EQ(w.lost_posts, 2u); // (the two that were lost: by the fewest open of BEFORE the swap it was one, and the other stayed)
+            int passes = 0;
+            for (at += 50; at <= seen + 13000; at += 50) { // the load goes on: the game is at the card at every look
+                const u32 m = static_cast<u32>(at / 200);
+                passes += w.Look(m + 3, m, at, true, 2) == W::kPass;
+            }
+            CHECK_EQ(passes, 0);
+            CHECK_EQ(w.lost_posts, 2u);
+            CHECK_EQ(w.realigned, 1u);
+        }
+        // (3) the review's case: the HOME button during a load. The read under way loses its end (ONE post skipped) and the load goes
+        // on at once: reads of 200 ms, one under way at every look, so the fewest seen open in 3 s is two - the lost end and the real
+        // read of the moment. One post was skipped: one end is lost, no more, and the capture stays off the card for the rest of the
+        // load (with two taken for lost, three looks of every four passed, and the capture wrote in the middle of the load)
+        {
+            W w;
+            (void)w.Look(0, 0, 0, true, 0);
+            CHECK_EQ(int(w.Look(1, 0, 50, true, 0)), int(W::kSkip)); // the read the swap interrupts
+            int passes = 0;
+            for (u64 at = 100; at <= 15000; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                passes += w.Look(n + 2, n, at, true, 1) == W::kPass;
+                CHECK_EQ(w.realigned, at < 100 + kReadStuckMs ? 0u : 1u);
+            }
+            CHECK_EQ(w.lost_posts, 1u);
+            CHECK_EQ(passes, 0);
+        }
+        // (4) "at every look" is no proof across a gap: a read under way at the last look before the HOME menu (or the lid) and one
+        // at the first look after it, six minutes later, are two looks - not five minutes of reads on end
+        {
+            W w;
+            (void)w.Look(0, 0, 0, true);
+            u64 at = 50;
+            for (; at <= 5000; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                (void)w.Look(n + 1, n, at, true);
+            }
+            at += 360000; // (nobody looked: the writer was stopped with the console)
+            for (const u64 end = at + 10000; at <= end; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                (void)w.Look(n + 1, n, at, true);
+            }
+            CHECK_EQ(w.realigned, 0u);
+            CHECK_EQ(w.lost_posts, 0u);
+            // ... and the last resort still comes when the looks have gaps (a forced slice that keeps the writer in a slow card for
+            // 1.5 s, every 10 s): after five minutes of the time that WAS looked at, the gaps left out
+            W v;
+            (void)v.Look(0, 0, 0, true);
+            u64 t = 0, looked_ms = 0;
+            u32 looks = 0;
+            while (v.realigned == 0 && t < 2 * u64(kReadLostMs)) {
+                const bool gap = ++looks % 200 == 0;
+                t += gap ? 1500 : 50;
+                looked_ms += gap ? 0 : 50;
+                const u32 n = static_cast<u32>(t / 200);
+                (void)v.Look(n + 2, n, t, true); // (one that never ends, and reads of 200 ms around it)
+            }
+            CHECK_EQ(v.realigned, 1u);
+            CHECK_EQ(looked_ms, u64(kReadLostMs) + 50); // (the run began at the first look, 50 ms in)
+            CHECK(t > looked_ms + 40000);               // (some thirty gaps went by, none of them counted)
+            // the plain rule needs no close looks: the same two counts at two looks six minutes apart - nothing began and nothing
+            // ended in between, whoever looked
+            W u;
+            (void)u.Look(4, 4, 0, true);
+            CHECK_EQ(int(u.Look(5, 4, 50, true)), int(W::kSkip));
+            CHECK_EQ(int(u.Look(5, 4, 360050, true)), int(W::kPass));
+            CHECK_EQ(u.lost_posts, 1u);
+            // a skipped post seen, then a gap of 5 s: the 3 s of the fewest-open rule are 3 s of looks, from the first one after it
+            W x;
+            (void)x.Look(0, 0, 0, true, 0);
+            (void)x.Look(2, 0, 50, true, 1); // (the look that sees the skipped post: the lost end and a read under way)
+            for (at = 5050; at < 5050 + kReadStuckMs; at += 50) {
+                const u32 n = static_cast<u32>(at / 200);
+                (void)x.Look(n + 2, n, at, true, 1);
+                CHECK_EQ(x.realigned, 0u);
+            }
+            const u32 n = static_cast<u32>(at / 200);
+            (void)x.Look(n + 2, n, at, true, 1);
+            CHECK_EQ(x.realigned, 1u);
+            CHECK_EQ(x.lost_posts, 1u);
+        }
+    }
+    {
+        // the plain rule wants BOTH counts still for 3 s: a second read that begins beside the first starts the 3 s again, and what
+        // is then put right is everything that is open
+        W w;
+        (void)w.Look(4, 4, 0, true);
+        for (u64 at = 50; at <= 1000; at += 50) {
+            CHECK_EQ(int(w.Look(5, 4, at, true)), int(W::kSkip));
+        }
+        for (u64 at = 1050; at < 4050; at += 50) {
+            CHECK_EQ(int(w.Look(6, 4, at, true)), int(W::kSkip)); // (3.05 s is 3 s after the first read began, 2 s after the second)
+        }
+        CHECK_EQ(int(w.Look(6, 4, 4050, true)), int(W::kPass));
+        CHECK_EQ(w.lost_posts, 2u);
+        CHECK_EQ(w.realigned, 1u);
+    }
+}
+
+static void TestCaptureLeavesTheCardToTheGame() {
+    std::printf("the capture and the card: the slice shrinks on a slow card, the card rests as long as the pass kept it, the game's reads come first\n");
+    const fs::path dir = MakeTempDir("pace");
+    PaceFiles files;
+    LogFiles log(&files, dir.string() + "/", platform::NowMs());
+    CHECK(log.SetLevel(1, true));
+    DebugReset();
+    FillFrames(300); // (~900 KB of text)
+    typedef LogFiles::CaptureTurn Turn;
+
+    // ---- the rest: a pass that kept the card 400 ms (more than the 250 ms that used to be the ceiling of the rest)
+    files.capture_write_ms = 400;
+    CHECK(log.DrainDebug(false));
+    const u64 t1 = platform::NowMs();
+    const u64 not_before = log.capture_not_before_ms();
+    std::printf("  a pass of 400 ms in the card: the capture is off it for %ld ms more\n", static_cast<long>(not_before - t1));
+    // (the upper bound is the ceiling of the rest plus slack, not "about 400": the pass is a real sleep and real calls to a real file, and a
+    // PC busy with the other lanes of the tests stretches them; that the rest FOLLOWS the pass is held by RestAfterPass in TestCapturePace)
+    CHECK(not_before >= t1 + 380 && not_before <= t1 + 5400);
+    CHECK(files.last_capture_write >= 64 * 1024);
+    // records are left, but the card rests: nothing now; the writer still wakes within 250 ms (the main log does not wait)
+    CHECK(log.NextCaptureTurn(t1, DebugRingUsedBytes(), false) == Turn::kWait);
+    CHECK_EQ(log.WriterWaitMs(t1), 250u);
+    CHECK_EQ(log.WriterWaitMs(not_before - 100), 100u); // ... and wakes when the rest ends
+    CHECK_EQ(log.WriterWaitMs(not_before - 5), 20u);
+    CHECK(log.NextCaptureTurn(not_before - 1, DebugRingUsedBytes(), false) == Turn::kWait);
+    CHECK(log.NextCaptureTurn(not_before, DebugRingUsedBytes(), false) == Turn::kPass);
+    // the HOME button does not wait for the rest
+    CHECK(log.NextCaptureTurn(t1, DebugRingUsedBytes(), true) == Turn::kPass);
+
+    // ---- the slice: that write was slow (over 250 ms), so the next ones are 8 KB ...
+    CHECK_EQ(log.TakeCardWindow().slice_bytes, 8u * 1024);
+    CHECK(log.DrainDebug(false));
+    CHECK(files.last_capture_write >= 8 * 1024 && files.last_capture_write < 12 * 1024);
+    // ... while the card stays slow, and until eight calls in a row were fast
+    files.capture_write_ms = 0;
+    int small_passes = 0;
+    for (int i = 0; i < 40; ++i) {
+        CHECK(log.DrainDebug(false));
+        if (files.last_capture_write >= 60 * 1024) {
+            break;
+        }
+        CHECK(files.last_capture_write >= 8 * 1024 && files.last_capture_write < 12 * 1024);
+        ++small_passes;
+    }
+    std::printf("  %d small passes after the card answered again, then 64 KB\n", small_passes);
+    // Eight calls: four writes and four flushes, one of them the slow pass's own flush - so never fewer than 3 passes. No tight upper
+    // bound here (2026-11-11): these are real calls to a real file, and one of them taking over 250 ms on a busy PC starts the count
+    // again, as it should; the exact count of eight is held with made-up calls in TestCapturePace (SliceSize::NoteCall).
+    CHECK(small_passes >= 3 && small_passes < 40);
+    CHECK(files.last_capture_write >= 64 * 1024);
+    CHECK_EQ(log.TakeCardWindow().slice_bytes, 64u * 1024);
+    // a slow FLUSH shrinks it too
+    files.capture_flush_ms = 300;
+    CHECK(log.DrainDebug(false));
+    CHECK_EQ(log.TakeCardWindow().slice_bytes, 8u * 1024);
+    files.capture_flush_ms = 0;
+
+    // ---- the game's reads: the svc hook's two counts
+    u32 begun = 0, done = 0;
+    log.SetGameReads(&begun, &done);
+    const u64 T = platform::NowMs() + 100000; // (long after any rest: only the reads decide)
+    CHECK(log.NextCaptureTurn(T, DebugRingUsedBytes(), false) == Turn::kPass); // no read: write
+    begun = 1; // a read under way
+    CHECK(log.NextCaptureTurn(T + 50, DebugRingUsedBytes(), false) == Turn::kWait);
+    CHECK_EQ(log.WriterWaitMs(T + 50), 50u); // (a look again soon)
+    done = 1; // it ended since the last look
+    CHECK(log.NextCaptureTurn(T + 100, DebugRingUsedBytes(), false) == Turn::kWait);
+    CHECK(log.NextCaptureTurn(T + 150, DebugRingUsedBytes(), false) == Turn::kPass);
+    // the HOME button does not wait for the game's reads
+    begun = 2;
+    CHECK(log.NextCaptureTurn(T + 200, DebugRingUsedBytes(), true) == Turn::kPass);
+    done = 2;
+    (void)log.TakeCardWindow();
+    // a game that reads all the time: 10 s of stepping aside, then one small slice
+    int waits = 0;
+    Turn turn = Turn::kWait;
+    u64 at = T + 1000;
+    for (; at < T + 1000 + 20000; at += 50) {
+        ++begun;
+        ++done;
+        turn = log.NextCaptureTurn(at, DebugRingUsedBytes(), false);
+        if (turn != Turn::kWait) {
+            break;
+        }
+        ++waits;
+    }
+    CHECK(turn == Turn::kSmallPass);
+    CHECK_EQ(waits, 200); // (10 s of looks 50 ms apart)
+    const CardWindow w = log.TakeCardWindow();
+    CHECK_EQ(w.forced, 1u);
+    CHECK_EQ(w.read_skips, 200u);
+    CHECK_EQ(w.game_reads, 202u); // (the 201 of the loop and the one of the HOME button's look)
+    // the forced slice is small whatever the card did: with the slice back at 64 KB, it is 8 KB all the same
+    for (int i = 0; i < 6 && log.TakeCardWindow().slice_bytes != 64u * 1024; ++i) {
+        CHECK(log.DrainDebug(false));
+    }
+    CHECK_EQ(log.TakeCardWindow().slice_bytes, 64u * 1024);
+    FillFrames(60);
+    CHECK(log.DrainDebug(false, true));
+    CHECK(files.last_capture_write >= 8 * 1024 && files.last_capture_write < 12 * 1024);
+    // the gate's count of skipped posts reaches the watch through LogFiles: reads under way at every look for 5 s are a lost end only
+    // once the gate has skipped a post (2026-11-11)
+    {
+        static u32 skipped;
+        skipped = 0;
+        log.SetGameReads(&begun, &done, [] { return skipped; });
+        const u64 T2 = at + 100000;
+        (void)log.NextCaptureTurn(T2, DebugRingUsedBytes(), false);
+        (void)log.TakeCardWindow();
+        ++begun; // one read whose end never comes ...
+        for (int i = 1; i <= 100; ++i) {
+            if (i % 2) {
+                ++begun; // ... and others around it
+            } else {
+                ++done;
+            }
+            (void)log.NextCaptureTurn(T2 + i * 50, DebugRingUsedBytes(), false);
+        }
+        CHECK_EQ(log.TakeCardWindow().realigned, 0u);
+        skipped = 1;
+        for (int i = 101; i <= 200; ++i) {
+            if (i % 2) {
+                ++begun;
+            } else {
+                ++done;
+            }
+            (void)log.NextCaptureTurn(T2 + i * 50, DebugRingUsedBytes(), false);
+        }
+        CHECK_EQ(log.TakeCardWindow().realigned, 1u);
+        done = begun;
+    }
+    // 2026-11-11, the second review: the gate's count is read BEFORE the two counts of the reads. A read that begins and loses its end
+    // while the writer is between its loads (here: inside the load of the skipped posts itself, before it answers or after it took its
+    // value) must not show its skipped post beside counts that do not hold the read yet - the look would find nothing under way and
+    // write the post off, and the lost end would stay in the count until the five minutes of the last resort
+    for (const bool before_the_load : {true, false}) {
+        static u32 skipped;
+        static u32* begun_at;
+        static int lose; // 1: a read begins and loses its end before this load answers; 2: after it took its value
+        skipped = 0;
+        begun_at = &begun;
+        lose = 0;
+        done = begun;
+        log.SetGameReads(&begun, &done, [] {
+            const u32 was = skipped;
+            if (lose != 0) {
+                ++*begun_at;
+                ++skipped;
+            }
+            const u32 answer = lose == 1 ? skipped : was;
+            lose = 0;
+            return answer;
+        });
+        const u64 T3 = platform::NowMs() + (before_the_load ? 400000 : 600000);
+        (void)log.NextCaptureTurn(T3, DebugRingUsedBytes(), false); // (a look with nothing under way: the count is right)
+        (void)log.TakeCardWindow();
+        lose = before_the_load ? 1 : 2;
+        for (int i = 1; i <= 70; ++i) { // 3.5 s of looks, the game reading around the lost end
+            if (i > 1) {
+                if (i % 2) {
+                    ++done;
+                } else {
+                    ++begun;
+                }
+            }
+            (void)log.NextCaptureTurn(T3 + i * 50, DebugRingUsedBytes(), false);
+        }
+        CHECK_EQ(lose, 0); // (the load did ask)
+        CHECK_EQ(log.TakeCardWindow().realigned, 1u);
+        done = begun;
+    }
+    // 2026-11-11: the two counts are of EVERY call of the game to the file system (azl/game_card_calls.hpp), not of the reads alone.
+    // Tekken 3D Prime Edition on a console: the call left waiting 26 s behind the writer was fs:USER OpenFileDirectly. The hook's two
+    // lines are played here as Sources/ctr/hook.cpp has them (the policy check pins the lines): an open, a write, a close under way
+    // make the capture step aside as a read does, and a call to gsp, dsp or APT never does.
+    {
+        const auto pre = [&begun](u32 header) {
+            if (IsFileSystemCall(header)) {
+                ++begun;
+            }
+        };
+        const auto post = [&done](u32 header) {
+            if (IsFileSystemCall(header)) {
+                ++done;
+            }
+        };
+        done = begun;
+        log.SetGameReads(&begun, &done);
+        u64 T4 = platform::NowMs() + 800000;
+        (void)log.NextCaptureTurn(T4, DebugRingUsedBytes(), false); // (the look that sees the counts of the case above put level)
+        CHECK(log.NextCaptureTurn(T4 += 50, DebugRingUsedBytes(), false) == Turn::kPass);
+        (void)log.TakeCardWindow();
+        // (OpenFileDirectly, OpenFile, FSFILE_Write, FSFILE_Close, FSFILE_GetSize, OpenArchive, ControlArchive, CreateFile, FSDIR_Read)
+        const u32 file_calls[] = {0x08030204, 0x080201C2, 0x08030102, 0x08080000, 0x08040000, 0x080C00C2, 0x080D0144, 0x08080202, 0x08010042};
+        u32 calls = 0;
+        for (const u32 header : file_calls) {
+            pre(header); // under way
+            CHECK(log.NextCaptureTurn(T4 += 50, DebugRingUsedBytes(), false) == Turn::kWait);
+            CHECK_EQ(log.WriterWaitMs(T4), 50u); // (a look again soon, as for a read)
+            post(header); // it ended since the last look
+            CHECK(log.NextCaptureTurn(T4 += 50, DebugRingUsedBytes(), false) == Turn::kWait);
+            CHECK(log.NextCaptureTurn(T4 += 50, DebugRingUsedBytes(), false) == Turn::kPass);
+            ++calls;
+        }
+        const CardWindow opens = log.TakeCardWindow();
+        CHECK_EQ(opens.game_reads, calls);
+        CHECK_EQ(opens.read_skips, 2 * calls);
+        CHECK_EQ(opens.forced, 0u);
+        // (gsp TriggerCmdReqQueue and FlushDataCache, dsp, srv, cfg:u, APT InquireNotification, nwm::UDS PullPacket, soc:U poll)
+        const u32 other_calls[] = {0x000C0000, 0x00080082, 0x001F0000, 0x00050100, 0x00010082, 0x000B0040, 0x001400C0, 0x00140084};
+        for (const u32 header : other_calls) {
+            pre(header);
+            CHECK(log.NextCaptureTurn(T4 += 50, DebugRingUsedBytes(), false) == Turn::kPass);
+            post(header);
+            CHECK(log.NextCaptureTurn(T4 += 50, DebugRingUsedBytes(), false) == Turn::kPass);
+        }
+        const CardWindow others = log.TakeCardWindow();
+        CHECK_EQ(others.game_reads, 0u);
+        CHECK_EQ(others.read_skips, 0u);
+        CHECK_EQ(begun, done);
+    }
+    log.SetGameReads(nullptr, nullptr);
+    // the gate of an Old 3DS's swap closed: the pass does not begin, and the writer comes back for it soon. From a clean state
+    // (2026-11-11): the ring emptied and nothing waiting, so that it is the stopped pass that makes the next one due
+    for (int i = 0; i < 200 && log.DrainDebug(false); ++i) {
+    }
+    CHECK_EQ(DebugBytesQueued(), 0u);
+    const u64 later = platform::NowMs() + 100000;
+    CHECK(log.NextCaptureTurn(later, DebugRingUsedBytes(), false) == Turn::kPass);
+    CHECK_EQ(log.WriterWaitMs(later), 250u); // (nothing owed)
+    volatile u32 gate = 1;
+    log.SetStopCapture(&gate);
+    CHECK(log.DrainDebug(false));
+    CHECK_EQ(log.WriterWaitMs(later), 20u);
+    gate = 0;
+    log.SetStopCapture(nullptr);
+    CHECK(log.SetLevel(0, false));
+    fs::remove_all(dir);
+    // a capture file that cannot be opened (the card is not ready): nothing is written, and the writer does not come back every 20 ms
+    // for a file that is not there
+    {
+        const fs::path missing = MakeTempDir("pace2") / "missing";
+        DirFiles none;
+        LogFiles late(&none, missing.string() + "/", platform::NowMs());
+        g_debug_level = 1;
+        FillFrames(5);
+        CHECK(!late.DrainDebug(false));
+        CHECK(!late.debug_open());
+        CHECK_EQ(late.WriterWaitMs(platform::NowMs()), 250u);
+        g_debug_level = 0;
+        late.Close();
+        DebugReset();
+        fs::remove_all(missing.parent_path());
+    }
+}
+
+static void TestCardWindow() {
+    std::printf("the calls to the card are counted one by one: writes and flushes, the capture and the main log\n");
+    const fs::path dir = MakeTempDir("cardwin");
+    PaceFiles files;
+    LogFiles log(&files, dir.string() + "/", platform::NowMs());
+    SetLogSink([&log](const char* line) { log.Append(line); });
+    CHECK(log.SetLevel(1, true));
+    DebugReset();
+    (void)log.TakeCardWindow();
+    files.capture_write_ms = 30;
+    files.capture_flush_ms = 20;
+    Log("a line of the main log");
+    log.Flush();
+    FillFrames(100);
+    CHECK(log.DrainDebug(false));
+    CHECK(log.DrainDebug(false));
+    const CardWindow w = log.TakeCardWindow();
+    CHECK_EQ(w.capture_write.calls, 2u);
+    CHECK(w.capture_write.bytes >= 128 * 1024 && w.capture_write.bytes < 136 * 1024);
+    CHECK(azl_ticks_to_ms(w.capture_write.ticks) >= 55 && azl_ticks_to_ms(w.capture_write.ticks) < 400);
+    CHECK(w.capture_write.longest_ms >= 28 && w.capture_write.longest_ms < 250);
+    CHECK(w.capture_write.longest_bytes >= 64 * 1024 && w.capture_write.longest_bytes < 68 * 1024);
+    CHECK_EQ(w.capture_flush.calls, 2u);
+    CHECK_EQ(w.capture_flush.bytes, 0u);
+    CHECK(azl_ticks_to_ms(w.capture_flush.ticks) >= 36 && azl_ticks_to_ms(w.capture_flush.ticks) < 300);
+    CHECK(w.capture_flush.longest_ms >= 18);
+    CHECK_EQ(w.main_write.calls, 1u);
+    CHECK_EQ(w.main_write.bytes, 12u + 22u + 1u); // ("[    0.000] " + the line + the newline)
+    CHECK_EQ(w.main_flush.calls, 1u);
+    CHECK_EQ(w.other.calls, 0u);
+    CHECK_EQ(w.passes, 2u);
+    CHECK_EQ(w.forced, 0u);
+    CHECK_EQ(w.slice_bytes, 64u * 1024);
+    CHECK(w.rest_ms >= 2 * 45 && w.rest_ms < 800); // (each pass kept the card ~50 ms: the capture stayed off it as long)
+    char line[512];
+    LogFiles::FormatCardLine(w, line, sizeof(line));
+    std::printf("  %s\n", line);
+    const std::string text = line;
+    CHECK(text.compare(0, 30, "stats: card: capture 2 writes ") == 0);
+    CHECK(Contains(text, " | main log 1 writes 35 B "));
+    CHECK(Contains(text, " | other 0 calls 0 ms | slice 64 KB, 2 passes (0 forced small), 0 skipped for the game's file calls (0 calls, 0 realigned), rest "));
+    CHECK(!Contains(text, "game:") && !Contains(text, "longer than")); // (the fields the analysis scripts read are not in it)
+    CHECK(text.size() < 440);
+    // taken: the next window starts from nothing (the slice stays what it is)
+    const CardWindow empty = log.TakeCardWindow();
+    CHECK_EQ(empty.capture_write.calls + empty.capture_flush.calls + empty.main_write.calls + empty.main_flush.calls, 0u);
+    CHECK_EQ(empty.capture_write.bytes + empty.capture_write.longest_ms + empty.passes + empty.rest_ms, 0u);
+    CHECK_EQ(empty.slice_bytes, 64u * 1024);
+    // the whole line, from numbers made up
+    CardWindow m;
+    m.capture_write = {2, 131072, 9310ull * AZL_TICKS_PER_MS, 4810, 65536};
+    m.capture_flush = {1, 0, 35ull * AZL_TICKS_PER_MS, 35, 0};
+    m.main_write = {5, 13824, 1234ull * AZL_TICKS_PER_MS, 999, 2764};
+    m.main_flush = {5, 0, 77ull * AZL_TICKS_PER_MS, 40, 0};
+    m.other = {1, 0, 12ull * AZL_TICKS_PER_MS, 12, 0};
+    m.slice_bytes = 8 * 1024;
+    m.passes = 12;
+    m.forced = 1;
+    m.read_skips = 37;
+    m.game_reads = 512;
+    m.realigned = 2;
+    m.rest_ms = 9345;
+    m.yields = 345;
+    m.beacons_same = 1234;
+    LogFiles::FormatCardLine(m, line, sizeof(line));
+    CHECK_EQ(std::string(line),
+             std::string("stats: card: capture 2 writes 131072 B 9310 ms (longest 4810 ms for 65536 B), 1 flushes 35 ms (longest 35 ms)"
+                         " | main log 5 writes 13824 B 1234 ms (longest 999 ms for 2764 B), 5 flushes 77 ms (longest 40 ms)"
+                         " | other 1 calls 12 ms | slice 8 KB, 12 passes (1 forced small), 37 skipped for the game's file calls"
+                         " (512 calls, 2 realigned), rest 9345 ms, 345 yields, 1234 beacons counted not written"));
+    // (2026-11-11: the count is of every call of the game to the file system, and the line says "calls" - a number of opens and closes
+    // under the name "reads" would be read wrong at the next console test)
+    CHECK(!Contains(std::string(line), "reads"));
+    // a rotation is counted apart (it is card time too)
+    CHECK(log.SetLevel(0, false));
+    SetLogSink([](const char*) {});
+    fs::remove_all(dir);
+    {
+        const fs::path dir2 = MakeTempDir("cardwin2");
+        PaceFiles files2;
+        LogFileLimits limits;
+        limits.debug_rotate_bytes = 32 * 1024;
+        LogFiles rot(&files2, dir2.string() + "/", platform::NowMs(), limits);
+        CHECK(rot.SetLevel(1, true));
+        DebugReset();
+        (void)rot.TakeCardWindow();
+        FillFrames(30);
+        CHECK(rot.DrainDebug(false));
+        CHECK_EQ(rot.TakeCardWindow().other.calls, 1u);
+        CHECK(rot.SetLevel(0, false));
+        fs::remove_all(dir2);
+    }
+}
+
+static LogFiles* g_between_log = nullptr;
+static int g_between_writes = 0;
+
+static void TestMainLogGoesFirst() {
+    std::printf("the main log's waiting lines are written before each write of the capture\n");
+    const fs::path dir = MakeTempDir("mainfirst");
+    PaceFiles files;
+    LogFiles log(&files, dir.string() + "/", platform::NowMs());
+    SetLogSink([&log](const char* line) { log.Append(line); });
+    CHECK(log.SetLevel(1, true));
+    DebugReset();
+    FillFrames(100);
+    Log("MAIN-FIRST: a line that waits for the writer");
+    files.trace.clear();
+    CHECK(log.DrainDebug(false));
+    CHECK_EQ(files.trace, std::string("MmCc")); // the main log (written and flushed), then the capture's one write and its flush
+    CHECK(Contains(ReadAll(dir / "AzaharLink.log"), "MAIN-FIRST: a line that waits for the writer\n"));
+    // nothing waiting: the capture alone
+    files.trace.clear();
+    CHECK(log.DrainDebug(false));
+    CHECK_EQ(files.trace, std::string("Cc"));
+    // the last pass of a launch writes slice after slice: a line that comes during the first write is on the card before the second
+    g_between_log = &log;
+    g_between_writes = 0;
+    files.on_capture_write = [] {
+        if (g_between_writes++ == 0) {
+            g_between_log->Append("BETWEEN: a line that came while the capture was in the card");
+        }
+    };
+    FillFrames(100);
+    files.trace.clear();
+    CHECK(!log.DrainDebug(true));
+    CHECK(files.trace.size() > 6);
+    CHECK_EQ(files.trace.substr(0, 4), std::string("CMmC"));
+    CHECK(files.trace.back() == 'c');
+    CHECK_EQ(static_cast<int>(std::count(files.trace.begin(), files.trace.end(), 'c')), 1); // (one flush of the capture for the whole pass)
+    CHECK_EQ(static_cast<int>(std::count(files.trace.begin(), files.trace.end(), 'M')), 1);
+    files.on_capture_write = nullptr;
+    g_between_log = nullptr;
+    CHECK(log.SetLevel(0, false));
+    SetLogSink([](const char*) {});
+    fs::remove_all(dir);
+}
+
+static std::size_t CountOf(const std::string& text, const std::string& needle) {
+    std::size_t n = 0;
+    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
+static void TestBeaconsAreCounted() {
+    std::printf("a beacon that is the one before of its transmitter is counted, not written again\n");
+    const fs::path dir = MakeTempDir("beacons");
+    DirFiles files;
+    LogFileLimits limits;
+    limits.debug_rotate_bytes = 6000;
+    limits.keep = 8;
+    LogFiles log(&files, dir.string() + "/", platform::NowMs(), limits);
+    CHECK(log.SetLevel(1, true));
+    DebugReset();
+    (void)log.TakeCardWindow();
+    const u8 mac_a[6] = {0x00, 0x1f, 0x32, 0xaa, 0xbb, 0xcc};
+    const u8 mac_b[6] = {0x40, 0xf4, 0x07, 0x01, 0x02, 0x03};
+    std::vector<u8> body_a(377), body_b(331);
+    for (std::size_t i = 0; i < body_a.size(); ++i) {
+        body_a[i] = static_cast<u8>(i * 7 + 1);
+    }
+    for (std::size_t i = 0; i < body_b.size(); ++i) {
+        body_b[i] = static_cast<u8>(i * 3 + 2);
+    }
+    std::string hex_a;
+    for (u8 b : body_a) {
+        char two[3];
+        std::snprintf(two, sizeof(two), "%02x", b);
+        hex_a += two;
+    }
+    const std::string whole_a = " BEACON rx    00:1f:32:aa:bb:cc ch11 377B: " + hex_a + "\n";
+    // 20 beacons of a host heard (rx) and 20 of ours (tx), the same bytes every time, with a frame among them
+    for (int i = 0; i < 20; ++i) {
+        DebugBeacon(kDirRx, mac_a, 11, body_a.data(), 377);
+        DebugBeacon(kDirTx, mac_b, 11, body_b.data(), 331);
+        if (i == 10) {
+            const u8 small[40] = {1, 2, 3};
+            DebugFrame(kDirRx, 1, 2, 3, small, sizeof(small));
+        }
+    }
+    CHECK(!log.DrainDebug(false));
+    std::string text = ReadAll(dir / "AzaharLink.debug.log");
+    CHECK_EQ(CountOf(text, whole_a), std::size_t(1)); // the first one whole, byte for byte the line of before
+    CHECK_EQ(CountOf(text, " BEACON rx    00:1f:32:aa:bb:cc ch11 377B: same x19 from "), std::size_t(1));
+    CHECK_EQ(CountOf(text, " BEACON tx    40:f4:07:01:02:03 ch11 331B: same x19 from "), std::size_t(1));
+    CHECK_EQ(CountOf(text, " BEACON "), std::size_t(4)); // two whole, two counts: not forty lines of 700 characters
+    CHECK_EQ(CountOf(text, ", longest gap "), std::size_t(2));
+    CHECK_EQ(CountOf(text, " FRAME rx "), std::size_t(1)); // (the other records are what they were)
+    CHECK(text.find(whole_a) < text.find("same x19 from")); // the whole beacon first, the count after it
+    CHECK_EQ(log.TakeCardWindow().beacons_same, 38u);
+    std::printf("  40 beacons in %lu bytes of capture\n", static_cast<unsigned long>(text.size()));
+    CHECK(text.size() < 2400); // (whole, the forty lines were 30 KB)
+
+    // the next pass: still the same bytes, so only counts; then the body changes: the count of the old one, then the new one whole
+    for (int i = 0; i < 3; ++i) {
+        DebugBeacon(kDirRx, mac_a, 11, body_a.data(), 377);
+    }
+    body_a[40] ^= 0x55;
+    DebugBeacon(kDirRx, mac_a, 11, body_a.data(), 377);
+    DebugBeacon(kDirRx, mac_a, 11, body_a.data(), 377);
+    CHECK(!log.DrainDebug(false));
+    text = ReadAll(dir / "AzaharLink.debug.log");
+    const std::size_t same3 = text.find("ch11 377B: same x3 from ");
+    const std::size_t same1 = text.find("ch11 377B: same x1 from ");
+    CHECK(same3 != std::string::npos && same1 != std::string::npos && same3 < same1);
+    const std::size_t changed = text.find(" BEACON rx    00:1f:32:aa:bb:cc ch11 377B: 0108", same3); // (the new body, whole, between the two counts)
+    CHECK(changed != std::string::npos && changed > same3 && changed < same1);
+    CHECK_EQ(CountOf(text, whole_a), std::size_t(1)); // (the old body was not written again)
+    // another channel or another length is another beacon
+    DebugBeacon(kDirRx, mac_a, 6, body_a.data(), 377);
+    DebugBeacon(kDirRx, mac_a, 6, body_a.data(), 376);
+    CHECK(!log.DrainDebug(false));
+    text = ReadAll(dir / "AzaharLink.debug.log");
+    CHECK_EQ(CountOf(text, " BEACON rx    00:1f:32:aa:bb:cc ch6 377B: 0108"), std::size_t(1));
+    CHECK_EQ(CountOf(text, " BEACON rx    00:1f:32:aa:bb:cc ch6 376B: 0108"), std::size_t(1));
+
+    // a new file (the rotation at 6000 bytes): its first beacon is whole again, whatever the file before had
+    for (int i = 0; i < 40; ++i) {
+        DebugEvent("padding %d: a line of text of the capture, long enough to fill the file and make it rotate at its small test size ............", i);
+    }
+    CHECK(!log.DrainDebug(false));
+    CHECK(!Blocks(Listing(dir), "AzaharLink.debug.").empty());
+    DebugBeacon(kDirRx, mac_a, 6, body_a.data(), 376);
+    DebugBeacon(kDirRx, mac_a, 6, body_a.data(), 376);
+    DebugBeacon(kDirRx, mac_a, 6, body_a.data(), 376);
+    CHECK(!log.DrainDebug(false));
+    text = ReadAll(dir / "AzaharLink.debug.log");
+    CHECK(Contains(text, "debug capture: this file begins here"));
+    CHECK(text.size() < 2000); // (the file after the rotation: the header, one beacon, one count)
+    CHECK_EQ(CountOf(text, " BEACON rx    00:1f:32:aa:bb:cc ch6 376B: 0108"), std::size_t(1));
+    CHECK_EQ(CountOf(text, " ch6 376B: same x2 from "), std::size_t(1));
+
+    // more transmitters than the table has places (a search among the public lobbies): the ninth is written whole every time, as before
+    CHECK(log.SetLevel(0, false));
+    fs::remove_all(dir);
+    const fs::path dir2 = MakeTempDir("beacons2");
+    DirFiles files2;
+    LogFiles many(&files2, dir2.string() + "/", platform::NowMs());
+    CHECK(many.SetLevel(1, true));
+    DebugReset();
+    for (int round = 0; round < 3; ++round) {
+        for (u8 host = 1; host <= 9; ++host) {
+            const u8 mac[6] = {0x02, 0, 0, 0, 0, host};
+            DebugBeacon(kDirRx, mac, 1, body_b.data(), 331);
+        }
+    }
+    CHECK(!many.DrainDebug(false));
+    text = ReadAll(dir2 / "AzaharLink.debug.log");
+    CHECK_EQ(CountOf(text, " ch1 331B: same x2 from "), std::size_t(8));
+    CHECK_EQ(CountOf(text, " BEACON rx    02:00:00:00:00:09 ch1 331B: 0205"), std::size_t(3));
+    CHECK_EQ(CountOf(text, " BEACON rx    02:00:00:00:00:01 ch1 331B: 0205"), std::size_t(1));
+    // a switch-off and on again opens the file anew: whole again
+    CHECK(many.SetLevel(0, false));
+    CHECK(many.SetLevel(1, true));
+    const u8 mac1[6] = {0x02, 0, 0, 0, 0, 1};
+    DebugBeacon(kDirRx, mac1, 1, body_b.data(), 331);
+    CHECK(!many.DrainDebug(false));
+    text = ReadAll(dir2 / "AzaharLink.debug.log");
+    CHECK_EQ(CountOf(text, " BEACON rx    02:00:00:00:00:01 ch1 331B: 0205"), std::size_t(2));
+    CHECK(many.SetLevel(0, false));
+    fs::remove_all(dir2);
+}
+
+static void TestWriterGivesTheCoreUp() {
+    std::printf("a pass that is not the last gives the core up while it formats; the last pass of a launch never does\n");
+    const fs::path dir = MakeTempDir("yield");
+    DirFiles files;
+    LogFileLimits limits;
+    limits.capture_yield_ms = 0; // (here: whenever any time at all has gone by, so that a PC as fast as it likes shows it)
+    LogFiles log(&files, dir.string() + "/", platform::NowMs(), limits);
+    CHECK(log.SetLevel(1, true));
+    DebugReset();
+    (void)log.TakeCardWindow();
+    CHECK_EQ(log.yielded_ticks(), u64(0));
+    FillFrames(60);
+    CHECK(log.DrainDebug(false));
+    const u32 yields = log.TakeCardWindow().yields;
+    std::printf("  %lu pauses in a block of 64 KB\n", static_cast<unsigned long>(yields));
+    CHECK(yields >= 10 && yields <= 25); // (one after each of the ~21 frames of the block)
+    // the time of the pauses is kept apart: the writer does not charge it as its CPU
+    const u64 yielded = log.yielded_ticks();
+    CHECK(azl_ticks_to_ms(yielded) >= yields && azl_ticks_to_ms(yielded) < 2000);
+    CHECK(!log.DrainDebug(true)); // the rest of the ring, at the end of the launch
+    CHECK_EQ(log.TakeCardWindow().yields, 0u);
+    CHECK_EQ(log.yielded_ticks(), yielded);
+    CHECK(log.SetLevel(0, false));
+    fs::remove_all(dir);
+    // the limit the plugin runs with
+    CHECK_EQ(LogFileLimits().capture_yield_ms, 2u);
 }
 
 // A thread above the writer never waits for a lock of the log (Tekken stuck at the publisher's screen with the log on,
@@ -1314,6 +2330,20 @@ static void TestCaptureFileHasTheDietAndTheMarkers() {
     // the marker comes before the frame that follows the hole, and after the frames before it
     const std::size_t last_frame = text.rfind("FRAME rx");
     CHECK(marker < last_frame);
+    // 2026-11-11: a pass that is NOT the last says it too, although it leaves records in the ring. Such a pass is one block, and with a
+    // capture the card cannot keep up with no pass ever empties the ring: the count stayed in memory until the end of the launch, and
+    // was lost with a game that fell (the review of the capture's writer: 0 passes of 40 wrote the line).
+    for (int round = 0; round < 3; ++round) {
+        const u32 lost_before = DebugCaptureTotals().lost_full[1];
+        for (int i = 0; i < 400; ++i) {
+            DebugFrame(kDirRx, 1, 2, 3, payload.data(), 1500);
+        }
+        const u32 lost_now = DebugCaptureTotals().lost_full[1] - lost_before;
+        CHECK(lost_now > 0);
+        CHECK(log.DrainDebug(false)); // (one block: records are left)
+        CHECK(DebugBytesQueued() > 0);
+        CHECK(Contains(ReadAll(dir / "AzaharLink.debug.log"), ("debug: " + std::to_string(lost_now) + " records were dropped (").c_str()));
+    }
     CHECK(log.SetLevel(0, false));
     fs::remove_all(dir);
 }
@@ -1794,6 +2824,103 @@ public:
     int stop_after = 0;
 };
 
+/// The files of TestGateClosesWhileAPassFormats: what was written, and whether the gate was closed by then (atomics: two threads).
+class GateWatchFiles : public DirFiles {
+public:
+    void* OpenAppend(const std::string& path) override {
+        void* file = DirFiles::OpenAppend(path);
+        if (file && path.size() >= 14 && path.compare(path.size() - 14, 14, "AzaharLink.log") == 0) {
+            main_log = file;
+        }
+        return file;
+    }
+    void Write(void* file, const char* data, std::size_t size) override {
+        if (file == main_log.load()) {
+            ++main_writes;
+        } else if (size >= 32 * 1024) {
+            ++capture_writes;
+            closed_at_capture_write = flag != 0;
+        }
+        DirFiles::Write(file, data, size);
+    }
+    volatile u32 flag = 0;
+    std::atomic<void*> main_log{nullptr};
+    std::atomic<int> main_writes{0};
+    std::atomic<int> capture_writes{0};
+    std::atomic<bool> closed_at_capture_write{false};
+};
+
+/// 2026-11-11 (the review of the capture's writer): the gate of the swap closes while a pass is formatting its block. The swap waits
+/// for that pass (CloseSwapGate), so from then on the pass does not sleep any more and does not write the main log's lines first: what
+/// is left of it is the formatting, ONE write and its flush, as before 2026-11-10. The gate is closed by this thread a little after the
+/// pass began on another; an attempt in which that came too early (the pass never began) or too late is made again, never judged.
+static void TestGateClosesWhileAPassFormats() {
+    std::printf("the swap of the block: with the gate closing, a pass under way stops sleeping and leaves the main log for later\n");
+    const fs::path dir = MakeTempDir("gateformat");
+    GateWatchFiles files;
+    LogFileLimits limits;
+    limits.capture_yield_ms = 0; // (a sleep of 1 ms after every record: a block of small records is most of a second of them)
+    LogFiles log(&files, dir.string() + "/", platform::NowMs(), limits);
+    log.SetStopCapture(&files.flag);
+    SetLogSink([&log](const char* line) { log.Append(line); });
+    CHECK(log.SetLevel(1, true));
+    const u8 small[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const auto fill = [&small] {
+        DebugReset();
+        for (int i = 0; i < 2500; ++i) {
+            DebugFrame(kDirRx, 1, 2, 3, small, sizeof(small));
+        }
+    };
+    // the measure: the same block with the gate open
+    fill();
+    log.Flush();
+    (void)log.TakeCardWindow();
+    CHECK(log.DrainDebug(false));
+    const u32 yields_open = log.TakeCardWindow().yields;
+    std::printf("  a block of small records with the gate open: %lu sleeps\n", static_cast<unsigned long>(yields_open));
+    CHECK(yields_open >= 400);
+    bool judged = false;
+    for (int attempt = 0; attempt < 8 && !judged; ++attempt) {
+        fill();
+        log.Flush();
+        (void)log.TakeCardWindow();
+        files.flag = 0;
+        files.capture_writes = 0;
+        files.closed_at_capture_write = false;
+        Log("GATE-FORMAT: a line that waits for the writer");
+        const int main_before = files.main_writes.load();
+        const auto begin = std::chrono::steady_clock::now();
+        std::thread pass([&log] { log.DrainDebug(false); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10 + 10 * attempt));
+        files.flag = 1; // SWAP_ENTER
+        const auto closed_after = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+        pass.join();
+        const u32 yields = log.TakeCardWindow().yields;
+        const int main_in_pass = files.main_writes.load() - main_before;
+        files.flag = 0;
+        // (began: it wrote its block; in time: it had at most `closed_after` sleeps of 1 ms behind it, a fraction of the block's)
+        const bool began = files.capture_writes.load() == 1;
+        const bool in_time = closed_after * 4 < static_cast<long long>(yields_open);
+        if (began && in_time && files.closed_at_capture_write.load()) {
+            judged = true;
+            std::printf("  the gate closed %ld ms into the pass: %lu sleeps in all, %d writes of the main log\n", static_cast<long>(closed_after),
+                        static_cast<unsigned long>(yields), main_in_pass);
+            CHECK(yields * 2 < yields_open); // (no sleep after the gate closed: before, all of the block's)
+            CHECK_EQ(main_in_pass, 0);       // (the main log's line was not written in front of the capture's block ...)
+            CHECK(!Contains(ReadAll(dir / "AzaharLink.log"), "GATE-FORMAT: a line that waits for the writer\n"));
+            log.Flush(); // (... it waited in the queue: the writer's next round, once the gate is open)
+            CHECK(Contains(ReadAll(dir / "AzaharLink.log"), "GATE-FORMAT: a line that waits for the writer\n"));
+        } else {
+            log.Flush();
+        }
+    }
+    CHECK(judged);
+    files.flag = 0;
+    CHECK(log.SetLevel(0, false));
+    SetLogSink([](const char*) {});
+    fs::remove_all(dir);
+}
+
 static void TestCaptureStopsAtTheGate() {
     std::printf("the swap of the block: the capture's pass does not begin with the gate closed, and stops after the write in hand\n");
     const std::vector<u8> payload(1500, 7);
@@ -1842,6 +2969,7 @@ static void TestCaptureStopsAtTheGate() {
     CHECK_EQ(DebugBytesQueued(), 0u);
     CHECK(log.SetLevel(0, false));
     fs::remove_all(dir);
+    TestGateClosesWhileAPassFormats();
 }
 
 /// The end of a launch on a slow card with a full ring (the Zelda session of 2026-10-14: a full 128 GB card, ~40 KB/s, ring at
@@ -1942,7 +3070,73 @@ static void TestTheEndOfALaunchIsBounded() {
     fs::remove_all(dir3);
 }
 
+// (2m-diag D2, D3, 2026-11-21) Tetris with eight, console 63, debug=1: six notices "room link silent ... WiFi" with the WiFi at full strength,
+// in windows the log writer held up to 17 s (one write of the card took 13.4 s). The notice now takes the datagrams per second over the
+// real window and names the room or the network at strength 3 (Plugin::CheckLinkSilence); the stats line marks a stretched window
+// (Plugin::LogStatsTiming). The plugin's code around them is pinned by the block "2m-diag" of Tests/policy_check.sh.
+static void TestLinkSilenceAndStretchedWindows() {
+    std::printf("the silence notice by datagrams per second of the real window, its cause at full strength, the stretched window (2m-diag D2/D3)\n");
+    // a normal window of 5 s: the old bound, 100 datagrams and two silences of 150 ms or more
+    CHECK(LinkSilenceWorthANotice(100, 2, 5000, 5000));
+    CHECK(!LinkSilenceWorthANotice(99, 2, 5000, 5000));
+    CHECK(!LinkSilenceWorthANotice(100, 1, 5000, 5000));
+    CHECK(LinkSilenceWorthANotice(1500, 6, 5000, 5000));
+    // (2m-rev) ... and so is an ordinary window of 5.0-6.0 s (the writer closes it at its first service after the 5 s): 105 in 5.6 s did
+    // not pass the bound of the 2m (112), it passes the 100 of before; beyond 6 s the real length less one second of the writer counts
+    CHECK(LinkSilenceWorthANotice(105, 2, 5600, 5000));
+    CHECK(LinkSilenceWorthANotice(100, 2, 5900, 5000));
+    CHECK(LinkSilenceWorthANotice(100, 2, 6000, 5000));
+    CHECK(!LinkSilenceWorthANotice(99, 2, 6000, 5000));
+    CHECK(!LinkSilenceWorthANotice(100, 2, 6001, 5000));
+    CHECK(LinkSilenceWorthANotice(101, 2, 6001, 5000));
+    CHECK(!LinkSilenceWorthANotice(99, 2, 4000, 5000)); // (a window shorter than the nominal one: never a lower bound than 100)
+    // a window of 17 s the writer held: 101 datagrams were "traffic" until the 2m, they are 5.9 a second now; the same rate as before does it
+    CHECK(!LinkSilenceWorthANotice(101, 3, 17000, 5000));
+    CHECK(!LinkSilenceWorthANotice(319, 3, 17000, 5000));
+    CHECK(LinkSilenceWorthANotice(320, 3, 17000, 5000));
+    CHECK(!LinkSilenceWorthANotice(0xFFFFFFFFu, 2, 0, 5000)); // (no window: no notice, no division)
+    CHECK(LinkSilenceWorthANotice(0xFFFFFFFFu, 2, 0xFFFFFFFFull, 5000)); // (no overflow in the products)
+    // where the notice says the silence is
+    CHECK(std::string(LinkSilenceWhere(3)) == "room/network");
+    for (int strength = 0; strength < 256; ++strength) {
+        if (strength != 3) {
+            CHECK(std::string(LinkSilenceWhere(static_cast<u8>(strength))) == "WiFi");
+        }
+    }
+    // the stretched window: twice the nominal 5 s or more (the window of 18.4 s around the write of 13.4 s; an ordinary 5.2 s one is not)
+    CHECK(!WindowStretched(5000, 5000));
+    CHECK(!WindowStretched(5200, 5000));
+    CHECK(!WindowStretched(9999, 5000));
+    CHECK(WindowStretched(10000, 5000));
+    CHECK(WindowStretched(18400, 5000));
+    // (2m-rev) ... and who stretched it: the writer when its SD card time and its latest wake-up cover half of the excess or more, the
+    // caller of Tick with no writer thread, something else (HOME, sleep) otherwise; a window that is not stretched has no mark
+    CHECK(WhoStretchedTheWindow(18400, 5000, 13400, 0, true) == StretchBy::LogWriter);   // (Tetris with eight: the write of 13.4 s)
+    CHECK(WhoStretchedTheWindow(18400, 5000, 6700, 0, true) == StretchBy::LogWriter);    // (half of the 13.4 s of excess)
+    CHECK(WhoStretchedTheWindow(18400, 5000, 6000, 699, true) == StretchBy::NotTheWriter);
+    CHECK(WhoStretchedTheWindow(18400, 5000, 6000, 700, true) == StretchBy::LogWriter);  // (the late wake-up counts with the card)
+    CHECK(WhoStretchedTheWindow(18400, 5000, 50, 3, true) == StretchBy::NotTheWriter);   // (HOME: the writer was not in the card)
+    CHECK(WhoStretchedTheWindow(18400, 5000, 13400, 0, false) == StretchBy::TickCaller); // (no writer thread: Tick's thread closed it)
+    CHECK(WhoStretchedTheWindow(9999, 5000, 9999, 9999, true) == StretchBy::None);
+    CHECK(WhoStretchedTheWindow(9999, 5000, 0, 0, false) == StretchBy::None);
+    CHECK(std::string(StretchedByText(StretchBy::LogWriter)) == "by the log writer");
+    CHECK(std::string(StretchedByText(StretchBy::NotTheWriter)) == "not by the log writer");
+    CHECK(std::string(StretchedByText(StretchBy::TickCaller)) == "by the caller of Tick (no writer thread)");
+    CHECK(std::string(StretchedByText(StretchBy::None)).empty());
+    // (D1) the count of the rounds long by the pause alone is a window's like the others: TakeStats gives it and clears it
+    (void)TakeStats();
+    g_stats.net_pause_rounds = 7;
+    g_stats.net_slow_rounds = 2;
+    const Stats w = TakeStats();
+    CHECK_EQ(w.net_pause_rounds, 7u);
+    CHECK_EQ(w.net_slow_rounds, 2u);
+    CHECK_EQ(g_stats.net_pause_rounds, 0u);
+}
+
 int main() {
+    // (the frames of this file are the load of the writer's tests - 1 500 bytes each, so many a second: they are whole, as a study
+    //  build writes them; the diet of the capture is Tests/capture_test.cpp's)
+    g_debug_whole = true;
     // (nothing may have turned the log on or allocated its ring before the test of level 0)
     TestLevelZeroIsFree();
     TestIniValues();
@@ -1959,6 +3153,12 @@ int main() {
     TestDrainIsBounded();
     TestFlushes();
     TestCaptureCadence();
+    TestCapturePace();
+    TestCaptureLeavesTheCardToTheGame();
+    TestCardWindow();
+    TestMainLogGoesFirst();
+    TestBeaconsAreCounted();
+    TestWriterGivesTheCoreUp();
     TestNobodyWaitsForTheWriter();
     TestTheEndOfALaunchIsBounded();
     TestCaptureStopsAtTheGate();
@@ -1966,6 +3166,7 @@ int main() {
     TestStatusNumbers();
     TestCpuNumbers();
     TestTakeStats();
+    TestLinkSilenceAndStretchedWindows();
     TestCardWait();
     TestWrapLines();
     TestSharedCounters();

@@ -382,7 +382,9 @@ static void TestCloseOfTheGame() {
                          kAptNoteUtilityResult, kAptNoteLimit, SleepCrumbs::kFwSwapBack, SleepCrumbs::kFwProcHomeEnter, SleepCrumbs::kFwProcHomeExit,
                          SleepCrumbs::kFwProcExit, kAptNoteReceiveWord, kAptNoteSrvNotification, kAptNoteCloseLimit,
                          SleepCrumbs::kExitGuardEnter, SleepCrumbs::kExitGuardRosalina, SleepCrumbs::kExitGuardWaited,
-                         SleepCrumbs::kExitGuardWordLast, SleepCrumbs::kExitGuardAction};
+                         SleepCrumbs::kExitGuardWordLast, SleepCrumbs::kExitGuardAction, SleepCrumbs::kChatKeyboardOpen,
+                         SleepCrumbs::kChatMirrorOn, SleepCrumbs::kChatKeyboardClosed, SleepCrumbs::kChatMirrorBackBegins,
+                         SleepCrumbs::kChatMirrorBackDone};
     const std::size_t count = sizeof(kinds) / sizeof(kinds[0]);
     for (std::size_t i = 0; i < count; ++i) {
         for (std::size_t j = i + 1; j < count; ++j) {
@@ -390,6 +392,179 @@ static void TestCloseOfTheGame() {
         }
     }
     CHECK_EQ(kLumaPluginWordAddress, 0x1FF800F0u);
+}
+
+// The chat's keyboard and its input mirror in the trail (2026-11-10): five lines an opening - open, the switch, closed, "about to hold the
+// game's threads" (pushed BEFORE the hold) and "the threads let go" (pushed after) - so that a console that stops around the way back of the
+// game's HID page leaves the step it had reached. The words are packed in one value each (SleepCrumbs::PackMirror).
+static void TestChatMirror() {
+    std::printf("sleep crumbs: the chat's keyboard and the input mirror: open, switched, closed, about to hold, let go\n");
+    using hidmirror::Outcome;
+    SleepCrumbs crumbs;
+    std::vector<std::string> lines;
+    crumbs.Poll(1000, Os(1000), &lines);
+    // one opening as console 63 logged it (RR3D: open 18.727, mirror 18.775 with the threads held 1056 us, closed 31.688), then the way back
+    crumbs.Push(SleepCrumbs::kChatKeyboardOpen, 3, 18727);
+    crumbs.Push(SleepCrumbs::kChatMirrorOn, SleepCrumbs::PackMirror(static_cast<u32>(Outcome::kDone), 22, 1056), 18775);
+    crumbs.Push(SleepCrumbs::kChatKeyboardClosed, SleepCrumbs::kChatClosedShown | SleepCrumbs::kChatClosedMirror, 31688);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(SleepCrumbs::kMirrorByPlugin, 24, 0), 32690);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackDone, SleepCrumbs::PackMirror(static_cast<u32>(Outcome::kDone), 24, 870), 32692);
+    crumbs.Poll(32700, Os(32700), &lines);
+    CHECK_EQ(lines.size(), std::size_t(5));
+    if (lines.size() == 5) {
+        CHECK(Has(lines[0], "sleep: chat: keyboard open (#3 of this launch) | tick 18727 ms"));
+        CHECK(Has(lines[1], "sleep: chat: input mirror on, the game's HID page is the mirror's (22 threads, held 1056 us) | tick 18775 ms"));
+        CHECK(Has(lines[2], "sleep: chat: keyboard closed, the game's HID page goes back once the keys are let go (1 s at most) | tick 31688 ms"));
+        // (2026-11-11, the second review: the plugin's thread's line says that the hold may come after a wait - it is pushed BEFORE the
+        // time this thread gives the trail to reach the card, and a console that stops in that wait leaves it with nothing after it)
+        CHECK(Has(lines[3], "sleep: chat: input mirror: the game's HID page goes back, by the plugin's thread: about to hold the game's threads "
+                            "(24 threads; this line is pushed before the hold, and this thread may first wait for it to be on the card: the "
+                            "game's threads run in that wait, the hold is not begun) | tick 32690 ms"));
+        CHECK(Has(lines[4], "sleep: chat: input mirror: the game's HID page is back, the game's threads let go (done; 24 threads, held 870 us) | "
+                            "tick 32692 ms"));
+    }
+    // the other ways: a keyboard never shown, a close at once, no mirror (an emulator), a switch refused, a way back from a game's thread
+    // and from the framework's events, one that fell back, the limits of the packed word
+    lines.clear();
+    crumbs.Push(SleepCrumbs::kChatKeyboardClosed, 0, 40000);
+    crumbs.Push(SleepCrumbs::kChatKeyboardClosed,
+                SleepCrumbs::kChatClosedShown | SleepCrumbs::kChatClosedMirror | SleepCrumbs::kChatClosedAtOnce, 40001);
+    crumbs.Push(SleepCrumbs::kChatKeyboardClosed, SleepCrumbs::kChatClosedShown, 40002);
+    crumbs.Push(SleepCrumbs::kChatMirrorOn, SleepCrumbs::PackMirror(static_cast<u32>(Outcome::kNeighbour), 30, 412), 40003);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(SleepCrumbs::kMirrorByNotification, 31, 0), 40004);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(3, 31, 0), 40005);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(5, 0, 0), 40006);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(0, 300, 0), 40007);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(1, 12, 0), 40008);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(42, 12, 0), 40009);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackDone, SleepCrumbs::PackMirror(static_cast<u32>(Outcome::kFellBack), 31, 70000), 40010);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackDone, SleepCrumbs::PackMirror(static_cast<u32>(Outcome::kLeftEmpty), 0, 5), 40011);
+    crumbs.Poll(40100, Os(40100), &lines);
+    CHECK_EQ(lines.size(), std::size_t(12));
+    if (lines.size() == 12) {
+        CHECK(Has(lines[0], "chat: keyboard closed, never shown, no input mirror to give back | tick 40000 ms"));
+        CHECK(Has(lines[1], "chat: keyboard closed, the game's HID page goes back at once | tick 40001 ms"));
+        CHECK(Has(lines[2], "chat: keyboard closed, no input mirror to give back | tick 40002 ms"));
+        CHECK(Has(lines[3], "chat: no input mirror (a writable shared neighbour; 30 threads, held 412 us)"));
+        CHECK(Has(lines[4], "goes back, by a game's thread, at a notification: about to hold the game's threads (31 threads;"));
+        // (the threads that push the line right before the hold say nothing of a wait: only the plugin's thread has one)
+        for (std::size_t i = 4; i <= 9; ++i) {
+            CHECK(Has(lines[i], "; this line is pushed before the hold) | tick "));
+            CHECK(!Has(lines[i], "may first wait"));
+        }
+        CHECK(Has(lines[5], "goes back, by the framework's thread, at HOME_ENTER: about to hold the game's threads (31 threads;"));
+        CHECK(Has(lines[6], "goes back, by the framework's thread, at SWAP_ENTER: about to hold the game's threads (threads not counted;"));
+        CHECK(Has(lines[7], "goes back, by the framework's thread, at EXIT: about to hold the game's threads (255 or more threads;"));
+        CHECK(Has(lines[8], "goes back, by the framework's thread, at SLEEP_ENTER: about to hold"));
+        CHECK(Has(lines[9], "goes back, by ?: about to hold"));
+        CHECK(Has(lines[10], "chat: input mirror: the way back ended without the page back, the game's threads let go (the real page could not be "
+                             "mapped back: the mirror stays; 31 threads, held 65535 us)"));
+        CHECK(Has(lines[11], "the way back ended without the page back, the game's threads let go (the real page could not be mapped back: the "
+                             "address is EMPTY; threads not counted, held 5 us)"));
+    }
+    // 2026-11-11: the plugin's thread said "about to hold", waited for the trail without the mirror's lock, and another thread gave the
+    // page back meanwhile (or had the lock): its "about to hold" is closed by a line that says it held nothing
+    lines.clear();
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(SleepCrumbs::kMirrorByPlugin, 24, 0), 41000);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(SleepCrumbs::kMirrorByNotification, 24, 0), 41010);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackDone, SleepCrumbs::PackMirror(static_cast<u32>(Outcome::kDone), 24, 800), 41011);
+    crumbs.Push(SleepCrumbs::kChatMirrorBackDone, SleepCrumbs::PackMirror(static_cast<u32>(Outcome::kBusy), 24, 0), 41020);
+    crumbs.Poll(41100, Os(41100), &lines);
+    CHECK_EQ(lines.size(), std::size_t(4));
+    if (lines.size() == 4) {
+        CHECK(Has(lines[2], "chat: input mirror: the game's HID page is back, the game's threads let go (done; 24 threads, held 800 us)"));
+        CHECK(Has(lines[3], "sleep: chat: input mirror: this thread did not hold the game's threads after all ("));
+        CHECK(Has(lines[3], ": the lines of that thread say how it went) | tick 41020 ms"));
+        CHECK(!Has(lines[3], "let go"));
+    }
+    // the packed word: 8 bits, 8 bits, 16 bits, each one capped and none spilling into its neighbour
+    CHECK_EQ(SleepCrumbs::PackMirror(0, 0, 0), 0u);
+    CHECK_EQ(SleepCrumbs::PackMirror(0x1FF, 0, 0), 0xFFu);
+    CHECK_EQ(SleepCrumbs::PackMirror(0, 254, 0), 254u << 8);
+    CHECK_EQ(SleepCrumbs::PackMirror(0, 1000, 0), 0xFFu << 8);
+    CHECK_EQ(SleepCrumbs::PackMirror(0, 0, 65534), 65534u << 16);
+    CHECK_EQ(SleepCrumbs::PackMirror(0, 0, 0xFFFFFFFFu), 0xFFFFu << 16);
+    CHECK_EQ(SleepCrumbs::PackMirror(100, 64, 1007), 100u | 64u << 8 | 1007u << 16);
+    // who gives the page back: the numbers the console's side uses (Sources/ctr/input_mirror.cpp asserts the framework's events)
+    CHECK_EQ(SleepCrumbs::kMirrorByPlugin, 99u);
+    CHECK_EQ(SleepCrumbs::kMirrorByNotification, 100u);
+    // The chat's lines do not arm the watch of a sleep, and they have a limit of lines of their own (2026-11-11: counted against the
+    // launch's 400, 80 openings of 5 lines used them all up, and the HOME, the swap or the exit at which the console then stopped left
+    // no line). 48 openings of 5 lines, the last line the limit's; then no more of them - and every other line as before.
+    CHECK(!crumbs.watching());
+    CHECK_EQ(SleepCrumbs::kMaxChatLines, 240u);
+    SleepCrumbs many;
+    std::vector<std::string> all;
+    many.Poll(1000, Os(1000), &all);
+    for (u32 opening = 0; opening < 80; ++opening) {
+        many.Push(SleepCrumbs::kChatKeyboardOpen, opening + 1, 2000 + opening);
+        many.Push(SleepCrumbs::kChatMirrorOn, SleepCrumbs::PackMirror(0, 20, 700), 2000 + opening);
+        many.Push(SleepCrumbs::kChatKeyboardClosed, 3, 2000 + opening);
+        many.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(99, 20, 0), 2000 + opening);
+        many.Push(SleepCrumbs::kChatMirrorBackDone, SleepCrumbs::PackMirror(0, 20, 700), 2000 + opening);
+        many.Poll(2000 + opening, Os(2000 + opening), &all);
+    }
+    CHECK_EQ(all.size(), std::size_t(SleepCrumbs::kMaxChatLines));
+    CHECK_EQ(many.chat_lines(), SleepCrumbs::kMaxChatLines);
+    CHECK_EQ(many.lines(), 0u); // (none of them counted against the launch's lines)
+    if (all.size() == SleepCrumbs::kMaxChatLines) {
+        CHECK(Has(all[SleepCrumbs::kMaxChatLines - 2], "about to hold the game's threads"));
+        CHECK(Has(all[SleepCrumbs::kMaxChatLines - 1], "the limit of lines about the chat's keyboard for one launch is reached"));
+        CHECK(!Has(all[SleepCrumbs::kMaxChatLines - 1], "nothing more is written"));
+    }
+    // the 81st opening leaves nothing; the HOME after it, the swap, the exit guard and the sleep are written like the first of the launch
+    all.clear();
+    many.Push(SleepCrumbs::kChatKeyboardOpen, 81, 3000);
+    many.Push(SleepCrumbs::kChatMirrorBackBegins, SleepCrumbs::PackMirror(3, 20, 0), 3001);
+    many.Push(SleepCrumbs::kFwProcHomeEnter, 0x00010001, 3002);
+    many.Push(SleepCrumbs::kChatMirrorBackDone, SleepCrumbs::PackMirror(0, 20, 700), 3003);
+    many.Push(SleepCrumbs::kFwSwapEnter, 1, 3004);
+    many.Push(SleepCrumbs::kExitGuardEnter, 0x00000003, 3005);
+    many.Push(SleepCrumbs::kExitGuardAction, 2, 3006);
+    many.Push(kAptNoteNotification, 5, 3007);
+    many.Poll(3010, Os(3010), &all);
+    CHECK_EQ(all.size(), std::size_t(5));
+    if (all.size() == 5) {
+        CHECK(Has(all[0], "framework event HOME_ENTER of the process"));
+        CHECK(Has(all[1], "framework event SWAP_ENTER #1"));
+        CHECK(Has(all[2], "exit guard: the game calls svcExitProcess"));
+        CHECK(Has(all[3], "exit guard: word set to running"));
+        CHECK(Has(all[4], "APT notification 5 (sleep begins)"));
+    }
+    CHECK_EQ(many.lines(), 5u);
+    // the mark of a chat's line does not outlive its event: after one (the last event of a turn), the thread's own lines - events that
+    // were lost, the wake-up - are not taken for the chat's and dropped at the chat's limit
+    all.clear();
+    many.Push(SleepCrumbs::kChatKeyboardOpen, 82, 3100);
+    many.Poll(3100, Os(3100), &all);
+    CHECK(all.empty());
+    for (u32 i = 0; i < 40; ++i) {
+        many.Push(SleepCrumbs::kFwSwapExit, i, 3200 + i); // (40 events, 32 slots)
+    }
+    many.Poll(3300, Os(3300), &all);
+    CHECK_EQ(all.size(), std::size_t(1 + SleepCrumbs::kSlots));
+    if (!all.empty()) {
+        CHECK(Has(all[0], "events were lost"));
+    }
+    // the other way round: the launch's own limit reached ("nothing more is written") stops the chat's lines too, as it says
+    SleepCrumbs full;
+    all.clear();
+    full.Poll(1000, Os(1000), &all);
+    full.Push(SleepCrumbs::kChatKeyboardOpen, 1, 1500);
+    full.Poll(1500, Os(1500), &all);
+    CHECK_EQ(all.size(), std::size_t(1));
+    for (u32 round = 0; round < 20; ++round) {
+        for (u32 i = 0; i < 30; ++i) {
+            full.Push(SleepCrumbs::kFwSwapExit, i, 5000 + round * 100 + i);
+        }
+        full.Poll(5000 + round * 100 + 50, Os(5000 + round * 100 + 50), &all);
+    }
+    CHECK_EQ(all.size(), std::size_t(1 + SleepCrumbs::kMaxLines));
+    CHECK(Has(all.back(), "the limit of lines for one launch is reached: nothing more is written"));
+    full.Push(SleepCrumbs::kChatKeyboardOpen, 2, 9000);
+    full.Poll(9000, Os(9000), &all);
+    CHECK_EQ(all.size(), std::size_t(1 + SleepCrumbs::kMaxLines));
+    CHECK_EQ(full.chat_lines(), 1u);
 }
 
 // The budget of the ReceiveParameter / AppletUtility lines (azl/apt_sleep.hpp, AptNoteBudget): 64, the limit's line once; after a close command 32
@@ -450,6 +625,7 @@ int main() {
     TestTwoProducersAndTheThread();
     TestOld3dsLines();
     TestCloseOfTheGame();
+    TestChatMirror();
     TestNoteBudget();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

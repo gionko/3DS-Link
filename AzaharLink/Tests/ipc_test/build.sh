@@ -48,7 +48,11 @@ for t in ffe_replay_test trace_replay_test result_closure_test command_matrix_te
       "$OUT"/enet_*.o -o "$OUT/$t"
 done
 # The fake Download Play lobby through the IPC front-end: UdsHle + DlpHub + two engines on the in-memory room (no room server needed),
-# raw IPC words, the GetServiceHandle / close hooks, the gate, the statistics, the 8 s cap of the join's wait.
-g++ -m32 -std=c++17 -O1 -g -w -pthread $INC \
+# raw IPC words, the GetServiceHandle / close hooks, the gate, the statistics, the 8 s cap of the join's wait. 1.1.4 (G1, L16): also the adapter
+# of the real Download Play (dlp:CLNT of the Download Play application, and a host of Island Tour), with the library's dlph_wire.c. 1.1.4, route B:
+# built with G1's join path (AZL_CLNT_SYSTEM_JOINS=1): L16 joins with StartSession, which the plugin itself never does (clnt::kSystemAppJoins false).
+gcc $CFLAGS32 -c ConfigApp/dlph/dlph_wire.c -o "$OUT/dlph_wire32.o"
+g++ -m32 -std=c++17 -O1 -g -w -pthread -DAZL_CLNT_SYSTEM_JOINS=1 $INC \
     Tests/ipc_test/dlp_lobby_hle_test.cpp Tests/ipc_test/shim_svc.cpp Sources/ctr/uds_hle.cpp $CORE \
+    Sources/azl/dlp_real_net.cpp Sources/azl/dlp_real_wire.cpp "$OUT/dlph_wire32.o" \
     "$OUT"/enet_*.o -o "$OUT/dlp_lobby_hle_test"

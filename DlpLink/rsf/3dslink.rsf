@@ -8,6 +8,12 @@
 # Luma3DS non controlla questa maschera (k11_extension/source/svcHandler.s passa ogni svc dalla sua tabella), ma la lista resta quella vera:
 # verify_cia.py --elf ferma la build se il codice usa un SVC che qui non c'e'.
 # dlp:SRVR tolto: l'host DLP di 3DS Link parla nwm::UDS grezzo e non apre dlp:SRVR.
+# ns:s al posto di cam:u (mai usato dall'app), 2026-11-16, strada B della 1.1.4: la pagina Download Play manda i 16 byte del riavvio con
+# SetWirelessRebootInfo (ConfigApp/source/dlp_join_sys.cpp) come la Modalita' download di sistema. Le voci restano 32. Luma non controlla l'elenco
+# (sm: checkServiceAccess sempre vero), la voce c'e' per pulizia.
+# pm:app al posto di pxi:dev (mai usato dall'app), 2026-11-20, DPAPP-2j: ConfigApp/source/zombie_free.cpp manda il SOLO comando 12
+# (UnregisterProcess) per liberare il gioco chiuso che pm tiene di un figlio Download Play nella forma M3c1 (terminato, senza thread, chiave
+# nostra). Le voci restano 32.
 BasicInfo:
   Title                   : $(APP_TITLE)
   CompanyCode             : "00"
@@ -147,7 +153,7 @@ AccessControlInfo:
    - ac:u
    - am:net
    - boss:U
-   - cam:u
+   - ns:s
    - cecd:u
    - cfg:nor
    - cfg:u
@@ -171,7 +177,7 @@ AccessControlInfo:
    - ptm:sysm
    - ps:ps
    - ptm:u
-   - pxi:dev
+   - pm:app
    - soc:U
    - ssl:C
    - y2r:u

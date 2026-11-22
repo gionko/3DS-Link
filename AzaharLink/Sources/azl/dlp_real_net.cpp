@@ -3,6 +3,8 @@
 
 #include <cstring>
 
+#include "azl/dlp_clnt_book.hpp"
+#include "azl/dlp_title_block.hpp"
 #include "azl/platform.hpp"
 
 namespace azl {
@@ -20,6 +22,13 @@ u32 Elapsed(u32 now, u32 stamp) {
 
 RealDlpNet::RealDlpNet(UdsEngine* engine) : engine_(engine) {
     engine_->SetLobbyBeaconKind(UdsEngine::LobbyBeaconKind::RealDlp);
+}
+
+void RealDlpNet::SetClntBook(DlpClntBook* book) {
+    clnt_book_ = book;
+    if (book != nullptr) {
+        book->SetChildrenSource(&children_);
+    }
 }
 
 u64 RealDlpNet::NowMs() {
@@ -63,7 +72,7 @@ void RealDlpNet::ClearClient() {
 }
 
 void RealDlpNet::ClearHost() {
-    for (u32 s = 0; s < kMaxClients; ++s) {
+    for (u32 s = 0; s < kRealClients; ++s) {  // (the whole table, whatever the title uses of it)
         peers_[s] = Peer();
     }
     hosting_ = false;
@@ -76,8 +85,8 @@ void RealDlpNet::ClearHost() {
 }
 
 bool RealDlpNet::HostOpen(const HostAnnounce& a, u8 channel, const Identity& me) {
-    if (a.max_nodes < 2 || a.max_nodes > kMaxPlayers) {
-        return false;  // (a lobby of more than 4 players is never announced)
+    if (a.max_nodes < 2 || a.max_nodes > players_) {
+        return false;  // (never more nodes than the ceiling of the title: four for Luigi's Mansion, whatever the tables hold)
     }
     const bool took = !held_;
     if (!Acquire(me)) {
@@ -94,6 +103,7 @@ bool RealDlpNet::HostOpen(const HostAnnounce& a, u8 channel, const Identity& me)
         Release();  // (the network this call began)
         return false;
     }
+    wait_.Reset();  // (H5: a new lobby - the wait of the last one is void)
     ClearHost();
     hosting_ = true;
     child_tid_ = dlp_real::kChildTidHigh | a.child_tid_low;
@@ -114,6 +124,7 @@ void RealDlpNet::HostUpdate(const HostAnnounce& a) {
 }
 
 void RealDlpNet::HostClose() {
+    wait_.Arm(Now());  // (H5: the Download Play's network ends here - the lobby's state 9: the guests noted at their final are counted from now)
     Release();
 }
 
@@ -122,7 +133,7 @@ void RealDlpNet::Kick(u8 node) {
         return;
     }
     engine_->EjectClient(node);  // (an id that is not there is no error; the host's own refuses)
-    if (hosting_ && node >= kFirstClientNode && node <= kMaxPlayers) {
+    if (hosting_ && node >= kFirstClientNode && node <= players_) {
         Peer& p = peers_[node - kFirstClientNode];
         p = Peer();
         p.st = kEjected;  // (nothing more to it until the engine no longer lists the node)
@@ -267,9 +278,11 @@ u8 RealDlpNet::MyNode() {
 }
 
 /// A client that is no longer in the mask loses its dialogue: the next node with its id starts from the Auth. Done wherever the mask is read
-/// (the Pump, and the lobby's own Members), so that the adapter forgets a client no later than the lobby does.
+/// (the Pump, and the lobby's own Members), so that the adapter forgets a client no later than the lobby does. Over the dialogues of the
+/// title (2..its ceiling: the places past it are never used). The three loops over the dialogues (here, Receive, PumpHost) say the size
+/// of the table too: whatever the ceiling says, no index past peers_ (the bytes after it are the object's own: no sanitizer would see it).
 void RealDlpNet::ForgetGone(u16 mask) {
-    for (u32 s = 0; s < kMaxClients; ++s) {
+    for (u32 s = 0; s < kRealClients && s + 1 < players_; ++s) {
         if ((mask & (1u << (s + kFirstClientNode - 1))) == 0) {
             peers_[s] = Peer();
         }
@@ -286,7 +299,7 @@ u32 RealDlpNet::Members(u8 (&nodes)[kMaxPlayers]) {
         return 0;
     }
     u32 count = 0;  // (the spectators are not in the mask: a searcher reading the announcement is never a client)
-    for (u32 id = 1; id <= 16 && count < kMaxPlayers; ++id) {
+    for (u32 id = 1; id <= 16 && count < players_; ++id) {
         if ((mask & (1u << (id - 1))) != 0) {
             nodes[count++] = static_cast<u8>(id);
         }
@@ -313,7 +326,7 @@ bool RealDlpNet::Send(u8 to_node, const u8* data, u32 size) {
     if (session_) {
         return to_node == kHostNode;  // (the searcher's START_ACK / GO_ACK: the Pump answered the host already)
     }
-    if (!hosting_ || to_node < kFirstClientNode || to_node > kMaxPlayers || size < 2) {
+    if (!hosting_ || to_node < kFirstClientNode || to_node > players_ || size < 2) {
         return false;
     }
     Peer& p = peers_[to_node - kFirstClientNode];
@@ -334,7 +347,7 @@ bool RealDlpNet::Send(u8 to_node, const u8* data, u32 size) {
     return false;
 }
 
-/// The START_ACK / GO_ACK the dialogue earned, one per call, as the dialect's messages.
+/// The START_ACK / GO_ACK the dialogue earned, one per call, as the dialect's messages (the lowest node first).
 bool RealDlpNet::Receive(u8* from_node, u8* data, u32 capacity, u32* size) {
     if (session_) {
         // the searcher: the host's StartDistribution as a START, then its final as a GO with the passphrase, once each
@@ -351,7 +364,7 @@ bool RealDlpNet::Receive(u8* from_node, u8* data, u32 capacity, u32* size) {
     if (!hosting_ || capacity < 2) {
         return false;
     }
-    for (u32 s = 0; s < kMaxClients; ++s) {
+    for (u32 s = 0; s < kRealClients && s + 1 < players_; ++s) {
         Peer& p = peers_[s];
         const u8 owed = (p.flags & kOweStartAck) != 0 ? kOweStartAck : ((p.flags & kOweGoAck) != 0 ? kOweGoAck : 0);
         if (owed == 0) {
@@ -372,7 +385,7 @@ bool RealDlpNet::Receive(u8* from_node, u8* data, u32 capacity, u32* size) {
 // ---- the network thread ---------------------------------------------------------------------------------------------
 
 void RealDlpNet::Pump() {
-    if (!hosting_ && !session_ && !scanning_) {
+    if (!hosting_ && !session_ && !scanning_ && wait_.Awaited() == 0) {
         return;
     }
     const u32 now = Now();
@@ -385,9 +398,69 @@ void RealDlpNet::Pump() {
         PumpHost(now);
     } else if (session_) {
         PumpSession();
-    } else {
+    } else if (scanning_) {
         PumpProbe(now);
     }
+    if (wait_.Awaited() != 0) {
+        PumpChildWait(now);
+    }
+}
+
+// ---- H5 and H3 on the network thread ------------------------------------------------------------------------------
+
+/// At the final to `node`: the guest is noted if the room lists it now in the system's Download Play application (wait on only).
+void RealDlpNet::NoteChild(u8 node) {
+    Mac mac;
+    if (wait_.on() && engine_->NodeMac(node, &mac)) {
+        wait_.Note(node - kFirstClientNode, mac, engine_->InRoom(mac) && engine_->InDownloadPlay(mac));
+    }
+}
+
+/// One round of the wait: the presence in the room, nothing sent. At its end the plugin's thread is told how it went (TakeChildWaitEnd).
+void RealDlpNet::PumpChildWait(u32 now) {
+    dlp_real::ChildWait::End end;
+    if (wait_.Step(now, [this](const Mac& m) { return engine_->InRoom(m); }, &end)) {
+        wait_end_.store(0x80000000u | end.waited_ms | (static_cast<u32>(end.back & 0xF) << 16) | (static_cast<u32>(end.stayed & 0xF) << 20) |
+                            (static_cast<u32>(end.missing & 0xF) << 24),
+                        std::memory_order_release);
+    }
+}
+
+bool RealDlpNet::TakeChildWaitEnd(dlp_real::ChildWait::End* out) {
+    const u32 v = wait_end_.exchange(0, std::memory_order_acq_rel);
+    if ((v & 0x80000000u) == 0) {
+        return false;
+    }
+    out->waited_ms = static_cast<u16>(v & 0xFFFFu);
+    out->back = static_cast<u8>((v >> 16) & 0xF);
+    out->stayed = static_cast<u8>((v >> 20) & 0xF);
+    out->missing = static_cast<u8>((v >> 24) & 0xF);
+    return true;
+}
+
+/// H3: the guest at `node` asked for the content and is being ejected: its MAC (the node table's, before the ejection) goes to the ring for the
+/// plugin's thread, which names it on the screen. A full ring drops it.
+void RealDlpNet::NoteContentGuest(u8 node) {
+    Mac mac;
+    if (!engine_->NodeMac(node, &mac)) {
+        return;
+    }
+    const u8 in = content_in_.load(std::memory_order_relaxed);
+    if (static_cast<u8>(in - content_out_.load(std::memory_order_acquire)) >= kContentQueue) {
+        return;
+    }
+    content_mac_[in % kContentQueue] = mac;
+    content_in_.store(static_cast<u8>(in + 1), std::memory_order_release);
+}
+
+bool RealDlpNet::TakeContentGuest(Mac* out) {
+    const u8 got = content_out_.load(std::memory_order_relaxed);
+    if (got == content_in_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    *out = content_mac_[got % kContentQueue];
+    content_out_.store(static_cast<u8>(got + 1), std::memory_order_release);
+    return true;
 }
 
 // ---- the searcher on the network thread ------------------------------------------------------------------------------
@@ -478,6 +551,9 @@ void RealDlpNet::Collect(u32 now) {
         if (p.index == 0) {
             probe_.child_tid_low = static_cast<u32>(dlp_real::AnnounceChildTid(buf_));
             probe_.max_nodes = dlp_real::AnnounceMaxNodes(buf_);
+            if (clnt_book_ != nullptr) {  // (1.1.4, G1: the Download Play application's book keeps the title and the sizes the host announces)
+                clnt_book_->NoteTitle(probe_.host, probe_.child_tid_low, buf_, n < sizeof(buf_) ? n : sizeof(buf_));
+            }
         }
         probe_.mask = static_cast<u8>(probe_.mask | (1u << p.index));
         if (probe_.mask == (1u << dlp_real::kAnnounceFrames) - 1) {
@@ -549,7 +625,7 @@ void RealDlpNet::PumpHost(u32 now) {
     engine_->NodeSnapshot(&me, &mask);  // (false = our network is gone: mask 0, every dialogue ends)
     ForgetGone(mask);
     TakePackets(now);
-    for (u32 s = 0; s < kMaxClients; ++s) {
+    for (u32 s = 0; s < kRealClients && s + 1 < players_; ++s) {
         const u32 node = s + kFirstClientNode;
         if ((mask & (1u << (node - 1))) != 0) {
             StepPeer(static_cast<u8>(node), now);
@@ -567,7 +643,7 @@ void RealDlpNet::TakePackets(u32 now) {
         }
         // (a frame longer than the buffer was taken out cut: its length field cannot match, the parser refuses it)
         const dlp_real::Packet p = dlp_real::ParseFromClient(buf_, n < sizeof(buf_) ? n : sizeof(buf_));
-        if (p.kind == dlp_real::Kind::None || src < kFirstClientNode || src > kMaxPlayers) {
+        if (p.kind == dlp_real::Kind::None || src < kFirstClientNode || src > players_) {
             Bump(&count_.bad);
             continue;
         }
@@ -583,6 +659,7 @@ void RealDlpNet::OnPacket(u8 node, const dlp_real::Packet& p, u32 now) {
         peer.st = kAuthed;
     } else if (p.kind == dlp_real::Kind::DistAck && peer.st == kDistWait) {
         if (p.needs_content) {  // (a download: this mode carries none; the lobby sees the node go and expels it)
+            NoteContentGuest(node);  // (H3: named on the host's screen by the plugin's thread - its MAC is read before the node goes)
             engine_->EjectClient(node);
             peer = Peer();
             peer.st = kEjected;
@@ -654,6 +731,7 @@ void RealDlpNet::StepPeer(u8 node, u32 now) {
             p.flags = static_cast<u8>((p.flags & 0x0F) | (1u << kTriesShift));
             SendDialogue(node, dlp_real::Final(buf_, dlp_real::kTxSeed, 3, p.rid, pass_));
             Bump(&count_.final);
+            NoteChild(node);  // (H5: the first final - a guest of the Download Play application is awaited in state 9)
         }
         break;
     case kGoWait: {
@@ -698,8 +776,12 @@ void RealDlpNet::Announce(u32 now) {
         group_ms_ = now;
         grouped_ = true;
         group_now_ = false;
+        // (the title, if the plugin gave one and it is THIS child's: decided here for the whole group)
+        const dlp_real::TitleBlock* const given = title_.load(std::memory_order_acquire);
+        group_titled_ = given != nullptr && given->child_tid_low == static_cast<u32>(child_tid_);
     }
-    const std::size_t len = dlp_real::AnnounceFrame(buf_, frame_, child_tid_, max_nodes_, dlp_real::kTxSeed);
+    const dlp_real::TitleBlock* const title = group_titled_ ? title_.load(std::memory_order_acquire) : nullptr;
+    const std::size_t len = dlp_real::AnnounceFrame(buf_, frame_, child_tid_, max_nodes_, dlp_real::kTxSeed, title);
     ++frame_;
     engine_->SendTo(kBroadcastNetworkNodeId, kChannelAnnounce, static_cast<u32>(len), 0, buf_, len);
     Bump(&count_.announce);

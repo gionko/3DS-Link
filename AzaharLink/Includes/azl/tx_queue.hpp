@@ -86,6 +86,31 @@ public:
         Clear();
     }
 
+    /// As Take, up to a budget (2026-11-15, the send budget of a round: RoomClient::SetSendBudget): moves the items in order until the next one would bring
+    /// what was moved over `max_bytes` - the first one always goes, whatever its size - and leaves the rest waiting, in order, for the next call (where
+    /// their age and the caps still hold). Returns true when something is left.
+    bool TakeUpTo(std::deque<Item>* out, u64 now_ms, Drops* drops, std::size_t max_bytes) {
+        std::size_t moved = 0;
+        bool any = false;
+        while (!queue_.empty()) {
+            Item& item = queue_.front();
+            if (item.expendable && Stale(item, now_ms)) {
+                ++drops->stale;
+                Forget(item);
+                queue_.pop_front();
+                continue;
+            }
+            if (any && moved + item.bytes.size() > max_bytes) {
+                return true;
+            }
+            moved += item.bytes.size();
+            any = true;
+            Forget(item);
+            out->push_back(std::move(item));
+            queue_.pop_front();
+        }
+        return false;
+    }
     void Clear() {
         queue_.clear();
         expendable_frames_ = expendable_bytes_ = protected_frames_ = 0;

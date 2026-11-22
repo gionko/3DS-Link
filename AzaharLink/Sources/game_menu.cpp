@@ -78,11 +78,25 @@ int TextW(const std::string& s) {
 }
 
 // `s` cut with "..." to `max_w` pixels (never in the middle of a UTF-8 letter).
+// A text longer than kFitMaxBytes is cut there first, before anything is measured (2026-11-10): the loop below takes one letter off and
+// measures the whole text again, every frame of the menu, and a room's or a game's name of some KB (a member's client decides it) made
+// the paused menu crawl. No text of 256 bytes fits a 400-pixel line, so such a text always ends in "...". The room's strings are cut at
+// their decoding too (azl/room_proto.hpp); this is the second fence, for whatever else reaches a line of the menu.
+constexpr std::size_t kFitMaxBytes = 256;
+
 std::string Fit(const std::string& s, int max_w) {
-    if (TextW(s) <= max_w) {
+    const bool too_long = s.size() > kFitMaxBytes;
+    if (!too_long && TextW(s) <= max_w) {
         return s;
     }
-    std::string cut = s;
+    std::size_t keep = s.size();
+    if (too_long) {
+        keep = kFitMaxBytes;
+        while (keep > 0 && (static_cast<unsigned char>(s[keep]) & 0xC0) == 0x80) {
+            --keep; // (the first byte left out is a continuation byte: the letter it belongs to goes too)
+        }
+    }
+    std::string cut(s, 0, keep);
     while (!cut.empty() && TextW(cut + "...") > max_w) {
         cut.pop_back();
         while (!cut.empty() && (static_cast<unsigned char>(cut.back()) & 0xC0) == 0x80) {

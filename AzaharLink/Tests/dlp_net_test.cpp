@@ -101,7 +101,7 @@ static void TestJoin() {
     CHECK(b.e().status() == NetworkStatus::ConnectedAsClient);
 
     // the creator tracks the client
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 0;
     CHECK(Until(ps, 2000, [&] {
         a.lobby.ServerConnectingClients(ids, 4, &total);
@@ -142,7 +142,7 @@ static void TestFullSequenceThenGameUds() {
     u32 res = 0;
     CHECK(Join(ps, b, a, &res));
     CHECK_EQ(res, 0u);
-    u16 ids[4];
+    u8 ids[4];
     u32 total = 0;
     CHECK(Until(ps, 2000, [&] {
         a.lobby.ServerConnectingClients(ids, 4, &total);
@@ -240,7 +240,7 @@ static void TestAdmissionClosedAndFull() {
     CHECK(Join(ps, b, a, &res));
     CHECK_EQ(res, 0u);
     CHECK(Until(ps, 2000, [&] {
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         a.lobby.ServerConnectingClients(ids, 4, &total);
         return total == 1;
@@ -257,7 +257,7 @@ static void TestAdmissionClosedAndFull() {
     CHECK_EQ(c.lobby.ClientTitleInfo(a.mac(), &v), 0u);  // the table is as it was: the same MAC can be tried again
     CHECK_EQ(b.lobby.ClientStopSession(), 0u);           // the seat is free again: the same stale entry now gets in
     CHECK(Until(ps, 3000, [&] {
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 1;
         a.lobby.ServerConnectingClients(ids, 4, &total);
         return total == 0;
@@ -303,7 +303,7 @@ static void TestFourPlayers() {
     CHECK_EQ(CliNode(b), 2u);
     CHECK_EQ(CliNode(c), 3u);
     CHECK_EQ(CliNode(d), 4u);
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 0;
     CHECK(Until(ps, 3000, [&] {
         a.lobby.ServerConnectingClients(ids, 4, &total);
@@ -356,7 +356,7 @@ static void TestLeaveAndGone() {
     u32 res = 0;
     CHECK(Join(ps, b, a, &res));
     CHECK(Join(ps, c, a, &res));
-    u16 ids[4];
+    u8 ids[4];
     u32 total = 0;
     CHECK(Until(ps, 3000, [&] {
         a.lobby.ServerConnectingClients(ids, 4, &total);
@@ -502,8 +502,8 @@ static void TestInboxAndStrangers() {
     CHECK(receive(a, &from, data, &size));
     CHECK_EQ(from, 2u);
     CHECK(!receive(a, &from, data, &size));
-    // The ring keeps eight: the oldest goes
-    for (u16 i = 0; i < 12; ++i) {
+    // The ring keeps sixteen (eight until 2026-11-15, D5): the oldest goes
+    for (u16 i = 0; i < 20; ++i) {
         const u8 numbered[3] = {3, 1, static_cast<u8>(i)};
         b.e().OnWifiPacket(LobbyFrame(a.mac(), b.mac(), 2, 1, static_cast<u16>(700 + i), numbered, 3));
     }
@@ -515,9 +515,9 @@ static void TestInboxAndStrangers() {
         last = data[2];
         ++n;
     }
-    CHECK_EQ(n, 8u);
+    CHECK_EQ(n, 16u);
     CHECK_EQ(first, 4u);
-    CHECK_EQ(last, 11u);
+    CHECK_EQ(last, 19u);
     // A frame is cut to the caller's room
     b.e().OnWifiPacket(LobbyFrame(a.mac(), b.mac(), 2, 1, 800, big, 12));
     CHECK(b.e().PopLobbyMessage(&from, data, 5, &size));

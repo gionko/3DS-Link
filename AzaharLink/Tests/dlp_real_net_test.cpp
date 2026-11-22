@@ -25,6 +25,8 @@
 //   R12  a full network: a second Azahar searcher gets no answer (timeout after 3 s), no announcement, the game goes on
 //   R14  the lobby's START and GO repeated every 200 ms, and the game's BeginGame every 33 ms with new passphrases: A3 does not start
 //        again, the finals are not counted again, the passphrase is the first; a GO to a client that has not finished: no final until it has
+//   H5   (1.1.4) the host's wait for the children: a client the room lists in the Download Play application at its final is awaited in 9
+//        until it is back in the room (or a new lobby voids it); not one that plays the game itself, nor with the wait off
 //   +    the game-thread calls of the adapter (Send, Receive, Members, the clock) allocate nothing; a node that leaves frees its dialogue
 //
 //   g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -ITests -pthread -fsanitize=address,undefined
@@ -61,7 +63,7 @@ struct RHost {
         lobby.Pump();
     }
     u32 Total() {
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0xFF;
         lobby.ServerConnectingClients(ids, 4, &total);
         return total;
@@ -325,6 +327,85 @@ static void R1_Sequence(u32 rtt, bool must_pass) {
     m.StopSession();
     CheckModel(m);
     CHECK_RULES();
+}
+
+/// H5 (1.1.4): the host's wait for the children. One Azahar client through Luigi's sequence to the lobby's 9, the room's lists given by hand:
+/// `wait` the adapter's switch (MakeRealDlpHub), `in_dlplay` whether the room lists the client in the Download Play application at its final.
+/// Then, by `after`: 0 the client leaves the room and comes back (its child), 1 the lobby starts again (HostOpen voids the wait), 2 nothing.
+static void H5_One(bool wait, bool in_dlplay, int after) {
+    std::printf("H5: the wait %s, the client %s the Download Play application, %s\n", wait ? "on" : "off", in_dlplay ? "in" : "not in",
+                after == 0 ? "it leaves the room and comes back" : after == 1 ? "a new lobby" : "nothing more");
+    g_rules.Reset();
+    MockRoom room;
+    RHost h(room, 1, "Host");
+    AzaharDlpClient m(room, 2, "Azahar");
+    Ticker ticker({&h.e(), &m.e()});
+    CHECK(!h.net.child_wait_on());  // (an adapter nobody told does not wait)
+    h.net.SetChildWait(wait);
+    CHECK_EQ(h.net.child_wait_on(), wait);
+    h.e().OnRoomMembers({h.mac(), m.mac()});
+    h.e().SetDownloadPlayMembers(in_dlplay ? std::vector<Mac>{m.mac()} : std::vector<Mac>{});
+    OpenLuigi(h);
+    u32 max_total = 0;
+    const AzaharDlpClient::Probe pr = ProbeOf(h, m, &max_total);
+    CHECK(pr.all);
+    bool joined = false;
+    Pumping(h, [&] { joined = m.StartSession(h.mac()); });
+    CHECK(joined);
+    CHECK(PumpUntil(h, 2000, [&] { return h.Total() == 1; }));
+    CHECK_EQ(h.net.ChildrenAwaited(), 0u);  // (nothing before the final)
+    const Outcome o = RunGame(h, m);
+    CHECK_EQ(o.begin_results_ok, 1u);
+    CHECK_EQ(h.lobby.server_state(), static_cast<u32>(kSrvComplete));
+    CHECK(!h.net.Holds());  // (the Download Play's network is gone whatever the wait)
+    const bool waits = wait && in_dlplay;
+    CHECK_EQ(h.net.ChildrenAwaited(), waits ? 0x01u : 0u);
+    CHECK_EQ(h.Total(), waits ? 1u : 0u);  // (state 9: the game waits for 0)
+    CHECK_EQ(h.ClientExt(2), waits ? 0x09u : 0xFFu);
+    dlp_real::ChildWait::End end = {};
+    CHECK(!h.net.TakeChildWaitEnd(&end));
+    if (!waits) {
+        PumpUntil(h, 300, [] { return false; });
+        CHECK_EQ(h.Total(), 0u);
+        CHECK(!h.net.TakeChildWaitEnd(&end));
+    } else if (after == 0) {
+        const u64 t9 = platform::NowMs();
+        h.e().OnRoomMembers({h.mac()});  // its Download Play application ends: out of the room
+        PumpUntil(h, 400, [] { return false; });
+        CHECK_EQ(h.Total(), 1u);
+        h.e().OnRoomMembers({h.mac(), m.mac()});  // the child is in the room
+        CHECK(PumpUntil(h, 1000, [&] { return h.Total() == 0; }));
+        const u32 waited = static_cast<u32>(platform::NowMs() - t9);
+        CHECK(waited < 2000);  // (nobody else to wait for: the end with the one back)
+        CHECK_EQ(h.net.ChildrenAwaited(), 0u);
+        CHECK(h.net.TakeChildWaitEnd(&end));
+        CHECK_EQ(end.back, 1u);
+        CHECK_EQ(end.stayed, 0u);
+        CHECK_EQ(end.missing, 0u);
+        CHECK(end.waited_ms >= 400 && end.waited_ms < 2000);
+        CHECK(!h.net.TakeChildWaitEnd(&end));  // (once)
+        std::printf("   state 9 with the client awaited, out of the room and back: the end after %u ms\n", static_cast<unsigned>(end.waited_ms));
+    } else if (after == 1) {
+        CHECK_EQ(h.lobby.ServerFinalize(), 0u);
+        CHECK_EQ(h.net.ChildrenAwaited(), 0x01u);  // (Finalize alone: the adapter still counts, the lobby in 0 does not ask)
+        OpenLuigi(h);                              // HostOpen: the wait of the last lobby is void
+        CHECK_EQ(h.net.ChildrenAwaited(), 0u);
+        CHECK_EQ(h.Total(), 0u);
+        PumpUntil(h, 300, [] { return false; });
+        CHECK(!h.net.TakeChildWaitEnd(&end));
+        CHECK_EQ(h.lobby.ServerFinalize(), 0u);
+    }
+    CHECK_EQ(h.net.counters().bad, 0u);
+    m.StopSession();
+    CheckModel(m);
+    CHECK_RULES();
+}
+
+static void H5_Wait() {
+    H5_One(true, true, 0);
+    H5_One(true, true, 1);
+    H5_One(true, false, 2);   // a guest that plays the game itself (Luigi's Mansion, Mario Kart 7 with their copies): never waited for
+    H5_One(false, true, 2);   // the wait off: as before
 }
 
 static void R1b_Announcement() {
@@ -1019,6 +1100,7 @@ int main() {
     R14_Idempotent();
     R14b_FinalsBounded();
     Release_Paths();
+    H5_Wait();
     // (rig helpers this binary has no use for)
     (void)&Join;
     (void)&FindGroup;

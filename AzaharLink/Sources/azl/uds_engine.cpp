@@ -70,8 +70,10 @@ constexpr u32 kClient = Bit(NetworkStatus::ConnectedAsClient);
 constexpr u32 kSpectator = Bit(NetworkStatus::ConnectedAsSpectator);
 constexpr u32 kInSession = kHost | kClient | kSpectator;
 
-/// Records a data frame for this node in the debug capture, whole (see stats.hpp).
-void DebugSecure(u8 dir, const WifiPacket& packet, const SecureDataHeader& h) {
+/// Records a data frame for this node in the debug capture (see stats.hpp, the diet of the capture): `whole` for a frame of
+/// the Download Play's network (the fake lobby's own channel, which says nothing here, and the real one's), false for a game's,
+/// which leaves its first bytes.
+void DebugSecure(u8 dir, const WifiPacket& packet, const SecureDataHeader& h, bool whole = true) {
     const std::size_t at = kLlcHeaderSize + kSecureDataHeaderSize;
     const u8* data = nullptr;
     u32 size = 0;
@@ -79,7 +81,7 @@ void DebugSecure(u8 dir, const WifiPacket& packet, const SecureDataHeader& h) {
         data = packet.data.data() + at;
         size = static_cast<u32>(std::min<std::size_t>(h.ActualDataSize(), packet.data.size() - at));
     }
-    DebugFrame(dir, h.src_node_id, h.dest_node_id, h.data_channel, data, size);
+    DebugFrame(static_cast<u8>(dir | (whole ? kDirWhole : 0)), h.src_node_id, h.dest_node_id, h.data_channel, data, size);
 }
 
 /// ... and a frame that is not for this node, or that is its own frame given back, as its header only: who sent it to whom,
@@ -511,6 +513,7 @@ void UdsEngine::Teardown(NetworkStatusChangeReason reason, bool send_deauth) {
     connection_status_.status_change_reason = static_cast<u32>(reason);
     connection_status_.network_node_id = node_id;
     beacon_active_ = false;
+    beacon_cache_.reset(); // (a client or an idle console has no use for it)
     host_beacon_ms_ = 0;
     associated_ = false;
     sync_valid_ = false;
@@ -562,6 +565,28 @@ bool UdsEngine::RemoveNodeLocked(std::map<Mac, Node>::iterator it, RemovedBy cau
         if (connection_status_.status == static_cast<u32>(NetworkStatus::ConnectedAsHost)) {
             RefreshClientsLocked();
         }
+    } else if (dlp_net_ && !node.spec && !AdmissionBlocked() && connection_status_.status == static_cast<u32>(NetworkStatus::ConnectedAsHost)) {
+        // The real Download Play's network with more than one client (design D17; Mario Kart 7, up to seven): the clients that remain
+        // are told at once, each with the Logoff of its own node, as in a lobby - a console does it with a status frame Azahar does not
+        // read; Azahar's own host says nothing (nwm_uds.cpp, HandleDeauthenticationFrame: "TODO broadcast new connection_status"; the
+        // capture of eight, 1096.759) and its clients keep the node until the next admission's Logoff rewrites their list - the same
+        // frame, the same handler. Only a CLIENT's departure: a spectator comes and goes at every probe of every searcher and is in
+        // nobody's list. With one client (Luigi's Mansion) nobody remains: not one frame more on the wire.
+        // Only while the network ADMITS clients (the lobby is forming): from StartDistribution on the door is shut, and at the final
+        // every client leaves within milliseconds - seven of them made 21 Logoffs (6+5+4+3+2+1) to consoles on their way to the
+        // game's own network, where an Azahar that is Connecting adopts any Logoff it hears; the capture has no frame of the host there.
+        RefreshClientsLocked();
+    } else if (!dlp_net_ && !node.spec && connection_status_.status == static_cast<u32>(NetworkStatus::ConnectedAsHost) && cause != kRemovedLink &&
+               !quiet_removals_ && tells_departures_) {
+        // GB-01 (2026-11-15, the user's decision D5): the game's OWN network. A console's host tells the clients that remain about a departure (their
+        // node lists, the bit of the node in changed_nodes, an event); this engine told nobody, and a client kept the player who had left - in its
+        // table, in GetNodeInformation, and when another console took the free id the word did not say the node had changed
+        // (analysis/lobby-otto-2026-11-13/revisione-uds-normale-a-otto, point 1; Tests/uds_eight_test.cpp). Each client gets the Logoff of its own node,
+        // the frame of an admission, which a console's engine and Azahar's client both read. Not in the real Download Play's network (above: D17),
+        // and not when telling is pointless: the room's link is gone (every node goes, nothing reaches anybody) or the host ejects everybody
+        // (EjectClient of the broadcast id: nobody remains). A client that authenticates again IS told about: its admission may never come
+        // (a Connect that fails, admission closed meanwhile), and then nobody would hear that its old node went (review of 2026-11-15).
+        RefreshClientsLocked();
     }
     return true;
 }
@@ -608,10 +633,9 @@ void UdsEngine::NotePeerSeedLocked(const NodeInfo& peer) {
         return;
     }
     seed_said_ = true;
-    Log("uds: WARNING node %u announces the same friend code seed as this console (%08lx%08lx): a game that tells"
+    Log("uds: WARNING node %u announces the same friend code seed as this console (%04lx...): a game that tells"
         " consoles apart by it will see one",
-        peer.network_node_id, static_cast<unsigned long>(peer.friend_code_seed >> 32),
-        static_cast<unsigned long>(peer.friend_code_seed));
+        peer.network_node_id, static_cast<unsigned long>(peer.friend_code_seed >> 48));
 }
 
 void UdsEngine::LogNodeMapLocked(const char* why) {
@@ -695,6 +719,19 @@ void UdsEngine::SetClientForeignFilterEnforced(bool enforced) {
 bool UdsEngine::client_foreign_filter_enforced() const {
     Guard lock(this);
     return client_foreign_filter_enforced_;
+}
+
+void UdsEngine::SetAdmissionToMembers(bool on) {
+    Guard lock(this);
+    admission_to_members_ = on;
+    if (on) { // (once, when the plugin starts in a game that asks for it: whoever reads the console's log knows the switch is on)
+        Log("uds: in this game's own network the Logoff of an admission goes to the members one by one, not to the room");
+    }
+}
+
+bool UdsEngine::admission_to_members() const {
+    Guard lock(this);
+    return admission_to_members_;
 }
 
 // A Deauthentication a host handled, so that the same MAC authenticating again a moment later is known to have a
@@ -917,14 +954,16 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
             return; // (a Logoff with id 0 would be adopted by every client that is still Connecting)
         }
 
-        if (!dlp_net_) {
+        if (!dlp_net_ && !admission_to_members_) {
             // Azahar broadcasts the EAPoL-Logoff (a real 3DS would only unicast it to the new client).
             SendEapolLogoffLocked(kBroadcastMac, node.network_node_id);
         } else if (spectator) {
             // The real Download Play's network (1.1.3): Azahar's nwm adopts ANY Logoff while it is Connecting (no look at the sender or
             // the id), and a searcher's spectator comes at every probe. Broadcast, its admission would make an Azahar console that is
             // joining (this host or another of the room) node 0, every frame for its own node then "not for me". It changes no node
-            // list: to the spectator alone.
+            // list: to the spectator alone. (And the game's own network of a title that asked for it, SetAdmissionToMembers: the
+            // seven of Mario Kart 7 come back from the Download Play within a tenth of a second, and broadcast, the first admission
+            // would be taken by every Azahar still Connecting as its own - the capture of eight, three players with another's id.)
             SendEapolLogoffLocked(packet.transmitter_address, node.network_node_id);
         } else {
             // A client's: to every member of the network (the joiner among them: their node lists stay whole), never to the room.
@@ -941,9 +980,11 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
         if (!ParseEapolLogoffFrame(packet.data, &logoff)) {
             return;
         }
-        // (a Logoff answers our Start, which goes out when the host's AssociationResponse arrives: in a lobby the host also sends one
-        // when a fellow leaves, and a console that is Connecting again while the host still holds its old node must not take it)
-        if (lobby_inbox_ && !associated_) {
+        // (a Logoff answers our Start, which goes out when the host's AssociationResponse arrives: the host also sends one to each client
+        // when a fellow leaves - in a lobby, and since GB-01 (2026-11-15) in a game's own network - naming that client's OWN node, and a
+        // console that is Connecting again while the host still holds its old node must not take it for its admission: in every network,
+        // the review of 2026-11-15 found it reachable in a game's own one)
+        if (!associated_) {
             return;
         }
         // The real Download Play's network (design D16 a, b): the same wait for the host's answer, and a client takes no Logoff
@@ -1027,6 +1068,7 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
         }
         const u8 max_nodes = network_info_.max_nodes > kUdsMaxNodes ? static_cast<u8>(kUdsMaxNodes)
                                                                       : network_info_.max_nodes;
+        const u8 old_total = connection_status_.total_nodes;
         network_info_.total_nodes = logoff.connected_nodes;
         connection_status_.total_nodes = logoff.connected_nodes;
         std::memset(connection_status_.nodes, 0, sizeof(connection_status_.nodes));
@@ -1056,7 +1098,16 @@ void UdsEngine::HandleEapolPacket(const WifiPacket& packet) {
         // before the game reads the status must leave both bits, or the SDK never asks about the first node)
         connection_status_.changed_nodes |= static_cast<u16>(old_bitmask ^ connection_status_.node_bitmask);
 
-        QueueSignalLocked(connection_status_event_);
+        // (2026-11-15, GB-01) The game is told only when the list changed - the mask, the count, or a node that is another console now: the host's
+        // refresh after a departure may come to a client that has already seen the departure itself (the room's list of members), and a list that
+        // is the same is no news for the game (the event would wake it for nothing).
+        bool same = old_bitmask == connection_status_.node_bitmask && old_total == connection_status_.total_nodes && before.size() == node_info_.size();
+        for (std::size_t i = 0; same && i < node_info_.size(); ++i) {
+            same = before[i].network_node_id == node_info_[i].network_node_id && before[i].friend_code_seed == node_info_[i].friend_code_seed;
+        }
+        if (!same) {
+            QueueSignalLocked(connection_status_event_);
+        }
         LogNodeMapLocked("the host's Logoff frame");
     }
 }
@@ -1204,7 +1255,7 @@ void UdsEngine::HandleSecureDataPacket(const WifiPacket& packet) {
     }
     g_stats.ring_overwritten += bind->ring.overwritten() - overwritten;
     ++g_stats.data_delivered;
-    DebugSecure(kDirRx, packet, secure_data);
+    DebugSecure(kDirRx, packet, secure_data, lobby_inbox_ || dlp_net_);
     if (bind->ring.used_units() > g_stats.ring_peak_units) {
         g_stats.ring_peak_units = bind->ring.used_units();
     }
@@ -1264,6 +1315,21 @@ void UdsEngine::HandleAuthenticationFrame(const WifiPacket& packet) {
         return;
     }
     auto known = node_map_.find(packet.transmitter_address);
+    // (a host of a title that keeps to its game answers no newcomer that plays another game in the room: azl/one_game_host.hpp)
+    if (!(known != node_map_.end() && known->second.connected) &&
+        std::find(other_game_.begin(), other_game_.end(), packet.transmitter_address) != other_game_.end()) {
+        ++g_stats.auth_other_game;
+        const u64 now = platform::NowMs();
+        if (packet.transmitter_address != other_game_logged_ || now - other_game_logged_ms_ >= 5000) {
+            other_game_logged_ = packet.transmitter_address;
+            other_game_logged_ms_ = now;
+            Log("uds: %02X:%02X:%02X:%02X:%02X:%02X asks to join, but in the room it plays another game: no answer, as when the"
+                " network is full",
+                packet.transmitter_address[0], packet.transmitter_address[1], packet.transmitter_address[2],
+                packet.transmitter_address[3], packet.transmitter_address[4], packet.transmitter_address[5]);
+        }
+        return;
+    }
     // (a closed network answers nobody; the real Download Play's host answers a newcomer, who may be a spectator - the EAPoL-Start
     // says which, and refuses a client there - but never drops a member's association while it is closed)
     if (AdmissionBlocked() &&
@@ -1454,6 +1520,28 @@ void UdsEngine::ResetRoomPresence() {
     present_.clear(); // (the first list after this one only says who is there: nobody was seen before it)
     absent_.clear();
     absent_count_.store(0, std::memory_order_relaxed);
+    other_game_.clear(); // (who plays what is the next room's list to say)
+    download_play_.clear(); // (H5: so is who is in the Download Play application)
+}
+
+void UdsEngine::SetDownloadPlayMembers(const std::vector<Mac>& members) {
+    Guard lock(this);
+    download_play_ = members;
+}
+
+bool UdsEngine::InDownloadPlay(const Mac& mac) const {
+    Guard lock(this);
+    return std::find(download_play_.begin(), download_play_.end(), mac) != download_play_.end();
+}
+
+bool UdsEngine::NodeMac(u16 node_id, Mac* out) const {
+    Guard lock(this);
+    return NodeMacLocked(node_id, out);
+}
+
+bool UdsEngine::InRoom(const Mac& mac) const {
+    Guard lock(this);
+    return InRoomLocked(mac);
 }
 
 void UdsEngine::OnRoomMembers(const std::vector<Mac>& members) {
@@ -1478,6 +1566,11 @@ void UdsEngine::OnRoomMembers(const std::vector<Mac>& members) {
         present_.push_back(a.mac);
     }
     absent_count_.store(static_cast<u32>(absent_.size()), std::memory_order_relaxed);
+}
+
+void UdsEngine::SetOtherGameMembers(const std::vector<Mac>& members) {
+    Guard lock(this);
+    other_game_ = members;
 }
 
 void UdsEngine::CheckPresenceLocked(u64 now_ms) {
@@ -1584,13 +1677,46 @@ bool UdsEngine::TryDiscardEncoded(const u8* msg, std::size_t size) {
     return false;
 }
 
+void UdsEngine::BeaconFrameLocked(std::vector<u8>* out) {
+    BeaconCache* cache = beacon_cache_.get();
+    if (cache && cache->nodes.size() == node_info_.size() &&
+        std::memcmp(&cache->network, &network_info_, sizeof(NetworkInfo)) == 0) {
+        bool same = true;
+        // (field by field: a NodeInfo has padding after its last field, and GenerateBeaconFrame reads these three and nothing else)
+        for (std::size_t i = 0; same && i < node_info_.size(); ++i) {
+            const NodeInfo& a = cache->nodes[i];
+            const NodeInfo& b = node_info_[i];
+            same = a.friend_code_seed == b.friend_code_seed && a.network_node_id == b.network_node_id &&
+                   std::memcmp(a.username, b.username, sizeof(a.username)) == 0;
+        }
+        if (same) {
+            ++g_stats.beacon_reused;
+            *out = cache->frame;
+            return;
+        }
+    }
+    ++g_stats.beacon_built;
+    if (!cache) {
+        beacon_cache_.reset(new (std::nothrow) BeaconCache());
+        cache = beacon_cache_.get();
+    }
+    if (!cache) {
+        *out = GenerateBeaconFrame(network_info_, node_info_); // (no memory for the copy: as it was, every time)
+        return;
+    }
+    std::memcpy(&cache->network, &network_info_, sizeof(NetworkInfo));
+    cache->nodes = node_info_;
+    cache->frame = GenerateBeaconFrame(network_info_, node_info_);
+    *out = cache->frame;
+}
+
 void UdsEngine::SendBeaconLocked() {
     if (connection_status_.status != static_cast<u32>(NetworkStatus::ConnectedAsHost)) {
         return;
     }
     WifiPacket packet;
     packet.type = WifiPacket::Type::Beacon;
-    packet.data = GenerateBeaconFrame(network_info_, node_info_);
+    BeaconFrameLocked(&packet.data);
     packet.destination_address = kBroadcastMac;
     packet.channel = network_channel_;
     SendPacket(packet);
@@ -1913,9 +2039,11 @@ u32 UdsEngine::EjectClient(u16 network_node_id) {
         }
         // Azahar's clients ignore a Deauthentication from the host, so nobody would ever tell us
         // they left: the host drops them itself.
+        quiet_removals_ = true; // (nobody remains to be told: GB-01 in RemoveNodeLocked)
         for (auto it = node_map_.begin(); it != node_map_.end();) {
             changed |= RemoveNodeLocked(it++, kRemovedEject);
         }
+        quiet_removals_ = false;
     } else {
         for (auto it = node_map_.begin(); it != node_map_.end(); ++it) {
             if (it->second.connected && !it->second.spec && it->second.node_id == network_node_id) {
@@ -2269,6 +2397,10 @@ u32 UdsEngine::ScanOnConnection(u8* out, u32 out_size, const ScanParams& scan) {
 void UdsEngine::SetScanFilterEnforced(bool enforced) {
     Guard lock(this);
     scan_filter_enforced_ = enforced;
+}
+
+void UdsEngine::SetSameFrameWindow(u32 window_ms) {
+    same_frame_ms_.store(window_ms, std::memory_order_relaxed);
 }
 
 void UdsEngine::WaitForScan(const ScanParams& scan, u64 window_ms) {
@@ -2655,7 +2787,13 @@ u32 UdsEngine::SendTo(u16 dest_node_id, u8 data_channel, u32 data_size, u8 flags
     u16 own_node_id = 0;
     u8 channel = 0;
     u16 sequence = 0;
-    bool peer_numbers = false, addressed = false;
+    bool peer_numbers = false, addressed = false, dlp_frame = false;
+    // The same-frame filter of the dense-broadcast titles (azl/flow_relief.hpp; off for every other game: one load and one compare). It looks
+    // only at a frame for ALL nodes, and the digests of its bytes are made here, before the lock, so that the lock is not held for a pass
+    // over the frame.
+    const u32 same_ms = same_frame_ms_.load(std::memory_order_relaxed);
+    const bool same_wanted = same_ms != 0 && dest_node_id == kBroadcastNetworkNodeId && data_size <= kMaxSendSize && data_size <= available;
+    const flow::FrameDigest digest = same_wanted ? flow::DigestOf(data, data_size) : flow::FrameDigest{};
     {
         Guard lock(this);
         ++g_stats.sendto_calls;
@@ -2686,6 +2824,13 @@ u32 UdsEngine::SendTo(u16 dest_node_id, u8 data_channel, u32 data_size, u8 flags
         }
         g_stats.sendto_bytes += data_size;
         g_stats.sendto_addressed += addressed ? 1u : 0u;
+        // A frame for all nodes that is the one last sent on this data channel, a moment ago, does not go again: no number is used up,
+        // nothing is built or queued, and the capture has no line for it (the statistics count it). Not in a Download Play lobby's network.
+        if (same_wanted && !(lobby_inbox_ || dlp_net_) &&
+            same_frame_.Repeats(data_channel, digest, data_size, static_cast<u32>(platform::NowMs()), same_ms)) {
+            ++g_stats.tx_same_dropped;
+            return res::kSuccess;
+        }
         own_node_id = connection_status_.network_node_id;
         channel = network_channel_;
         // The real nwm numbers its frames; Azahar sends 0 and reads nothing of it. The number is what lets the plugin on the
@@ -2697,8 +2842,9 @@ u32 UdsEngine::SendTo(u16 dest_node_id, u8 data_channel, u32 data_size, u8 flags
         // (a radio_like=2 sender doubles a unicast frame only for a node that numbers its own: one with this plugin, which
         //  drops the copy; an Azahar or an older plugin would hand both to its game, so it gets the frame once, reliable)
         peer_numbers = dest_node_id != kBroadcastNetworkNodeId && copy_dedupe_.Numbers(dest_node_id);
+        dlp_frame = lobby_inbox_ || dlp_net_; // (the Download Play's network: its frames are whole in the capture)
     }
-    DebugFrame(kDirTx, own_node_id, dest_node_id, data_channel, data, data_size);
+    DebugFrame(static_cast<u8>(kDirTx | (dlp_frame ? kDirWhole : 0)), own_node_id, dest_node_id, data_channel, data, data_size);
 
     WifiPacket packet;
     packet.destination_address = dest_address;

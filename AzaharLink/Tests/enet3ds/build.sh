@@ -4,7 +4,8 @@
 # and the timing of every soc call, and nothing else runs it off the console. (The receive that is left out when the socket was
 # found empty and a poll follows is ENet's own, ENetHost::azlSkipEmptyRecv: enet_path_test checks it against this layer too.)
 # Run inside the build container (Linux, g++), from anywhere:
-#   bash Tests/enet3ds/build.sh && /tmp/azl_e3ds/room_integration_3ds --tx-queue && /tmp/azl_e3ds/enet_path_test_3ds
+#   bash Tests/enet3ds/build.sh && /tmp/azl_e3ds/room_integration_3ds --tx-queue && /tmp/azl_e3ds/enet_path_test_3ds && /tmp/azl_e3ds/soc_send_test_3ds
+# (soc_send_test, the count of the datagrams handed to the socket, needs this layer and nothing else: Tests/run.sh builds it too, with the sanitizers, and runs it.)
 set -e
 cd "$(dirname "$0")/../.."
 OUT=${OUT:-/tmp/azl_e3ds}
@@ -21,3 +22,6 @@ g++ -std=c++17 -O1 -g -w -DAZL_E3DS=1 -IIncludes -pthread Tests/room_integration
 # the data path of the ENet client (what a service call reads, when the acknowledgements go, the counters) against the same layer; the link wraps
 # the three socket calls and the clock the way Tests/run.sh does for the PC's layer
 g++ -std=c++17 -O1 -g -w -DAZL_E3DS=1 -IIncludes -pthread Tests/enet_path_test.cpp $CORE "$OUT"/enet_*.o -Wl,--wrap=enet_socket_receive -Wl,--wrap=enet_socket_send -Wl,--wrap=enet_socket_wait -Wl,--wrap=enet_time_get -o "$OUT/enet_path_test_3ds"
+# the count of the datagrams handed to the socket (azl/stats.hpp, soc_send_*): enet_socket_send of this layer called by hand; the link wraps the socket calls
+# under it (the test decides what the socket answers) and the layer's two hooks (the test sees what they are told)
+g++ -std=c++17 -O1 -g -w -DAZL_E3DS=1 -IIncludes -pthread Tests/soc_send_test.cpp Sources/azl/log.cpp Sources/azl/platform.cpp "$OUT/enet_3ds.o" -Wl,--wrap=sendto -Wl,--wrap=send -Wl,--wrap=azl_c_soc_send -Wl,--wrap=azl_c_soc_call -o "$OUT/soc_send_test_3ds"

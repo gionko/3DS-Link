@@ -6,6 +6,7 @@
 #include <cstring>
 #include <new>
 
+#include "azl/beacon_fold.hpp"
 #include "azl/platform.hpp"
 #include "azl/printf_lite.hpp"
 #include "azl/stats.hpp"
@@ -27,6 +28,12 @@ u32 g_cmd_counts[kStatsCommands];
 // ---- debug capture ring --------------------------------------------------------------------
 // The master switch of the log (see stats.hpp): 0 no log of any kind, 1 everything.
 volatile int g_debug_level = 0;
+// The capture without its diet (stats.hpp): a study build only, never the delivered plugin (Tests/policy_check.sh), and the tests.
+#ifdef AZL_CAPTURE_WHOLE
+volatile bool g_debug_whole = true;
+#else
+volatile bool g_debug_whole = false;
+#endif
 
 namespace {
 constexpr u32 kDebugRingBytes = 512 * 1024;
@@ -47,6 +54,22 @@ constexpr u32 kDietProbe = 4;
 constexpr u32 kDietWindowMs = 1000;  // one count line per second and kind ...
 constexpr u32 kDietFullCalls = 3;    // ... after the first three calls of that second
 constexpr u32 kDietSvcReal = 1u << 31; // (the diet's key of a traced service's command, DebugSvcReal: the command with this bit, never an IPC header)
+// The diet of the commands a game polls (stats.hpp, "the diet of the capture"): a table of its own, so that the kinds of the game's
+// UDS thread never take a slot from the IPC lines of the hook, and the forms of its count lines (in the header word of a slot).
+constexpr u32 kCmdDietSlots = 64;    // (a power of two; eight players are 7 nodes of a bind, 8 destinations and the status reads)
+static_assert((kDebugRingBytes & 7) == 0, "the table of the polled commands starts on a word, after the ring");
+constexpr u32 kCmdDietSlotBits = 6;
+constexpr u32 kCmdDietProbe = 8;
+constexpr u32 kCmdDietFullCalls = 1; // (ONE whole line a second and kind, then the count: the frame's own line is next to every call)
+constexpr u32 kDietUdsForm = 0xFFu << 16;
+constexpr u32 kDietUdsPull = 1u << 16; // "uds PullPacket bind B: N bytes from node M": the kind is the bind and the node
+constexpr u32 kDietUdsSend = 2u << 16; // a SendTo that succeeded: the kind is the data channel, the destination, the first word and the flags
+constexpr u32 kDietUdsSendFirstShift = 9;  // (kDietUdsSend: the request's first word, 7 bits, between the command and the form ...
+constexpr u32 kDietUdsSendFlagsShift = 24; //  ... and its flags word, 8 bits, above the form)
+constexpr u32 kDietUdsSame = 3u << 16; // any other polled command that succeeded: the kind is ALL its words (their hash)
+constexpr u32 kDietUdsArg = 1u << 8;   // (kDietUdsSame: the request had words, the count line shows the first)
+// DebugRecord::dir of a count line (kDbgIpcAgg): the table it came from.
+enum AggOrigin : u8 { kAggIpc = 0, kAggCommand = 1 };
 
 // The layout DebugIpc writes by hand (little-endian words: stored, kind, dir | ms | src, dest | size, channel, pad)
 static_assert(offsetof(DebugRecord, stored) == 0 && offsetof(DebugRecord, kind) == 2 && offsetof(DebugRecord, dir) == 3 &&
@@ -92,6 +115,9 @@ struct DietSlot {
     u32 name[3];       // a traced service's name (DebugSvcReal: its count line says it), all 0 for a line of DebugIpc
 };
 DietSlot g_dbg_diet[kDietSlots];
+// The table of the polled UDS commands (CommandDietLocked): kCmdDietSlots slots at the end of the ring's block, so that it is
+// there with the ring and only with it - with the log off the capture has no memory at all, as before.
+DietSlot* g_dbg_cmd_diet = nullptr;
 
 void RingWrite(const void* data, u32 n) {
     const u8* p = static_cast<const u8*>(data);
@@ -300,11 +326,11 @@ __attribute__((always_inline)) inline bool PushSmallLocked(const DebugRecord& re
 // (`done`) and, when `with_pending`, those of the second that is still open. Only the writer thread calls this - a game
 // thread that finds its second over hands the count over in the slot and goes on - so the stack it needs is the writer's.
 // g_dbg_mutex held.
-__attribute__((noinline)) void PushAggregateLocked(DietSlot& slot, u32 now, bool with_pending) {
+__attribute__((noinline)) void PushAggregateLocked(DietSlot& slot, u32 now, bool with_pending, u8 origin = kAggIpc) {
     DebugRecord rec;
     rec.stored = 7 * sizeof(u32);
     rec.kind = kDbgIpcAgg;
-    rec.dir = 0;
+    rec.dir = origin; // (an AggOrigin: the writer makes the line of an IPC call or of a UDS command)
     rec.ms = now;
     rec.src = rec.dest = rec.size = 0;
     rec.channel = 0;
@@ -347,15 +373,19 @@ inline bool SecondOver(u32 now, u32 since) {
 // The diet: true when the call (result 0) is only counted. g_dbg_mutex held. A kind (session handle and command) written
 // whole the first three times of every second, then one line for the rest of that second; a table with no free slot writes
 // everything whole. `name`: the 12 bytes of a traced service's name (DebugSvcReal), nullptr for DebugIpc.
-__attribute__((always_inline)) inline bool DietLocked(u32 handle, u32 header, u32 arg, u32 now, const void* name = nullptr) {
+// (`table`, `bits`, `reach`, `full`: the table and the rule of the IPC lines unless the caller has its own - CommandDietLocked's.
+//  They are constants at every call, in line: nothing is passed at run time.)
+__attribute__((always_inline)) inline bool DietLocked(u32 handle, u32 header, u32 arg, u32 now, const void* name = nullptr,
+                                                      DietSlot* table = g_dbg_diet, u32 bits = kDietSlotBits,
+                                                      u32 reach = kDietProbe, u32 full = kDietFullCalls) {
     if (handle == 0) {
         return false;
     }
-    const u32 index = ((handle * 0x9E3779B1u) ^ (header * 0x85EBCA77u)) >> (32 - kDietSlotBits);
+    const u32 index = ((handle * 0x9E3779B1u) ^ (header * 0x85EBCA77u)) >> (32 - bits);
     DietSlot* slot = nullptr;
     DietSlot* spare = nullptr;
-    for (u32 probe = 0; probe < kDietProbe; ++probe) {
-        DietSlot& s = g_dbg_diet[(index + probe) & (kDietSlots - 1)];
+    for (u32 probe = 0; probe < reach; ++probe) {
+        DietSlot& s = table[(index + probe) & ((1u << bits) - 1)];
         if (s.handle == handle && s.header == header) {
             slot = &s;
             break;
@@ -396,7 +426,7 @@ __attribute__((always_inline)) inline bool DietLocked(u32 handle, u32 header, u3
         slot->calls = 0;
         slot->pending = 0;
     }
-    if (++slot->calls <= kDietFullCalls) {
+    if (++slot->calls <= full) {
         return false;
     }
     if (slot->pending++ == 0) {
@@ -437,7 +467,13 @@ bool DebugInit() {
     if (g_dbg_ring) {
         return true;
     }
-    g_dbg_ring = new (std::nothrow) u8[kDebugRingBytes];
+    // (one block, the allocation there always was: the ring and, after it, the 3.3 KB of the table of the polled commands)
+    u8* block = new (std::nothrow) u8[kDebugRingBytes + kCmdDietSlots * sizeof(DietSlot)];
+    if (block) {
+        g_dbg_cmd_diet = reinterpret_cast<DietSlot*>(block + kDebugRingBytes);
+        std::memset(g_dbg_cmd_diet, 0, kCmdDietSlots * sizeof(DietSlot));
+        g_dbg_ring = block; // (last: a producer looks at the ring before anything else)
+    }
     return g_dbg_ring != nullptr;
 }
 
@@ -450,13 +486,16 @@ void DebugFrame(u8 dir, u16 src, u16 dest, u8 channel, const u8* payload, u32 si
     if (g_debug_level <= 0 || !g_dbg_ring) {
         return;
     }
+    // The diet of the frames (stats.hpp): a game's data frame leaves its first kDebugFrameHead bytes in the ring, under its whole
+    // header (the length included); a frame of the Download Play's network (kDirWhole), and every frame of a study build, is whole.
+    const u32 keep = (dir & kDirWhole) != 0 || g_debug_whole ? kDebugMaxPayload : kDebugFrameHead;
     DebugRecord rec = MakeRecord(kDbgFrame, kLaneHeavy);
-    rec.dir = dir;
+    rec.dir = static_cast<u8>(dir & ~kDirWhole);
     rec.src = src;
     rec.dest = dest;
     rec.size = static_cast<u16>(size > 0xFFFF ? 0xFFFF : size);
     rec.channel = channel;
-    rec.stored = static_cast<u16>(payload ? std::min<u32>(size, kDebugMaxPayload) : 0);
+    rec.stored = static_cast<u16>(payload ? std::min<u32>(size, keep) : 0);
     DebugPush(rec, payload);
 }
 // <<< game-thread code
@@ -633,6 +672,59 @@ bool HotUdsCommand(u32 id) {
     return false;
 }
 
+// The diet of the commands a game polls (stats.hpp): true when this command is only counted - under its kind, in the table of
+// the polled commands - and no record is made of it. Never a command of the control lane, a command that failed, or anything
+// at all in a study build. g_dbg_mutex held. (A function of its own, not in line, with four arguments - the lane and the time are
+// the record's: its registers are not part of PushCommand's frame, which every command of the game's UDS thread pays, the ones
+// of the control lane too.)
+__attribute__((noinline)) bool CommandDietLocked(const DebugRecord& rec, const CommandHead& head, const u32* request, const u32* reply) {
+    if (rec.pad != kLaneHeavy || g_debug_whole) {
+        return false;
+    }
+    u32 key, header, arg;
+    if (head.tag == kCmdPull) {
+        // (a PullPacket that gave a frame; the frame's own line has its length, so the kind is the bind and the node)
+        if (head.a >= 0x8000u || head.c > 0xFFFFu) {
+            return false;
+        }
+        key = 0x80000000u | (head.a << 16) | head.c;
+        header = kDietUdsPull | 0x14;
+        arg = head.b;
+    } else {
+        if (head.tag != kCmdUds || head.reply_words == 0 || reply[0] != 0) {
+            return false; // (a command that failed is always whole)
+        }
+        if (head.a == 0x17 && head.request_words >= 6 && request[0] <= 0x7Fu && request[1] <= 0xFFFFu && request[2] <= 0xFFu &&
+            request[5] <= 0xFFu) {
+            // (a SendTo: the destination node and the data channel, and its first word and its flags too - no other line of the
+            //  capture has those two words and games differ in them (1 and flags 3 for one, 3 and flags 1 for another, 2026-11-13):
+            //  a count never stands for calls that differ in them; the bytes are the fifth word. A word with bits above its field
+            //  - games leave them there - is no kind of this form: the call falls to the rule of the same words below)
+            key = 0x80000000u | (request[2] << 16) | request[1];
+            header = kDietUdsSend | (request[5] << kDietUdsSendFlagsShift) | (request[0] << kDietUdsSendFirstShift) | 0x17;
+            arg = request[4];
+        } else {
+            // Any other polled command: the same line again, word for word. Every step is one-to-one in the word it takes, so
+            // two calls that differ in ONE word never have the same key (a status read whose reply changed is a line of its own).
+            u32 hash = 0x811C9DC5u ^ head.a;
+            for (u32 i = 0; i < head.request_words; ++i) {
+                hash = (hash ^ request[i]) * 0x01000193u;
+            }
+            hash = (hash ^ 0x2Du) * 0x01000193u; // (the arrow between the two lists)
+            for (u32 i = 0; i < head.reply_words; ++i) {
+                hash = (hash ^ reply[i]) * 0x01000193u;
+            }
+            hash ^= hash >> 15;
+            hash *= 0x2C1B3C6Du;
+            hash ^= hash >> 12;
+            key = hash != 0 ? hash : 1;
+            header = kDietUdsSame | (head.request_words != 0 ? kDietUdsArg : 0) | (head.a & 0xFFu);
+            arg = head.request_words != 0 ? request[0] : 0;
+        }
+    }
+    return DietLocked(key, header, arg, rec.ms, nullptr, g_dbg_cmd_diet, kCmdDietSlotBits, kCmdDietProbe, kCmdDietFullCalls);
+}
+
 // One command of the HLE proper as raw words: the caller formats nothing and holds the lock for a copy.
 void PushCommand(u8 lane, CommandHead head, const char* text, const u32* request, const u32* reply) {
     head.request_words = static_cast<u8>(std::min(static_cast<u32>(head.request_words), kMaxCommandWords));
@@ -643,7 +735,8 @@ void PushCommand(u8 lane, CommandHead head, const char* text, const u32* request
         NoteMiss(lane, rec.ms);
         return;
     }
-    if (AdmitLocked(lane, sizeof(DebugRecord) + rec.stored, rec.ms)) {
+    // The diet of the polled commands: past the first of a kind in a second the call is counted, and no record is made of it.
+    if (!CommandDietLocked(rec, head, request, reply) && AdmitLocked(lane, sizeof(DebugRecord) + rec.stored, rec.ms)) {
         RingWrite(&rec, sizeof(rec));
         RingWrite(&head, sizeof(head));
         if (head.text_len) {
@@ -803,6 +896,13 @@ void DebugFlushAggregates(bool final) {
             PushAggregateLocked(slot, now, with_pending);
         }
     }
+    for (u32 i = 0; i < kCmdDietSlots; ++i) { // (the polled UDS commands: the same counts, from their own table)
+        DietSlot& slot = g_dbg_cmd_diet[i];
+        const bool with_pending = slot.pending != 0 && (final || SecondOver(now, slot.window_ms));
+        if (slot.done != 0 || with_pending) {
+            PushAggregateLocked(slot, now, with_pending, kAggCommand);
+        }
+    }
 }
 
 u32 DebugBytesQueued() {
@@ -827,6 +927,9 @@ void DebugReset() {
     g_dbg_miss_any = 0;
     std::memset(&g_dbg_totals, 0, sizeof(g_dbg_totals));
     std::memset(g_dbg_diet, 0, sizeof(g_dbg_diet));
+    if (g_dbg_cmd_diet) {
+        std::memset(g_dbg_cmd_diet, 0, kCmdDietSlots * sizeof(DietSlot));
+    }
 }
 
 namespace {
@@ -887,6 +990,42 @@ void DebugFormat(const DebugRecord& rec, const u8* payload, u32 start_ms, std::s
                       static_cast<unsigned long>(w[0]), static_cast<unsigned long>(w[1]),
                       static_cast<unsigned long>(w[2]), static_cast<unsigned long>(w[3]));
         *out += line;
+        *out += '\n';
+    } else if (rec.kind == kDbgIpcAgg && rec.dir == kAggCommand && rec.stored >= 7 * sizeof(u32)) {
+        // The count of a polled UDS command (the diet of the commands): how the line of its last call began, then the count and
+        // the times as for an IPC call. A PullPacket by bind and node and a SendTo by channel, destination, first word and flags,
+        // with the bytes of the last one; any other command by its words, which are those of the whole lines of the same second ("same").
+        u32 w[7];
+        std::memcpy(w, payload, sizeof(w));
+        const u32 form = w[1] & kDietUdsForm;
+        const unsigned long node = w[0] & 0xFFFFu;
+        stamp();
+        if (form == kDietUdsPull) {
+            std::snprintf(line, sizeof(line), "uds PullPacket bind %lu: %lu bytes from node %lu",
+                          static_cast<unsigned long>((w[0] >> 16) & 0x7FFFu), static_cast<unsigned long>(w[2]), node);
+        } else if (form == kDietUdsSend) {
+            char to[8]; // ("all": the broadcast)
+            if (node == 0xFFFFu) {
+                std::snprintf(to, sizeof(to), "all");
+            } else {
+                std::snprintf(to, sizeof(to), "%lu", node);
+            }
+            std::snprintf(line, sizeof(line), "uds cmd 0x17 (req %08lx) to node %s ch%lu flags 0x%02lx: %lu bytes",
+                          static_cast<unsigned long>((w[1] >> kDietUdsSendFirstShift) & 0x7Fu), to,
+                          static_cast<unsigned long>((w[0] >> 16) & 0xFFu),
+                          static_cast<unsigned long>(w[1] >> kDietUdsSendFlagsShift), static_cast<unsigned long>(w[2]));
+        } else if ((w[1] & kDietUdsArg) != 0) {
+            std::snprintf(line, sizeof(line), "uds cmd 0x%02lx (req %08lx) same", static_cast<unsigned long>(w[1] & 0xFFu),
+                          static_cast<unsigned long>(w[2]));
+        } else {
+            std::snprintf(line, sizeof(line), "uds cmd 0x%02lx same", static_cast<unsigned long>(w[1] & 0xFFu));
+        }
+        *out += line;
+        std::snprintf(line, sizeof(line), " x%lu from ", static_cast<unsigned long>(w[4]));
+        *out += line;
+        AppendRelative(out, w[5], start_ms);
+        *out += " to ";
+        AppendRelative(out, w[6], start_ms);
         *out += '\n';
     } else if (rec.kind == kDbgIpcAgg && rec.stored >= 7 * sizeof(u32) + 12) {
         // The count of a traced service's command (DebugSvcReal under the diet): the line of its last call, the service by name, then
@@ -1005,6 +1144,128 @@ void DebugFormat(const DebugRecord& rec, const u8* payload, u32 start_ms, std::s
     }
 }
 
+// ---- the beacons that say nothing new (azl/beacon_fold.hpp): the writer's side only, never a producer's ----
+void BeaconFold::Reset() {
+    for (Slot& slot : slots_) {
+        slot.used = false;
+        slot.same = 0;
+    }
+}
+
+void BeaconFold::Summary(Slot& slot, u32 start_ms, std::string* out) {
+    if (slot.same == 0) {
+        return;
+    }
+    static const char* const kDirs[] = {"tx", "rx", "other", "dup", "echo"};
+    const u32 rel = last_ms_ - start_ms;
+    char line[160];
+    std::snprintf(line, sizeof(line), "%6lu.%03lu BEACON %-5s %02x:%02x:%02x:%02x:%02x:%02x ch%u %uB: same x%lu from ",
+                  static_cast<unsigned long>(rel / 1000), static_cast<unsigned long>(rel % 1000), kDirs[slot.dir <= 4 ? slot.dir : 2],
+                  slot.mac[0], slot.mac[1], slot.mac[2], slot.mac[3], slot.mac[4], slot.mac[5], slot.channel, slot.size,
+                  static_cast<unsigned long>(slot.same));
+    *out += line;
+    AppendRelative(out, slot.first_ms, start_ms);
+    *out += " to ";
+    AppendRelative(out, slot.last_ms, start_ms);
+    std::snprintf(line, sizeof(line), ", longest gap %lu ms", static_cast<unsigned long>(slot.longest_gap_ms));
+    *out += line;
+    if (slot.holes != 0) {
+        std::snprintf(line, sizeof(line), ", %lu gaps not known (LOST)", static_cast<unsigned long>(slot.holes));
+        *out += line;
+    }
+    *out += '\n';
+    slot.same = 0;
+    slot.longest_gap_ms = 0;
+    slot.holes = 0;
+}
+
+void BeaconFold::Summaries(u32 start_ms, std::string* out) {
+    for (Slot& slot : slots_) {
+        if (slot.used) {
+            Summary(slot, start_ms, out);
+        }
+    }
+}
+
+bool BeaconFold::Keep(const DebugRecord& rec, const u8* payload, u32 start_ms, std::string* out) {
+    last_ms_ = rec.ms;
+    if (rec.kind == kDbgLost) {
+        if (rec.dir == kLaneHeavy) { // (a hole in the lane the beacons are in: some of them may be among the lost)
+            for (Slot& slot : slots_) {
+                slot.prev_known = false;
+            }
+        }
+        return true;
+    }
+    if (rec.kind != kDbgBeacon || rec.stored < 6) {
+        return true;
+    }
+    const u32 body_len = rec.stored - 6u;
+    Slot* slot = nullptr;
+    for (Slot& s : slots_) {
+        if (s.used && s.dir == rec.dir && std::memcmp(s.mac, payload, 6) == 0) {
+            slot = &s;
+            break;
+        }
+    }
+    if (body_len > kMaxBody || rec.size + 6u > rec.stored) {
+        // (longer than a place holds, or cut by the ring: written whole, and what was counted for its transmitter is said first)
+        if (slot) {
+            Summary(*slot, start_ms, out);
+            slot->used = false;
+        }
+        return true;
+    }
+    if (slot && slot->channel == rec.channel && slot->size == rec.size && slot->body_len == body_len &&
+        std::memcmp(slot->body, payload + 6, body_len) == 0 && rec.ms - slot->whole_ms < kWholeEveryMs) {
+        if (slot->prev_known) {
+            const u32 gap = rec.ms - slot->prev_ms;
+            if (gap > slot->longest_gap_ms) {
+                slot->longest_gap_ms = gap;
+            }
+        } else {
+            ++slot->holes;
+            slot->prev_known = true;
+        }
+        if (slot->same == 0) {
+            slot->first_ms = rec.ms;
+        }
+        slot->last_ms = rec.ms;
+        slot->prev_ms = rec.ms;
+        ++slot->same;
+        ++folded_;
+        return false;
+    }
+    if (slot) {
+        Summary(*slot, start_ms, out); // (the count of the body before, ahead of the line of the new one)
+    } else {
+        for (Slot& s : slots_) {
+            // a free place, or one whose transmitter was not heard for a minute (nothing is counted for it: Summaries ran since)
+            if (!s.used || (s.same == 0 && rec.ms - s.prev_ms >= kWholeEveryMs)) {
+                slot = &s;
+                break;
+            }
+        }
+        if (!slot) {
+            return true; // (more transmitters than places: this one is written whole every time, as before)
+        }
+        slot->used = true;
+        slot->dir = rec.dir;
+        std::memcpy(slot->mac, payload, 6);
+        slot->same = 0;
+        slot->longest_gap_ms = 0;
+        slot->holes = 0;
+    }
+    slot->channel = rec.channel;
+    slot->size = rec.size;
+    slot->body_len = static_cast<u16>(body_len);
+    std::memcpy(slot->body, payload + 6, body_len);
+    slot->whole_ms = rec.ms;
+    slot->prev_ms = rec.ms;
+    slot->prev_known = true;
+    return true;
+}
+
 u32 DebugRingUsedBytes() {
     return __atomic_load_n(&g_dbg_used, __ATOMIC_RELAXED);
 }
@@ -1037,6 +1298,34 @@ void StatsSocCall(int kind, u64 ticks) {
     }
     // The network thread was blocked on the soc process for that long: not its CPU (the loop takes it off its sections).
     platform::NoteNetWait(ticks);
+}
+
+void StatsSocSend(u32 bytes, int outcome) {
+    if (!platform::IsNetThread()) {
+        return; // (like StatsSocCall: the network thread's own)
+    }
+    switch (outcome) {
+    case kSocSendTaken:
+        if (bytes >= kSocSendBig) {
+            ++g_stats.soc_send_big;
+        }
+        if (bytes > g_stats.soc_send_max_bytes) {
+            g_stats.soc_send_max_bytes = bytes;
+        }
+        break;
+    case kSocSendRefused:
+        ++g_stats.soc_send_refused;
+        if (bytes >= kSocSendBig) {
+            ++g_stats.soc_send_refused_big;
+        }
+        break;
+    case kSocSendShort:
+        ++g_stats.soc_send_short;
+        break;
+    default:
+        ++g_stats.soc_send_failed;
+        break;
+    }
 }
 
 Stats TakeStats() {
@@ -1346,6 +1635,10 @@ void Log(const char* fmt, ...) {
 // For the C sources (the ENet platform layer): statistics of the soc calls and of the room datagrams.
 extern "C" void azl_c_soc_call(int kind, unsigned long long ticks) {
     azl::StatsSocCall(kind, ticks);
+}
+
+extern "C" void azl_c_soc_send(unsigned bytes, int outcome) {
+    azl::StatsSocSend(bytes, outcome);
 }
 
 extern "C" void azl_c_room_datagram(unsigned bytes, unsigned long long gap_ticks) {

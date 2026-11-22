@@ -14,6 +14,7 @@
 #include "azl/osk.hpp"
 #include "azl/osk_draw.hpp"
 #include "azl/platform.hpp"
+#include "azl/sleep_crumbs.hpp"
 #include "azl/stats.hpp"
 #include "azl/swap_gate.hpp"
 #include "ctr/input_mirror.hpp"
@@ -68,6 +69,8 @@ chat::PadLatch g_latch;
 chat::ChordEdge g_chord;
 bool g_shown = false;                  // this opening's Image was published: the game's input is the mirror's from then on
 u32 g_opened_ms = 0;
+u32 g_frame_ms = 0;                    // this frame's clock (ChatFrame): the one the close and the mirror's frame both count from
+u32 g_openings = 0;                    // the keyboard's openings of this launch (the trail's line says which)
 u32 g_cost_logged_ms = 0;
 u32 g_counted_logged = 0; // the sum of the chat's counters at the last line (they only grow: a new sum, a counter moved)
 chat::PostWatch g_watch;  // our last message, until the network thread sent it or refused it
@@ -213,6 +216,7 @@ const char* EnsureImage() {
     im->col_bytes = chat::kImageH * bpp;
     g_image = im;
     Redraw(true);
+    g_overlay.bottom_watch.Reset(); // (the count of the presents without a copy starts with the picture there is to copy)
     g_overlay.image.Publish(im);
     if (!g_shown) {
         g_shown = true;
@@ -223,8 +227,8 @@ const char* EnsureImage() {
 
 // The keyboard closes: the draft kept (`keep`; Send no longer closes it: it empties it), the game's thread told first, the Image withdrawn (freed once no copy
 // can read it), the keyboard deleted. The game's input page goes back once the keys are let go (`at_once`: now - the game is going away,
-// the room was left or the chat is off).
-void Close(bool keep, const char* why, bool at_once = false) {
+// the room was left, the chat is off or the game no longer shows the keyboard; `trail_wait`: see MirrorRestoreNow).
+void Close(bool keep, const char* why, bool at_once = false, bool trail_wait = false) {
     if (!g_osk) {
         return;
     }
@@ -245,14 +249,20 @@ void Close(bool keep, const char* why, bool at_once = false) {
     g_osk = nullptr;
     g_drawn_valid = false;
     Log("chat: keyboard closed (%s)%s", why, keep && g_draft[0] ? ", the draft kept" : "");
+    // (the trail, debug only: the close, before the zombie probe's lines and the way back)
+    Plugin::NoteSleepEvent(SleepCrumbs::kChatKeyboardClosed, (g_shown ? SleepCrumbs::kChatClosedShown : 0u) |
+                                                                 (MirrorActive() ? SleepCrumbs::kChatClosedMirror : 0u) |
+                                                                 (at_once ? SleepCrumbs::kChatClosedAtOnce : 0u));
     // The zombie probe (debug only): what the game's process reference count and thread states are at the keyboard's
     // close, to compare with the clean closes (the keyboard path is the one the stuck sessions share).
     zombie::GameRefcount("keyboard close");
     zombie::ThreadSchedDump("keyboard close");
     if (at_once) {
-        MirrorRestoreNow(why);
+        MirrorRestoreNow(why, trail_wait);
     } else {
-        MirrorRelease(static_cast<u32>(platform::NowMs()));
+        // The FRAME's clock, never a new reading (2026-11-10): MirrorFrame looks at the wait with the frame's, read before the close's log
+        // lines and probes, and a start 1-2 ms after it gave the game its page back in this very frame, the closing key still held.
+        MirrorRelease(g_frame_ms);
     }
 }
 
@@ -279,8 +289,15 @@ void Open(Plugin& plugin, u32 now_ms) {
     g_drawn_valid = false;
     g_shown = false; // (the game's input stays its own until the Image is published: EnsureImage)
     g_opened_ms = now_ms;
+    // Every opening waits for the game's bottom screen again (2026-11-10): the geometry kept from the opening before made the picture be
+    // published at once, and the look of kShowWaitMs was skipped from the second opening of a launch on (a keyboard open over a game
+    // that was not presenting its bottom screen then: the game's keys gone, nothing to see). The game's thread writes it again at its
+    // first present of the bottom screen with the keyboard open, a frame or two from now.
+    g_overlay.bottom_geometry.store(0, std::memory_order_release);
+    g_overlay.bottom_watch.Reset();
     g_overlay.keyboard.store(1, std::memory_order_release);
     Log("chat: keyboard open%s", g_draft[0] ? " with the draft" : "");
+    Plugin::NoteSleepEvent(SleepCrumbs::kChatKeyboardOpen, ++g_openings); // (the trail, debug only)
     zombie::GameRefcount("keyboard open"); // (debug only: the reference count at the open, the baseline for the close)
     zombie::ThreadSchedDump("keyboard open");
 }
@@ -303,6 +320,23 @@ void Type(Plugin& plugin, ChatSink* sink, u32 held, u32 now_ms) {
     if (cannot) {
         Close(true, "not shown"); // (the mirror never taken, or let go once the keys are: the game's input is its own again)
         Notify(cannot);
+        return;
+    }
+    // A keyboard that was shown and is no longer copied onto the bottom screen (chat::BottomWatch: the game presented its top screen
+    // kBottomLostTops times since the last copy, and it has been so for kBottomLostMs of this thread's looks, in which the game went on
+    // presenting its top screen: a game that stands still - a load - closes nothing) closes by itself, its
+    // draft kept: the user cannot see what is typed, and the game's keys are dead for as long as it stays. The game's input page goes
+    // back AT ONCE when nothing is held, and once the keys are let go otherwise (2026-11-11: a game that stops presenting its bottom
+    // screen leaves the LAST picture on it, which is the keyboard's - the user sees a keyboard that stands still and goes on touching
+    // it, or holds B to erase; the page given back with the finger or the key still down showed the game a fresh press, which skipped
+    // the film or pressed the button of the menu that came up. The wait is the one of every other close: 50 ms of nothing held, 1 s at
+    // the most).
+    if (g_shown && g_overlay.bottom_watch.LostFor(now_ms)) {
+        const bool quiet = MirrorInputQuiet(); // (the REAL page, before the close: no key, no Circle Pad, no finger)
+        Log("chat: the game presented its top screen %lu times with no copy of the keyboard on the bottom one: the keyboard is closed%s",
+            static_cast<unsigned long>(g_overlay.bottom_watch.tops()), quiet ? "" : " (something is held: the game's input goes back at the release)");
+        Close(true, "not shown any more", quiet, true);
+        Notify("Keyboard closed: the game is not showing the bottom screen");
         return;
     }
     if (!g_shown || !g_pacer.Due(svcGetSystemTick())) {
@@ -384,6 +418,7 @@ void LogCosts(u32 now_ms, const ChatSink& sink) {
 void ChatFrame(u32 chord, bool pad_read) {
     Plugin& plugin = Plugin::Get();
     const u32 now_ms = static_cast<u32>(platform::NowMs());
+    g_frame_ms = now_ms; // (the one clock of this frame: Close's MirrorRelease and MirrorFrame below)
     // (an Image withdrawn earlier, once no copy of the game's thread can read it any more)
     FreeImage(g_keeper.Freeable(g_overlay.image));
     if (!g_osk && g_image && g_keeper.Retire(g_overlay.image)) {

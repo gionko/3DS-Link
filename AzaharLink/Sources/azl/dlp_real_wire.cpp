@@ -2,6 +2,8 @@
 // same bytes as Azahar's: design 2.4); the notice A8, the announcement in our form and the fake client's answers are written here.
 #include "azl/dlp_real_wire.hpp"
 
+#include "azl/dlp_title_block.hpp"
+
 #include "../../ConfigApp/dlph/dlph_wire.h"  // (one file of the library, by name: the Makefile builds dlph_wire.c and nothing else of ConfigApp/dlph)
 
 namespace azl {
@@ -14,6 +16,15 @@ static_assert(kAuthBytes == 0x14 && kStartDistBytes == 0x14 && kFinishBytes == 0
 namespace {
 
 constexpr u8 kTypeAnnounce = 1, kTypeAuth = 2, kTypeStartDist = 3, kTypeFinish = 5, kTypeBegin = 6;
+
+// Where the title of the child is in the announcement (Azahar's DLPBroadcastPacket1..4; the capture of Mario Party: Island Tour).
+constexpr std::size_t kTransferSizeAt = 0x38, kRequiredSizeAt = 0x3C, kTitleShortAt = 0x40, kTitleLongAt = 0xC0, kIconAt0 = 0x1C0;
+constexpr std::size_t kIconBytes0 = 0x9C * 2;                        // the icon's first 0x9C units, in frame 0
+constexpr std::size_t kIconBytesN = kIconFrameBytes - kHeaderBytes;  // 0x2CC units in each of the frames 1..3
+constexpr unsigned kIconFrames = 4;                                  // frames 0..3 carry the title; frame 4 does not
+static_assert(kTitleShortAt + kTitleShortBytes == kTitleLongAt && kTitleLongAt + kTitleLongBytes == kIconAt0, "the names and the icon follow one another");
+static_assert(kIconAt0 + kIconBytes0 + 8 == kFrame0Bytes, "frame 0 ends with the icon's first part and 8 bytes that stay zero");
+static_assert(kIconBytes0 + (kIconFrames - 1) * kIconBytesN == kTitleIconBytes, "the four parts are the whole icon, 48 x 48 units");
 
 void Header(u8* o, u8 type, std::size_t len, u8 index, u8 seq, u8 rid0, u8 rid1) {
     std::memset(o, 0, len);
@@ -80,6 +91,24 @@ std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, 
         buf[0x20] = max_nodes;
     }
     Seal(seed, buf, len);
+    return len;
+}
+
+std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4], const TitleBlock* title) {
+    const std::size_t len = AnnounceFrame(buf, index, child_tid, max_nodes, seed);  // (the frame of every game, sealed)
+    if (title == nullptr || index >= kIconFrames) {
+        return len;  // (no title, frame 4 which carries none, or no frame at all: what it was)
+    }
+    if (index == 0) {
+        StoreBE32(buf + kTransferSizeAt, title->transfer_size);
+        StoreBE32(buf + kRequiredSizeAt, title->required_size);
+        std::memcpy(buf + kTitleShortAt, title->title_short, kTitleShortBytes);
+        std::memcpy(buf + kTitleLongAt, title->title_long, kTitleLongBytes);
+        std::memcpy(buf + kIconAt0, title->icon, kIconBytes0);
+    } else {
+        std::memcpy(buf + kHeaderBytes, title->icon + kIconBytes0 + (index - 1) * kIconBytesN, kIconBytesN);
+    }
+    Seal(seed, buf, len);  // (again: the checksum is of the whole frame)
     return len;
 }
 

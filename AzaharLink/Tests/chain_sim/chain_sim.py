@@ -270,6 +270,7 @@ class Sim:
         self.observed = []          # ... and the real ones that were watched (the clock; the adapter's when the engine is real)
         self.net_calls = []         # the same two lists for the calls the network thread (DlpHub::Tick) made
         self.spy_group = None       # the HeardGroup the spy's ScanRead reports (36 bytes)
+        self.spy_book = 0           # (1.1.4, G1) the book of dlp:CLNT the spy's ClntBook gives (0: none, as every game's network)
         self.join_polls = 0         # ConnectPoll calls so far (the spy answers "joining" twice, then "failed")
         uc.hook_add(UC_HOOK_CODE, self.on_code)
         uc.hook_add(UC_HOOK_INTR, self.on_svc)
@@ -516,6 +517,8 @@ class Sim:
             return 0
         if name in ('HostOpen', 'ScanOpen', 'ConnectBegin', 'Send'):
             return 1
+        if name == 'ClntBook':
+            return self.spy_book
         if name == 'ConnectPoll':
             self.join_polls += 1
             return 0 if self.join_polls <= 2 else 0xFFFFFFFF      # joining, joining, failed
@@ -903,6 +906,76 @@ def scenario_diet(elf, level):
     lines = sim.capture_lines()
     check(lines == ['LOST 3 records (ring full 0, lock busy 3)', 'ipc h=0x14801f cmd=0x000c0000 arg=0x9 -> 0x00000000'],
           'lanes: the marker of the records given up for the lock, then the call (%r)' % (lines,))
+
+
+# The game's calls to the file system as the captures of a real console have them (2026-11-11: Tekken 3D Prime Edition, New Super
+# Mario Bros. 2 and others), and calls to the other services (gsp, dsp, srv, cfg:u, APT, nwm::UDS, soc:U: a gsp command whose id has
+# 0x08 in its LOW byte among them)
+FILE_CALLS = (0x08030204, 0x080200C2, 0x080201C2, 0x08030102, 0x08080000, 0x08040000, 0x080C00C2, 0x080E0080, 0x080D0144, 0x08080202,
+              0x080B0102, 0x08010042, 0x08020000, 0x08050080, 0x08040142, 0x08010002, 0x08610042, 0x08620040, 0x08630000, 0x08170000)
+OTHER_CALLS = (0x000C0000, 0x00080082, 0x001F0000, 0x000B0000, 0x00010082, 0x000B0040, 0x001400C0, 0x00140084, 0x04010082, 0x10010080)
+
+
+def scenario_file_calls(elf, level):
+    """The count of the game's calls to the file system in the compiled hook (PassThroughPre / PassThroughPost), on the dispatcher
+    thread of Tri Force Heroes. With the log on every fs command is counted as begun before the svc and as ended after it - an open, a
+    write, a close as well as a read (Tekken 3D on a console: the call that waited 26 s behind the log's writer was an OPEN) - and no
+    call to another service is; a call the kernel fails is ended all the same. With the log off the two words are never written.
+    All of it within what the plain pass-through fits."""
+    sim = Sim(elf, level, hle=True)
+    uc = sim.uc
+    begun_at, done_at = elf.find('g_game_reads_begun'), elf.find('g_game_reads_done')
+    writes = []
+    hook = uc.hook_add(UC_HOOK_MEM_WRITE, lambda u, access, address, size, value, user: writes.append(address),
+                       begin=min(begun_at, done_at), end=max(begun_at, done_at) + 3)
+    at_svc = []
+    result = [0]
+
+    def kernel(s, num):
+        at_svc.append((r32(s.uc, begun_at), r32(s.uc, done_at)))     # the two words while the call is in the kernel
+        p32(s.uc, s.cmd() + 4, result[0])
+        return result[0]
+    sim.kernel = kernel
+    worst = 0
+    written = 0
+    counted = 0
+    calls = FILE_CALLS + OTHER_CALLS + (0x08030204,)
+    for i, header in enumerate(calls):
+        file_call = header >> 24 == 0x08
+        failing = i == len(calls) - 1                                # (the last one: an open the kernel refuses)
+        result[0] = 0xD8E007F7 if failing else 0
+        before = (r32(uc, begun_at), r32(uc, done_at))
+        # (the first word after the header is 0 in one call out of two, the first one - the open of Tekken 3D - and the refused one among
+        # them: on a console the opens of fs:USER have 0 there, their transaction word, and a count that looked at it would be blind to them)
+        sim.set_request([header, 0 if i % 2 == 0 else 0x1000])
+        r0, depth, ok = sim.enter('gate32', 0x1F002A, 'call 0x%08x' % header)
+        worst = max(worst, depth)
+        if not failing:
+            written = max(written, sim.last_written)
+        after = (r32(uc, begun_at), r32(uc, done_at))
+        check(r0 == result[0], 'file calls: the result of 0x%08x comes back untouched' % header)
+        check(len(at_svc) >= 1 and sim.svc_log.count(0x32) == len(at_svc), 'file calls: one svc 0x32 a call')
+        if level > 0 and file_call:
+            counted += 1
+            check(at_svc[-1] == (before[0] + 1, before[1]),
+                  'file calls at debug 1: 0x%08x is counted as begun, and not yet as ended, while it is in the kernel (%r -> %r)' % (header, before, at_svc[-1]))
+            check(after == (before[0] + 1, before[1] + 1), 'file calls at debug 1: 0x%08x is counted as ended after the svc (%r -> %r)' % (header, before, after))
+        else:
+            check(at_svc[-1] == before and after == before,
+                  'file calls at debug %d: 0x%08x moves neither word (%r, %r in the kernel, %r)' % (level, header, before, at_svc[-1], after))
+    if level > 0:
+        check(counted == len(FILE_CALLS) + 1 and r32(uc, begun_at) == counted and r32(uc, done_at) == counted,
+              'file calls at debug 1: %d fs calls made, %d begun and %d ended' % (len(FILE_CALLS) + 1, r32(uc, begun_at), r32(uc, done_at)))
+        check(len(writes) == 2 * counted, 'file calls at debug 1: one store a count, nothing else writes the two words (%d stores)' % len(writes))
+    else:
+        check(writes == [], 'file calls at debug 0: neither word is ever written (%d stores)' % len(writes))
+        check(r32(uc, begun_at) == 0 and r32(uc, done_at) == 0, 'file calls at debug 0: the two words stay 0')
+    uc.hook_del(hook)
+    record('pass-through, the game\'s file calls (counted at debug 1)', level, worst, BUDGET_PURE, 'pure')
+    # (the count is two registers and no frame: a file call writes no deeper than srv:ReceiveNotification does)
+    check(written <= PURE_WRITTEN[level],
+          'file calls at debug %d: %d bytes written below the entry SP, the plain pass-through writes %d' % (level, written, PURE_WRITTEN[level]))
+    print('  the game\'s file calls at debug %d: %d bytes written, SP down to %d at the most' % (level, written, worst))
 
 
 def scenario_getservice(elf, level):
@@ -1586,6 +1659,49 @@ def scenario_hle_front(elf, level):
               'fake session close capture lines (%r)' % (sim.capture_lines(),))
 
 
+def scenario_prepared_child(elf, level):
+    """1.1.4 (G4): dlp:SRVR of the Download Play child 3DS Link prepared, as the child uses it - opened, IsChild, closed - through the compiled
+    UdsHle::SetDlpChild (the probe's kind of service, IsChild true, no hub; made with the emulator's malloc): GetServiceHandle answered with no
+    kernel, IsChild [0x000E0080, 0, 1] - RunTraced (debug 1) > RunDlp > RunDlpChild > DlpService::Dispatch, its line, NoteCommand -, another command
+    "invalid state" with its line (GetServerState, a request of one word as IsChild's), and the close. The commands are held to the HLE's ceiling
+    (520 at debug 1: HLE_CEILING), the open and the close to the log's. (At debug 1 RunTraced copies the words a request declares: the SRVR
+    Initialize of a game, 9 words, costs 32 bytes more - 528 - as on any traced service; the child is not seen to send it.) Without SetDlpChild
+    the title's dlp:SRVR is the real one (the kernel is called)."""
+    sim = Sim(elf, level, hle=True)
+    calls = []
+    sim.kernel = lambda s, n: (calls.append(n), srv_reply([0x00050040, 0xD8E06406])(s, n))[1]
+    sim.set_request([0x00050100] + list(struct.unpack('<2I', name12('dlp:SRVR'))) + [8, 0])
+    sim.enter('gate32', 0x14801F, 'open dlp:SRVR, no child')
+    check(calls == [0x32], 'without SetDlpChild dlp:SRVR is the real service (the kernel answered it: %r)' % (calls,))
+    sim.call(elf.sym('_ZN3azl3ctr6UdsHle11SetDlpChildEb'), [sim.hle, 1])
+    sim.log_lines.clear()
+    if level > 0:
+        sim.clear_capture()
+    words = struct.unpack('<2I', name12('dlp:SRVR'))
+    sim.kernel = lambda s, n: (_ for _ in ()).throw(AssertionError('the real kernel was called for the prepared child\'s dlp:SRVR'))
+    sim.set_request([0x00050100, words[0], words[1], 8, 0])
+    r0, depth, ok = sim.enter('gate32', 0x14801F, 'open dlp:SRVR (prepared child)')
+    h = r32(sim.uc, sim.cmd() + 12)
+    check(h != 0, 'the prepared child gets a fake dlp:SRVR session')
+    record('prepared child: opening its dlp:SRVR (InterceptGetServiceHandle)', level, depth, BUDGET_LOG, 'log')
+    sim.log_lines.clear()
+    r0, depth, ok = dlp_call(sim, h, 0x000E0040, [0x2A], 'prepared child IsChild', roomy=True)
+    check(reply(sim, 3) == [0x000E0080, 0, 1], 'the prepared child\'s IsChild says TRUE (%r)' % ([hex(x) for x in reply(sim, 3)],))
+    record('prepared child: dlp:SRVR IsChild (RunDlp, RunDlpChild, its line)', level, depth, HLE_CEILING[level], 'hle')
+    true_lines = [l for l in sim.log_lines if l.startswith('dlp: dlp:SRVR IsChild answered TRUE here')]
+    check(len(true_lines) == (1 if level > 0 else 0), 'the line of the first IsChild (%r)' % (sim.log_lines,))
+    sim.log_lines.clear()
+    r0, depth, ok = dlp_call(sim, h, 0x00030000, [], 'prepared child GetServerState', roomy=True)
+    check(reply(sim, 2) == [0x00030040, 0xE0A0AC01], 'another command of the child: invalid state (%r)' % ([hex(x) for x in reply(sim, 2)],))
+    record('prepared child: another dlp:SRVR command (refused, its line)', level, depth, HLE_CEILING[level], 'hle')
+    if level > 0:
+        check(any(l.startswith('dlp: the prepared child called dlp:SRVR command 0x03 (answered invalid state; 1 so far)') for l in sim.log_lines),
+              'the line of a refused command (%r)' % (sim.log_lines,))
+    r0, depth, ok = sim.enter('gate23', h, 'close dlp:SRVR (prepared child)')
+    record('prepared child: closing its dlp:SRVR session', level, depth, BUDGET_LOG, 'log')
+    return sim
+
+
 def scenario_throttle(elf, level):
     """A game thread that keeps calling a command that fails (here: an unknown id, 0xD900182F, which needs no engine): the
     first 50 replies in 100 ms are answered at once, each further one is preceded by svcSleepThread(0.5 ms); the reply is
@@ -1681,7 +1797,9 @@ def scenario_log_cost(elf, level):
 # The network thread is the sim's other thread: whenever the game thread waits or sleeps, DlpHub::Tick runs in its place.
 LOBBYNET_SLOTS = ('NowMs', 'NowTicks', 'HostOpen', 'HostUpdate', 'HostClose', 'Kick', 'ScanOpen', 'ScanClose', 'ScanRead',
                   'ConnectBegin', 'ConnectPoll', 'Disconnect', 'MyNode', 'Members', 'ReadNode', 'Send', 'Receive',
-                  'Pump', 'Holds')   # (1.1.3: the two that are not pure; the hub calls them only of an adapter that is not its own)
+                  'Pump', 'Holds',   # (1.1.3: the two that are not pure; the hub calls them only of an adapter that is not its own)
+                  'ClntBook',        # (1.1.4, G1: the book of dlp:CLNT - the Download Play application's adapter only; the spy gives spy_book, 0 by default)
+                  'ChildrenAwaited')  # (1.1.4, H5, after ClntBook - contract K6/C8: the clients the host still waits for in its state 9; the spy says 0)
 CLOCK_SLOTS = ('NowMs', 'NowTicks')
 TD_TID = 0x000400000010C000          # Kirby Triple Deluxe
 HOST_MAC = bytes([0x02, 0x00, 0x00, 0x00, 0xAB, 0xCD])
@@ -1695,7 +1813,7 @@ FK_START_SCAN, FK_STOP_SCAN, FK_SERVER_INFO, FK_TITLE_INFO = 0x00050180, 0x00060
 FK_IN_ORDER, FK_START_FAKE, FK_MY_STATUS, FK_NODES = 0x00090040, 0x000B0100, 0x000C0000, 0x000D0040
 SV_INIT, SV_INIT_NAME, SV_START_ACCEPT = 0x00010183, 0x000F0303, 0x00050080
 FK_STOP_SESSION, SV_FINALIZE, SV_END_ACCEPT = 0x00100000, 0x00020000, 0x00060000     # (the commands that succeed in every state, with FK_FINALIZE / FK_STOP_SCAN)
-HUB_BYTES = 416                      # sizeof(DlpHub) on ARM32 is at most 408 (Tests/dlp_stack_probe.cpp holds that)
+HUB_BYTES = 544                      # sizeof(DlpHub) on ARM32 is at most 536 (Tests/dlp_stack_probe.cpp holds that; 408 while the lobby's tables held four players)
 
 
 def hdr(cmd_id, normal, translate=0):
@@ -1714,7 +1832,8 @@ class HubRig:
         p32(uc, self.kernel, elf.sym('_ZTVN3azl3ctr12CtrKernelOpsE') + 8)
         self.engine = 0x0F000000 if engine == 'spy' else self.make_engine(room)
         cfg = sim.alloc(48)
-        uc.mem_write(cfg, struct.pack('<QQ20s', TD_TID, 0x1122334455667788, 'Link'.encode('utf-16-le').ljust(20, b'\0')))
+        # (LobbyConfig: the title id, the seed, the name and the ceiling of players of the title - 4, what the plugin gives Kirby Triple Deluxe)
+        uc.mem_write(cfg, struct.pack('<QQ20sB', TD_TID, 0x1122334455667788, 'Link'.encode('utf-16-le').ljust(20, b'\0'), 4))
         res = sim.alloc(8)
         p32(uc, res, 0)
         p32(uc, res + 4, elf.sym('_ZN3azl3ctr12_GLOBAL__N_1L14MapGameAddressEPvmm'))
@@ -1724,7 +1843,7 @@ class HubRig:
             self.real = sim.alloc(2048, 8)
             sim.call(elf.sym('_ZN3azl10RealDlpNetC1EPNS_9UdsEngineE'), [self.real, self.engine])
             check(r32(uc, self.real) == elf.sym('_ZTVN3azl10RealDlpNetE') + 8, 'the real adapter was built (its vtable pointer is at +0)')
-        self.hub = sim.alloc(512)
+        self.hub = sim.alloc(HUB_BYTES)  # (a block as large as the object: in 512 bytes the hub of 536 would run over the next block)
         sim.call(elf.sym('_ZN3azl6DlpHubC1EPNS_9UdsEngineEPNS_9KernelOpsERKNS_11LobbyConfigERKNS_11IpcResolverEPNS_8LobbyNetE'),
                  [self.hub, self.engine, self.kernel, cfg], stack_args=[res, self.real])
         vt = elf.sym('_ZTVN3azl14EngineLobbyNetE')
@@ -1976,6 +2095,89 @@ def scenario_hub_commands(elf, level):
     return sim
 
 
+CL_INIT, CL_FINALIZE, CL_START_SCAN, CL_STOP_SCAN = 0x000100C3, 0x00020000, 0x00050180, 0x00060000
+CL_SERVER_INFO, CL_IN_ORDER, CL_START_SESSION, CL_MY_STATUS, CL_PASSPHRASE = 0x00070080, 0x00090040, 0x000D0100, 0x000E0000, 0x00110000
+BOOK_BYTES = 1400                    # sizeof(DlpClntBook) on ARM32 is at most 1400 (Tests/dlp_stack_probe.cpp holds that)
+# The ceiling of dlp:CLNT at both levels (1-G1.md section 4.6: 520): the Download Play application is the only process with that service, and its threads
+# are not the 464-byte thread of Tri Force Heroes the 320 of debug 0 is for; record(.., 'hub') still holds every path to the smallest thread seen (444).
+CLNT_CEILING = 520
+
+
+def scenario_hub_clnt(elf, level):
+    """1.1.4 (G1): dlp:CLNT of the system's Download Play application, as the application sends it, through the compiled hub: the spy network gives
+    the hub's service a book (a zeroed block is a book with no record, no title and no table: every host is "not known yet", refused). Initialize
+    and StartScan are posted (the network thread runs them), the pump hears a host, GetServerInfo / GetTitleInfoInOrder / GetMyStatus are served on
+    the game thread with the clock and the book's pointer as the only calls into the network, and StartSession (posted) is refused there with no
+    join. Every path is held to the ceiling of the HLE at both debug levels; at debug 1 the trace (ClntTraceRequest, ClntTraceReply) is in the chain."""
+    sim = Sim(elf, level, hle=False)
+    rig = HubRig(sim, elf)
+    sim.spy_book = sim.alloc(BOOK_BYTES, 8)
+    obj = hle_for_hub(sim, elf, rig)
+    run = elf.sym('_ZN3azl3ctr6UdsHle6RunDlpEhmPm') & ~1
+    off = None
+    for i in range(16):
+        ins = r32(sim.uc, run + 4 * i)
+        if (ins & 0xFFF00000) == 0xE5900000:
+            off = ins & 0xFFF
+            break
+    check(off is not None, 'UdsHle::RunDlp loads the hub (dlp_clnt_ is the byte after it: Includes/ctr/uds_hle.hpp)')
+    sim.uc.mem_write(obj + off + 4, b'\x01')     # SetDlpClnt(true) (inline: the flag is the member after the hub's pointer)
+    sim.hle_rig = rig
+    ceiling = CLNT_CEILING
+    h = open_session(sim, 'dlp:CLNT')
+    check(h != 0, 'with a hub and SetDlpClnt the plugin opens a fake dlp:CLNT session')
+    rig.tick()
+    y0 = sim.yields
+    r0, depth, ok = dlp_call(sim, h, CL_INIT, [0x232000, 16, 0x200000, 0x04000000, 0x1111, 0x2222], 'clnt Initialize')
+    check(reply(sim, 2) == [hdr(0x01, 1), 0], 'CLNT Initialize is answered by the network thread: %r' % (reply(sim, 2),))
+    check(sim.yields > y0, 'CLNT Initialize waited for the network thread (a posted command)')
+    record('hub: posted command (CLNT Initialize)', level, depth, ceiling, 'hub')
+    sim.spy_group = struct.pack('<6sBBI20sBB2x', HOST_MAC, 1, 3, (TD_TID & 0xFFFFFF00) | 0, 'Host'.encode('utf-16-le').ljust(20, b'\0'), 4, 1)
+    r0, depth, ok = dlp_call(sim, h, CL_START_SCAN, [1, 0, 0, 0, 0, 0], 'clnt StartScan')
+    check(reply(sim, 2) == [hdr(0x05, 1), 0], 'CLNT StartScan is answered: %r' % (reply(sim, 2),))
+    check('ScanOpen' in sim.net_calls and 'ScanOpen' not in sim.spy_calls, 'CLNT StartScan opened the scan on the network thread')
+    rig.tick()
+    mlo, mhi = mac_words(HOST_MAC)
+    for header, size, label, words, mac_at in (
+            (CL_IN_ORDER, 0x13A8, 'GetTitleInfoInOrder (the next record, delivered to the book)', [0], 8),
+            (CL_SERVER_INFO, 0x298, 'GetServerInfo (the 0x298-byte record of the book)', [mlo, mhi], 0),
+            (CL_MY_STATUS, 0, 'GetMyStatus', [], 0),
+            (CL_PASSPHRASE, 0, 'GetWirelessRebootPassphrase', [], 0)):
+        sim.spy_calls.clear()
+        sim.observed.clear()
+        buf = static_buffer(sim, size) if size else 0
+        y0 = sim.yields
+        sim.log_lines.clear()
+        r0, depth, ok = dlp_call(sim, h, header, words, 'clnt ' + label)
+        rep = reply(sim, 4)
+        check(sim.yields == y0, 'inline CLNT %s did not wait for the network thread' % label)
+        check([c for c in sim.spy_calls if c != 'ClntBook'] == [],
+              'inline CLNT %s called no LobbyNet method but the book\'s pointer on the game thread (%r)' % (label, sim.spy_calls))
+        check(all(o in CLOCK_SLOTS for o in sim.observed), 'inline CLNT %s called only the clock (%r)' % (label, sim.observed))
+        if size:
+            check(rep[0] >> 16 == header >> 16 and rep[1] == 0, 'inline CLNT %s: the record was written (%r)' % (label, [hex(x) for x in rep]))
+            check(bytes(sim.uc.mem_read(buf + mac_at, 6)) == HOST_MAC, 'inline CLNT %s: the record holds the host\'s MAC (at +%d)' % (label, mac_at))
+        if level == 1 and header == CL_SERVER_INFO:
+            lines = [l for l in sim.log_lines if l.startswith('dlpc: dlp:CLNT 0x07 req')]
+            check(len(lines) == 1 and lines[0].startswith('dlpc: dlp:CLNT 0x07 req 00000000 00000000 '),
+                  'debug 1: the trace of GetServerInfo has zeros for the MAC (%r)' % (lines,))
+        record('hub: inline CLNT ' + label, level, depth, ceiling, 'hub')
+    r0, depth, ok = dlp_call(sim, h, CL_STOP_SCAN, [], 'clnt StopScan')
+    check(reply(sim, 2) == [hdr(0x06, 1), 0], 'CLNT StopScan is answered')
+    sim.spy_calls.clear()
+    sim.net_calls.clear()
+    r0, depth, ok = dlp_call(sim, h, CL_START_SESSION, [mlo, mhi, 0x0010C000, 0x00040001], 'clnt StartSession')
+    check(reply(sim, 2) == [hdr(0x0D, 1), 0], 'CLNT StartSession of a host whose child is not known yet: 0, refused (%r)' % ([hex(x) for x in reply(sim, 2)],))
+    check('ConnectBegin' not in sim.net_calls and 'ConnectBegin' not in sim.spy_calls, 'the refused StartSession began no join')
+    record('hub: posted command (CLNT StartSession, refused)', level, depth, ceiling, 'hub')
+    r0, depth, ok = dlp_call(sim, h, CL_MY_STATUS, [], 'clnt GetMyStatus')
+    check(reply(sim, 3)[2] >> 24 == 0x80, 'after the refusal GetMyStatus shows 0x80 (%r)' % ([hex(x) for x in reply(sim, 3)],))
+    r0, depth, ok = dlp_call(sim, h, CL_FINALIZE, [], 'clnt Finalize')
+    check(reply(sim, 2) == [hdr(0x02, 1), 0], 'CLNT Finalize is answered')
+    record('hub: posted command (CLNT Finalize)', level, depth, ceiling, 'hub')
+    return sim
+
+
 def scenario_hub_trace_dedupe(elf, level):
     """The trace of the commands (DlpTraceReply) as the target's compiler built it: a reply the command has already given in the last 2 s is
     counted and not written, a NEW reply is a line at once, one command remembers up to 6 replies per window, a seventh distinct one is
@@ -2170,7 +2372,7 @@ def scenario_hub_always_succeeds(elf, level):
         # words of the request (all zero for Finalize), the result and no reply word, and the duration of the simulated clock. The first line
         # names the thread that made the call (decimal) and its priority (hex): the hub's threads wait for each other's locks, and the console
         # test reads from this line how the game's dlp threads stand against the network thread's 0x2F.
-        check(len(sim.log_lines) == 3 and sim.log_lines[0] == 'dlp: the first command of dlp:FKCL is 0x02: the Download Play lobby is carried by the room'
+        check(len(sim.log_lines) == 3 and sim.log_lines[0] == 'dlp: the first command of dlp:FKCL is 0x02: Download Play is served by the plugin over the room'
               ' (thread %d, priority 0x%x)' % (SIM_THREAD_ID, SIM_THREAD_PRIORITY)
               and re.fullmatch(r'dlpc: dlp:FKCL 0x02 req( 00000000){6} -> 0x00000000 rep \(\d+ ms\)', sim.log_lines[1]) is not None
               and sim.log_lines[2] == 'dlp:FKCL: command 0x02 -> 0x00000000 (first call)',
@@ -2240,7 +2442,7 @@ def scenario_hub_always_succeeds(elf, level):
     if level > 0:
         # the first command of dlp:SRVR: its own line, once, with the thread and the priority the kernel answered (dlp:FKCL's is checked in A)
         first = [l for l in sim.log_lines if l.startswith('dlp: the first command of ')]
-        check(first == ['dlp: the first command of dlp:SRVR is 0x0f: the Download Play lobby is carried by the room (thread %d, priority 0x%x)' % (
+        check(first == ['dlp: the first command of dlp:SRVR is 0x0f: Download Play is served by the plugin over the room (thread %d, priority 0x%x)' % (
             SIM_THREAD_ID, SIM_THREAD_PRIORITY)], 'dlp:SRVR: the first-command line names the thread and its priority (%r)' % (first,))
     dlp_call(sim, h, SV_START_ACCEPT, [0, 0], 'srvr StartAccepting')
     check(reply(sim, 2) == success(0x05), 'SRVR StartAccepting was served by the network thread: %r' % ([hex(x) for x in reply(sim, 2)],))
@@ -2621,11 +2823,13 @@ def main():
             scenario_hub_found_dead(elf, level)
             scenario_hub_engine(elf, level)
             scenario_hub_real_engine(elf, level)
+            scenario_hub_clnt(elf, level)
             continue
         scenario_pure(elf, level)
         if only_pass_through:
             continue
         scenario_diet(elf, level)
+        scenario_file_calls(elf, level)
         scenario_getservice(elf, level)
         scenario_traced(elf, level)
         scenario_apt(elf, level)
@@ -2636,6 +2840,7 @@ def main():
         scenario_swap_gate(elf, level)
         scenario_worker_off_core1(elf, level)
         scenario_hle_front(elf, level)
+        scenario_prepared_child(elf, level)
         scenario_throttle(elf, level)
         scenario_log_cost(elf, level)
         if only_hub or not only_pass_through:
@@ -2649,6 +2854,7 @@ def main():
             scenario_hub_found_dead(elf, level)
             scenario_hub_engine(elf, level)
             scenario_hub_real_engine(elf, level)
+            scenario_hub_clnt(elf, level)
     print()
     print('%-72s %5s %7s %7s' % ('path (bytes below the SP at azl_gate_32)', 'debug', 'used', 'budget'))
     for scenario, level, depth, budget, kind in results:

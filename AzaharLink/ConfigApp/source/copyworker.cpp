@@ -1,6 +1,7 @@
 #include "copyworker.hpp"
 
 #include <deque>
+#include <utility>
 #include <vector>
 
 namespace setup {
@@ -12,6 +13,8 @@ struct Job {
     CopyKind kind = CopyKind::Enable;
     std::string source;
     bool refresh = false; // a quiet look: the copy is made again only when it differs, and nobody is told unless it was
+    u64 game = 0;         // (Guest) the game whose prepared title `tid` is
+    bool on = false;      // (Guest) the copy put in, or taken out
 };
 
 } // namespace
@@ -20,6 +23,7 @@ struct CopyWorker::Impl {
     LightLock lock;
     std::deque<Job> queue;
     std::deque<CopyDone> done;
+    std::vector<std::pair<u64, bool>> guest_done; // (Guest jobs) the prepared title and whether its folder is as asked
     int refreshed = 0;    // the copies the quiet looks made (not yet asked for)
     bool running = false; // a job is being made (it is not in the queue any more)
     Job current;
@@ -34,6 +38,11 @@ CopyDone RunJob(const Job& job, bool* refreshed = nullptr) {
     CopyDone result;
     result.tid = job.tid;
     result.kind = job.kind;
+    if (job.kind == CopyKind::Guest) {
+        // (the folder of a prepared title: the guards of games.cpp take nothing but EXACTLY the game's prepared title)
+        result.disable_ok = job.on ? EnableGuestFolder(job.tid, job.game, job.source.c_str()) == EnableResult::Ok : DisableGuestFolder(job.tid, job.game);
+        return result;
+    }
     if (job.refresh) {
         bool copied = false;
         result.enable_result = RefreshGameCopy(job.tid, job.source.c_str(), &copied);
@@ -76,7 +85,9 @@ void WorkerMain(void* arg) {
         const CopyDone result = RunJob(job, &refreshed);
 
         LightLock_Lock(&impl->lock);
-        if (job.refresh) {
+        if (job.kind == CopyKind::Guest) {
+            impl->guest_done.emplace_back(job.tid, result.disable_ok);
+        } else if (job.refresh) {
             impl->refreshed += refreshed ? 1 : 0; // (a quiet look reports only that it made a copy)
         } else {
             impl->done.push_back(result);
@@ -128,13 +139,39 @@ void CopyWorker::Submit(u64 tid, CopyKind kind, const std::string& source) {
     Submit(tid, kind, source, false);
 }
 
-void CopyWorker::Submit(u64 tid, CopyKind kind, const std::string& source, bool refresh) {
+void CopyWorker::SubmitGuest(u64 prepared, u64 game, bool on, const std::string& source) {
+    Submit(prepared, CopyKind::Guest, on ? source : std::string(), false, game, on);
+}
+
+bool CopyWorker::TakeGuestDone(u64 prepared, bool* ok) {
+    LightLock_Lock(&impl_->lock);
+    bool found = false;
+    for (std::size_t i = impl_->guest_done.size(); i > 0 && !found; --i) {
+        if (impl_->guest_done[i - 1].first == prepared) {
+            found = true;
+            *ok = impl_->guest_done[i - 1].second;
+        }
+    }
+    std::vector<std::pair<u64, bool>> kept;
+    for (const std::pair<u64, bool>& d : impl_->guest_done) {
+        if (d.first != prepared) {
+            kept.push_back(d);
+        }
+    }
+    impl_->guest_done.swap(kept);
+    LightLock_Unlock(&impl_->lock);
+    return found;
+}
+
+void CopyWorker::Submit(u64 tid, CopyKind kind, const std::string& source, bool refresh, u64 game, bool on) {
     LightLock_Lock(&impl_->lock);
     Job job;
     job.tid = tid;
     job.kind = kind;
     job.source = source;
     job.refresh = refresh;
+    job.game = game;
+    job.on = on;
     impl_->queue.push_back(job);
     const bool need_thread = impl_->thread == nullptr;
     LightLock_Unlock(&impl_->lock);
@@ -153,7 +190,9 @@ void CopyWorker::Submit(u64 tid, CopyKind kind, const std::string& source, bool 
                 bool refreshed = false;
                 const CopyDone result = RunJob(j, &refreshed);
                 LightLock_Lock(&impl_->lock);
-                if (j.refresh) {
+                if (j.kind == CopyKind::Guest) {
+                    impl_->guest_done.emplace_back(j.tid, result.disable_ok);
+                } else if (j.refresh) {
                     impl_->refreshed += refreshed ? 1 : 0;
                 } else {
                     impl_->done.push_back(result);

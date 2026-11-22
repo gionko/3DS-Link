@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <new>
 
+#include "azl/beacon_fold.hpp"
 #include "azl/stats.hpp"
 #include "azl/wallclock.hpp"
 
@@ -35,6 +37,7 @@ LogFiles::~LogFiles() {
     if (crumb_file_) {
         files_->Close(crumb_file_);
     }
+    delete beacons_;
 }
 
 std::string LogFiles::PathOf(Kind kind, int index) const {
@@ -148,6 +151,9 @@ void LogFiles::OpenDebugLocked() {
     debug_file_ = files_->OpenAppend(DebugPath(0));
     debug_size_ = debug_file_ ? files_->Size(debug_file_) : 0;
     if (debug_file_) {
+        // (a file is read on its own: the first beacon of every transmitter in it is whole - azl/beacon_fold.hpp; the pass that is
+        // under way starts its table again at its next block)
+        __atomic_store_n(&beacon_reset_, 1u, __ATOMIC_RELAXED);
         // The first line of every file (a new launch appending to an old one, and every file after a rotation): when it
         // began by the console's clock. The lines of a capture only carry the time since the plugin started, and a file
         // is read on its own, without the main log or the others.
@@ -320,13 +326,81 @@ void LogFiles::WriteMainLocked(const std::string& text) {
         }
         return;
     }
-    CardTimer card(&card_wait_ticks_);
-    files_->Write(log_file_, text.data(), text.size());
-    files_->Flush(log_file_); // (every time: the main log is small, and its last lines are what a post-mortem needs)
+    {
+        CardCall card(this, kCardMainWrite, text.size());
+        files_->Write(log_file_, text.data(), text.size());
+    }
+    {
+        CardCall card(this, kCardMainFlush, 0);
+        files_->Flush(log_file_); // (every time: the main log is small, and its last lines are what a post-mortem needs)
+    }
     log_size_ += text.size();
     if (log_size_ >= limits_.log_rotate_bytes) {
+        CardCall card(this, kCardOther, 0);
         RotateLogLocked();
     }
+}
+
+// One call into the file layer ended (CardCall; file_mutex_ held, so one at a time). The counts are read and cleared by the writer's
+// statistics with no lock, a field at a time: a call that ends meanwhile is in this window or in the next.
+void LogFiles::NoteCardCall(CardSlot slot, std::size_t bytes, u64 ticks) {
+    __atomic_fetch_add(&card_wait_ticks_, ticks, __ATOMIC_RELAXED);
+    CardCount& c = card_[slot];
+    const u64 ms = azl_ticks_to_ms(ticks);
+    const u32 shown_ms = ms > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<u32>(ms);
+    __atomic_fetch_add(&c.calls, 1u, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&c.bytes, static_cast<u32>(bytes), __ATOMIC_RELAXED);
+    __atomic_fetch_add(&c.ticks, ticks, __ATOMIC_RELAXED);
+    if (shown_ms >= __atomic_load_n(&c.longest_ms, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&c.longest_ms, shown_ms, __ATOMIC_RELAXED);
+        __atomic_store_n(&c.longest_bytes, static_cast<u32>(bytes), __ATOMIC_RELAXED);
+    }
+    if (slot == kCardCaptureWrite || slot == kCardCaptureFlush) {
+        // (every call of the capture is made by a pass, under drain_mutex_: the size of the slice is the pass's own)
+        slice_.NoteCall(ms);
+        __atomic_store_n(&slice_bytes_now_, slice_.Bytes(), __ATOMIC_RELAXED);
+    }
+}
+
+CardWindow LogFiles::TakeCardWindow() {
+    CardWindow w;
+    CardCalls* const out[kCardSlots] = {&w.capture_write, &w.capture_flush, &w.main_write, &w.main_flush, &w.other};
+    for (int i = 0; i < kCardSlots; ++i) {
+        out[i]->calls = __atomic_exchange_n(&card_[i].calls, 0u, __ATOMIC_RELAXED);
+        out[i]->bytes = __atomic_exchange_n(&card_[i].bytes, 0u, __ATOMIC_RELAXED);
+        out[i]->ticks = __atomic_exchange_n(&card_[i].ticks, u64(0), __ATOMIC_RELAXED);
+        out[i]->longest_ms = __atomic_exchange_n(&card_[i].longest_ms, 0u, __ATOMIC_RELAXED);
+        out[i]->longest_bytes = __atomic_exchange_n(&card_[i].longest_bytes, 0u, __ATOMIC_RELAXED);
+    }
+    w.slice_bytes = __atomic_load_n(&slice_bytes_now_, __ATOMIC_RELAXED);
+    w.passes = __atomic_exchange_n(&win_passes_, 0u, __ATOMIC_RELAXED);
+    w.forced = __atomic_exchange_n(&win_forced_, 0u, __ATOMIC_RELAXED);
+    w.read_skips = __atomic_exchange_n(&win_read_skips_, 0u, __ATOMIC_RELAXED);
+    w.rest_ms = __atomic_exchange_n(&win_rest_ms_, 0u, __ATOMIC_RELAXED);
+    w.yields = __atomic_exchange_n(&win_yields_, 0u, __ATOMIC_RELAXED);
+    w.beacons_same = __atomic_exchange_n(&win_beacons_, 0u, __ATOMIC_RELAXED);
+    // (the watch of the game's reads is the writer thread's own, and so is this call: the statistics run on it)
+    w.game_reads = read_watch_.reads;
+    w.realigned = read_watch_.realigned;
+    read_watch_.reads = 0;
+    read_watch_.realigned = 0;
+    return w;
+}
+
+void LogFiles::FormatCardLine(const CardWindow& w, char* out, std::size_t cap) {
+    const auto ms = [](const CardCalls& c) { return static_cast<unsigned long>(azl_ticks_to_ms(c.ticks)); };
+    const auto ul = [](u32 v) { return static_cast<unsigned long>(v); };
+    std::snprintf(out, cap,
+                  "stats: card: capture %lu writes %lu B %lu ms (longest %lu ms for %lu B), %lu flushes %lu ms (longest %lu ms)"
+                  " | main log %lu writes %lu B %lu ms (longest %lu ms for %lu B), %lu flushes %lu ms (longest %lu ms)"
+                  " | other %lu calls %lu ms | slice %lu KB, %lu passes (%lu forced small), %lu skipped for the game's file calls"
+                  " (%lu calls, %lu realigned), rest %lu ms, %lu yields, %lu beacons counted not written",
+                  ul(w.capture_write.calls), ul(w.capture_write.bytes), ms(w.capture_write), ul(w.capture_write.longest_ms),
+                  ul(w.capture_write.longest_bytes), ul(w.capture_flush.calls), ms(w.capture_flush), ul(w.capture_flush.longest_ms),
+                  ul(w.main_write.calls), ul(w.main_write.bytes), ms(w.main_write), ul(w.main_write.longest_ms),
+                  ul(w.main_write.longest_bytes), ul(w.main_flush.calls), ms(w.main_flush), ul(w.main_flush.longest_ms),
+                  ul(w.other.calls), ms(w.other), ul(w.slice_bytes / 1024), ul(w.passes), ul(w.forced), ul(w.read_skips),
+                  ul(w.game_reads), ul(w.realigned), ul(w.rest_ms), ul(w.yields), ul(w.beacons_same));
 }
 
 bool LogFiles::FlushWithin(u32 within_ms) {
@@ -377,7 +451,64 @@ void LogFiles::NoteCapturePass(u64 now_ms) {
     __atomic_store_n(&last_capture_ms_, now_ms == 0 ? 1 : now_ms, __ATOMIC_RELAXED);
 }
 
-bool LogFiles::DrainDebug(bool final) {
+LogFiles::CaptureTurn LogFiles::NextCaptureTurn(u64 now_ms, u32 ring_used, bool early) {
+    if (!DebugRingReady()) {
+        __atomic_store_n(&capture_waiting_, 0u, __ATOMIC_RELAXED);
+        return CaptureTurn::kWait; // (no capture: nothing to pace)
+    }
+    const bool due = __atomic_load_n(&capture_backlog_, __ATOMIC_RELAXED) != 0 || CaptureDue(now_ms, ring_used, early);
+    const bool rested = early || now_ms >= __atomic_load_n(&capture_not_before_ms_, __ATOMIC_RELAXED);
+    const bool wanted = due && rested;
+    // The game's calls to the file system (reads, opens, closes ...: azl/game_card_calls.hpp), looked at every time the writer wakes (the
+    // two words of the svc hook; `done` first: capture_pace.hpp).
+    // The gate's count of skipped posts is read BEFORE the two (2026-11-11): read after them, a read that began and lost its end in
+    // between showed its skipped post beside counts that did not hold it yet (GameReadWatch::Look).
+    pace::GameReadWatch::Verdict reads = pace::GameReadWatch::kPass;
+    if (reads_begun_ && reads_done_) {
+        const u32 skipped = posts_skipped_ ? posts_skipped_() : 0u;
+        const u32 done = __atomic_load_n(reads_done_, __ATOMIC_RELAXED);
+        const u32 begun = __atomic_load_n(reads_begun_, __ATOMIC_RELAXED);
+        reads = read_watch_.Look(begun, done, now_ms, wanted && !early, skipped);
+    }
+    if (!wanted) {
+        __atomic_store_n(&capture_waiting_, due ? 1u : 0u, __ATOMIC_RELAXED); // (due, but the card rests)
+        return CaptureTurn::kWait;
+    }
+    __atomic_store_n(&capture_waiting_, 0u, __ATOMIC_RELAXED);
+    if (early) {
+        read_watch_.PassedAnyway(); // (the HOME button: the capture goes to the card now, whoever reads)
+        return CaptureTurn::kPass;
+    }
+    if (reads == pace::GameReadWatch::kSkip) {
+        // The game is at its files: its call (a read, an open ...) would wait behind our write for as long as the card takes. Not now; a
+        // look again soon.
+        __atomic_fetch_add(&win_read_skips_, 1u, __ATOMIC_RELAXED);
+        __atomic_store_n(&capture_waiting_, 2u, __ATOMIC_RELAXED);
+        return CaptureTurn::kWait;
+    }
+    if (reads == pace::GameReadWatch::kForced) {
+        __atomic_fetch_add(&win_forced_, 1u, __ATOMIC_RELAXED);
+        return CaptureTurn::kSmallPass;
+    }
+    return CaptureTurn::kPass;
+}
+
+u32 LogFiles::WriterWaitMs(u64 now_ms) const {
+    const u32 waiting = __atomic_load_n(&capture_waiting_, __ATOMIC_RELAXED);
+    if (waiting == 2) {
+        return pace::kReadPollMs;
+    }
+    if (waiting == 1 || __atomic_load_n(&capture_backlog_, __ATOMIC_RELAXED) != 0) {
+        // The capture has something for the card and waits for its rest to end: wake then, and no later than the usual wake (the main
+        // log and the statistics do not wait for the capture's rest).
+        const u64 not_before = __atomic_load_n(&capture_not_before_ms_, __ATOMIC_RELAXED);
+        const u64 left = not_before > now_ms ? not_before - now_ms : 0;
+        return left < pace::kRestMinMs ? pace::kRestMinMs : left > pace::kWakeMs ? pace::kWakeMs : static_cast<u32>(left);
+    }
+    return pace::kWakeMs;
+}
+
+bool LogFiles::DrainDebug(bool final, bool small_slice) {
     // One pass at a time: the writer thread and a switch-off (menu thread) may both come here.
     platform::LockGuard drain_lock(drain_mutex_);
     {
@@ -388,49 +519,77 @@ bool LogFiles::DrainDebug(bool final) {
             OpenDebugLocked();
         }
         if (!debug_file_) {
+            __atomic_store_n(&capture_backlog_, 0u, __ATOMIC_RELAXED); // (no coming back soon for a file that is not there)
             return false; // (nothing to wait for: it is the file that is missing)
         }
     }
-    // One buffer for every pass (kept between them: reserving it again every 250 ms was an allocation and a free for
-    // nothing). A pass writes what it formatted every 64 KB, so the buffer stays at 68 KB (heap, and only with the log
-    // on). Until 2026-10-20 the writes were 16 KB and each was flushed: four times the calls into the file system, and a
-    // flush costs the card as much as a small write.
     if (!final && stop_capture_ && __atomic_load_n(stop_capture_, __ATOMIC_ACQUIRE) != 0) {
+        __atomic_store_n(&capture_backlog_, 1u, __ATOMIC_RELAXED);
         return true; // (SetStopCapture: the writer comes back soon, once it may)
     }
     NoteCapturePass(platform::NowMs());
-    constexpr std::size_t kWriteBytes = 64 * 1024;   // one write to the card: the most a "service call" of this pass is
-    constexpr std::size_t kPassBytes = 256 * 1024;   // ... and the most text one pass of the writer puts on the card
-    constexpr u64 kPassMs = 200;
+    // One buffer for every pass (kept between them: reserving it again every 250 ms was an allocation and a free for
+    // nothing), as large as the largest write: 68 KB of heap, and only with the log on. ONE write a pass that is not the last
+    // (2026-11-10): the file system serves one call at a time, a file read of the game waits behind the write in hand, and a
+    // pass of two writes of 64 KB and a flush on a slow card was 9 s of that (until 2026-10-20 the writes were 16 KB and each
+    // was flushed: four times the calls, and a flush costs the card as much as a small write). The write is 64 KB while the
+    // card answers and 8 KB after a call it took long over (pace::SliceSize); the last pass of a launch writes slice after slice.
     std::string& out = drain_out_;
-    if (out.capacity() < kWriteBytes + 4096) {
-        out.reserve(kWriteBytes + 4096);
+    if (out.capacity() < pace::kSliceLargeBytes + 4096) {
+        out.reserve(pace::kSliceLargeBytes + 4096);
+    }
+    if (!beacons_) {
+        beacons_ = new (std::nothrow) BeaconFold(); // (the plugin's heap, with the log on only; without it every beacon is written)
     }
     // The counts that wait for their second to end (the diet) go into the ring ahead of what is drained.
     DebugFlushAggregates(final);
-    const u64 begin_ms = platform::NowMs();
+    const u32 start_ms = static_cast<u32>(start_ms_);
+    // The gate closed after this pass began (an Old 3DS is about to swap the plugin's block out, and waits for the writer to leave the
+    // card): the pass is to end as soon as it can - see the two places below (2026-11-11). Never the last pass, which is not stopped.
+    const auto gate_closing = [this, final]() { return !final && stop_capture_ && __atomic_load_n(stop_capture_, __ATOMIC_ACQUIRE) != 0; };
+    const u64 card_before = card_wait_ticks();
+    const u64 yield_ticks = static_cast<u64>(limits_.capture_yield_ms) * AZL_TICKS_PER_MS;
+    u64 paused_at = platform::NowTicks();
+    u32 yields = 0;
+    u64 yielded = 0; // ticks given up: not the writer's CPU (yielded_ticks())
     std::size_t written = 0;
     DebugRecord rec;
     u8 buf[1700];
-    bool more = true;
-    bool cut = false; // this pass stopped at its bounds with records left
-    while (more) {
+    bool cut = false; // this pass stopped with records left
+    for (;;) {
         out.clear();
-        more = false;
+        const std::size_t slice_bytes = small_slice ? pace::kSliceSmallBytes : slice_.Bytes(); // (the write before may have changed it)
+        if (beacons_ && __atomic_exchange_n(&beacon_reset_, 0u, __ATOMIC_RELAXED) != 0) {
+            beacons_->Reset(); // (a new file: its first beacons are whole)
+        }
+        bool more = false;
         while (DebugPop(&rec, buf, sizeof(buf))) {
-            DebugFormat(rec, buf, static_cast<u32>(start_ms_), &out);
-            if (out.size() >= kWriteBytes) {
-                more = true; // write this much now, then go on
+            // A beacon that is the one before of its transmitter is counted, not written (azl/beacon_fold.hpp).
+            if (!beacons_ || beacons_->Keep(rec, buf, start_ms, &out)) {
+                DebugFormat(rec, buf, start_ms, &out);
+            }
+            if (out.size() >= slice_bytes) {
+                more = true; // write this much now
                 break;
             }
+            // The writer is above the network thread and the game's: it does not format a whole block in one go (LogFileLimits::
+            // capture_yield_ms). Never in the last pass: the end of a launch has half a second. And no more of it once the gate of the
+            // swap closes: the swap waits for this pass, and a sleep here is at least a millisecond of that wait, often more.
+            if (!final && platform::NowTicks() - paused_at > yield_ticks && !gate_closing()) {
+                const u64 pause_from = platform::NowTicks();
+                platform::SleepMs(1);
+                paused_at = platform::NowTicks();
+                yielded += paused_at - pause_from;
+                ++yields;
+            }
         }
-        // Never hog the writer thread - or the file lock, which every write holds: the rest on the next pass (the end of
-        // the launch is the exception: that pass takes what it takes).
-        if (more && !final && (written + out.size() >= kPassBytes || platform::NowMs() - begin_ms > kPassMs)) {
-            more = false;
-            cut = true;
+        if (beacons_) {
+            beacons_->Summaries(start_ms, &out); // (before the write: a rotation after it finds nothing counted and not said)
         }
-        if (!more) {
+        // What the ring dropped is said by every pass that is not the last, and by the last one when it has emptied the ring
+        // (2026-11-11: a pass that is not the last is ONE block, and with a capture the card cannot keep up with - the very case - it
+        // never empties the ring: said only then, the count stayed in memory for the whole match and was lost with a game that fell).
+        if (!more || !final) {
             const u32 dropped = DebugTakeDropped();
             if (dropped) {
                 char line[128];
@@ -445,21 +604,28 @@ bool LogFiles::DrainDebug(bool final) {
         if (out.empty()) {
             break;
         }
+        // The main log first: its lines are few and they are what a post-mortem reads; they do not wait in memory behind a
+        // write of the capture that may take seconds (2026-11-10). Not with the gate of the swap closing: that is a write and a flush
+        // more for the swap to wait for; the lines stay in the queue and the writer's next round writes them, once the gate is open.
+        if (!gate_closing()) {
+            Flush();
+        }
         written += out.size();
         WriteDebug(out);
-        if (more && !final && stop_capture_ && __atomic_load_n(stop_capture_, __ATOMIC_ACQUIRE) != 0) { // (SetStopCapture: the rest stays in the ring)
-            cut = true;
+        if (!more) {
+            break;
+        }
+        if (!final) {
+            cut = DebugBytesQueued() != 0; // one write a pass: the rest of the ring on the next, after the card has rested
             break;
         }
         // The launch is ending (BeginShutdown) and the card cannot keep up: stop after the write in hand and leave the rest of the
         // ring - the game must be able to leave, and the main log's last lines must reach the file (Close() writes them first and
         // then says how much of the capture was not written). A switch-off from the menu has no deadline and drains everything.
-        if (more) {
-            const u64 deadline = __atomic_load_n(&shutdown_deadline_ms_, __ATOMIC_RELAXED);
-            if (deadline != 0 && platform::NowMs() >= deadline) {
-                cut = true;
-                break;
-            }
+        const u64 deadline = __atomic_load_n(&shutdown_deadline_ms_, __ATOMIC_RELAXED);
+        if (deadline != 0 && platform::NowMs() >= deadline) {
+            cut = true;
+            break;
         }
     }
     // One flush for the whole pass (the file system holds the writes until then): a flush costs the card as much as a small
@@ -468,9 +634,24 @@ bool LogFiles::DrainDebug(bool final) {
     if (written != 0) {
         platform::LockGuard lock(file_mutex_);
         if (debug_file_) {
-            CardTimer card(&card_wait_ticks_);
+            CardCall card(this, kCardCaptureFlush, 0);
             files_->Flush(debug_file_);
         }
+    }
+    // The card rests for as long as this pass kept it (its writes, its flush and the main log's lines it wrote first): the game reads
+    // from the same card, and the capture is at it for half of the time at the most (a pass of more than 5 s rests 5 s). The next
+    // pass is not before then.
+    const u32 rest_ms = pace::RestAfterPass(azl_ticks_to_ms(card_wait_ticks() - card_before));
+    __atomic_store_n(&capture_not_before_ms_, platform::NowMs() + rest_ms, __ATOMIC_RELAXED);
+    __atomic_store_n(&capture_backlog_, cut ? 1u : 0u, __ATOMIC_RELAXED);
+    if (!final) {
+        __atomic_fetch_add(&win_passes_, 1u, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&win_rest_ms_, rest_ms, __ATOMIC_RELAXED);
+    }
+    __atomic_fetch_add(&win_yields_, yields, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&yielded_ticks_, yielded, __ATOMIC_RELAXED);
+    if (beacons_) {
+        __atomic_fetch_add(&win_beacons_, beacons_->TakeFolded(), __ATOMIC_RELAXED);
     }
     return cut;
 }
@@ -480,10 +661,13 @@ void LogFiles::WriteDebug(const std::string& text) {
     if (!debug_file_) {
         return; // the rotation could not reopen the file: the records are lost, the next pass retries
     }
-    CardTimer card(&card_wait_ticks_);
-    files_->Write(debug_file_, text.data(), text.size()); // (flushed once a pass: DrainDebug)
+    {
+        CardCall card(this, kCardCaptureWrite, text.size());
+        files_->Write(debug_file_, text.data(), text.size()); // (flushed once a pass: DrainDebug)
+    }
     debug_size_ += text.size();
     if (debug_size_ >= limits_.debug_rotate_bytes) {
+        CardCall card(this, kCardOther, 0);
         RotateLocked(kDebug);
         OpenDebugLocked();
     }

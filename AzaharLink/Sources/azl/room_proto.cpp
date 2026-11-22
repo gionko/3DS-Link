@@ -55,12 +55,13 @@ bool DecodeWifiPacket(const u8* data, std::size_t size, WifiPacket* out) {
 bool DecodeRoomInformation(const u8* data, std::size_t size, RoomInfo* out) {
     PacketReader r(data, size);
     r.Skip(1);
-    out->name = r.String();
-    out->description = r.String();
+    // Every string with its limit (2026-11-10, Includes/azl/room_proto.hpp: kKeep*): what is past it is skipped, never kept.
+    out->name = r.String(kKeepRoomName);
+    out->description = r.String(kKeepDescription);
     out->member_slots = r.U32();
     out->port = r.U16();
-    out->preferred_game = r.String();
-    out->host_username = r.String();
+    out->preferred_game = r.String(kKeepGameName);
+    out->host_username = r.String(kKeepHostUsername);
     const u32 count = r.U32();
     out->members.clear();
     // Each member needs at least 6 (mac) + 5*4 (string lengths) + 8 (game id) bytes.
@@ -69,13 +70,13 @@ bool DecodeRoomInformation(const u8* data, std::size_t size, RoomInfo* out) {
     }
     for (u32 i = 0; i < count; ++i) {
         MemberInfo m;
-        m.nickname = r.String();
+        m.nickname = r.String(kKeepNickname);
         m.mac = r.MacAddress();
-        m.game_name = r.String();
+        m.game_name = r.String(kKeepGameName);
         m.game_id = r.U64();
-        m.username = r.String();
-        m.display_name = r.String();
-        m.avatar_url = r.String();
+        m.username = r.String(0); // (these three nobody reads, here or in the app: skipped, the fields left empty)
+        m.display_name = r.String(0);
+        m.avatar_url = r.String(0);
         if (!r.ok()) {
             return false;
         }

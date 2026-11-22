@@ -14,7 +14,7 @@
 
 namespace setup {
 
-constexpr const char* kVersion = "1.1.3";
+constexpr const char* kVersion = "1.1.4";
 // The places that are not the app's to choose: Luma3DS loads plugins from this folder (a title's copy of the plugin goes to
 // sdmc:/luma/plugins/<title id>/, games.hpp), and the plugin reads its settings and writes its logs in sdmc:/3ds/3DSLink, whatever folder
 // the app itself is in (kIniPath and the folder are in paths.hpp with the other fixed places). Until 2026-10-19 the settings were in
@@ -44,7 +44,7 @@ struct Settings {
     int debug = 0; // 0 no log at all (no file is written), 1 everything (AzaharLink.log + AzaharLink.debug.log); a 2 reads as 1
     int rcvbuf_kb = azl::ini::kRcvbufKbDefault; // not shown by the app (an advanced fallback: 8, 16, 32 or 64), but a field of its own: it is written, never lost
     int sleep_stop = azl::ini::kSleepStopDefault; // not shown since 1.1.1 (0 off, 1 a client, 2 a host too): written, never lost
-    bool chat = true;                           // the row "In-game chat"
+    bool chat = azl::ini::kChatDefault;         // the row "In-game chat" (off by default since 2026-11-19: the user's choice)
     std::string chat_key = azl::ini::kDefaultChatKey; // the row "Chat keys"
     int chat_pos = azl::ini::kChatPosDefault;   // the row "Chat position" (azl::ini::ChatPos; the file holds the word)
     std::vector<std::string> unknown_lines;

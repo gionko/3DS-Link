@@ -2,16 +2,22 @@
 // (the creator), over a virtual network the adapter gives us (LobbyNet). Design: analysis/dlp-lobby-fake-2026-10-28/
 // DESIGN-FASE1.md (binding) and SPEC-DLP.md. Pure C++: no kernel, no engine, no file, no log, no heap, no thread.
 //
-// HARD LIMITS (rules of the user): at most 4 players (host + 3 clients), ever; minimum memory; minimum stack.
+// HARD LIMITS (rules of the user): the tables hold 8 players (host + 7 clients) and every title has a ceiling of its own, four
+// unless its configuration says more (LobbyConfig::max_players, TitlePlayers); minimum memory; minimum stack.
+// THE CEILING OF THE TITLE is applied here and nowhere else, in five places: the clients a game may ask for (ServerInitialize, so
+// the announcement and the network the adapter hosts), the lobbies a searcher lists (ScanAbsorb), the entry of a session that was
+// not in the table (EnterSession), the members read from the engine (ReadMembers) and the slots of the creator with the ejection of
+// an id above them (TrackClients). A title of four behaves in each of them as it did when the tables held four.
 //
 // MEMORY. One DlpLobby is a fixed object with NO heap (no vector / string / new / function / exception / RTTI). The 5032-byte
 // and 664-byte records of the games are NOT kept: the IPC front-end composes them in the game's own buffer from a
-// Group (40 bytes) or from a Track. The balance, in bytes (x86-64 and ARM32 measured, both 272; i386 not compiled here,
-// computed about 264), the bound being static_assert(sizeof <= 320):
-//     LobbyNet* net_ 8 (4) | u64 filter_ 8 | Identity id_ 32 | Tables u_ 168 (a union of ONE of three shapes, chosen by
-//     tab_: Scan 4 x 40 = 160, Session 40 + 4 x 32 = 168, Host 3 x 8 = 24) | 7 x u32 28 | join_mac_ 6 | my_node_ 1 |
+// Group (40 bytes) or from a Track. The balance, in bytes (x86-64 and ARM32 measured, both 400 - 272 while the tables held four
+// players; i386 not compiled here), the bound being static_assert(sizeof <= 400):
+//     LobbyNet* net_ 8 (4) | u64 filter_ 8 | Identity id_ 32 | Tables u_ 296 (a union of ONE of three shapes, chosen by
+//     tab_: Scan 4 x 40 = 160, Session 40 + 8 x 32 = 296, Host 7 x 8 = 56) | 7 x u32 28 | join_mac_ 6 | my_node_ 1 |
 //     go_ 11 (the passphrase kept AS the GO message {3, 9, nine bytes}: it is sent from there, no buffer on a stack) |
-//     10 x u8 (states, use_, tab_, limits, cursor_, flags_, flags2_) | padding = 272.
+//     10 x u8 (states, use_, tab_, limits, cursor_, flags_, flags2_ - whose high half is the ceiling of the title: no byte
+//     was added for it) | padding = 400.
 //     The searcher and the creator never hold the network together, which is why one table shape is enough.
 // STACK. Every function runs on the game thread that made the IPC call, some of which have 464 bytes below the call. No
 // local above 40 bytes (the largest: a HeardGroup, 36), no recursion, and the frames are kept apart so that the CHAIN of
@@ -50,9 +56,10 @@ namespace azl {
 /// The virtual network as the lobby sees it. The adapter (phase 2) implements it on the UDS engine, the tests on an
 /// in-memory air. Contract: nothing blocks; HostClose() and Disconnect() are synchronous with respect to the engine;
 /// Receive() delivers only messages sent by a node of OUR virtual network, with from_node authenticated by the adapter
-/// (never read from the body); Send() is always unicast to one node 1..4; HeardGroup::host is the MAC the creator's own
+/// (never read from the body); Send() is always unicast to one node 1..kMaxPlayers; HeardGroup::host is the MAC the creator's own
 /// nwm::UDS will use for the game's network; ScanRead(i) is the i-th lobby heard FRESH now, of any game (the lobby
 /// filters by game); Members() and ReadNode() read the engine's state on the host and on the client alike.
+class DlpClntBook;  // azl/dlp_clnt_book.hpp: what dlp:CLNT keeps beside the lobby (1.1.4, G1: the system's Download Play application only)
 class LobbyNet {
 public:
     virtual u64 NowMs() = 0;     // monotonic, never the wall clock
@@ -73,12 +80,19 @@ public:
     virtual u8 MyNode() = 0;                             // our node id (host = 1), 0 = not in a network
     virtual u32 Members(u8 (&nodes)[kMaxPlayers]) = 0;   // node ids present now, host included, ascending
     virtual bool ReadNode(u8 node, NodeEntry* out) = 0;  // identity of one present node
-    virtual bool Send(u8 to_node, const u8* data, u32 size) = 0;  // unicast to ONE node 1..4; size <= kMaxMessage
+    virtual bool Send(u8 to_node, const u8* data, u32 size) = 0;  // unicast to ONE node 1..kMaxPlayers; size <= kMaxMessage
     virtual bool Receive(u8* from_node, u8* data, u32 capacity, u32* size) = 0;  // pops one message; false = none
     // 1.1.3 (the plugin's hub with an adapter of its own, azl/dlp_real_net.hpp). NOT pure: EngineLobbyNet and the tests' networks keep
-    // these defaults, and the hub asks them only of an adapter that is not its own EngineLobbyNet. The lobby itself never calls them.
+    // these defaults, and the hub asks them only of an adapter that is not its own EngineLobbyNet. The lobby itself never calls Pump and Holds.
     virtual void Pump() {}                        // the network thread's round (the hub's Tick), before the lobby's own pump
     virtual bool Holds() const { return false; }  // true while the adapter holds the engine (the hub's EngineHeld / FreeEngine)
+    // 1.1.4 (G1), NOT pure either: the book of dlp:CLNT, which only the adapter of the real Download Play of the system's Download Play application
+    // has (its SetClntBook); every other network keeps this null, and DlpService serves no dlp:CLNT command without it.
+    virtual DlpClntBook* ClntBook() { return nullptr; }
+    // 1.1.4 (H5), NOT pure, after ClntBook (contract K6/C8: the slots of the table stay where they are): the clients the host still waits for in
+    // its state 9 (bit s = node s + 2), the guests of the system's Download Play application that went to start their child. 0 for every
+    // network but the real Download Play's adapter with its wait on; the lobby asks it in its state 9 only, and the hub to stay active.
+    virtual u8 ChildrenAwaited() const { return 0; }
 
 protected:
     ~LobbyNet() = default;  // nobody deletes through the interface
@@ -88,6 +102,8 @@ struct LobbyConfig {  // given once, before the first Initialize: everything the
     u64 game_tid;     // title id of the running game (only the low 32 bits are used)
     u64 friend_seed;  // the local friend code seed (the adapter makes it unique per console; 0 is allowed)
     u16 name[kNameUnits];  // the default player name (InitializeWithName overrides it)
+    u8 max_players;   // the ceiling of the title, host included: 0 = four (TitlePlayers; a zeroed configuration is a title of four)
+    u8 any_title;     // 1.1.4 (G1): 0 = the searcher lists only the running game's child (every game); 1 = any game's lobby (the Download Play application)
 };
 
 struct Group {          // a lobby heard (40 bytes, no u64: the same on ARM32 and x86-64)
@@ -126,7 +142,8 @@ public:
     static_assert(kPollMs <= kResendMs, "Poll must run at least once per resend period");
 
     // A client of the creator. state: 0 free, 1 waiting for acceptance, 2 accepted, 3 START_ACK received, 4 GO_ACK
-    // received, 5 ejected (waits for the engine to remove it). The slot is node - 2 (clients are nodes 2..4).
+    // received, 5 ejected (waits for the engine to remove it). The slot is node - 2 (clients are nodes 2..kMaxPlayers; a title
+    // uses the slots below its own ceiling and the others stay free).
     struct Track {
         u32 sent_ms;  // when START / GO / Kick was last sent to it
         u8 state;
@@ -149,14 +166,19 @@ public:
     static_assert(sizeof(ScanTable::g) / sizeof(Group) == kMaxGroups, "the scan table holds kMaxGroups entries");
     static_assert(sizeof(SessionTable::roster) / sizeof(NodeEntry) == kMaxPlayers, "the roster holds kMaxPlayers");
     static_assert(sizeof(HostTable::t) / sizeof(Track) == kMaxClients, "the creator tracks kMaxClients clients");
-    static_assert(sizeof(Tables) <= 168, "one of three shapes: at most 168 bytes");
+    static_assert(sizeof(Tables) <= 296, "one of three shapes: at most 296 bytes");
+
+    /// The low word a lobby of LobbyConfig::any_title keeps instead of its title's (1.1.4, G1): no title has it (a unique id is 24 bits at the
+    /// most), and the searcher's filter by game is off with it. No byte of the lobby is added for the switch: sizeof(DlpLobby) is 400, its ceiling.
+    static constexpr u32 kAnyTitleLow = 0xFFFFFFFFu;
 
     /// Builds the lobby. `net` outlives it. Cost: one memset of the table and a name copy; no call into LobbyNet.
     DlpLobby(LobbyNet* net, const LobbyConfig& cfg) : net_(net) {
         std::memset(&u_, 0, sizeof(u_));
         id_.seed = cfg.friend_seed;
         CopyName(id_.name, cfg.name);
-        tid_low_ = static_cast<u32>(cfg.game_tid);
+        tid_low_ = cfg.any_title != 0 ? kAnyTitleLow : static_cast<u32>(cfg.game_tid);
+        flags2_ = static_cast<u8>(TitlePlayers(cfg.max_players) << kF2CapShift);
     }
     DlpLobby(const DlpLobby&) = delete;
     DlpLobby& operator=(const DlpLobby&) = delete;
@@ -254,6 +276,55 @@ public:
         return kNoData;
     }
 
+    /// 1.1.4 (G1, dlp:CLNT): the entry of the scan table in `slot` (0..kMaxGroups-1), with no cursor - the book of dlp:CLNT walks the slots
+    /// itself and remembers what it delivered - or null. States 1, 2, 3 and a used slot only. Nothing of LobbyNet, not even the clock (the book
+    /// writes its records with the tick of now): the chain of a game thread ends here.
+    const Group* ClientScanEntry(u32 slot) const {
+        if (tab_ != kTabScan || slot >= kMaxGroups || !(cli_state_ == kCliIdle || cli_state_ == kCliScanning || cli_state_ == kCliJoining)) {
+            return nullptr;
+        }
+        const Group* g = &u_.scan.g[slot];
+        return (g->flags & kGroupUsed) != 0 ? g : nullptr;
+    }
+    /// 1.1.4 (G1, dlp:CLNT GetServerInfo): what the lobby knows of `host` now - its entry of the scan table in 1, 2, 3, the host joined in 5, 6, 9 -
+    /// or null; ClientServerInfo's lookup without the view (no clock).
+    const Group* ClientGroupOf(const Mac& host) const {
+        if (cli_state_ == kCliIdle || cli_state_ == kCliScanning || cli_state_ == kCliJoining) {
+            for (u32 i = 0; tab_ == kTabScan && i < kMaxGroups; ++i) {
+                if ((u_.scan.g[i].flags & kGroupUsed) != 0 && u_.scan.g[i].host == host) {
+                    return &u_.scan.g[i];
+                }
+            }
+        } else if (InSession() && tab_ == kTabSession && u_.session.host.host == host) {
+            return &u_.session.host;
+        }
+        return nullptr;
+    }
+
+    /// 1.1.4 (G1, dlp:CLNT StartSession): puts a host the book of dlp:CLNT delivered back into the scan table, so that a join can begin on it after
+    /// the table forgot it (it expired, or a new StartScan cleared it). State 1 only (kInvalidState otherwise): its own entry, else the first free
+    /// slot, else slot 0, as `g` with the clock of now. No call into LobbyNet but the clock.
+    u32 ClientAdoptGroup(const Group& g) {
+        if (cli_state_ != kCliIdle) {
+            return kInvalidState;
+        }
+        if (tab_ != kTabScan) {
+            ClearTables();
+            tab_ = kTabScan;
+        }
+        Group* slot = FindScan(g.host);
+        for (u32 i = 0; i < kMaxGroups && slot == nullptr; ++i) {
+            slot = (u_.scan.g[i].flags & kGroupUsed) == 0 ? &u_.scan.g[i] : nullptr;
+        }
+        if (slot == nullptr) {
+            slot = &u_.scan.g[0];
+        }
+        *slot = g;
+        slot->flags = kGroupUsed;
+        slot->last_seen_ms = Now();
+        return 0;
+    }
+
     /// FKCL DeleteScanInfo. States 1 and 2: removes the entry only (no ignore list: a lobby still alive comes back at
     /// the next round); unknown MAC or any other state -> kNoData. Stack (ARM, -Os): frame 8 B, no call into LobbyNet.
     u32 ClientDeleteScanInfo(const Mac& host) {
@@ -322,9 +393,10 @@ public:
     }
 
     /// FKCL GetConnectingNodes. In 5, 6, 9 the ids of the session roster (host included, ascending), *total = how many;
-    /// elsewhere success with *total = 0. Writes min(*total, capacity) ids (capacity <= 4).
+    /// elsewhere success with *total = 0. Writes min(*total, capacity) ids (capacity <= kMaxPlayers). The ids are bytes (a node
+    /// id is 1..16): eight of them are the eight bytes that four u16 were in the caller's frame.
     /// Stack (ARM, -Os): frame 4 B, no call into LobbyNet.
-    u32 ClientConnectingNodes(u16* ids, u32 capacity, u32* total) const {
+    u32 ClientConnectingNodes(u8* ids, u32 capacity, u32* total) const {
         u32 count = 0;
         if (InSession() && tab_ == kTabSession) {
             for (u32 i = 0; i < kMaxPlayers; ++i) {
@@ -368,13 +440,17 @@ public:
     // 9 complete.
 
     /// SRVR Initialize / InitializeWithName. Always 0. Tears down the creator's own state (HostClose if its network is
-    /// open), then state 1. max_clients is limited to 1..3 (0 counts as 1: our choice, the real module takes 1..15); the
-    /// child index is the low byte; a given name replaces the current one. The searcher is not touched.
-    /// Stack (ARM, -Os): frame 16 B, chain 24 B.
+    /// open), then state 1. max_clients is limited to 1..(the ceiling of the title - 1), which is 1..3 for a title of four and
+    /// 1..7 for one of eight (0 counts as 1: our choice, the real module takes 1..15); the child index is the low byte; a given
+    /// name replaces the current one. The searcher is not touched.
+    /// Stack (ARM, -Os): frame 24 B, chain 32 B (a function of its own since it reads the ceiling of the title: the two handlers
+    /// that call it lost what they carried for it, 24 -> 8 and 48 -> 40, and their chains are 8 and 16 bytes longer, far below the
+    /// deepest one).
     u32 ServerInitialize(u32 max_clients, u32 child_index, const u16* name_or_null) {
         ServerReset();
         srv_state_ = kSrvIdle;
-        max_clients_ = static_cast<u8>(max_clients < 1 ? 1 : (max_clients > kMaxClients ? kMaxClients : max_clients));
+        const u32 most = CeilingClients();  // (1..3 for a title of four players, 1..7 for one of eight)
+        max_clients_ = static_cast<u8>(max_clients < 1 ? 1 : (max_clients > most ? most : max_clients));
         child_index_ = static_cast<u8>(child_index & 0xFF);
         if (name_or_null != nullptr) {
             CopyName(id_.name, name_or_null);
@@ -438,9 +514,10 @@ public:
     }
 
     /// SRVR GetConnectingClients. State 0 -> kInvalidState; else the ids of the tracked clients still present
-    /// (ascending, host excluded), *total = how many (at most 3); in state 9 *total = 0. Writes min(*total, capacity)
-    /// ids (capacity <= 4). Stack (ARM, -Os): frame 4 B, no call into LobbyNet.
-    u32 ServerConnectingClients(u16* ids, u32 capacity, u32* total) const {
+    /// (ascending, host excluded), *total = how many (at most the ceiling of the title - 1); in state 9 *total = the clients the
+    /// adapter still waits for (LobbyNet::ChildrenAwaited: 0 but for H5, the guests that went to start their child). Writes
+    /// min(*total, capacity) ids (capacity <= kMaxClients), as bytes. Stack (ARM, -Os): frame 4 B; in state 9 one call into LobbyNet (a leaf).
+    u32 ServerConnectingClients(u8* ids, u32 capacity, u32* total) const {
         if (srv_state_ == kSrvOff) {
             return kInvalidState;
         }
@@ -449,7 +526,17 @@ public:
             for (u32 s = 0; s < kMaxClients; ++s) {
                 if (Listed(u_.host.t[s].state)) {
                     if (count < capacity) {
-                        ids[count] = static_cast<u16>(s + kFirstClientNode);
+                        ids[count] = static_cast<u8>(s + kFirstClientNode);
+                    }
+                    ++count;
+                }
+            }
+        } else if (srv_state_ == kSrvComplete) {
+            const u8 awaited = net_->ChildrenAwaited();  // (H5: 0 for every title but a host of the real Download Play whose guests run their child; never on the wire)
+            for (u32 b = 0; b < kMaxClients; ++b) {
+                if (((awaited >> b) & 1u) != 0) {
+                    if (count < capacity) {
+                        ids[count] = static_cast<u8>(b + kFirstClientNode);
                     }
                     ++count;
                 }
@@ -476,6 +563,12 @@ public:
             return kNoData;
         }
         if (TrackOf(node) == nullptr) {
+            if (AwaitedNode(node)) {  // (H5: an id state 9 lists has an answer, as a tracked node whose ReadNode fails)
+                out->seed = 0;
+                std::memset(out->name, 0, sizeof(out->name));
+                out->node = static_cast<u8>(node);
+                return 0;
+            }
             return kNoData;
         }
         if (!net_->ReadNode(static_cast<u8>(node), out)) {
@@ -496,6 +589,10 @@ public:
         }
         const Track* t = TrackOf(node);
         if (t == nullptr) {
+            if (AwaitedNode(node)) {  // (H5: an id state 9 lists is a client that has the passphrase: 0x09, joined)
+                *word = (static_cast<u32>(kPeerComplete) << 24) | (1u << 16) | node;
+                return 0;
+            }
             return kNoData;
         }
         u32 ext = kPeerAccepted;
@@ -650,6 +747,11 @@ public:
         SetF2(kF2OnNet, on);
     }
 
+    /// The ceiling of the title (players, host included): what the configuration said, 4 when it said nothing.
+    u32 max_players() const {
+        return Ceiling();
+    }
+
     /// Messages refused (bad format, wrong role, wrong sender), saturating.
     u32 bad_messages() const {
         return bad_messages_;
@@ -708,6 +810,10 @@ private:
     static constexpr u8 kF2FinalRoster = 1;    // flags2_: a GO arrived, the roster is read once more before it freezes
     static constexpr u8 kF2External = 2;       // flags2_: the network work is the network thread's (SetExternalPoll)
     static constexpr u8 kF2OnNet = 4;          // flags2_: the caller is the network thread (SetOnNet)
+    static constexpr u8 kF2Stalled = 8;        // flags2_: this poll came kResendMs or more after the previous one (the caller was stalled)
+    static constexpr u8 kF2CapShift = 4;       // flags2_: the high half is the ceiling of the title (2..kMaxPlayers), set once by the constructor
+    static_assert((kMaxPlayers << kF2CapShift) <= 0xFF && (kF2FinalRoster | kF2External | kF2OnNet | kF2Stalled) < (1u << kF2CapShift),
+                  "the ceiling of the title and the three bits share one byte");
 
     // The messages without a body, as bytes (a constant in the code: nothing to build on a stack). The test of the lobby holds them
     // to the bytes the codec writes.
@@ -725,12 +831,15 @@ private:
     /// the work starts.
     DLP_NOINLINE bool Due(bool force) {
         const u32 now = Now();
-        if (!force && (flags_ & kFlagPumped) != 0) {
+        bool stalled = false;
+        if ((flags_ & kFlagPumped) != 0) {
             const s32 d = static_cast<s32>(now - pump_ms_);
-            if (d >= 0 && static_cast<u32>(d) < kPollMs) {
+            if (!force && d >= 0 && static_cast<u32>(d) < kPollMs) {
                 return false;
             }
+            stalled = d >= 0 && static_cast<u32>(d) >= kResendMs;
         }
+        SetF2(kF2Stalled, stalled); // (2026-11-15, D5: a creator stalled after START judges the grace only once it has read what came meanwhile)
         pump_ms_ = now;
         flags_ |= kFlagPumped;
         return true;
@@ -740,6 +849,13 @@ private:
     }
     DLP_ALWAYS_INLINE void SetF2(u8 bit, bool on) {
         flags2_ = static_cast<u8>(on ? (flags2_ | bit) : (flags2_ & ~bit));
+    }
+    /// The ceiling of the title: players (host included), and the clients of one host. Read from the byte every time: no local, no frame.
+    DLP_ALWAYS_INLINE u32 Ceiling() const {
+        return static_cast<u32>(flags2_ >> kF2CapShift);
+    }
+    DLP_ALWAYS_INLINE u32 CeilingClients() const {
+        return Ceiling() - 1;
     }
     static u32 Elapsed(u32 now, u32 stamp) {
         const s32 d = static_cast<s32>(now - stamp);
@@ -840,7 +956,7 @@ private:
     void ClientReset() {
         ClientRelease();
         flags_ = static_cast<u8>(flags_ & ~(kFlagJoinActive | kFlagJoinReady));
-        flags2_ = static_cast<u8>(flags2_ & ~kF2FinalRoster);  // (only that bit: kF2External / kF2OnNet are the hub's, not the searcher's)
+        flags2_ = static_cast<u8>(flags2_ & ~kF2FinalRoster);  // (only that bit: kF2External / kF2OnNet are the hub's, the high half is the title's ceiling)
         if (tab_ == kTabScan || tab_ == kTabSession) {
             ClearTables();
         }
@@ -965,10 +1081,10 @@ private:
     /// Takes one heard lobby: validates it, then inserts / refreshes / removes its entry.
     void ScanAbsorb(const HeardGroup& hg) {
         const HostAnnounce& a = hg.announce;
-        if (a.max_nodes < 2 || a.max_nodes > kMaxPlayers || hg.total_nodes < 1 || hg.total_nodes > a.max_nodes) {
+        if (a.max_nodes < 2 || a.max_nodes > Ceiling() || hg.total_nodes < 1 || hg.total_nodes > a.max_nodes) {
             return;
         }
-        if ((a.child_tid_low >> 8) != (tid_low_ >> 8) || !FilterPass(filter_, a.child_tid_low)) {
+        if (((a.child_tid_low >> 8) != (tid_low_ >> 8) && tid_low_ != kAnyTitleLow) || !FilterPass(filter_, a.child_tid_low)) {
             return;
         }
         Group* g = FindScan(hg.host);
@@ -1021,7 +1137,7 @@ private:
             std::memset(g, 0, sizeof(Group));
             g->host = join_mac_;
             g->flags = kGroupUsed;
-            g->max_nodes = kMaxPlayers;
+            g->max_nodes = static_cast<u8>(Ceiling());
             g->total_nodes = 1;
         } else if (g != &u_.scan.g[0]) {
             for (u32 i = 0; i < sizeof(Group); i += 4) {
@@ -1061,9 +1177,11 @@ private:
             ReadRoster(nodes, n);
         }
     }
+    /// The members the engine lists, the first Ceiling() of them (ascending: a title of four reads the four it read when the
+    /// array held four, whatever a faulty engine lists after them).
     DLP_ALWAYS_INLINE u32 ReadMembers(u8 (&nodes)[kMaxPlayers]) {
         const u32 n = net_->Members(nodes);
-        return n > kMaxPlayers ? kMaxPlayers : n;
+        return n > Ceiling() ? Ceiling() : n;
     }
     DLP_ALWAYS_INLINE void ReadRoster() {
         u8 nodes[kMaxPlayers];
@@ -1165,6 +1283,11 @@ private:
         }
         return &u_.host.t[node - 2];
     }
+    /// H5: in state 9, a client node the adapter still waits for (LobbyNet::ChildrenAwaited; never in another state).
+    DLP_ALWAYS_INLINE bool AwaitedNode(u16 node) const {
+        return srv_state_ == kSrvComplete && node >= kFirstClientNode && node <= kMaxPlayers &&
+               ((net_->ChildrenAwaited() >> (node - kFirstClientNode)) & 1u) != 0;
+    }
     DLP_ALWAYS_INLINE void Eject(Track* t, u8 node, u32 now) {
         net_->Kick(node);
         t->state = kTrkEjected;
@@ -1198,14 +1321,15 @@ private:
         TrackClients(nodes, n, now);
         Advance(now);
     }
-    /// One slot per client node (2..4): born when the node shows up in Members while we accept, freed the moment it no
-    /// longer does; a node we cannot take is ejected (and again every kResendMs while it lingers). (Deviation: the design
-    /// says such a node is "never stored"; it holds its slot in the "ejected" state, which is not a client and is never
-    /// listed, only to rate-limit the Kick. An id above 4 has no slot and shares one timer (aux_ms_), so Kick(5..255) may
-    /// reach the engine, at most once per kResendMs; the id 0 is not a node and is never passed to the engine. Both can only come
-    /// from a faulty engine: the virtual network admits at most kMaxPlayers.)
+    /// One slot per client node of the title (2..its ceiling: 2..4 for a title of four, 2..8 for one of eight): born when the
+    /// node shows up in Members while we accept, freed the moment it no longer does; a node we cannot take is ejected (and again
+    /// every kResendMs while it lingers). (Deviation: the design says such a node is "never stored"; it holds its slot in the
+    /// "ejected" state, which is not a client and is never listed, only to rate-limit the Kick. An id above the ceiling of the
+    /// title has no slot of its own - the slots past the ceiling stay free for ever - and shares one timer (aux_ms_), so Kick of
+    /// such an id may reach the engine, at most once per kResendMs; the id 0 is not a node and is never passed to the engine.
+    /// Both can only come from a faulty engine: the virtual network admits at most what the title announced.)
     DLP_NOINLINE void TrackClients(const u8* nodes, u32 n, u32 now) {
-        for (u32 s = 0; s < kMaxClients; ++s) {
+        for (u32 s = 0; s < CeilingClients(); ++s) {
             Track& t = u_.host.t[s];
             const u8 node = static_cast<u8>(s + kFirstClientNode);
             if (!Contains(nodes, n, node)) {
@@ -1220,8 +1344,8 @@ private:
                 Eject(&t, node, now);
             }
         }
-        for (u32 i = 0; i < n; ++i) {  // an id above 4 can never be stored: a fifth player does not exist
-            if (nodes[i] > kMaxPlayers && Elapsed(now, aux_ms_) >= kResendMs) {
+        for (u32 i = 0; i < n; ++i) {  // an id above the ceiling of the title is never stored: for a title of four a fifth player does not exist
+            if (nodes[i] > Ceiling() && Elapsed(now, aux_ms_) >= kResendMs) {
                 net_->Kick(nodes[i]);
                 aux_ms_ = now;
             }
@@ -1230,8 +1354,10 @@ private:
     /// The phases of the creator, recomputed after every event: 6 -> 8 and 8 (GO sent) -> 9.
     DLP_NOINLINE void Advance(u32 now) {
         if (srv_state_ == kSrvDistributing) {
-            // START is resent to those who have not confirmed; at kStartGraceMs they are thrown out; nobody left -> 8
-            if (Elapsed(now, t0_) >= kStartGraceMs) {
+            // START is resent to those who have not confirmed; at kStartGraceMs they are thrown out; nobody left -> 8. (2026-11-15, D5) Not in a
+            // poll that comes after a stall of kResendMs or more: the acks that waited in the room come in over the next rounds, one a round, and
+            // a grace judged at once threw out clients that had confirmed (6 of 7 with Mario Kart 7, 2 of 3 with a title of four, a host stalled 1.5 s)
+            if (Elapsed(now, t0_) >= kStartGraceMs && (flags2_ & kF2Stalled) == 0) {
                 EjectState(kTrkAccepted, now);
                 srv_state_ = kSrvPassphrase;
             } else if (SendPhase(false, true, now) == 0) {
@@ -1286,7 +1412,7 @@ private:
     u32 t0_ = 0;           // start of the join / of a creator's phase
     u32 join_result_ = 0;  // outcome waiting for ClientJoinPoll (valid if kFlagJoinReady)
     u32 gone_ms_ = 0;      // since when the host / our network is missing (valid if kFlagGone)
-    u32 aux_ms_ = 0;       // searcher: last roster read; creator: last Kick of an id outside 1..4
+    u32 aux_ms_ = 0;       // searcher: last roster read; creator: last Kick of an id above the ceiling of the title
     u32 bad_messages_ = 0;
     Mac join_mac_ = {};    // the host being joined / joined
     u8 my_node_ = 0;       // our node in the session we joined
@@ -1295,15 +1421,15 @@ private:
     u8 srv_state_ = kSrvOff;
     u8 use_ = kUseNone;    // who holds the network
     u8 tab_ = kTabNone;    // which shape of u_ is alive
-    u8 max_clients_ = 1;   // 1..3
+    u8 max_clients_ = 1;   // 1..(the ceiling of the title - 1): 1..3 for a title of four
     u8 child_index_ = 0;
     u8 max_groups_ = 1;    // 1..4 (FKCL Initialize max_beacons)
     u8 cursor_ = 0;        // GetTitleInfoInOrder: next slot
     u8 flags_ = 0;
-    u8 flags2_ = 0;        // kF2FinalRoster, kF2External, kF2OnNet (the spare byte of the padding: sizeof does not change)
+    u8 flags2_ = 0;        // kF2FinalRoster, kF2External, kF2OnNet; the high half is the ceiling of the title (kF2CapShift)
 };
 
-static_assert(sizeof(DlpLobby) <= 320, "DlpLobby must stay small: it lives next to a game that needs the memory");
+static_assert(sizeof(DlpLobby) <= 400, "DlpLobby must stay small: it lives next to a game that needs the memory");
 
 #undef DLP_NOINLINE
 #undef DLP_ALWAYS_INLINE

@@ -5,11 +5,15 @@
 // result codes, the constexpr helpers of the IPC headers and descriptors, and the byte formats of the virtual network
 // (the beacon announcement and the four messages) with their codecs.
 //
-// HARD LIMITS (rules of the user, 28/10): THERE IS NEVER A FIFTH PLAYER. Everything is sized for host + 3 clients and
-// says so with a static_assert, here on the constants and in dlp_lobby.hpp on the tables. No heap, no state, no log.
+// HARD LIMITS (rules of the user). 28/10: "never a fifth player"; 13/11: "a game that plays in eight is played in eight". So there
+// are TWO numbers. The CAPACITY of the tables is host + 7 clients (kMaxPlayers) and says so with a static_assert, here on the
+// constants and in dlp_lobby.hpp on the tables. The CEILING of a title is its own: four unless the title's configuration says
+// more (TitlePlayers, below; the lobby applies it), and a title of four never sees, hosts or enters a lobby of five.
+// No heap, no state, no log.
 #pragma once
 
 #include "azl/common.hpp"
+#include "azl/dlp_mode.hpp"  // (DlpGameMode, the modes of the Download Play column of azl/title_rules.hpp)
 
 namespace azl {
 
@@ -18,15 +22,27 @@ namespace azl {
 // ---------------------------------------------------------------------------------------------------------------
 // Limits.
 
-constexpr u32 kMaxPlayers = 4;  // host + 3 clients: THERE IS NEVER A FIFTH
-constexpr u32 kMaxClients = 3;  // clients of one host
-constexpr u32 kMaxGroups = 4;   // lobbies a searcher keeps (a room of 4 players holds at most 4 hosts)
+constexpr u32 kMaxPlayers = 8;  // host + 7 clients: the CAPACITY of the tables (the ceiling of a title is TitlePlayers)
+constexpr u32 kMaxClients = 7;  // clients of one host
+constexpr u32 kMaxGroups = 4;   // lobbies a searcher keeps (the engine remembers as many: UdsEngine::kHeardLobbies)
 constexpr u32 kNameUnits = 10;  // UTF-16 units of a player name
-static_assert(kMaxPlayers == 4, "the product never has more than 4 players: do not raise this");
+static_assert(kMaxPlayers == 8, "no game of the table plays with more than 8: the tables, the frames and the memory are measured for 8");
 static_assert(kMaxClients + 1 == kMaxPlayers, "host + clients = players");
-constexpr u32 kFirstClientNode = 2;  // the host is node 1; the clients are nodes 2..4
+constexpr u32 kFirstClientNode = 2;  // the host is node 1; the clients are nodes 2..kMaxPlayers
 static_assert(kFirstClientNode + kMaxClients - 1 == kMaxPlayers, "the last client is the last player");
 static_assert(kMaxGroups <= kMaxPlayers, "in a room of kMaxPlayers there are at most kMaxPlayers lobbies");
+
+// The ceiling of ONE title (players, host included). A title whose configuration does not say it has four: every game of the
+// table but Mario Kart 7 (the Download Play column of azl/title_rules.hpp), on the wire and in every answer exactly as before the tables grew.
+constexpr u32 kTitlePlayers = 4;
+static_assert(kTitlePlayers >= 2 && kTitlePlayers <= kMaxPlayers, "the ceiling of a title fits in the tables");
+/// What a title's configuration says (LobbyConfig::max_players) as its ceiling. The ONE place that decides it: 0 - a configuration
+/// that was zeroed and never told, which is every one written before the field existed - is kTitlePlayers, FOUR; 1 is 2 (a lobby is
+/// a host and a client at least); more than the tables hold is kMaxPlayers.
+constexpr u32 TitlePlayers(u32 said) {
+    return said == 0 ? kTitlePlayers : (said < 2 ? 2 : (said > kMaxPlayers ? kMaxPlayers : said));
+}
+static_assert(TitlePlayers(0) == 4, "a configuration that says nothing is a title of four players");
 
 // ---------------------------------------------------------------------------------------------------------------
 // The records of the game (little endian, natural alignment of the module). Offsets, not structs.
@@ -140,7 +156,7 @@ struct NodeEntry {  // one node of the virtual network as the engine knows it (3
 struct HostAnnounce {  // what the creator puts in the beacon's application data
     u32 child_tid_low; // (game title id low32 & 0xFFFFFF00) | child index
     u16 name[kNameUnits];
-    u8 max_nodes;      // max clients + 1, 2..4
+    u8 max_nodes;      // max clients + 1, 2..kMaxPlayers (never above the ceiling of the title that announces it)
     u8 accepting;      // 1 while new nodes are admitted
 };
 // (Deviation: the fields are in this order, not the design's, to make it 36 bytes instead of 40: the largest local of the
@@ -184,8 +200,9 @@ inline void EncodeAnnounce(const HostAnnounce& a, u8 out[kAnnounceSize]) {
 }
 
 /// Reads and validates an announcement. Returns false (and leaves *out untouched) for: null data, size < 29, magic or
-/// version different, max_nodes outside 2..4. A longer announcement with version 1 is accepted (later fields are
-/// ignored). Cost: 16 bytes of stack. Never reads beyond `size`.
+/// version different, max_nodes outside 2..kMaxPlayers (what the format can say; a title's own ceiling is the lobby's to
+/// apply: DlpLobby::ScanAbsorb). A longer announcement with version 1 is accepted (later fields are ignored). Cost: 16 bytes of
+/// stack. Never reads beyond `size`.
 inline bool DecodeAnnounce(const u8* data, u32 size, HostAnnounce* out) {
     if (data == nullptr || out == nullptr || size < kAnnounceSize) {
         return false;

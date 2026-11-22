@@ -969,6 +969,279 @@ static void TestOverlay() {
     o.image.Withdraw();
 }
 
+// The open keyboard is still on the screen (chat::BottomWatch, 2026-11-10): the top screens the game presents with the keyboard open are
+// counted, a copy of the keyboard onto the bottom screen clears the count, and at kBottomLostTops with no copy the keyboard is lost (the
+// plugin's thread closes it: Sources/ctr/chat_overlay.cpp, Type). Driven through DrawOverlay, as the OSD callback does. What it must NOT
+// do: count with the keyboard closed or the chat off, be cleared by a bottom screen the picture was not copied onto (another format, no
+// picture), or reach the count while the bottom screen is copied at any rate up to 59 top screens apart (a game at 60 and 30 fps, a
+// hitch: no clock is read, so a game that presents nothing counts nothing).
+static void TestBottomWatch() {
+    chat::Overlay o;
+    static ChatSink g_sink;
+    o.sink.store(&g_sink);
+    Fb top(gfx::kBGR8, 240, 400);
+    Fb bottom(gfx::kRGB565, 240);
+    const u32 t0 = 90000;
+    CHECK(chat::kBottomLostTops == 60);
+
+    // the chat off, or the keyboard closed: nothing is counted
+    o.keyboard.store(1);
+    for (u32 i = 0; i < 200; ++i) {
+        Draw(o, top.s, true, t0 + i);
+    }
+    CHECK(o.bottom_watch.tops() == 0 && !o.bottom_watch.Lost());
+    o.on.store(1);
+    o.keyboard.store(0);
+    for (u32 i = 0; i < 200; ++i) {
+        Draw(o, top.s, true, t0 + i);
+        Draw(o, bottom.s, false, t0 + i);
+    }
+    CHECK(o.bottom_watch.tops() == 0 && !o.bottom_watch.Lost());
+
+    // open, the picture published and copied every frame: the count never passes 1
+    o.keyboard.store(1);
+    OwnedImage right(gfx::kRGB565);
+    o.image.Publish(&right.im);
+    u32 worst = 0;
+    for (u32 i = 0; i < 300; ++i) {
+        Draw(o, top.s, true, t0 + i);
+        worst = o.bottom_watch.tops() > worst ? o.bottom_watch.tops() : worst;
+        CHECK(Draw(o, bottom.s, false, t0 + i) == chat::kDrewKeyboard);
+        CHECK(o.bottom_watch.tops() == 0);
+    }
+    CHECK(worst == 1 && !o.bottom_watch.Lost());
+    // a bottom screen presented once every 59 top screens (a game that hardly presents it): still not lost
+    for (u32 round = 0; round < 5; ++round) {
+        for (u32 i = 0; i < chat::kBottomLostTops - 1; ++i) {
+            Draw(o, top.s, true, t0);
+            CHECK(!o.bottom_watch.Lost());
+        }
+        CHECK(o.bottom_watch.tops() == chat::kBottomLostTops - 1);
+        CHECK(Draw(o, bottom.s, false, t0) == chat::kDrewKeyboard);
+        CHECK(o.bottom_watch.tops() == 0);
+    }
+    // the game stops presenting the bottom screen (a movie): lost at the 60th top screen, not before, and it stays lost
+    for (u32 i = 0; i < chat::kBottomLostTops - 1; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.Lost());
+    Draw(o, top.s, true, t0);
+    CHECK(o.bottom_watch.Lost() && o.bottom_watch.tops() == chat::kBottomLostTops);
+    Draw(o, top.s, true, t0);
+    CHECK(o.bottom_watch.Lost());
+    // ... a copy brings it back (the plugin's thread did not look in between), and so does the plugin's thread's Reset (a new opening)
+    CHECK(Draw(o, bottom.s, false, t0) == chat::kDrewKeyboard);
+    CHECK(!o.bottom_watch.Lost() && o.bottom_watch.tops() == 0);
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(o.bottom_watch.Lost());
+    o.bottom_watch.Reset();
+    CHECK(!o.bottom_watch.Lost() && o.bottom_watch.tops() == 0);
+
+    // 2026-11-11: what closes the keyboard is LostFor - lost by the count, at every look of the plugin's thread for kBottomLostMs of its
+    // clock (60 presents are half a second of a game that swaps its top screen twice a frame)
+    // ... in which the game went on presenting its top screen, kBottomLostMoreTops times more (the second review: a game that stands
+    // still after the 60th present - a load - gives no look and no present, and the first look after it must not close)
+    CHECK(chat::kBottomLostMs == 1000);
+    CHECK(chat::kBottomLostMoreTops == 30);
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(o.bottom_watch.Lost());
+    CHECK(!o.bottom_watch.LostFor(t0)); // (the first look that finds it lost starts the second)
+    for (u32 i = 0; i < chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 999));
+    CHECK(o.bottom_watch.LostFor(t0 + 1000));
+    CHECK(o.bottom_watch.LostFor(t0 + 5000)); // (and it stays so)
+    // the second alone is not enough: 29 presents more in 1.5 s close nothing, the 30th does
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 6000));
+    for (u32 i = 0; i + 1 < chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 7500));
+    Draw(o, top.s, true, t0);
+    CHECK(o.bottom_watch.LostFor(t0 + 7500));
+    // a copy between two looks starts the second again, although the count is back at 60 by the next look
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 10000));
+    CHECK(!o.bottom_watch.LostFor(t0 + 10900));
+    CHECK(Draw(o, bottom.s, false, t0) == chat::kDrewKeyboard);
+    CHECK(!o.bottom_watch.LostFor(t0 + 10950)); // (seen copied)
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 11000)); // (1 s after the first look, 50 ms after the one that saw the copy)
+    for (u32 i = 0; i < chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 11999));
+    CHECK(o.bottom_watch.LostFor(t0 + 12000));
+    // ... and a copy NO look saw (the count is lower than at the look before: it was cleared and went up again): the second and the
+    // presents are counted from this look
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < 100; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 13000));
+    CHECK(Draw(o, bottom.s, false, t0) == chat::kDrewKeyboard);
+    for (u32 i = 0; i < 70; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(o.bottom_watch.Lost() && o.bottom_watch.tops() == 70);
+    CHECK(!o.bottom_watch.LostFor(t0 + 14500)); // (1.5 s after a look that found it lost - but 70 is not "100 and 30 more")
+    for (u32 i = 0; i < chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(t0 + 15499));
+    CHECK(o.bottom_watch.LostFor(t0 + 15500));
+    // the review's case: a change of scene that presents only the top screen for 1.2 s, at 60 presents a second and at 120 (two swaps
+    // a frame), a look of the plugin's thread at every present; then the bottom screen is back. The keyboard stays open
+    for (const u32 per_second : {60u, 120u}) {
+        o.bottom_watch.Reset();
+        bool closed = false;
+        const u32 presents = per_second * 12 / 10;
+        for (u32 i = 0; i < presents; ++i) {
+            Draw(o, top.s, true, t0);
+            closed = closed || o.bottom_watch.LostFor(t0 + 20000 + i * 1000 / per_second);
+        }
+        CHECK(o.bottom_watch.Lost()); // (by the count alone it was closed here)
+        CHECK(!closed);
+        CHECK(Draw(o, bottom.s, false, t0) == chat::kDrewKeyboard);
+        CHECK(!o.bottom_watch.LostFor(t0 + 20000 + 1300));
+    }
+    // ... and a film (no bottom screen for 5 s): closed, about a second after the 60th present
+    {
+        o.bottom_watch.Reset();
+        u32 closed_at = 0;
+        for (u32 i = 0; i < 300 && closed_at == 0; ++i) {
+            Draw(o, top.s, true, t0);
+            if (o.bottom_watch.LostFor(t0 + 30000 + i * 1000 / 60)) {
+                closed_at = i * 1000 / 60;
+            }
+        }
+        CHECK(closed_at >= 1950 && closed_at <= 2050);
+    }
+    // the clock alone never closes: 59 presents, then looks for a minute (a game that presents nothing: a hitch, a load)
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops - 1; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    for (u32 ms = 0; ms <= 60000; ms += 250) {
+        CHECK(!o.bottom_watch.LostFor(t0 + 40000 + ms));
+    }
+    // looks far apart (the plugin's thread under a film that fills the CPU, one look every 1.5 s, the film going on in between - 90
+    // presents): the second look closes
+    Draw(o, top.s, true, t0);
+    CHECK(!o.bottom_watch.LostFor(t0 + 110000));
+    for (u32 i = 0; i < 90; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(o.bottom_watch.LostFor(t0 + 111500));
+    // the second review's case: the game shows its top screen alone for 60 presents (a fade), a look at each; then it loads for 1.1 s
+    // and presents NOTHING - no present wakes the plugin's thread, so no look, and the count stands still. The first present of the
+    // new scene is a look that finds the keyboard "lost for over a second": it stays open (the game did not go on presenting), through
+    // the frames of the top screen alone the scene begins with, and the bottom screen's copy starts everything again
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+        CHECK(!o.bottom_watch.LostFor(t0 + 120000 + i * 1000 / 60));
+    }
+    CHECK(o.bottom_watch.Lost());
+    Draw(o, top.s, true, t0);
+    CHECK(!o.bottom_watch.LostFor(t0 + 120000 + 1000 + 1100));
+    for (u32 i = 0; i + 2 < chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+        CHECK(!o.bottom_watch.LostFor(t0 + 120000 + 2100 + i * 1000 / 60));
+    }
+    CHECK(Draw(o, bottom.s, false, t0) == chat::kDrewKeyboard);
+    CHECK(!o.bottom_watch.LostFor(t0 + 120000 + 2600) && o.bottom_watch.tops() == 0);
+    // ... and a game that stops for good with the keyboard lost presents nothing more: no look closes it, however late
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    for (u32 ms = 0; ms <= 60000; ms += 250) {
+        CHECK(!o.bottom_watch.LostFor(t0 + 130000 + ms));
+    }
+    // the clock wraps (49 days): the second is counted across it
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(0xFFFFFF00u));
+    for (u32 i = 0; i < chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(0xFFFFFF00u + 999));
+    CHECK(o.bottom_watch.LostFor(0xFFFFFF00u + 1000));
+    // a new opening (Reset) forgets a second that had begun
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(5000));
+    o.bottom_watch.Reset();
+    for (u32 i = 0; i < chat::kBottomLostTops + chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(6500)); // (1.5 s and 30 presents after the look of the opening before: this is the first of this one)
+    for (u32 i = 0; i < chat::kBottomLostMoreTops; ++i) {
+        Draw(o, top.s, true, t0);
+    }
+    CHECK(!o.bottom_watch.LostFor(7499));
+    CHECK(o.bottom_watch.LostFor(7500));
+    o.bottom_watch.Reset();
+    CHECK(!o.bottom_watch.Lost() && o.bottom_watch.tops() == 0);
+
+    // the bottom screen presented, but the picture not copied onto it (the game changed its format; no picture; a picture of another
+    // format): that is no copy - the format is told, the count goes on
+    Fb bottom24(gfx::kBGR8, 240);
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+        CHECK(Draw(o, bottom24.s, false, t0) == chat::kDrewNothing);
+    }
+    CHECK(o.bottom_watch.Lost());
+    CHECK(o.bottom_geometry.load() == chat::GeometryOf(bottom24.s));
+    o.bottom_watch.Reset();
+    o.image.Withdraw();
+    for (u32 i = 0; i < chat::kBottomLostTops; ++i) {
+        Draw(o, top.s, true, t0);
+        CHECK(Draw(o, bottom.s, false, t0) == chat::kDrewNothing);
+    }
+    CHECK(o.bottom_watch.Lost());
+
+    // a top screen the callback cannot draw on is a present all the same (the count is of presents, not of lines drawn)
+    o.bottom_watch.Reset();
+    Fb narrow(gfx::kBGR8, 240, 320); // (not a top screen's width: TopUsable refuses it)
+    CHECK(Draw(o, narrow.s, true, t0) == chat::kDrewNothing);
+    CHECK(o.bottom_watch.tops() == 1);
+    // the keyboard closed again: the count stops where it was (the next opening resets it)
+    o.keyboard.store(0);
+    Draw(o, top.s, true, t0);
+    CHECK(o.bottom_watch.tops() == 1);
+
+    // the geometry is 0 again at an opening and told again at the first present after it (what Open() does: every opening has its own
+    // look of kShowWaitMs)
+    o.bottom_geometry.store(0);
+    o.bottom_watch.Reset();
+    o.keyboard.store(1);
+    Draw(o, top.s, true, t0);
+    CHECK(o.bottom_geometry.load() == 0); // (the top screen tells nothing of the bottom one)
+    Draw(o, bottom.s, false, t0);
+    CHECK(o.bottom_geometry.load() == chat::GeometryOf(bottom.s));
+    CHECK(g_draw_allocs == 0); // (the game's thread allocates nothing)
+}
+
 // The framework's screen as the callback takes it (gfx::ScreenSurface, what Sources/ctr/chat_overlay.cpp's SurfaceOf calls): the framework
 // hands the game's format byte unmasked (0x40 the top screen in 2D, 0x20 the 3D; libctrpf 0.8.0's OSDImpl::CallbackCommon) and works its
 // Screen::BytesPerPixel out of it unmasked (GetBPP: 0 -> 4, 2..4 -> 2, anything else 3). In every format with every high bit the surface is the
@@ -1222,6 +1495,7 @@ int main() {
     TestSlotThreads();
     TestCopy();
     TestOverlay();
+    TestBottomWatch();
     TestScreenFormats();
     TestSubmit();
     TestPostWatch();

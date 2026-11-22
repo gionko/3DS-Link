@@ -162,6 +162,8 @@ static void TestRoomBasics(const std::string& host, u16 port, const std::string&
     {
         Player nobody(host, 1, "NoRoomHere", "3ds-nobody");
         CHECK(nobody.JoinError() == RoomClient::Error::CouldNotConnect);
+        nobody.room.Stop();
+        CHECK(!nobody.room.LeaveAcknowledged());  // (1.1.4, route B D-B10: no room, no answer)
     }
     // Password room with two slots
     {
@@ -182,7 +184,9 @@ static void TestRoomBasics(const std::string& host, u16 port, const std::string&
 
     // Leaving updates the member list seen by the others
     const Mac bob_mac = bob.room.mac();
+    CHECK(!bob.room.LeaveAcknowledged());  // (1.1.4, route B D-B10: false from the Start until a polite leave the room answered)
     bob.room.Stop();
+    CHECK(bob.room.LeaveAcknowledged());   // ... the real room answers the DISCONNECT
     CHECK(WaitFor([&] { return alice.room.room_info().members.size() == 1; }));
     {
         const std::vector<std::string> lines = RoomMemberLines(member_rows(with_bob), member_rows(alice.room.room_info()), with_bob.member_slots);
@@ -1438,6 +1442,7 @@ static void TestQuickStopSendsWhatIsQueued() {
     client.room.RequestStop(true);
     client.Release();
     CHECK(client.room.StopWithin(3000));
+    CHECK(!client.room.LeaveAcknowledged());  // (1.1.4, route B D-B10: a quick stop waits for no answer - never acknowledged)
     CHECK(WaitFor([&] { return server.Count() >= 6; }, 3000));
     const auto got = server.Frames();
     int data = 0, deauth = 0;
@@ -1668,6 +1673,11 @@ static void TestSocketErrorsAreSpacedOut() {
         CHECK(c.net10 <= 500);                          // ... which are not CPU: under 50 ms per second
         CHECK(c.net10 + c.pause10 + c.soc10 + c.poll10 + c.netlock10 <= c.wall10 + 300); // nothing counted twice
         CHECK(window.t_net_pause > 0);
+        // (2m-diag D1) the rounds the pause made longer than 50 ms (64 ms once, then 128 ms each) are counted apart, not as slow rounds:
+        // Tetris with eight, console 63, the lid closed: 2.369 lines "slow round" that were this pause alone
+        std::printf("  the same window: %u rounds long by the pause alone, %u slow rounds\n", window.net_pause_rounds, window.net_slow_rounds);
+        CHECK(window.net_pause_rounds >= 5);
+        CHECK(window.net_slow_rounds <= 1);
     }
     CHECK(client.room.last_errno() != 0);                // ENOTSOCK here, ENETDOWN on the console
     CHECK(client.room.joined());                         // (ENet gives up after 5 s, not before)
@@ -1780,7 +1790,7 @@ static void TestStuckNetworkThreadIsAbandoned() {
     CHECK(WaitFor([&] { return in_hold.load(); }));
 
     const auto began = std::chrono::steady_clock::now();
-    room.Stop();                                         // the thread is asleep in the tick callback for 5 s
+    CHECK(!room.Stop());                                 // the thread is asleep in the tick callback for 5 s: abandoned, and Stop says so
     const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
     std::printf("  Stop() returned after %.2f s (the thread sleeps 5 s)\n", took);
     CHECK(took >= 1.9 && took < 3.5);
@@ -1803,7 +1813,7 @@ static void TestStuckNetworkThreadIsAbandoned() {
     room.SendWifiPacket(TxFrame(3, 100));                 // the new session's queue is the new thread's
     CHECK(WaitFor([&] { return server.Count() >= 1; }, 3000));
     CHECK_EQ(server.Count(), std::size_t(1));
-    room.Stop();
+    CHECK(room.Stop());                                   // (a thread that leaves in time: Stop says it ended - the app frees what it used only then)
     CHECK(room.state() == RoomClient::State::Idle);
 }
 

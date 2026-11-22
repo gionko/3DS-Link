@@ -184,6 +184,8 @@ typedef struct _ENetIncomingCommand
    ENetPacket *     packet;
    enet_uint32      azlDispatched; /**< AzaharLink: 1 = a placeholder: the packet was handed over out of order already (packet is NULL) */
    enet_uint32      azlHoleSince;  /**< AzaharLink: the host clock (ms, never 0) when this command was queued behind a hole in the reliable sequence; 0 = it came in order */
+   enet_uint32      azlArrived;    /**< AzaharLink: the host clock (ms) when this command was queued, i.e. when its datagram was handled */
+   enet_uint32      azlLagMs;      /**< AzaharLink: how late that datagram was when it was handled, against the best one of the connection (ms; see ENetHost::azlLagBase) */
 } ENetIncomingCommand;
 
 typedef enum _ENetPeerState
@@ -245,6 +247,7 @@ typedef struct _ENetChannel
    enet_uint16  incomingUnreliableSequenceNumber;
    ENetList     incomingReliableCommands;
    ENetList     incomingUnreliableCommands;
+   enet_uint16  azlHighestSeen; /**< AzaharLink: the highest reliable sequence number seen on this channel, taken or refused (see ENetAzlCounters::seqSkipped) */
 } ENetChannel;
 
 typedef enum _ENetPeerFlag
@@ -360,6 +363,27 @@ typedef struct _ENetAzlCounters
    enet_uint32 eventsBeforeAck;  /**< packets handed over while the acknowledgements of the datagrams that carried them still waited (see azlAckHoldEvents) */
    enet_uint32 ackHoldLimitHits; /**< times the acknowledgements were sent because they had waited for azlAckHoldEvents packets or azlAckHoldMs */
    enet_uint32 ackHoldMaxMs;     /**< the longest an acknowledgement waited between being queued and being sent (a maximum) */
+   enet_uint32 capRefused;       /**< commands not taken because the data that waited was at the host's limit (maximumWaitingData): they are not acknowledged, the sender sends them again */
+   enet_uint32 capAdmitted;      /**< reliable commands taken OVER that limit because they were the next of the sequence, the one the waiting data was behind (see ENET_AZL_HOLE_CLOSER) */
+   enet_uint32 waitingMaxBytes;  /**< the most data that waited at once when a command was queued: handed over and not yet taken by the caller, or behind a hole (bytes; a maximum) */
+   enet_uint32 streamLagMaxMs;   /**< the latest a packet reached the caller: how late its datagram was read (against the best one of the connection) plus what it then waited
+                                      in here, behind a hole or behind the caller (ms; a maximum; see ENetHost::azlLagBase). A LOWER bound of the packet's delay: the clock in
+                                      a datagram's header is the sender's when it put THAT datagram on the wire, so the time a packet waited in the sender's own queue (its
+                                      window full, a copy sent again) is not in it */
+   enet_uint32 capDropped;       /**< commands acknowledged and dropped at the limit instead of refused (ENetHost::azlCapDrop: the listed titles only) */
+   enet_uint32 capDropFull;      /**< ... the refused ones (in capRefused) that would have been dropped but the placeholders were at azlCapDropMax */
+   enet_uint32 capDropHeldMax;   /**< the most placeholders held at once (a maximum; a window starts from the number held then) */
+   enet_uint32 seqSkipped;       /**< reliable sequence numbers of the room never seen: a command arrived more than one past the highest seen on its channel. The room sends
+                                      new numbers in order, so each is a command lost on the way (Wi-Fi or the socket's ring) or late; refused ones were seen and do not
+                                      count. A lost copy of a command sent again is not seen here */
+   enet_uint32 seqSkippedAway;   /**< ... the ones found in a service call that came ENET_AZL_AWAY_MS or more after the previous one: the thread had been away, the ring
+                                      may have overflowed. Found in a call that came sooner, the ring could not fill: the loss was on the way */
+   enet_uint32 awayEpisodes;     /**< (2026-11-15) service calls that came ENET_AZL_AWAY_MS or more after the previous one with the socket found empty since the last such one:
+                                      the times the thread was away and the ring filled alone */
+   enet_uint32 awayDatagramsMax; /**< ... the most datagrams read in one of them, from the first read after the thread came back until the socket was found empty (over
+                                      several passes and service calls; a maximum): what the ring held, or more if the room went on sending meanwhile */
+   enet_uint32 awayBytesMax;     /**< ... the same in bytes (a maximum): with awayDatagramsMax it says whether the ring is bound by its bytes or by its datagrams */
+   enet_uint32 awayDupMax;       /**< ... the most commands the room sent again (dupCommands) among them in one of them (a maximum) */
 } ENetAzlCounters;
 
 /** An ENet host for communicating with peers.
@@ -421,6 +445,11 @@ typedef struct _ENetHost
       link, and would inflate the RTT variance (the retransmission timeout) and lower the packet throttle. */
    enet_uint32          azlLastServiceTime;
    enet_uint32          azlServiceGap;
+   enet_uint32          azlAwayBacklog; /* (running) 1 = a service call came ENET_AZL_AWAY_MS or more after the previous one and the socket has not been found
+                                           empty since: what is read now waited in the ring while the thread was away (see ENetAzlCounters::seqSkippedAway) */
+   enet_uint32          azlAwayDatagrams; /* (running) the datagrams, bytes and copies sent again read since azlAwayBacklog was set (see ENetAzlCounters::awayEpisodes) */
+   enet_uint32          azlAwayBytes;
+   enet_uint32          azlAwayDups;
    /* AzaharLink: 1 = a reliable packet is handed over as soon as it is complete, whatever is still missing before it (the room's
       messages are independent of each other, and a UDS frame is a radio frame that may come late); the ordering is kept in the
       sequence accounting by a placeholder (ENetIncomingCommand::azlDispatched), so a late copy is still a duplicate. 0 = ENet's
@@ -463,6 +492,48 @@ typedef struct _ENetHost
    enet_uint32          azlAckHoldMs;
    enet_uint32          azlAckEvents;  /* (running) packets handed over since the acknowledgements started to wait */
    enet_uint32          azlAckSince;   /* (running) the host clock when the first of the waiting acknowledgements was queued, 0 = none waits */
+   /* AzaharLink: the limit of waiting data (maximumWaitingData; the plugin gives 192 KB) and its dead end. ENet refuses EVERY command that would be queued
+      while the data that waits is at the limit, without an acknowledgement. What waits is either ready for the caller, who takes it and makes room, or
+      behind a hole of the reliable sequence - and then only the command that closes the hole can ever make it ready, and that command was refused like
+      the others: once the limit was reached behind a hole nothing was taken any more, for as long as the connection lasted (Mario Party: Island Tour on
+      a console, 2026-11-14: five sessions of five ended there). So a reliable command that is the NEXT of its channel's sequence is taken over the limit
+      when reliable commands of that channel wait behind it (ENET_AZL_HOLE_CLOSER in peer.c), up to maximumPacketSize beyond the limit.
+      Bound: a command is queued under the limit (the data then stays below limit + maximumPacketSize, as ever) or it is such a command queued below
+      limit + maximumPacketSize, so the waiting data is always below maximumWaitingData + 2 * maximumPacketSize. What this is good for, and no more: a
+      stream of reliable commands only - the room's is all reliable - has no dead end left: with nothing ready for the caller everything waits in the
+      channel's reliable list, queued under the limit, less than limit + maximumPacketSize, so the next command of the sequence is taken; and when that
+      one is the first fragment of a large packet, the fragments that complete it are never subject to the limit (they are copied into the packet that
+      is there). Not claimed: unreliable commands that fill the limit behind a missing reliable one (this ENet does not hand them over when that one
+      comes: see ENET_AZL_HOLE_CLOSER); a sender that never sends again the command it was not acknowledged for (ENet's own timeout ends that
+      connection); and a caller that does not take what is ready still finds the limit closed.
+      A command that is refused ends ITS handling and is not acknowledged; the rest of its datagram is still read (azlCapRefused), where ENet dropped the
+      whole datagram: the command that closes the hole, a ping of the room or an acknowledgement may come after it in the same datagram. */
+   enet_uint32          azlCapRefused; /* (running) 1 = the command being handled was refused for the limit of waiting data */
+   /* AzaharLink (2026-11-14, the minigames of Mario Party: Island Tour hosted by a console): what a refusal at the limit costs. A refused command is not
+      acknowledged, so the sender's timer of THAT command doubles at every refusal (ENet: roundTripTimeout *= 2 at every timeout), and the refused commands
+      are exactly the ones the stream needs next once the hole is closed: the next hole lasts as long as their timers, which grew during the last one, and
+      the sender ends the connection when one of them has gone 6 times with nothing acknowledged for 5 s (timeoutLimit 32, timeoutMinimum 5000). The room
+      ended the console's link that way after 32 s of long holes (2.9, 6.4, 8.7 s), and the model (Tests/vsim, minigame_grid.sh) ends it in 8 runs of 24.
+      With azlCapDrop set, a reliable command that would be refused at the limit and whose data this returns nonzero for (the room client gives the filter of
+      the relayed game frames and beacons - what a radio may lose) is acknowledged and dropped instead: a placeholder with no packet keeps its sequence
+      number (ENetIncomingCommand::azlDispatched = 2), so the order of the rest, the duplicates and the fragments of a dropped packet are accounted as for
+      any other command, and nothing of it is ever handed over. A fragment can be told only by its packet's first bytes (azlFragmentHead): a later fragment
+      seen first is refused as before. At most azlCapDropMax placeholders wait at once (0 = ENET_AZL_CAP_DROP_MAX); beyond that, refused as before. The
+      waiting data does not grow (a placeholder has no data); a placeholder costs sizeof (ENetIncomingCommand). NULL (the default) = refused, as ever. */
+   int (* azlCapDrop) (const enet_uint8 * data, size_t dataLength);
+   enet_uint32          azlCapDropMax;
+   enet_uint32          azlCapDropHeld;        /* (running) placeholders of dropped commands in the channel's list */
+   const enet_uint8 *   azlFragmentHead;       /* (running) the data of the fragment being queued when it holds its packet's first bytes, else NULL */
+   size_t               azlFragmentHeadLength;
+   /* AzaharLink: how late the room's stream is, with no clock of its own to read: every datagram that carries a reliable command has the sender's clock in
+      its header (16 bits of ms). (Our clock when the datagram is handled - host -> serviceTime, the call's - less that) is the delay plus a constant that
+      is not known; the smallest value seen is the base, and what a datagram has above it is its lag: the time it spent on the way and in the socket. The
+      base gives way by 1 ms every ENET_AZL_LAG_LEAK_MS, so that two clocks that drift apart do not show as a lag (a real lag of seconds is told to within
+      a few ms). A lag is good up to 32 s (the header's 16 bits). One base per host: the plugin's host has one peer, the room. */
+   enet_uint32          azlLagKnown;    /* 1 = azlLagBase holds a value */
+   enet_uint32          azlLagBase;     /* the smallest (our clock - the sender's), 16 bits */
+   enet_uint32          azlLagBaseTime; /* the host clock when the base was last moved by the leak */
+   enet_uint32          azlDatagramLag; /* (running) the lag of the datagram being handled, ms */
    ENetAzlCounters      azlCounters;
 } ENetHost;
 
@@ -476,6 +547,21 @@ typedef struct _ENetHost
 /* The defaults of ENetHost::azlAckHoldEvents / azlAckHoldMs (see there). */
 #define ENET_AZL_ACK_HOLD_EVENTS 8
 #define ENET_AZL_ACK_HOLD_MS 8
+/* How often the base of the stream's lag gives way by 1 ms (see ENetHost::azlLagBase): 244 parts in a million, more than two clocks drift. */
+#define ENET_AZL_LAG_LEAK_MS 4096
+/* The default of ENetHost::azlCapDropMax (see there): about 50 KB of the plugin's heap at the most. */
+#define ENET_AZL_CAP_DROP_MAX 512
+/* AzaharLink: a command the room sent again after it had been handled (ENetAzlCounters::dupCommands), a whole one or a fragment of one; while the thread is
+   back from being away, it is counted in the episode too (awayDupMax). Used by peer.c and protocol.c. */
+#define ENET_AZL_NOTE_DUP(host) \
+   do { \
+      ++ (host) -> azlCounters.dupCommands; \
+      if ((host) -> azlAwayBacklog && ++ (host) -> azlAwayDups > (host) -> azlCounters.awayDupMax) \
+        (host) -> azlCounters.awayDupMax = (host) -> azlAwayDups; \
+   } while (0)
+
+/* ENetAzlCounters::seqSkippedAway: a service call this long after the previous one (ms) had the thread away from the socket. */
+#define ENET_AZL_AWAY_MS 100
 extern enet_uint32 enet_azl_throttled_packets;
 extern enet_uint32 enet_azl_ack_samples_skipped;
 extern enet_uint32 enet_azl_early_dispatched; /* reliable packets handed over out of order (azlDeliverOutOfOrder) */

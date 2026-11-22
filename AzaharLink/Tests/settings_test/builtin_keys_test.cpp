@@ -1,6 +1,8 @@
-// The two values 3DS Link carries (ConfigApp/titleshare_host/builtin_keys.c: the constant of the key generator and the IV of the Download Play checksum),
-// run by Tests/run.sh with TitleShare's own aes, sdcrypt and sha256 (the vendored copies). What it pins:
-//  * the two names give their 16 bytes and every other name (another case, a prefix, an empty one, none) gives -1 and zeros;
+// The values 3DS Link carries (ConfigApp/titleshare_host/builtin_keys.c: the constant of the key generator, the IV of the Download Play checksum and,
+// since 1.1.4, the KeyY of the common key 0 for the Download Play child the app prepares with boot9.bin), run by Tests/run.sh with TitleShare's own aes,
+// sdcrypt and sha256 (the vendored copies). What it pins:
+//  * the three names give their 16 bytes and every other name (another case, a prefix, an empty one, none) gives -1 and zeros;
+//  * the blob stays under the 256 bytes bk_get reads (it is the generated builtin_keys_blob.h, included here for its size only);
 //  * the 16 bytes are the right ones: only their SHA-256 is written here (the old code, with the constant inline, gave the same answers: the three known
 //    answers below are the hashes of what ncch_scramble made of three pairs of made-up X and Y with it; a wrong constant cannot give them);
 //  * a call changes nothing for the next one, and a hundred calls from four threads at once all give the same bytes.
@@ -17,6 +19,7 @@ extern "C" {
 #include "../../ConfigApp/titleshare/common/sdcrypt.h"
 #include "../../ConfigApp/titleshare/common/sha256.h"
 #include "../../ConfigApp/titleshare_host/builtin_keys.h"
+#include "../../ConfigApp/titleshare_host/builtin_keys_blob.h"
 }
 
 static int g_failures = 0;
@@ -50,19 +53,23 @@ static bool AllZero(const uint8_t* p, size_t n) {
 }
 
 int main() {
-    uint8_t c[16], iv[16];
+    uint8_t c[16], iv[16], y0[16];
     CHECK(bk_get(BK_GENERATOR_CONSTANT, c) == 0);
     CHECK(bk_get(BK_DLP_CHECKSUM_IV, iv) == 0);
-    CHECK(!AllZero(c, 16) && !AllZero(iv, 16));
-    CHECK(std::memcmp(c, iv, 16) != 0);
+    CHECK(bk_get(BK_COMMON_KEY_Y0, y0) == 0);
+    CHECK(!AllZero(c, 16) && !AllZero(iv, 16) && !AllZero(y0, 16));
+    CHECK(std::memcmp(c, iv, 16) != 0 && std::memcmp(c, y0, 16) != 0 && std::memcmp(iv, y0, 16) != 0);
+    CHECK(sizeof(bk_blob) < 256);  // (bk_get refuses a blob of more than 256 bytes: three values are 146)
+    CHECK(std::string(BK_COMMON_KEY_Y0) == "commonKeyY0");
 
     // the right bytes: their hashes
     CHECK(Sha(c, 16) == "05d6564396705f79890a12cd05dd914b0adc01ccaa4d5158a90bb32553025997");
     CHECK(Sha(iv, 16) == "c3189f2828a025438eb47194056b1743b99a39ec2045e994f06a8b9e828821e8");
+    CHECK(Sha(y0, 16) == "0a1c7b55860589b0edd8874b5055e34716a2cde25bad1248bbbbeed1b340b1b8");
 
     // any other name: -1 and zeros in the output
     const char* const others[] = {"", "generatorconstant", "GeneratorConstant", "generator", "generatorConstant ", "generatorConstant=", "dlpChecksumModIV", "dlpChecksumMod",
-                                  "dlpKeyY", "otpKey", "=", "name"};
+                                  "dlpKeyY", "otpKey", "=", "name", "commonKeyY", "commonKeyY1", "commonkeyy0", "commonKeyY0 ", "CommonKeyY0"};
     for (const char* name : others) {
         uint8_t out[16];
         std::memset(out, 0xEE, sizeof(out));
@@ -81,6 +88,7 @@ int main() {
         CHECK(bk_get("nothing", bad) == -1);
         CHECK(bk_get(BK_GENERATOR_CONSTANT, again) == 0 && std::memcmp(again, c, 16) == 0);
         CHECK(bk_get(BK_DLP_CHECKSUM_IV, again) == 0 && std::memcmp(again, iv, 16) == 0);
+        CHECK(bk_get(BK_COMMON_KEY_Y0, again) == 0 && std::memcmp(again, y0, 16) == 0);
     }
 
     // the key generator: the old code (the constant inline) gave these three answers for these three pairs

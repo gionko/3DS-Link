@@ -49,6 +49,25 @@ struct Stats {
     u32 enet_events_before_ack; ///< packets of the room handed to the game's code before the acknowledgement of their datagram was sent
     u32 enet_ack_limit_hits;  ///< times the acknowledgements were sent because they had waited for 8 packets or 8 ms
     u32 enet_ack_hold_max_ms; ///< the longest an acknowledgement waited between being queued and being sent (ms; a maximum)
+    // The flow of the room's stream (2026-11-14, Mario Party: Island Tour; the line "room stream flow", azl/flow_relief.hpp):
+    u32 enet_cap_refused;     ///< commands of the room ENet did not take because the data that waited was at the limit (192 KB): not acknowledged, the room sends them again
+    u32 enet_cap_admitted;    ///< ... and the ones taken over the limit because they were the next of the sequence (they close the hole the waiting data is behind)
+    u32 enet_cap_dropped;     ///< ... and the game frames acknowledged and dropped at the limit instead of refused (the listed titles: RoomClient::SetCapDrop)
+    u32 enet_cap_full;        ///< ... the refused ones (in enet_cap_refused) that would have been dropped but the placeholders were at their maximum (the title's bound)
+    u32 enet_cap_held_max;    ///< ... the most placeholders of dropped frames held at once (a maximum)
+    u32 enet_seq_skipped;     ///< reliable sequence numbers of the room never seen (a new command lost on the way - Wi-Fi or the socket's ring - or late)
+    u32 enet_seq_skipped_away; ///< ... found in what had waited in the socket while the network thread was away 100 ms or more (the ring may have overflowed)
+    u32 enet_away_episodes;   ///< (2026-11-15) the times the network thread was away 100 ms or more and the socket's ring filled alone ...
+    u32 enet_away_dgrams_max; ///< ... the most datagrams read after one of them before the socket was empty (a maximum) ...
+    u32 enet_away_bytes_max;  ///< ... the same in bytes (a maximum: ring bound by bytes or by datagrams) ...
+    u32 enet_away_dup_max;    ///< ... and the most copies the room sent again among them (a maximum)
+    u32 enet_waiting_max;     ///< the most data that waited in ENet, ready or behind a hole (bytes; a maximum)
+    u32 enet_lag_max_ms;      ///< the latest a packet of the room reached the game's code: its datagram's delay against the best one of the connection, plus its wait in ENet (ms; a maximum)
+    u32 rx_same_round;        ///< packets of the room handed over in the round of another one (the hand-over burst of the dense-broadcast titles) ...
+    u32 rx_round_max;         ///< ... and the most one round handed over
+    u32 tx_budget_rounds;     ///< (2026-11-15) rounds that sent the title's send budget and left the rest of the game's queue for the next one
+    u32 tx_drain_rounds;      ///< (2026-11-15) rounds of a title with a send budget that held the game's queue back to read what the ring held after an absence
+    u32 tx_same_dropped;      ///< broadcast frames of the game not sent because they were the frame last sent, a moment before (the same-frame filter of those titles)
     u32 loop_iters;    ///< iterations of the network loop
     u32 loop_gap_max;  ///< longest pause between two iterations (ms): thread starvation
     u32 delay_max;     ///< longest time a frame waited before being handed to ENet (ms)
@@ -69,6 +88,7 @@ struct Stats {
     u32 drop_foreign;      ///< frames of another network in the same room (their transmitter is not ours) that were refused
     u32 foreign_shadow;    ///< ... and those a client let through because its foreign-lobby filter only counts (yet)
     u32 deauth_late;       ///< host: Deauthentications swallowed as the late second copy of a goodbye (a node that joined again)
+    u32 auth_other_game;   ///< host of a title that keeps to its game: Authentications not answered, the newcomer plays another game (azl/one_game_host.hpp)
     u32 ring_overwritten;  ///< frames a bind's ring pushed out to make room for newer ones (the game reads too slowly)
     u32 ring_peak_units;   ///< the most 32-byte units any ring held at once
     u32 ring_flushed;      ///< frames of the last session still queued when the next one began: dropped
@@ -104,9 +124,12 @@ struct Stats {
     u32 sendto_errors;
     u32 sendto_bytes;
     u32 sendto_addressed;     ///< ... of which sent with the broadcast flag to a node the room has: addressed to its MAC, so that the room delivers it to that member alone
+    u32 beacon_built;         ///< host: beacons generated (SHA-1 + MD5 + AES in software): one per change of the network (UdsEngine::BeaconFrameLocked)
+    u32 beacon_reused;        ///< host: beacons sent from the copy of the last one (nothing in the network had changed)
 
     // Where the plugin's time goes (the 64-bit sums are at the end of the struct).
-    u32 net_slow_rounds;   ///< network rounds longer than 50 ms
+    u32 net_slow_rounds;   ///< network rounds longer than 50 ms (the pause after a socket error not counted: ClassifyRound)
+    u32 net_pause_rounds;  ///< (2m-diag D1) ... and the rounds longer than 50 ms only by that pause: the loop waiting, not a slow round
     u32 service_max_ticks; ///< the slowest single enet_host_service() call
     u32 frames;            ///< frame callbacks
     u32 frame_gap_max;     ///< the longest interval between two frame callbacks (ticks)
@@ -130,6 +153,14 @@ struct Stats {
     u32 soc_max_ticks[kSocKinds];
     u32 soc_over20[kSocKinds];    ///< calls that took more than 20 ms / more than 100 ms
     u32 soc_over100[kSocKinds];
+    // The datagrams the network thread hands to the socket (2026-11-11, Fantasy Life: a client's broadcast frames above ENet's
+    // fragment length never reached the room, and a send the socket refuses is taken by ENet as "0 bytes sent", in silence).
+    u32 soc_send_refused;         ///< sends the socket refused (EWOULDBLOCK): the datagram is gone, ENet resends only a reliable one
+    u32 soc_send_refused_big;     ///< ... of them, datagrams of kSocSendBig bytes or more
+    u32 soc_send_failed;          ///< sends that failed with another error (ENet's service call returns an error)
+    u32 soc_send_short;           ///< sends that took fewer bytes than the datagram held
+    u32 soc_send_big;             ///< datagrams of kSocSendBig bytes or more the socket took whole
+    u32 soc_send_max_bytes;       ///< the largest datagram the socket took whole
     u32 drain_dgrams_max;         ///< most datagrams (and their bytes) one enet_host_service() read from the socket:
     u32 drain_bytes_max;          ///< how much the soc ring held when the thread got to it
     u32 drain_dgrams_cur;         ///< (running totals of the call in progress)
@@ -232,6 +263,76 @@ extern u32 g_cmd_counts[kStatsCommands];
 /// 50 ms in system ticks: a game frame / network round longer than this is a hitch.
 constexpr u32 kSlowTicks = 50 * AZL_TICKS_PER_MS;
 
+/// (2m-diag D1, 2026-11-21) What a network round longer than kSlowTicks was. The pause after a failing socket call
+/// (RoomClient::ServiceErrorPauseMs, up to 128 ms) is the loop waiting on purpose: Tetris with eight, console 63, lid closed and the WiFi
+/// gone, made 2.369 lines "slow round" of that pause alone. A round is Slow when it is longer than kSlowTicks WITHOUT the pause (a round
+/// with no pause: exactly as before), PauseOnly when only the pause made it so (counted in net_pause_rounds, no line), Normal otherwise.
+enum class RoundKind { Normal, Slow, PauseOnly };
+constexpr RoundKind ClassifyRound(u64 round_ticks, u64 pause_ticks) {
+    return round_ticks <= kSlowTicks ? RoundKind::Normal
+           : round_ticks - (pause_ticks < round_ticks ? pause_ticks : round_ticks) > kSlowTicks ? RoundKind::Slow
+                                                                                                 : RoundKind::PauseOnly;
+}
+/// (2m-rev, 2026-11-22) ... and the pause it takes off is the one the loop ASKED for (ServiceErrorPauseMs) plus kPauseSlackMs, never
+/// more: the time measured around SleepMs also holds the thread woken up late, and a round late by the scheduler is a slow round that
+/// says so with its line, as before the 2m (428 ms measured for 128 asked: 300 ms of the round are not the pause).
+constexpr u32 kPauseSlackMs = 10;
+constexpr u64 PauseTakenOff(u64 measured_ticks, u32 asked_ms) {
+    return measured_ticks < (static_cast<u64>(asked_ms) + kPauseSlackMs) * AZL_TICKS_PER_MS
+               ? measured_ticks
+               : (static_cast<u64>(asked_ms) + kPauseSlackMs) * AZL_TICKS_PER_MS;
+}
+
+/// (2m-diag D2, 2026-11-21) The notice "room link silent" (debug=1 only, Plugin::CheckLinkSilence): at least kSilenceMinGaps silences of
+/// 150 ms or more in a window whose datagrams came at kSilenceMinDatagramsPerSecond or more, over the REAL length of the window. Until the
+/// 2m the bound was 100 datagrams in the window, which is this rate in the nominal 5 s, but a window the log writer held for 17 s (the
+/// SD card of console 63) passed it with a third of the rate.
+/// (2m-rev, 2026-11-22) The rate is taken over the nominal window (nominal_ms) as long as the real one is not longer than that by more
+/// than kSilenceWindowSlackMs, and over the real one less kSilenceWindowSlackMs beyond: the writer closes the window at its first service
+/// after the 5 s (every 900-1000 ms), so an ordinary window lasts 5.0-5.9 s and its bound is the 100 datagrams of before, not 100-118.
+constexpr u32 kSilenceMinDatagramsPerSecond = 20;
+constexpr u32 kSilenceMinGaps = 2;
+constexpr u32 kSilenceWindowSlackMs = 1000;
+constexpr bool LinkSilenceWorthANotice(u32 rx_datagrams, u32 silences, u64 window_ms, u32 nominal_ms) {
+    return window_ms != 0 && silences >= kSilenceMinGaps &&
+           static_cast<u64>(rx_datagrams) * 1000u >=
+               static_cast<u64>(kSilenceMinDatagramsPerSecond) *
+                   (window_ms > static_cast<u64>(nominal_ms) + kSilenceWindowSlackMs ? window_ms - kSilenceWindowSlackMs
+                                                                                    : static_cast<u64>(nominal_ms));
+}
+/// ... and where the notice says the silence is: with the shared page's WiFi strength at 3 (full) the radio of this console is not
+/// the likely place, the room or the network behind the access point is (Tetris with eight: 6 notices, all of them with the strength at 3).
+/// (2m-rev) The strength given is the LOWEST of the window (Plugin::SampleLinkState, every 50 ms), not the one read when it closes: a
+/// WiFi that fell and came back to 3 inside the window is the WiFi.
+constexpr const char* LinkSilenceWhere(u8 wifi_strength) {
+    return wifi_strength == 3 ? "room/network" : "WiFi";
+}
+
+/// (2m-diag D3, 2026-11-21) A statistics window the log writer stretched: the writer closes the windows and it is the thread that sits in
+/// the SD card (Tetris with eight: one write of 13.4 s), so a window "of 5 s" can last 17 s. Twice the nominal length or more.
+/// (2m-rev) The figures per second are averages over the real length and stay right; what such a window changes are its counts
+/// (frames, rounds longer than 50 ms, silences), which are those of all of it.
+constexpr bool WindowStretched(u64 window_ms, u32 nominal_ms) {
+    return window_ms >= 2u * static_cast<u64>(nominal_ms);
+}
+/// (2m-rev, 2026-11-22) ... and who stretched it, which the mark says instead of always blaming the writer: with no writer thread the
+/// window is closed by the thread that calls Plugin::Tick (ServiceLog's fallback); with the writer, it is the writer when the time it
+/// spent in the SD card plus its latest wake-up cover at least half of the excess over the nominal window, and something else (HOME,
+/// sleep, the plugin's threads held) otherwise.
+enum class StretchBy { None, LogWriter, NotTheWriter, TickCaller };
+constexpr StretchBy WhoStretchedTheWindow(u64 window_ms, u32 nominal_ms, u64 card_ms, u64 writer_late_max_ms, bool writer_thread) {
+    return !WindowStretched(window_ms, nominal_ms) ? StretchBy::None
+           : !writer_thread                         ? StretchBy::TickCaller
+           : 2u * (card_ms + writer_late_max_ms) >= window_ms - nominal_ms ? StretchBy::LogWriter
+                                                                           : StretchBy::NotTheWriter;
+}
+constexpr const char* StretchedByText(StretchBy by) {
+    return by == StretchBy::LogWriter      ? "by the log writer"
+           : by == StretchBy::TickCaller   ? "by the caller of Tick (no writer thread)"
+           : by == StretchBy::NotTheWriter ? "not by the log writer"
+                                           : "";
+}
+
 // Directions of the frames in the debug capture (below).
 // Other: frames between other nodes; Dup: the host's second copy of a frame that reached us directly, dropped
 // (header only: its bytes are those of the Rx record of the direct copy); Echo: our own frame, which the room gave
@@ -239,22 +340,49 @@ constexpr u32 kSlowTicks = 50 * AZL_TICKS_PER_MS;
 // are not what a capture is read for, and they were half of its volume (PROVA 2: 19.7 of 39.9 MB of FRAME lines);
 // the frames for us (Rx) and ours (Tx) keep their whole payload.
 enum DebugDir : u8 { kDirTx = 0, kDirRx = 1, kDirOther = 2, kDirDup = 3, kDirEcho = 4 };
+/// OR-ed into the direction given to DebugFrame(): a frame of the Download Play's network, kept whole whatever the diet says (its
+/// frames are what its protocol is studied from). It is not stored: a record's dir is the DebugDir alone.
+constexpr u8 kDirWhole = 0x80;
+/// The bytes of a game's data frame that the capture keeps (the diet of the frames, below).
+constexpr u32 kDebugFrameHead = 32;
 
 // ---------------------------------------------------------------------------------------------
-// The log ("debug=1" in the ini): EVERYTHING the protocol does. There are two levels and nothing between:
+// The log ("debug=1" in the ini): EVERYTHING the protocol does. There are two levels and nothing between (what the capture
+// keeps of a game's data frames and of the commands a game polls is "the diet of the capture", after the two levels):
 //   0: no log of any kind. Log() and the Debug*() calls return at once (nothing is formatted, allocated or
 //      locked), the capture ring below is not allocated and no file is created or written; only the
 //      always-on counters (Stats, StatusNumbers) go on, because the warnings and the menu's status page
 //      feed on them;
 //   1: AzaharLink.log (2 files of 1 MB) with the control plane, the statistics blocks and the memory lines,
-//      and AzaharLink.debug.log (rotated over several files), the capture: every UDS data frame (full
-//      payload), UDS/ndm commands with ALL the request/reply words their IPC headers declare (SendTo,
+//      and AzaharLink.debug.log (rotated over several files), the capture: every UDS data frame (see
+//      the diet below), UDS/ndm commands with ALL the request/reply words their IPC headers declare (SendTo,
 //      failed PullPackets and every scan/status read included), every beacon (whole body: replayable),
 //      the other room frames, every service the game opens, the commands of the network-relevant real
 //      services and every other IPC request of the game (session handle, command, result).
 // Producers (game threads, the engine, the network thread) append binary records to an in-memory ring under
-// a small lock; the log writer thread drains the ring, formats it and writes it. Frames carry their whole
-// payload. The ring is allocated only when level 1 is on.
+// a small lock; the log writer thread drains the ring, formats it and writes it. The ring is allocated only
+// when level 1 is on.
+//
+// The diet of the capture (1.1.4, 2026-11-13). Four players of Final Fantasy Explorers for 43 minutes: the ring stayed full, the
+// card took 16 KB a second and two heavy records of three were lost - and three quarters of what was written were the bytes of
+// the game's frames (540 characters a line), another sixth the PullPacket and SendTo lines. The ring is the games' memory and the
+// writer gives the card up to the game on purpose, so the capture writes less:
+//   - a data frame of the GAME (to this node, or its own) keeps its header - time, direction, nodes, channel, length - and its
+//     first kDebugFrameHead bytes: the transport's header, the checksum and the library's sequence numbers, which is what tells
+//     the protocol and a lost or repeated frame. Its line says "189B (cut): <64 hex digits>";
+//   - a data frame of the Download Play's network (the fake lobby's and the real one's, wlancommid 0x2810: DebugFrame with
+//     kDirWhole) is whole, as are the beacons and every management frame: they are what that protocol is studied from;
+//   - a command a game polls (the heavy lane's: PullPacket, SendTo, the status and node reads, the scans) that succeeds is
+//     written whole ONCE a second and kind, then counted in one line a second, as the IPC calls are (kDbgIpcAgg below):
+//     "uds PullPacket bind 2: 197 bytes from node 3 x27 from 11.345 to 12.340" (a kind: the bind and the node; the bytes of the
+//     last), "uds cmd 0x17 (req 00000001) to node 2 ch243 flags 0x03: 189 bytes x27 from ..." (a kind: the channel, the
+//     destination, the first word and the flags - the two words of a SendTo that no other line of the capture has), and for the
+//     others "uds cmd 0x0d (req 00000001) same x57 from ..." - a kind is then ALL the words of the request and the reply, so
+//     a count line stands for calls whose line would have been the whole line of that second, word for word. A command
+//     that fails is always whole, and so is every command of the control lane and of ndm:u.
+// g_debug_whole takes the diet of the frames and of the commands away (every frame whole, every command a line: what level 1
+// was until 1.1.4), for the study of a game's protocol (Tests/make_goldens.py needs it). The delivered plugin never sets it:
+// a study build does (make EXTRA_CFLAGS=-DAZL_CAPTURE_WHOLE, by hand, to one console), and the tests.
 //
 // The ring has two lanes. A "heavy" record (a frame, a beacon, an IPC call, a PullPacket / SendTo line) may fill the ring
 // up to 480 KB; a "control" record (a role change, a Deauthentication, a session opening or closing, a sleep, a state
@@ -305,10 +433,13 @@ struct DebugRecord {
 static_assert(sizeof(DebugRecord) == 16, "DebugRecord layout");
 
 extern volatile int g_debug_level; ///< 0 no log at all, 1 everything (the master switch of Log() and the Debug*() calls)
+extern volatile bool g_debug_whole; ///< the capture without its diet of frames and commands: a study build and the tests only (see above)
 /// Allocates the ring (call once, before the producers run). Returns false if memory is short.
 bool DebugInit();
 /// True once DebugInit() has given the capture a ring.
 bool DebugRingReady();
+/// A UDS data frame. `dir` is a DebugDir, with kDirWhole for a frame of the Download Play's network; without it the record
+/// keeps the first kDebugFrameHead bytes of `payload` (and the whole length in its header).
 void DebugFrame(u8 dir, u16 src, u16 dest, u8 channel, const u8* payload, u32 size);
 void DebugEvent(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 // ---- Capture lines for code on the GAME's threads (the svc hook, Tests/policy_check.sh keeps the printf family out
@@ -352,7 +483,8 @@ bool DebugPop(DebugRecord* rec, u8* buf, u32 cap);
 bool DebugOldestMs(u32* ms);
 /// Appends the text line of one popped record to `out` (the format AzaharLink.debug.log has):
 ///   "  12.345 <text>"                                          text events, commands, roles
-///   "  12.345 FRAME rx    3>2 ch243 140B: <hex>"                UDS data frames (header only for other / dup / echo)
+///   "  12.345 FRAME rx    3>2 ch243 140B: <hex>"                UDS data frames (header only for other / dup / echo;
+///                                                               "140B (cut): <hex>" when the record keeps the first bytes)
 ///   "  12.345 BEACON rx    00:1f:32:aa:bb:cc ch11 377B: <hex>"  beacons (whole 802.11 body)
 ///   "  12.345 LOST 52 heavy records from 11.900 to 12.300 (ring full 40, lock busy 12)"   a hole
 /// `start_ms` is the time the plugin started (the lines show the time since).
@@ -387,6 +519,14 @@ void DebugReset();
 /// A soc call of the network thread: `kind` is a SocKind, `ticks` its duration. Every call is timed: the network thread was
 /// waiting for the soc process that long, which is not its CPU (platform::NoteNetWait).
 void StatsSocCall(int kind, u64 ticks);
+/// A datagram of `bytes` handed to the room socket by the network thread, and what the socket did with it (a SocSendOutcome).
+enum SocSendOutcome : int { kSocSendTaken = 0, kSocSendRefused = 1, kSocSendFailed = 2, kSocSendShort = 3 };
+/// A "big" datagram is a FULL one, whatever it carries: ENet fills every datagram to its MTU (ENET_HOST_DEFAULT_MTU, 1392 here) with
+/// the commands that wait - the fragments of a large frame, or many small frames of one round of the network thread. So the two
+/// counts "of kSocSendBig bytes or more" say that full datagrams were taken or refused, not that a large frame was sent: to tell,
+/// hold them against the frames above ENet's fragment length that the capture shows going out in the same window.
+constexpr u32 kSocSendBig = 1024;
+void StatsSocSend(u32 bytes, int outcome);
 /// A datagram of `bytes` read from the room, `gap_ticks` after the previous one (0 = the first).
 void StatsRoomDatagram(u32 bytes, u64 gap_ticks);
 /// End of one enet_host_service() call, which lasted `ticks`: closes the drain count and returns how many

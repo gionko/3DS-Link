@@ -3,8 +3,12 @@
 // work on the air is dlph/ (a copy of DlpLink/host, see dlph/README.md).
 #pragma once
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
+
+#include "azl/dlp_mode.hpp"
+#include "azl/title_rules.hpp"
 
 namespace dlp {
 
@@ -115,7 +119,7 @@ inline bool CloseNeedsQuestion(int seat) {
 constexpr const char* kCloseQuestion = "A console that has not finished will stop receiving.";
 
 // Why the room is not open (or why the package it hands out could not be made first). The title is one line, the text what to do about it.
-enum class Failure { None, NoChild, BadChild, NoMac, Wireless, Library, Room, Thread, SwitchedOff, NoBoot9, NoModel, NoPlugin, NoSource, NoKeys, BadAppFile, Prepare };
+enum class Failure { None, NoChild, BadChild, NoMac, Wireless, Library, Room, Thread, NoBoot9, NoModel, NoPlugin, NoSource, NoKeys, BadAppFile, Prepare };
 
 inline const char* FailureTitle(Failure f) {
     switch (f) {
@@ -133,8 +137,6 @@ inline const char* FailureTitle(Failure f) {
         return "The room could not be opened";
     case Failure::Thread:
         return "Not enough memory to open the room";
-    case Failure::SwitchedOff:
-        return "3DS Link Delivery is switched off";
     case Failure::NoBoot9:
         return "boot9.bin is missing";
     case Failure::NoModel:
@@ -173,9 +175,6 @@ inline std::string BadAppFileText(const std::string& file, const std::string& fo
 inline std::string FailureText(Failure f, const std::string& detail) {
     std::string text;
     switch (f) {
-    case Failure::SwitchedOff:
-        text = "It is switched off in Settings (Download Play delivery). Switch it on there to use it.";
-        break;
     case Failure::NoBoot9:
         text = "Sharing 3DS Link needs boot9.bin, the key file of this console. 3DS Link works without it: it is only needed to share. "
                "Press Y to see how to get it.";
@@ -252,29 +251,23 @@ inline std::string StepText(int index, const std::string& host) {
 // right of the row, a note that says why, and A only says it again in a line). Sharing needs boot9.bin; 3DS Link works without it, and says so.
 // ---------------------------------------------------------------------------------------------
 
-enum class Gate { Open, Off, NoBoot9 };
+enum class Gate { Open, NoBoot9 };
 
-// `switch_on`: Settings > Download Play delivery (the emergency switch). It comes first: switched off, nothing else about the entry is looked at.
-inline Gate GateOf(bool switch_on, bool boot9_found) {
-    if (!switch_on) {
-        return Gate::Off;
-    }
+// boot9.bin decides, and nothing else (1.1.4, spec 9: the emergency switch Settings > Download Play delivery is gone).
+inline Gate GateOf(bool boot9_found) {
     return boot9_found ? Gate::Open : Gate::NoBoot9;
 }
 
 inline const char* GateValue(Gate g) {
-    return g == Gate::Off ? "switched off" : (g == Gate::NoBoot9 ? "needs boot9.bin" : "");
+    return g == Gate::NoBoot9 ? "needs boot9.bin" : "";
 }
 
 inline const char* GateNoteTitle(Gate g) {
-    return g == Gate::Off ? "3DS Link Delivery is switched off" : (g == Gate::NoBoot9 ? "boot9.bin is missing" : "3DS Link Delivery");
+    return g == Gate::NoBoot9 ? "boot9.bin is missing" : "3DS Link Delivery";
 }
 
 inline std::string GateNote(Gate g) {
     switch (g) {
-    case Gate::Off:
-        return "It is switched off in Settings (Download Play delivery). Nothing of it runs, and nothing is read or written for it, until you switch it on "
-               "again.";
     case Gate::NoBoot9:
         return "Sharing 3DS Link needs boot9.bin, the key file of this console. 3DS Link itself works without it.\n\nPress Y to see, step by step, how to get it.";
     default:
@@ -284,8 +277,8 @@ inline std::string GateNote(Gate g) {
 }
 
 // What A says on the shut entry, in a line.
-inline const char* GateToast(Gate g) {
-    return g == Gate::Off ? "Switched off: Settings > Download Play delivery." : "boot9.bin is missing: press Y to see how to get it.";
+inline const char* GateToast(Gate) {
+    return "boot9.bin is missing: press Y to see how to get it."; // (the one way the entry is shut)
 }
 
 // The key that opens the guide "How to get boot9.bin", as a footer's hint shows it (short: the room between the buttons is small), and what is said when this
@@ -293,18 +286,6 @@ inline const char* GateToast(Gate g) {
 constexpr const char* kGuideHint = "Y guide";
 constexpr const char* kGuideLabel = "Guide";
 constexpr const char* kNoGuideToast = "The guide is not in this build.";
-
-// Settings > Download Play delivery: the one switch of the feature. `on` is what it says now.
-constexpr const char* kSwitchLabel = "Download Play delivery";
-constexpr const char* kSwitchNoteTitle = "Download Play delivery";
-constexpr const char* kSwitchNote =
-    "ON: the main page offers 3DS Link Delivery, which lets a console that has only Download Play get 3DS Link from this one.\n"
-    "OFF: the whole feature is shut. Its entry is faint and nothing of it runs or is read or written. Use it if that part ever misbehaves: the rest of 3DS "
-    "Link is not affected.";
-
-inline const char* SwitchToast(bool on) {
-    return on ? "3DS Link Delivery is on." : "3DS Link Delivery is switched off.";
-}
 
 // ---------------------------------------------------------------------------------------------
 // The one-time work before the room: the package that other consoles download is built from 3DS Link's own CIA and the plugin (dlp_prepare_logic.hpp)
@@ -333,7 +314,7 @@ constexpr const char* kCancelPrepareQuestion = "Nothing is left half done, and t
 // The question when a run that was building the package did not end (the marker was still there): `died` is how many runs in a row did not.
 inline std::string DiedQuestion(int died) {
     if (died >= 2) {
-        return "The last " + std::to_string(died) + " preparations in a row did not finish. If it keeps happening, switch Download Play delivery off in Settings: "
+        return "The last " + std::to_string(died) + " preparations in a row did not finish. If it keeps happening, leave 3DS Link Delivery alone: "
                "3DS Link works without it. Try again?";
     }
     return "The last preparation did not finish: the console was switched off, or the app stopped. Try again?";
@@ -342,6 +323,17 @@ inline std::string DiedQuestion(int died) {
 // What the screen says when the work went wrong: the composer's phrase made a sentence, and what to do about it (dlp_prepare_logic.hpp).
 inline std::string PrepareFailedText(const std::string& sentence, const std::string& advice) {
     return sentence.empty() ? advice : (advice.empty() ? sentence : sentence + " " + advice);
+}
+
+// (the build 2f, B2 of analysis/piano-1.1.4-2026-11-15/prova-2e-2026-11-19/ANALISI.md 4) Who can host the Download Play of `game` for a console
+// that joins with its prepared guest: a console with 3DS Link hosts it only for the games whose row of azl/title_rules.hpp carries the real
+// Download Play (DlpOf: the application's row, read only); for every other game only Azahar does. The guest is made all the same: with an Azahar
+// host it is what joins. Download Play > Enable games says it on the sheet of a game that is on, and at the end of a preparation (one line of the
+// sheet: short on purpose).
+inline const char* HostsNote(std::uint64_t game) {
+    return azl::title_rules::DlpOf(game).mode == azl::DlpGameMode::RealDlp
+               ? "Hosts: a console with 3DS Link, or Azahar."
+               : "Hosts: Azahar only, not a console with 3DS Link yet.";
 }
 
 } // namespace dlp

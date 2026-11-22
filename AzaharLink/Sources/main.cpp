@@ -216,7 +216,7 @@ int main(void) {
     look.BackgroundBorderColor = Color(46, 50, 58);
 
     // The framework's menu is only the loop that calls OnFrame once a game frame: it has no entry and never opens.
-    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 1, 3, "");
+    PluginMenu* menu = new PluginMenu("AzaharLink", 1, 1, 4, "");
     menu->SynchronizeWithFrame(true);
     menu->ShowWelcomeMessage(false);
     menu->SetHexEditorState(false);

@@ -1,7 +1,9 @@
 // The debug capture (azl/log.cpp, azl/stats.hpp), run by Tests/run.sh: the two lanes of the ring and what the lane of control
 // records is for, the LOST markers of a hole, a producer that never waits for the ring's lock, the diet of the IPC lines, the
-// raw records of the HLE proper's commands against the printf formats they replaced, and the header-only frame records.
-// Time is the real clock (the diet works in seconds): the test takes about 6 s.
+// raw records of the HLE proper's commands against the printf formats they replaced, the header-only frame records, the diet
+// of the capture (1.1.4: a game's frame keeps its first 32 bytes, a polled command is one whole line a second and a count), and
+// the writer's table of the beacons that say nothing new (azl/beacon_fold.hpp).
+// Time is the real clock (the diet works in seconds): the test takes about 7 s.
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -17,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "azl/beacon_fold.hpp"
 #include "azl/log.hpp"
 #include "azl/platform.hpp"
 #include "azl/stats.hpp"
@@ -62,14 +65,18 @@ u32 NowMs() {
 }
 
 /// A fresh capture: a ring, the level on, nothing in it.
+/// (`whole`: without the diet of the frames and of the polled commands - a study build's capture - for the tests that fill
+/// the ring with frames of a size they choose)
 struct Fresh {
-    Fresh() {
+    explicit Fresh(bool whole = false) {
         CHECK(DebugInit());
         DebugReset();
+        g_debug_whole = whole;
         g_debug_level = 1;
     }
     ~Fresh() {
         g_debug_level = 0;
+        g_debug_whole = false;
         DebugReset();
     }
 };
@@ -85,7 +92,7 @@ int Count(const std::vector<Popped>& all, u8 kind) {
 // ---- 1. the lanes ----------------------------------------------------------------------------------------------------------
 void TestLanes() {
     std::printf("the ring has a lane for control records: a flood of frames fills the rest and nothing more\n");
-    Fresh fresh;
+    Fresh fresh(true); // (frames of the test's own size: whole)
     const u32 start = NowMs();
     const std::vector<u8> payload(1000, 0x5A);
     constexpr u32 kFrameRecord = 16 + 1000;
@@ -293,7 +300,7 @@ void TestLockBusy() {
 // ---- 3. the diet --------------------------------------------------------------------------------------------------------------
 void TestDiet() {
     std::printf("the diet: an IPC call that succeeds is written whole three times a second, then counted\n");
-    Fresh fresh;
+    Fresh fresh(true); // (frames of the test's own size: whole)
     const u32 start = NowMs();
     const u32 gsp = 0x250036, flush = 0x000C0000;
     const u32 t0 = NowMs();
@@ -556,7 +563,7 @@ std::string Words(const u32* w, u32 n) {
 
 void TestCommandRecords() {
     std::printf("the commands of the HLE proper are raw words: the writer makes the lines the printf formats made\n");
-    Fresh fresh;
+    Fresh fresh(true); // (frames of the test's own size: whole)
     const u32 start = NowMs();
     std::mt19937 rng(2468);
     for (int i = 0; i < 4000; ++i) {
@@ -683,12 +690,339 @@ void TestFrameLines() {
     }
 }
 
+// ---- 5b. the diet of the frames (1.1.4) --------------------------------------------------------------------------------------
+// A game's data frame leaves its header and its first kDebugFrameHead bytes in the ring; a frame of the Download Play's network
+// (kDirWhole) and every frame of a study build (g_debug_whole) is whole.
+void TestFrameDiet() {
+    std::printf("the diet of the frames: a game's frame keeps its first 32 bytes, the Download Play's and a study build's are whole\n");
+    Fresh fresh;
+    const u32 start = NowMs();
+    std::vector<u8> data(189);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<u8>(i * 7 + 1);
+    }
+    std::string head_hex, all_hex;
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        all_hex += Fmt("%02x", data[i]);
+        if (i < kDebugFrameHead) {
+            head_hex += Fmt("%02x", data[i]);
+        }
+    }
+    CHECK_EQ(kDebugFrameHead, 32u);
+    auto body = [](const Popped& p) { return p.line.substr(p.line.find(' ', 6) + 1); };
+
+    DebugFrame(kDirRx, 3, 2, 243, data.data(), 189);                 // a game's frame for this node ...
+    DebugFrame(kDirTx, 2, 3, 243, data.data(), 189);                 // ... and one of its own
+    DebugFrame(kDirRx, 3, 2, 243, data.data(), kDebugFrameHead);     // as long as the head: whole, nothing is cut
+    DebugFrame(kDirRx, 3, 2, 243, data.data(), kDebugFrameHead + 1); // one byte more: cut
+    DebugFrame(kDirRx | kDirWhole, 3, 0xFFFF, 1, data.data(), 189);  // the Download Play's network: whole
+    DebugFrame(kDirTx | kDirWhole, 1, 0xFFFF, 1, data.data(), 189);
+    DebugFrame(kDirOther, 3, 4, 243, nullptr, 189);                  // header only, as before
+    std::vector<Popped> all = Drain(start);
+    CHECK_EQ(all.size(), std::size_t(7));
+    if (all.size() == 7) {
+        CHECK_EQ(body(all[0]), "FRAME rx    3>2 ch243 189B (cut): " + head_hex + "\n");
+        CHECK_EQ(body(all[1]), "FRAME tx    2>3 ch243 189B (cut): " + head_hex + "\n");
+        CHECK_EQ(static_cast<u32>(all[0].rec.stored), kDebugFrameHead); // what the ring held: 16 + 32 bytes, not 16 + 189
+        CHECK_EQ(static_cast<u32>(all[0].rec.size), 189u);              // ... and the length is the frame's
+        CHECK_EQ(body(all[2]), "FRAME rx    3>2 ch243 32B: " + head_hex + "\n");
+        CHECK_EQ(body(all[3]), "FRAME rx    3>2 ch243 33B (cut): " + head_hex + "\n");
+        CHECK_EQ(body(all[4]), "FRAME rx    3>all ch1 189B: " + all_hex + "\n");
+        CHECK_EQ(body(all[5]), "FRAME tx    1>all ch1 189B: " + all_hex + "\n");
+        CHECK_EQ(static_cast<int>(all[4].rec.dir), static_cast<int>(kDirRx)); // (the flag is not stored)
+        CHECK_EQ(static_cast<int>(all[5].rec.dir), static_cast<int>(kDirTx));
+        CHECK_EQ(body(all[6]), std::string("FRAME other 3>4 ch243 189B: \n"));
+        // the pattern of the analysis scripts reads them all, and tells a frame that was cut from a whole one
+        const std::regex frame(R"(^\s*([\d.]+) FRAME (\S+)\s+(\S+)>(\S+) ch(\d+) (\d+)B(\s\(cut\))?: ([0-9a-f]*)$)");
+        int cut = 0;
+        for (const Popped& p : all) {
+            std::smatch m;
+            const std::string one = p.line.substr(0, p.line.size() - 1);
+            CHECK(std::regex_match(one, m, frame));
+            cut += m.size() == 9 && m[7].matched ? 1 : 0;
+        }
+        CHECK_EQ(cut, 3);
+    }
+    // a study build: every frame whole
+    g_debug_whole = true;
+    DebugFrame(kDirRx, 3, 2, 243, data.data(), 189);
+    g_debug_whole = false;
+    all = Drain(start);
+    CHECK_EQ(all.size(), std::size_t(1));
+    if (all.size() == 1) {
+        CHECK_EQ(body(all[0]), "FRAME rx    3>2 ch243 189B: " + all_hex + "\n");
+    }
+    // What it is for. The four players of 2026-11-13 made about 80 frames of 200 bytes a second for one console: a minute and a
+    // half of them with the writer away go into the heavy lane cut (7 200 x 48 bytes = 338 KB) and none is lost; whole they were
+    // 1.5 MB, and two of three had no room.
+    DebugReset();
+    const std::vector<u8> frame(200, 0x42);
+    for (int i = 0; i < 7200; ++i) {
+        DebugFrame(i % 2 ? kDirRx : kDirTx, 1, 2, 243, frame.data(), 200);
+    }
+    CaptureTotals t = DebugCaptureTotals();
+    CHECK_EQ(t.records[kLaneHeavy], 7200u);
+    CHECK_EQ(t.lost_full[kLaneHeavy], 0u);
+    CHECK_EQ(DebugBytesQueued(), 7200u * (16 + kDebugFrameHead));
+    DebugReset();
+    g_debug_whole = true;
+    for (int i = 0; i < 7200; ++i) {
+        DebugFrame(i % 2 ? kDirRx : kDirTx, 1, 2, 243, frame.data(), 200);
+    }
+    g_debug_whole = false;
+    t = DebugCaptureTotals();
+    CHECK(t.lost_full[kLaneHeavy] > 4800u); // (480 KB / 216 bytes: 2 275 go in)
+}
+
+// ---- 5c. the diet of the commands a game polls (1.1.4) -------------------------------------------------------------------------
+// A PullPacket that gave a frame, a SendTo that succeeded, a status or node read with the same words: ONE whole line a second and
+// kind, then a count line a second, from a table of their own. A failure, a command of the control lane, ndm:u and a study build:
+// every call a line.
+void TestCommandDiet() {
+    std::printf("the diet of the polled commands: one whole line a second and kind, then a count; a failure and a study build whole\n");
+    Fresh fresh;
+    const u32 start = NowMs();
+    auto body = [](const Popped& p) { return p.line.substr(p.line.find(' ', 6) + 1); };
+    // (how many of the count lines read like this, with a time "from" and a time "to" inside [t0, t1] of the test's clock)
+    auto counts_like = [&](const std::vector<Popped>& all, const std::string& text, u32 t0, u32 t1) {
+        const std::regex line("^" + text + R"( from (\d+)\.(\d{3}) to (\d+)\.(\d{3})\n$)");
+        int n = 0;
+        for (const Popped& p : all) {
+            std::smatch m;
+            const std::string b = body(p);
+            if (p.rec.kind == kDbgIpcAgg && std::regex_match(b, m, line)) {
+                const double from = std::stod(m[1].str() + "." + m[2].str()) * 1000, to = std::stod(m[3].str() + "." + m[4].str()) * 1000;
+                n += from >= static_cast<double>(t0) - start - 1 && to <= static_cast<double>(t1) - start + 1 && from <= to ? 1 : 0;
+            }
+        }
+        return n;
+    };
+    // the words of a console's own lines (Final Fantasy Explorers with four players, 2026-11-13)
+    const u32 pull_req[3] = {2, 0x177, 0x5DC};
+    u32 pull_rep[5] = {0, 0xC5, 3, 0x01720002, 0x007E989C};
+    u32 send_req[8] = {1, 2, 0xF3, 0x32, 0xC5, 3, 0x00321402, 0x007B68FC};
+    const u32 ok[1] = {0};
+    const u32 t0 = NowMs();
+    for (u32 i = 0; i < 40; ++i) {
+        pull_rep[1] = 189 + i; // (the frames are not all as long: the kind is the bind and the node, not the bytes)
+        DebugPullPacket(2, 189 + i, 3, pull_req, 3, pull_rep, 5);
+        DebugPullPacket(2, 189 + i, 4, pull_req, 3, pull_rep, 5); // another node: another kind
+        send_req[4] = 189 + i;
+        send_req[1] = 2;
+        DebugServiceCommand(true, 0x17, send_req, 8, ok, 1);
+        send_req[1] = 0xFFFF;                                     // another destination: another kind
+        DebugServiceCommand(true, 0x17, send_req, 8, ok, 1);
+    }
+    const u32 t1 = NowMs();
+    CHECK(t1 - t0 < 900); // (the second of the test)
+    DebugFlushAggregates(false);
+    std::vector<Popped> all = Drain(start);
+    CHECK_EQ(all.size(), std::size_t(4)); // the first call of each kind, whole; no count before its second is over
+    if (all.size() == 4) {
+        CHECK_EQ(body(all[0]), std::string("uds PullPacket bind 2: 189 bytes from node 3 req 00000002 00000177 000005dc -> rep 00000000 000000bd"
+                                           " 00000003 01720002 007e989c\n"));
+        CHECK_EQ(body(all[1]), std::string("uds PullPacket bind 2: 189 bytes from node 4 req 00000002 00000177 000005dc -> rep 00000000 000000bd"
+                                           " 00000003 01720002 007e989c\n"));
+        CHECK_EQ(body(all[2]), std::string("uds cmd 0x17 req 00000001 00000002 000000f3 00000032 000000bd 00000003 00321402 007b68fc -> rep 00000000\n"));
+        CHECK_EQ(body(all[3]), std::string("uds cmd 0x17 req 00000001 0000ffff 000000f3 00000032 000000bd 00000003 00321402 007b68fc -> rep 00000000\n"));
+        for (const Popped& p : all) {
+            CHECK_EQ(static_cast<int>(p.rec.kind), static_cast<int>(kDbgCommand));
+        }
+    }
+    DebugFlushAggregates(true); // (the writer's last turn: the counts come out, with the bytes of the last call of each kind)
+    all = Drain(start);
+    CHECK_EQ(all.size(), std::size_t(4));
+    CHECK_EQ(Count(all, kDbgIpcAgg), 4);
+    CHECK_EQ(counts_like(all, "uds PullPacket bind 2: 228 bytes from node 3 x39", t0, t1), 1);
+    CHECK_EQ(counts_like(all, "uds PullPacket bind 2: 228 bytes from node 4 x39", t0, t1), 1);
+    CHECK_EQ(counts_like(all, R"(uds cmd 0x17 \(req 00000001\) to node 2 ch243 flags 0x03: 228 bytes x39)", t0, t1), 1);
+    CHECK_EQ(counts_like(all, R"(uds cmd 0x17 \(req 00000001\) to node all ch243 flags 0x03: 228 bytes x39)", t0, t1), 1);
+    for (const Popped& p : all) {
+        CHECK_EQ(static_cast<int>(p.rec.pad), static_cast<int>(kLaneControl)); // (a count is a control record, as the IPC lines' is)
+        // the patterns that read a whole line (Tests/make_goldens.py) do not take a count for a call
+        const std::regex whole_pull(R"(PullPacket bind (\d+): (\d+) bytes from node (\d+) req (.*?) -> rep (.*))");
+        const std::regex whole_cmd(R"( cmd 0x([0-9a-f]+) req ?(.*?) -> rep ?(.*))");
+        CHECK(!std::regex_search(p.line, whole_pull));
+        CHECK(!std::regex_search(p.line, whole_cmd));
+    }
+    CHECK_EQ(DebugCaptureTotals().agg_lines, 4u);
+    CHECK_EQ(DebugCaptureTotals().agg_calls, 4u * 39);
+    DebugFlushAggregates(true);
+    CHECK(Drain(start).empty()); // (written once)
+
+    // The first word and the flags of a SendTo are part of its kind: no other line of the capture has them (the frame's line has
+    // the nodes, the channel and the bytes). In the console's files of 2026-11-13 one game sends with first word 1 and flags 3 and
+    // another with 3 and 1 - never the two in one second there, but ONE count for calls that differ in them would say nothing of
+    // how many of each if a game did. Two kinds: a whole line and a count each, which names both words.
+    DebugReset();
+    u32 one_a[8] = {1, 0xFFFF, 0xF3, 0x44, 0x10F, 3, 0x00441402, 0x165E6DAC};
+    u32 one_b[8] = {3, 0xFFFF, 0xF3, 0x44, 0x10F, 1, 0x00441402, 0x165E6DAC};
+    const u32 t4 = NowMs();
+    for (int i = 0; i < 12; ++i) {
+        DebugServiceCommand(true, 0x17, one_a, 8, ok, 1);
+        DebugServiceCommand(true, 0x17, one_b, 8, ok, 1);
+        DebugServiceCommand(true, 0x17, one_b, 8, ok, 1);
+    }
+    const u32 t5 = NowMs();
+    DebugFlushAggregates(true);
+    all = Drain(start);
+    CHECK_EQ(Count(all, kDbgCommand), 2);
+    CHECK_EQ(Count(all, kDbgIpcAgg), 2);
+    if (all.size() == 4) {
+        CHECK_EQ(body(all[0]), std::string("uds cmd 0x17 req 00000001 0000ffff 000000f3 00000044 0000010f 00000003 00441402 165e6dac -> rep 00000000\n"));
+        CHECK_EQ(body(all[1]), std::string("uds cmd 0x17 req 00000003 0000ffff 000000f3 00000044 0000010f 00000001 00441402 165e6dac -> rep 00000000\n"));
+    }
+    CHECK_EQ(counts_like(all, R"(uds cmd 0x17 \(req 00000001\) to node all ch243 flags 0x03: 271 bytes x11)", t4, t5), 1);
+    CHECK_EQ(counts_like(all, R"(uds cmd 0x17 \(req 00000003\) to node all ch243 flags 0x01: 271 bytes x23)", t4, t5), 1);
+    // A word with bits above its field (the game leaves them there and the service reads the low byte or half: the channel
+    // 0x004b8001 and the flags 0x00800001 of a game's own channel 1, the destination 0x020dffff of Final Fantasy Explorers'
+    // broadcast) is no kind of that form: the call is counted only with the same words, every one, and its count says "same".
+    DebugReset();
+    u32 high_channel[8] = {1, 0xFFFF, 0x004B8001, 0x0D, 0x34, 0x00800001, 0x000D1402, 0x0828EA40};
+    u32 high_dest[8] = {1, 0x020DFFFF, 0xF3, 0x23, 0x8C, 0x0FFFFE03, 0x00231402, 0x0FFFE924};
+    u32 high_flags[8] = {1, 2, 0xF3, 0x23, 0x8C, 0x00800003, 0x00231402, 0x0FFFE924}; // (the flags word alone)
+    for (int i = 0; i < 5; ++i) {
+        DebugServiceCommand(true, 0x17, high_channel, 8, ok, 1);
+        DebugServiceCommand(true, 0x17, high_dest, 8, ok, 1);
+        DebugServiceCommand(true, 0x17, high_flags, 8, ok, 1);
+    }
+    high_channel[4] = 0x7C; // (another length: other words, a line of its own)
+    DebugServiceCommand(true, 0x17, high_channel, 8, ok, 1);
+    DebugFlushAggregates(true);
+    all = Drain(start);
+    CHECK_EQ(Count(all, kDbgCommand), 4);
+    CHECK_EQ(Count(all, kDbgIpcAgg), 3);
+    {
+        int same = 0;
+        for (const Popped& p : all) {
+            same += p.rec.kind == kDbgIpcAgg && body(p).rfind("uds cmd 0x17 (req 00000001) same x4 from ", 0) == 0 ? 1 : 0;
+            CHECK(body(p).find(" to node ") == std::string::npos); // (never the line of a kind it is not)
+        }
+        CHECK_EQ(same, 3);
+    }
+
+    // the status and node reads (Mario Kart 7: 210 a second): the same words again are counted, ONE other word is a line of its own
+    DebugReset();
+    const u32 node_req[1] = {1};
+    u32 node_rep[11] = {0, 0x0a5cc011, 0x37110002, 0x00690047, 0x006E006F, 0x006F006B, 0, 0, 0, 1, 0};
+    u32 status_rep[13] = {0, 6, 1, 0x00010001, 1, 0, 0, 0, 0, 0, 0, 0, 0x00010801};
+    const u32 t2 = NowMs();
+    for (int i = 0; i < 30; ++i) {
+        DebugServiceCommand(true, 0x0D, node_req, 1, node_rep, 11);
+        DebugServiceCommand(true, 0x0B, nullptr, 0, status_rep, 13);
+    }
+    status_rep[3] = 0x00000001; // the status changed
+    DebugServiceCommand(true, 0x0B, nullptr, 0, status_rep, 13);
+    node_rep[10] = 0x80000000;  // (a word that differs in its top bit alone is another line too)
+    DebugServiceCommand(true, 0x0D, node_req, 1, node_rep, 11);
+    const u32 t3 = NowMs();
+    DebugFlushAggregates(true);
+    all = Drain(start);
+    CHECK_EQ(Count(all, kDbgCommand), 4); // the two kinds and the two changes
+    CHECK_EQ(Count(all, kDbgIpcAgg), 2);
+    if (all.size() == 6) {
+        CHECK_EQ(body(all[0]), std::string("uds cmd 0x0d req 00000001 -> rep 00000000 0a5cc011 37110002 00690047 006e006f 006f006b 00000000 00000000"
+                                           " 00000000 00000001 00000000\n"));
+        CHECK_EQ(body(all[1]), std::string("uds cmd 0x0b req -> rep 00000000 00000006 00000001 00010001 00000001 00000000 00000000 00000000 00000000"
+                                           " 00000000 00000000 00000000 00010801\n"));
+        CHECK_EQ(body(all[2]), std::string("uds cmd 0x0b req -> rep 00000000 00000006 00000001 00000001 00000001 00000000 00000000 00000000 00000000"
+                                           " 00000000 00000000 00000000 00010801\n"));
+        CHECK(body(all[3]).find(" 00000001 80000000\n") != std::string::npos);
+    }
+    CHECK_EQ(counts_like(all, R"(uds cmd 0x0d \(req 00000001\) same x29)", t2, t3), 1);
+    CHECK_EQ(counts_like(all, "uds cmd 0x0b same x29", t2, t3), 1);
+
+    // what is never counted: a command that failed, a command of the control lane, ndm:u, a line with a head of its own
+    DebugReset();
+    const u32 failed[1] = {0xC8A11BEF};
+    for (int i = 0; i < 10; ++i) {
+        DebugServiceCommand(true, 0x17, send_req, 8, failed, 1); // a SendTo the engine refused
+        DebugServiceCommand(true, 0x0B, nullptr, 0, failed, 1);
+        DebugServiceCommand(true, 0x1B, send_req, 2, ok, 1);     // (the control lane's)
+        DebugServiceCommand(false, 0x0D, node_req, 1, ok, 1);    // ndm:u
+        DebugCommand("uds cmd 0x0d", node_req, 1, ok, 1);
+    }
+    DebugFlushAggregates(true);
+    all = Drain(start);
+    CHECK_EQ(Count(all, kDbgCommand), 50);
+    CHECK_EQ(Count(all, kDbgIpcAgg), 0);
+
+    // a study build: every call a line
+    DebugReset();
+    g_debug_whole = true;
+    for (int i = 0; i < 20; ++i) {
+        DebugPullPacket(2, 189, 3, pull_req, 3, pull_rep, 5);
+        DebugServiceCommand(true, 0x17, send_req, 8, ok, 1);
+        DebugServiceCommand(true, 0x0B, nullptr, 0, status_rep, 13);
+    }
+    g_debug_whole = false;
+    DebugFlushAggregates(true);
+    all = Drain(start);
+    CHECK_EQ(Count(all, kDbgCommand), 60);
+    CHECK_EQ(Count(all, kDbgIpcAgg), 0);
+
+    // A table of their own: 200 kinds of polled commands - more than it holds - take no slot from the IPC lines of the hook, and
+    // what the table cannot hold is written whole: every call is a line or is in a count.
+    DebugReset();
+    u32 calls = 0;
+    for (u32 round = 0; round < 3; ++round) {
+        for (u32 node = 0; node < 200; ++node) {
+            DebugPullPacket(2, 100, node, pull_req, 3, pull_rep, 5);
+            ++calls;
+        }
+    }
+    for (u32 i = 0; i < 10; ++i) {
+        DebugIpc(0x250036, 0x000C0000, i, 0);
+    }
+    DebugFlushAggregates(true);
+    all = Drain(start);
+    u32 whole = 0, counted = 0, count_lines = 0, ipc_counted = 0;
+    const std::regex times(R"( x(\d+) from )");
+    for (const Popped& p : all) {
+        std::smatch m;
+        if (p.rec.kind == kDbgCommand) {
+            ++whole;
+        } else if (p.rec.kind == kDbgIpcAgg && std::regex_search(p.line, m, times)) {
+            if (p.line.find(" uds PullPacket bind 2: 100 bytes from node ") != std::string::npos) {
+                counted += static_cast<u32>(std::stoul(m[1].str()));
+                ++count_lines;
+            } else if (p.line.find(" ipc h=0x250036 ") != std::string::npos) {
+                ipc_counted += static_cast<u32>(std::stoul(m[1].str()));
+            }
+        }
+    }
+    CHECK_EQ(whole + counted, calls);
+    CHECK(count_lines >= 32 && count_lines <= 64); // (64 slots: most of them taken, none twice)
+    CHECK_EQ(counted, 2 * count_lines);            // a kind with a slot: one whole call, two counted
+    CHECK_EQ(Count(all, kDbgIpc), 3);              // the IPC lines keep their rule (three whole) and their table
+    CHECK_EQ(ipc_counted, 7u);
+
+    // One count line a second: the game's thread hands the count of the second that ended over (it pushes no record for it), the
+    // writer writes it; the first call of the next second is whole again.
+    DebugReset();
+    for (int i = 0; i < 10; ++i) {
+        DebugPullPacket(2, 197, 3, pull_req, 3, pull_rep, 5);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1050));
+    DebugPullPacket(2, 245, 3, pull_req, 3, pull_rep, 5);
+    all = Drain(start);
+    CHECK_EQ(all.size(), std::size_t(2));
+    CHECK_EQ(Count(all, kDbgCommand), 2);
+    DebugFlushAggregates(false);
+    all = Drain(start);
+    CHECK_EQ(all.size(), std::size_t(1));
+    if (all.size() == 1) {
+        CHECK_EQ(static_cast<int>(all[0].rec.kind), static_cast<int>(kDbgIpcAgg));
+        CHECK(all[0].line.find(" uds PullPacket bind 2: 197 bytes from node 3 x9 from ") != std::string::npos);
+    }
+}
+
 // ---- 6. the writer pops while the producers push ---------------------------------------------------------------------------------
 // DebugPop copies the payload without the lock (nobody writes between the tail and the head): every record that comes out
 // must be whole, in order per producer, and none may be lost or repeated.
 void TestPopWhilePushing() {
     std::printf("the writer pops without the lock while three producers push: every record whole, none lost or repeated\n");
-    Fresh fresh;
+    Fresh fresh(true); // (frames of the test's own size: whole)
     constexpr int kThreads = 3;
     constexpr int kPerThread = 15000;
     std::atomic<int> attempts{0};
@@ -768,6 +1102,186 @@ void TestPopWhilePushing() {
 
 } // namespace
 
+
+// The beacons the writer counts instead of writing (azl/beacon_fold.hpp, 2026-11-10), record by record with times made up: what a
+// file of the capture shows of them is in Tests/log_files_test.cpp (TestBeaconsAreCounted).
+namespace {
+
+/// A beacon record as DebugPop hands it over: the transmitter's MAC, then the body.
+DebugRecord BeaconRecord(u8 dir, u32 ms, u8 channel, u32 body_size, u32 stored_body) {
+    DebugRecord rec = {};
+    rec.kind = kDbgBeacon;
+    rec.dir = dir;
+    rec.ms = ms;
+    rec.channel = channel;
+    rec.size = static_cast<u16>(body_size);
+    rec.stored = static_cast<u16>(6 + stored_body);
+    rec.pad = kLaneHeavy;
+    return rec;
+}
+
+std::vector<std::string> Lines(const std::string& text) {
+    std::vector<std::string> lines;
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const std::size_t end = text.find('\n', at);
+        lines.push_back(text.substr(at, end - at));
+        at = end == std::string::npos ? text.size() : end + 1;
+    }
+    return lines;
+}
+
+} // namespace
+
+static void TestBeaconFold() {
+    std::printf("the writer's table of beacons: equal to the last one is counted; whole when it changes, once a minute, in a new file\n");
+    std::vector<u8> a(6 + 377), b(6 + 377);
+    const u8 mac_a[6] = {0x00, 0x1f, 0x32, 0xaa, 0xbb, 0xcc};
+    const u8 mac_b[6] = {0x00, 0x1f, 0x32, 0x11, 0x22, 0x33};
+    std::memcpy(a.data(), mac_a, 6);
+    std::memcpy(b.data(), mac_b, 6);
+    for (std::size_t i = 6; i < a.size(); ++i) {
+        a[i] = static_cast<u8>(i);
+        b[i] = static_cast<u8>(i * 5);
+    }
+    const u32 start = 1000;
+    BeaconFold* fold = new BeaconFold(); // (on the heap, as the writer keeps it: 4.5 KB)
+    std::printf("  the table is %lu bytes\n", static_cast<unsigned long>(sizeof(BeaconFold)));
+    CHECK(sizeof(BeaconFold) < 5 * 1024);
+    std::string out;
+    // the first of a transmitter is written; the same bytes after it are counted, with the longest interval between two of them
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 11000, 11, 377, 377), a.data(), start, &out));
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 11102, 11, 377, 377), a.data(), start, &out));
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 11204, 11, 377, 377), a.data(), start, &out));
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 11512, 11, 377, 377), a.data(), start, &out)); // (two beacons missed: 308 ms)
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 11614, 11, 377, 377), a.data(), start, &out));
+    // ... and the same transmitter in the other direction, or another transmitter, is another line
+    CHECK(fold->Keep(BeaconRecord(kDirTx, 11620, 11, 377, 377), a.data(), start, &out));
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 11630, 11, 377, 377), b.data(), start, &out));
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 11732, 11, 377, 377), b.data(), start, &out));
+    CHECK(out.empty()); // (nothing is said until the block ends or the beacon changes)
+    fold->Summaries(start, &out);
+    std::vector<std::string> lines = Lines(out);
+    CHECK_EQ(lines.size(), std::size_t(2));
+    if (lines.size() == 2) {
+        CHECK_EQ(lines[0], std::string("    10.732 BEACON rx    00:1f:32:aa:bb:cc ch11 377B: same x4 from 10.102 to 10.614, longest gap 308 ms"));
+        CHECK_EQ(lines[1], std::string("    10.732 BEACON rx    00:1f:32:11:22:33 ch11 377B: same x1 from 10.732 to 10.732, longest gap 102 ms"));
+    }
+    CHECK_EQ(fold->TakeFolded(), 5u);
+    CHECK_EQ(fold->TakeFolded(), 0u);
+    // said once: the next block starts its counts from nothing, and the gap is still measured from the beacon before
+    out.clear();
+    fold->Summaries(start, &out);
+    CHECK(out.empty());
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 11716, 11, 377, 377), a.data(), start, &out));
+    fold->Summaries(start, &out);
+    CHECK_EQ(out, std::string("    10.716 BEACON rx    00:1f:32:aa:bb:cc ch11 377B: same x1 from 10.716 to 10.716, longest gap 102 ms\n"));
+
+    // the body changes: what was counted of the old one is said first, and the new one is written
+    out.clear();
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 11818, 11, 377, 377), a.data(), start, &out));
+    a[6 + 100] ^= 1;
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 11920, 11, 377, 377), a.data(), start, &out));
+    CHECK_EQ(out, std::string("    10.920 BEACON rx    00:1f:32:aa:bb:cc ch11 377B: same x1 from 10.818 to 10.818, longest gap 102 ms\n"));
+    out.clear();
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 12022, 11, 377, 377), a.data(), start, &out));
+    // another channel, another length: written
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 12124, 6, 377, 377), a.data(), start, &out));
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 12226, 6, 376, 376), a.data(), start, &out));
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 12328, 6, 376, 376), a.data(), start, &out));
+    out.clear();
+    fold->Summaries(start, &out);
+
+    // once a minute the whole beacon, whatever it says (59.9 s after the last whole one: counted; 60 s: written)
+    out.clear();
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 12226 + 59900, 6, 376, 376), a.data(), start, &out));
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 12226 + 60000, 6, 376, 376), a.data(), start, &out));
+    CHECK(Lines(out).size() == 1 && out.find("same x1 from ") != std::string::npos); // (the count comes before it)
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 12226 + 60100, 6, 376, 376), a.data(), start, &out));
+
+    // a hole in the heavy lane (a LOST marker): beacons may be among the lost, so the interval across it is not a gap that was seen
+    out.clear();
+    fold->Summaries(start, &out);
+    out.clear();
+    u32 t = 100000;
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t, 6, 376, 376), a.data(), start, &out));
+    fold->Summaries(start, &out);
+    out.clear();
+    DebugRecord lost = {};
+    lost.kind = kDbgLost;
+    lost.dir = kLaneControl; // (a hole in the control lane says nothing about the beacons)
+    lost.ms = t + 50;
+    CHECK(fold->Keep(lost, a.data(), start, &out));
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t + 100, 6, 376, 376), a.data(), start, &out));
+    lost.dir = kLaneHeavy;
+    lost.ms = t + 150;
+    CHECK(fold->Keep(lost, a.data(), start, &out)); // (the marker itself is written, as every record that is not a beacon)
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t + 7000, 6, 376, 376), a.data(), start, &out)); // 6.9 s later: NOT a gap of 6.9 s
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t + 7104, 6, 376, 376), a.data(), start, &out));
+    fold->Summaries(start, &out);
+    CHECK(out.find("same x3 from 99.100 to 106.104, longest gap 104 ms, 1 gaps not known (LOST)\n") != std::string::npos);
+    CHECK(out.find("longest gap 6") == std::string::npos);
+
+    // a new file: nothing is remembered, the first beacon of every transmitter is whole
+    out.clear();
+    fold->Reset();
+    CHECK(fold->Keep(BeaconRecord(kDirRx, t + 7200, 6, 376, 376), a.data(), start, &out));
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t + 7300, 6, 376, 376), a.data(), start, &out));
+    fold->Summaries(start, &out);
+
+    // eight places: a ninth transmitter is written every time; a place whose transmitter was not heard for a minute is given up
+    fold->Reset();
+    out.clear();
+    std::vector<u8> h(6 + 300, 0x5a);
+    t = 500000;
+    for (u8 host = 1; host <= 9; ++host) {
+        h[5] = host;
+        CHECK(fold->Keep(BeaconRecord(kDirRx, t + host, 1, 300, 300), h.data(), start, &out));
+    }
+    for (u8 host = 1; host <= 9; ++host) {
+        h[5] = host;
+        CHECK_EQ(fold->Keep(BeaconRecord(kDirRx, t + 100 + host, 1, 300, 300), h.data(), start, &out), host == 9);
+    }
+    fold->Summaries(start, &out);
+    CHECK_EQ(Lines(out).size(), std::size_t(8));
+    out.clear();
+    h[5] = 9;
+    CHECK(fold->Keep(BeaconRecord(kDirRx, t + 30000, 1, 300, 300), h.data(), start, &out)); // (half a minute: every place still has its host)
+    h[5] = 1;
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t + 59000, 1, 300, 300), h.data(), start, &out)); // host 1 is still there
+    fold->Summaries(start, &out);
+    out.clear();
+    h[5] = 9;
+    CHECK(fold->Keep(BeaconRecord(kDirRx, t + 61000, 1, 300, 300), h.data(), start, &out));  // takes the place of a host silent for a minute
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t + 61100, 1, 300, 300), h.data(), start, &out)); // ... and is counted from now on
+    h[5] = 1;
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, t + 59900, 1, 300, 300), h.data(), start, &out)); // (host 1 kept its own)
+    fold->Summaries(start, &out);
+    CHECK_EQ(Lines(out).size(), std::size_t(2));
+
+    // a body longer than a place holds, or one the ring cut: written whole every time (what was counted before is said first)
+    fold->Reset();
+    out.clear();
+    std::vector<u8> big(6 + 600, 0x33);
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 700000, 1, 600, 600), big.data(), start, &out));
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 700100, 1, 600, 600), big.data(), start, &out));
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 700200, 1, 512, 512), big.data(), start, &out)); // (512 bytes fit)
+    CHECK(!fold->Keep(BeaconRecord(kDirRx, 700300, 1, 512, 512), big.data(), start, &out));
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 700400, 1, 2000, 512), big.data(), start, &out)); // cut: 2000 bytes sent, 512 kept
+    CHECK(out.find("same x1 from ") != std::string::npos);
+    CHECK(fold->Keep(BeaconRecord(kDirRx, 700500, 1, 512, 512), big.data(), start, &out)); // (its place was given up: whole again)
+    // a record without a MAC is not a beacon the table can know (DebugFormat does not print it as one either)
+    DebugRecord odd = BeaconRecord(kDirRx, 700600, 1, 0, 0);
+    odd.stored = 3;
+    CHECK(fold->Keep(odd, big.data(), start, &out));
+    // every other record goes through
+    DebugRecord frame = {};
+    frame.kind = kDbgFrame;
+    frame.ms = 700700;
+    CHECK(fold->Keep(frame, big.data(), start, &out));
+    delete fold;
+}
+
 int main() {
     TestLanes();
     TestControlLaneFull();
@@ -776,7 +1290,10 @@ int main() {
     TestDietConserves();
     TestCommandRecords();
     TestFrameLines();
+    TestFrameDiet();
+    TestCommandDiet();
     TestPopWhilePushing();
+    TestBeaconFold();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

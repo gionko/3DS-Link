@@ -145,7 +145,7 @@ static bool Clean(Node& n) {
     return !n.e().initialized() && !n.net->engine_held();
 }
 static u32 Clients(Node& host) {
-    u16 ids[4];
+    u8 ids[4];
     u32 total = 0;
     host.lobby->ServerConnectingClients(ids, 4, &total);
     return total;
@@ -291,7 +291,7 @@ static void TestFourPlayers(const std::string& host, u16 port) {
     CHECK_EQ(CliNode(d), 4u);
     CHECK(Until(ns, 4000, [&] { return Clients(a) == 3; }));
     for (Node* g : guests) {
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         CHECK(Until(ns, 4000, [&] {
             g->lobby->ClientConnectingNodes(ids, 4, &total);
@@ -330,7 +330,7 @@ static void TestLeaveAndGone(const std::string& host, u16 port) {
 }
 
 static std::string RosterOf(Node& n) {
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 0;
     n.lobby->ClientConnectingNodes(ids, 4, &total);
     std::string r;

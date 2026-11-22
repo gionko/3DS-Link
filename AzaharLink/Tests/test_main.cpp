@@ -24,6 +24,8 @@
 #include "azl/crypto.hpp"
 #include "azl/log.hpp"
 #include "azl/ndm_hle.hpp"
+#include "azl/one_game_host.hpp"
+#include "azl/title_rules.hpp"
 #include "azl/room_members.hpp"
 #include "azl/room_proto.hpp"
 #include "azl/ticks.h"
@@ -164,6 +166,142 @@ static void TestProto() {
     bad.String("d");
     bad.U32(0x7FFFFFFF);
     CHECK(!room::DecodeRoomInformation(bad.data().data(), bad.data().size(), &info));
+
+    // The strings of the room's information are kept up to a limit each and skipped past it (2026-11-10: a member's client decides its
+    // game's name, a host its room's; without a limit a packet of 64 KB was 64 KB of strings on the plugin's heap, measured a byte at a
+    // time by the in-game menu). PacketReader::String(keep) first, then the decoder's limits.
+    {
+        room::PacketWriter sw;
+        sw.String("abcdefgh");
+        sw.String("");
+        sw.String("xyz");
+        sw.U32(0x11223344);
+        room::PacketReader sr(sw.data().data(), sw.data().size());
+        CHECK(sr.String(3) == "abc"); // (cut: the rest skipped)
+        CHECK(sr.String(5).empty());  // (an empty one)
+        CHECK(sr.String(64) == "xyz"); // (shorter than the limit: whole)
+        CHECK_EQ(sr.U32(), 0x11223344u); // (the reader is where the strings end, whatever was kept)
+        CHECK(sr.ok());
+        room::PacketReader skip(sw.data().data(), sw.data().size());
+        CHECK(skip.String(0).empty() && skip.String(0).empty() && skip.String(0).empty()); // (a field nobody reads: only skipped)
+        CHECK_EQ(skip.U32(), 0x11223344u);
+        CHECK(skip.ok());
+        // a cut never leaves half a UTF-8 letter: "aé€😀" is 1 + 2 + 3 + 4 bytes
+        const std::string utf8 = "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80";
+        room::PacketWriter uw;
+        uw.String(utf8);
+        const std::string expect[] = {"", "a", "a", "a\xC3\xA9", "a\xC3\xA9", "a\xC3\xA9", "a\xC3\xA9\xE2\x82\xAC",
+                                      "a\xC3\xA9\xE2\x82\xAC", "a\xC3\xA9\xE2\x82\xAC", "a\xC3\xA9\xE2\x82\xAC", utf8, utf8};
+        for (std::size_t keep = 0; keep < sizeof(expect) / sizeof(expect[0]); ++keep) {
+            room::PacketReader ur(uw.data().data(), uw.data().size());
+            CHECK(ur.String(keep) == expect[keep]);
+            CHECK(ur.ok());
+        }
+        // a length past the end of the packet is a bad packet whatever is kept, 0 too: ok() false, nothing kept, and it stays false
+        for (std::size_t keep : {std::size_t(0), std::size_t(4), std::size_t(1000)}) {
+            room::PacketWriter lw;
+            lw.U32(9); // (says 9 bytes ...)
+            lw.U8('a');
+            lw.U8('b'); // (... and has 2)
+            room::PacketReader lr(lw.data().data(), lw.data().size());
+            CHECK(lr.String(keep).empty());
+            CHECK(!lr.ok());
+            CHECK_EQ(lr.U8(), 0u);
+            CHECK(!lr.ok());
+        }
+        const u8 huge[] = {0xFF, 0xFF, 0xFF, 0xFF, 'x'}; // (a length of 4 GB)
+        room::PacketReader hr(huge, sizeof(huge));
+        CHECK(hr.String(8).empty() && !hr.ok());
+        const u8 half[] = {0, 0}; // (not even a length)
+        room::PacketReader fr(half, sizeof(half));
+        CHECK(fr.String(8).empty() && !fr.ok());
+    }
+    {
+        // a full room of 16 members, every string far over its limit: decoded, each one cut to its own limit, the unread ones empty
+        const std::string long_room(5000, 'R'), long_desc(9000, 'D'), long_pref(700, 'P'), long_host(300, 'H');
+        room::PacketWriter big;
+        big.U8(room::IdRoomInformation);
+        big.String(long_room);
+        big.String(long_desc);
+        big.U32(16);
+        big.U16(24872);
+        big.String(long_pref);
+        big.String(long_host);
+        big.U32(16);
+        for (int i = 0; i < 16; ++i) {
+            big.String(std::string(100, static_cast<char>('a' + i)));  // nickname
+            big.MacAddress({0, 0x1F, 0x32, 0, 0, static_cast<u8>(i + 1)});
+            big.String(std::string(2000, static_cast<char>('A' + i))); // game name
+            big.U64(0x0004000000100000ull + i);
+            big.String(std::string(40, 'u'));
+            big.String(std::string(4000, 'd'));
+            big.String(std::string(300, 'v'));
+        }
+        room::RoomInfo full;
+        CHECK(room::DecodeRoomInformation(big.data().data(), big.data().size(), &full));
+        CHECK_EQ(full.name.size(), room::kKeepRoomName);
+        CHECK(full.name == std::string(room::kKeepRoomName, 'R'));
+        CHECK_EQ(full.description.size(), room::kKeepDescription);
+        CHECK_EQ(full.preferred_game.size(), room::kKeepGameName);
+        CHECK_EQ(full.host_username.size(), room::kKeepHostUsername);
+        CHECK_EQ(full.member_slots, 16u);
+        CHECK_EQ(full.port, u16(24872));
+        CHECK_EQ(full.members.size(), std::size_t(16));
+        std::size_t kept = full.name.size() + full.description.size() + full.preferred_game.size() + full.host_username.size();
+        for (std::size_t i = 0; i < full.members.size(); ++i) {
+            const room::MemberInfo& m = full.members[i];
+            CHECK(m.nickname == std::string(room::kKeepNickname, static_cast<char>('a' + i)));
+            CHECK(m.game_name == std::string(room::kKeepGameName, static_cast<char>('A' + i)));
+            CHECK_EQ(m.game_id, u64(0x0004000000100000ull + i));
+            CHECK(m.mac[5] == static_cast<u8>(i + 1));
+            CHECK(m.username.empty() && m.display_name.empty() && m.avatar_url.empty());
+            kept += m.nickname.size() + m.game_name.size();
+        }
+        CHECK(big.data().size() > 100000); // (the packet: over 100 KB of strings ...)
+        CHECK(kept < 6000);                // (... of which under 6 KB are kept)
+        // the limits: the game's name is NOT under the 80 bytes the plugin itself cuts its title at and sends back to the room
+        CHECK(room::kKeepGameName >= 255 && room::kKeepNickname >= 20 && room::kKeepRoomName >= 64);
+        // every cut of that packet is refused (no member half read), and none reads past its end (ASan)
+        for (std::size_t n = 0; n < big.data().size(); n += 997) {
+            room::RoomInfo part;
+            CHECK(!room::DecodeRoomInformation(big.data().data(), n, &part));
+        }
+        CHECK(!room::DecodeRoomInformation(big.data().data(), big.data().size() - 1, &full));
+    }
+    {
+        // a field that is only skipped (a member's avatar URL) whose length goes past the packet: refused, as a kept one would be
+        room::PacketWriter sk;
+        sk.U8(room::IdRoomInformation);
+        sk.String("room");
+        sk.String("");
+        sk.U32(4);
+        sk.U16(1);
+        sk.String("");
+        sk.String("");
+        sk.U32(1);
+        sk.String("nick");
+        sk.MacAddress({0, 0x1F, 0x32, 0, 0, 1});
+        sk.String("game");
+        sk.U64(7);
+        sk.String("u");
+        sk.String("d");
+        const std::size_t before_avatar = sk.data().size();
+        sk.String("avatar");
+        room::RoomInfo ok_info;
+        CHECK(room::DecodeRoomInformation(sk.data().data(), sk.data().size(), &ok_info));
+        CHECK(ok_info.members.size() == 1 && ok_info.members[0].nickname == "nick" && ok_info.members[0].game_name == "game");
+        std::vector<u8> lying(sk.data().begin(), sk.data().end());
+        lying[before_avatar + 3] = 7; // (the avatar says 7 bytes and has 6)
+        CHECK(!room::DecodeRoomInformation(lying.data(), lying.size(), &ok_info));
+        lying[before_avatar] = 0x7F; // (... or 2 GB)
+        CHECK(!room::DecodeRoomInformation(lying.data(), lying.size(), &ok_info));
+        // the same on the username, the first of the three (the two after it are then not there to read)
+        std::vector<u8> lying2(sk.data().begin(), sk.data().end());
+        const std::size_t username_at = before_avatar - (4 + 1) - (4 + 1);
+        CHECK(lying2[username_at + 3] == 1 && lying2[username_at + 4] == 'u');
+        lying2[username_at + 2] = 1; // (257 bytes)
+        CHECK(!room::DecodeRoomInformation(lying2.data(), lying2.size(), &ok_info));
+    }
 
     Mac m;
     const u8 js[] = {room::IdJoinSuccess, 0, 0x1F, 0x32, 1, 2, 3};
@@ -1383,7 +1521,7 @@ static void TestDebugCapture() {
         CHECK(std::regex_search(no_newline, m, frame));
         CHECK(m.size() == 9 && m[2].str() == "tx" && m[3].str() == "4" && m[4].str() == "all" && m[8].str() == "0102030405");
         std::vector<u8> big(2000, 0xAB);
-        DebugFrame(kDirOther, 2, 3, 7, big.data(), static_cast<u32>(big.size()));
+        DebugFrame(kDirOther | kDirWhole, 2, 3, 7, big.data(), static_cast<u32>(big.size())); // (whole: cut at the ring's 1 600)
         const std::string cut = PopLine();
         CHECK(cut.find("FRAME other 2>3 ch7 2000B (cut): ab") != std::string::npos);
         CHECK_EQ(cut.size(), std::string("     0.000 FRAME other 2>3 ch7 2000B (cut): ").size() + 1600 * 2 + 1);
@@ -1870,8 +2008,9 @@ static void TestEjectClient() {
 
     const u32 events = host.Signals(host.status_event);
     CHECK_EQ(host.e().EjectClient(2), 0u);
-    CHECK_EQ(host.sent.Total(), std::size_t(1));
+    CHECK_EQ(host.sent.Total(), std::size_t(2)); // the Deauthentication, and (GB-01, 2026-11-15) the Logoff that tells bob, who remains
     CHECK_EQ(host.sent.CountTo(WifiPacket::Type::Deauthentication, alice.console.mac), 1);
+    CHECK_EQ(host.sent.CountTo(WifiPacket::Type::Data, bob.console.mac), 1);
     ConnectionStatus st = host.Status();
     CHECK_EQ(st.total_nodes, 2);
     CHECK_EQ(st.node_bitmask, 5); // nodes 1 and 3
@@ -3536,6 +3675,46 @@ static void TestTxQueue() {
             CHECK_EQ(tags[1 + i], static_cast<u8>(100 + i));
         }
     }
+    // (2026-11-15) up to a budget: in order, the first item always, the rest waits with its age and caps still held
+    {
+        TxQueue q;
+        TxQueue::Drops d;
+        for (int i = 0; i < 10; ++i) {
+            CHECK(q.Push(TxItem(1000, 0, true, static_cast<u8>(i)), 0, &d));
+        }
+        std::deque<TxQueue::Item> out;
+        CHECK(q.TakeUpTo(&out, 0, &d, 4096)); // 4 of 1000 fit, the fifth would be 5000
+        CHECK_EQ(out.size(), std::size_t(4));
+        CHECK(out.front().bytes[0] == 0 && out.back().bytes[0] == 3);
+        CHECK_EQ(q.size(), std::size_t(6));
+        CHECK_EQ(q.bytes(), std::size_t(6000));
+        out.clear();
+        CHECK(!q.TakeUpTo(&out, 0, &d, 1u << 20)); // a budget larger than the queue: all of it, nothing left
+        CHECK(out.size() == 6 && out.front().bytes[0] == 4 && out.back().bytes[0] == 9);
+        CHECK(q.empty() && q.bytes() == 0);
+        // the first item goes whatever its size
+        q.Push(TxItem(5000, 0, true, 1), 0, &d);
+        q.Push(TxItem(10, 0, true, 2), 0, &d);
+        out.clear();
+        CHECK(q.TakeUpTo(&out, 0, &d, 1392));
+        CHECK(out.size() == 1 && out[0].bytes.size() == 5000);
+        out.clear();
+        CHECK(!q.TakeUpTo(&out, 0, &d, 1392));
+        CHECK(out.size() == 1 && out[0].bytes[0] == 2);
+        // what waited goes stale as in the queue, and the handshake keeps its place
+        q.Push(TxItem(800, 0, true, 1), 0, &d);
+        q.Push(TxItem(800, 0, false, 2), 0, &d);
+        q.Push(TxItem(800, 0, true, 3), 0, &d);
+        out.clear();
+        CHECK(q.TakeUpTo(&out, 0, &d, 1000));
+        CHECK(out.size() == 1 && out[0].bytes[0] == 1);
+        const u32 stale_before = d.stale;
+        out.clear();
+        CHECK(!q.TakeUpTo(&out, 2000, &d, 1000)); // two seconds later: the game frame is stale, the handshake is not
+        CHECK(out.size() == 1 && out[0].bytes[0] == 2);
+        CHECK_EQ(d.stale, stale_before + 1);
+        CHECK(q.empty() && q.bytes() == 0);
+    }
     // a reference model: random pushes and takes agree with a plain re-implementation of the rules
     {
         struct Ref {
@@ -3915,6 +4094,19 @@ static void TestServiceTimeoutRule() {
     CHECK_EQ(ServiceTimeoutFor(false, 5, 0xFFFFFFFCu), kQuickPollMs); // the truncated clock wrapped: 9 ms after
     CHECK_EQ(ServiceTimeoutFor(false, 100, 0), kServiceTimeoutMs);
     CHECK_EQ(ServiceTimeoutFor(false, 0, 0), kQuickPollMs); // (the first ms of a session: harmless)
+    // 2026-11-10: which frames start the 10 ms of 1 ms polls when they are queued. Every frame but the host's own beacon (the
+    // network thread queues one every 102 ms with nothing of the game behind it: a host that stood still made 38 to 75 quick
+    // rounds a second for them). The beacon still goes out in the next round: "queued" above does not look at the type.
+    CHECK(!StartsQuickPoll(WifiPacket::Type::Beacon));
+    CHECK(StartsQuickPoll(WifiPacket::Type::Data));
+    CHECK(StartsQuickPoll(WifiPacket::Type::Authentication));
+    CHECK(StartsQuickPoll(WifiPacket::Type::AssociationResponse));
+    CHECK(StartsQuickPoll(WifiPacket::Type::Deauthentication));
+    CHECK(StartsQuickPoll(WifiPacket::Type::NodeMap));
+    for (int type = 0; type < 256; ++type) { // (and whatever a later version adds: only the beacon is left out)
+        CHECK_EQ(StartsQuickPoll(static_cast<WifiPacket::Type>(type)), type != static_cast<int>(WifiPacket::Type::Beacon));
+    }
+    CHECK_EQ(ServiceTimeoutFor(true, 1000, 0), 0u); // a beacon that is queued and never started a window: no wait at all
 
     // how a frame goes out at each level: the handshake always reliable and single; beacons and broadcast data unreliable from
     // level 1; unicast game data reliable at level 1, unreliable and doubled at level 2
@@ -3944,6 +4136,59 @@ static void TestServiceTimeoutRule() {
     CHECK_EQ(levels.fast_level(), 2);
     levels.SetFastData(false);
     CHECK(levels.fast_level() == 0 && !levels.fast_data());
+}
+
+// (2m-diag D1, 2026-11-21) The pause after a socket error is not a slow round. Tetris with eight, console 63: the lid closed, the WiFi gone,
+// 59.242 failing calls in 7.602 s and 2.369 lines "slow round" that were the 128 ms pause alone. ClassifyRound is what the network loop of
+// room_client.cpp asks at the end of every round; the real loop with a failing socket is in Tests/room_integration.cpp (TestSocketErrorsAreSpacedOut).
+static void TestSlowRoundsAndErrorPauses() {
+    std::printf("net loop: the pause after a socket error is not a slow round, a slow round still is (2m-diag D1)\n");
+    const u64 ms = AZL_TICKS_PER_MS;
+    // without a pause: exactly the rule of before (longer than 50 ms)
+    for (u64 t = 0; t <= 200 * ms; t += ms / 4) {
+        CHECK((ClassifyRound(t, 0) == RoundKind::Slow) == (t > kSlowTicks));
+        CHECK(ClassifyRound(t, 0) != RoundKind::PauseOnly);
+    }
+    CHECK(ClassifyRound(kSlowTicks, 0) == RoundKind::Normal);
+    CHECK(ClassifyRound(kSlowTicks + 1, 0) == RoundKind::Slow);
+    // socket errors in a row, as the loop pauses for them (2, 4 ... 64, then 128 ms) in rounds that are otherwise 3 ms: no slow round,
+    // and the ones the pause made longer than 50 ms counted apart (the 64 ms one and every 128 ms one)
+    u32 slow = 0, pause_only = 0;
+    for (u32 in_a_row = 1; in_a_row <= 40; ++in_a_row) {
+        const u64 pause = RoomClient::ServiceErrorPauseMs(in_a_row) * ms;
+        const RoundKind kind = ClassifyRound(pause + 3 * ms, pause);
+        slow += kind == RoundKind::Slow ? 1u : 0u;
+        pause_only += kind == RoundKind::PauseOnly ? 1u : 0u;
+    }
+    CHECK_EQ(slow, 0u);
+    CHECK_EQ(pause_only, 35u); // (the 6th error in a row, 64 ms, and the 7th..40th, 128 ms)
+    // a round slow besides its pause is still slow: 128 ms of pause and 60 ms of the round's own work
+    CHECK(ClassifyRound(188 * ms, 128 * ms) == RoundKind::Slow);
+    CHECK(ClassifyRound(178 * ms, 128 * ms) == RoundKind::PauseOnly); // (50 ms of its own: not more than 50)
+    CHECK(ClassifyRound(40 * ms, 32 * ms) == RoundKind::Normal);      // (short with its pause: nothing to count)
+    CHECK(ClassifyRound(100 * ms, 200 * ms) == RoundKind::PauseOnly); // (a pause read longer than the round: never a wrap to a slow one)
+    // (2m-rev, 2026-11-22) The loop gives ClassifyRound the pause MEASURED around SleepMs, capped by PauseTakenOff at the one asked for
+    // plus 10 ms: a thread woken up late is a slow round with its line, as before the 2m.
+    CHECK(PauseTakenOff(128 * ms, 128) == 128 * ms);
+    CHECK(PauseTakenOff(138 * ms, 128) == 138 * ms);
+    CHECK(PauseTakenOff(139 * ms, 128) == (128 + kPauseSlackMs) * ms);
+    CHECK(PauseTakenOff(428 * ms, 128) == 138 * ms);
+    CHECK(PauseTakenOff(0, 0) == 0); // (a round with no error: nothing to take off)
+    CHECK(ClassifyRound(431 * ms, PauseTakenOff(428 * ms, 128)) == RoundKind::Slow); // (300 ms late: the scheduler, not the pause)
+    CHECK(ClassifyRound(431 * ms, 428 * ms) == RoundKind::PauseOnly);                 // (... which the 2m took for the pause)
+    // a wake-up up to 10 ms late is still the pause: the socket errors in a row of above, each woken up 0-10 ms late, no slow round
+    u32 late_slow = 0;
+    for (u32 in_a_row = 1; in_a_row <= 40; ++in_a_row) {
+        const u32 asked = RoomClient::ServiceErrorPauseMs(in_a_row);
+        for (u64 late = 0; late <= kPauseSlackMs * ms; late += ms / 2) {
+            const u64 measured = asked * ms + late;
+            late_slow += ClassifyRound(measured + 3 * ms, PauseTakenOff(measured, asked)) == RoundKind::Slow ? 1u : 0u;
+        }
+    }
+    CHECK_EQ(late_slow, 0u);
+    // a round of 16.1 s (the thread held) is slow, with its pause or without: 64 bits, no wrap of 2^32 ticks (about 16 s) to 81 ms
+    CHECK(ClassifyRound(16100 * ms, PauseTakenOff(128 * ms, 128)) == RoundKind::Slow);
+    CHECK(ClassifyRound(16100 * ms, 0) == RoundKind::Slow);
 }
 
 static void TestStatsSinks() {
@@ -4330,6 +4575,87 @@ static std::vector<std::string> CaptureTexts() {
         texts.push_back(line.substr(line.find(' ', 6) + 1)); // (without the time)
     }
     return texts;
+}
+
+// The diet of the capture where the engine decides it (1.1.4): on a GAME's network the frame a bind takes and the frame SendTo
+// sends leave their first 32 bytes; on the Download Play's network (here: the lobby's inbox switched on) they are whole.
+static void TestCaptureDietOnTheWire() {
+    std::printf("capture: a game's data frames leave their first 32 bytes, the Download Play's network's are whole\n");
+    g_rules.Reset();
+    MockRoom room;
+    Bench host(room, 1), alice(room, 2);
+    host.Init();
+    host.BeginHosting(4);
+    alice.Init();
+    CHECK_EQ(JoinBench(room, alice, host), 0u);
+    const u16 me = alice.Status().network_node_id;
+    CHECK_EQ(me, 2);
+    u32 bind_event = 0;
+    CHECK_EQ(alice.e().Bind(2, 0x5F4, 243, kBroadcastNetworkNodeId, &bind_event), 0u);
+    CHECK(DebugInit());
+    g_debug_level = 1;
+    DebugReset();
+    u8 in[100], out[100];
+    std::string in_hex, out_hex;
+    for (int i = 0; i < 100; ++i) {
+        in[i] = static_cast<u8>(0x10 + i);
+        out[i] = static_cast<u8>(0xC0 ^ i);
+        char two[3];
+        std::snprintf(two, sizeof(two), "%02x", in[i]);
+        in_hex += two;
+        std::snprintf(two, sizeof(two), "%02x", out[i]);
+        out_hex += two;
+    }
+    const auto packet = [&]() {
+        WifiPacket p;
+        p.type = WifiPacket::Type::Data;
+        p.channel = 11;
+        p.transmitter_address = host.console.mac;
+        p.destination_address = kBroadcastMac;
+        p.data = GenerateDataPayload(in, sizeof(in), 243, me, 1, 0);
+        return p;
+    };
+    // (the host's own lines of what alice sends come when the room's thread gets to them: each line is looked for, not counted)
+    const auto has = [](const std::vector<std::string>& lines, const std::string& line) {
+        return std::count(lines.begin(), lines.end(), line) == 1;
+    };
+    // a game's network: the head of the frame, and its whole length in the header of the line
+    alice.e().OnWifiPacket(packet());
+    CHECK_EQ(alice.e().SendTo(1, 243, sizeof(out), 0, out, sizeof(out)), 0u);
+    std::vector<std::string> lines = CaptureTexts();
+    CHECK(has(lines, "FRAME rx    1>2 ch243 100B (cut): " + in_hex.substr(0, 2 * kDebugFrameHead) + "\n"));
+    CHECK(has(lines, "FRAME tx    2>1 ch243 100B (cut): " + out_hex.substr(0, 2 * kDebugFrameHead) + "\n"));
+    // the Download Play's network: whole, both ways
+    alice.e().SetLobbyInbox(true);
+    alice.e().OnWifiPacket(packet());
+    CHECK_EQ(alice.e().SendTo(1, 243, sizeof(out), 0, out, sizeof(out)), 0u);
+    lines = CaptureTexts();
+    CHECK(has(lines, "FRAME rx    1>2 ch243 100B: " + in_hex + "\n"));
+    CHECK(has(lines, "FRAME tx    2>1 ch243 100B: " + out_hex + "\n"));
+    alice.e().SetLobbyInbox(false);
+    // ... and a game's again once the lobby is over
+    alice.e().OnWifiPacket(packet());
+    lines = CaptureTexts();
+    CHECK(has(lines, "FRAME rx    1>2 ch243 100B (cut): " + in_hex.substr(0, 2 * kDebugFrameHead) + "\n"));
+    // The REAL Download Play's network (BeginHostingDlp: the engine's other flag, dlp_net_) is whole as the lobby's is - its
+    // announces go out on channel 2 - and the same console's frames are a game's again after the Shutdown that ends it.
+    Bench carol(room, 3);
+    carol.Init();
+    CHECK_EQ(carol.e().BeginHostingDlp(4, 6), 0u);
+    CaptureTexts();
+    CHECK_EQ(carol.e().SendTo(kBroadcastNetworkNodeId, 2, sizeof(out), 0, out, sizeof(out)), 0u);
+    lines = CaptureTexts();
+    CHECK(has(lines, "FRAME tx    1>all ch2 100B: " + out_hex + "\n"));
+    CHECK_EQ(carol.e().Shutdown(), 0u);
+    carol.Init();
+    carol.BeginHosting(4);
+    CaptureTexts();
+    CHECK_EQ(carol.e().SendTo(kBroadcastNetworkNodeId, 2, sizeof(out), 0, out, sizeof(out)), 0u);
+    lines = CaptureTexts();
+    CHECK(has(lines, "FRAME tx    1>all ch2 100B (cut): " + out_hex.substr(0, 2 * kDebugFrameHead) + "\n"));
+    g_debug_level = 0;
+    DebugReset();
+    CHECK_RULES();
 }
 
 static void TestCaptureOfDroppedFrames() {
@@ -4839,7 +5165,8 @@ static void TestRoomPresence() {
     host.e().Tick(In(10000));
     CHECK_EQ(host.Status().total_nodes, 3);
 
-    // Gone for good: his node is removed once, the game is told once, nothing is sent (spec U3).
+    // Gone for good: his node is removed once, the game is told once, and (GB-01, 2026-11-15: spec U3 said nothing was sent) alice, who
+    // remains, gets the Logoff of her node - the one frame.
     host.sent.Clear();
     const u32 events = host.Signals(host.status_event);
     host.e().OnRoomMembers(Members({&host, &alice}));
@@ -4855,7 +5182,8 @@ static void TestRoomPresence() {
     CHECK_EQ(host.e().GetNodeInformation(3, &node), kNodeNotFound);
     host.e().Tick(In(9000));
     CHECK_EQ(host.Signals(host.status_event), events + 1);
-    CHECK_EQ(NonBeacons(host), std::size_t(0));
+    CHECK_EQ(NonBeacons(host), std::size_t(1));
+    CHECK_EQ(host.sent.CountTo(WifiPacket::Type::Data, alice.console.mac), 1);
     CHECK_EQ(g_stats.node_removed[3], 1u);
     // His own MAC missing from a list means nothing (the room lists the member it is talking to).
     host.e().OnRoomMembers(Members({&alice}));
@@ -4874,7 +5202,7 @@ static void TestRoomPresence() {
     host.e().Tick(In(4000));
     CHECK_EQ(host.Status().total_nodes, 1); // alice went; carol was never a node
     CHECK_EQ(host.Signals(host.status_event), events + 2);
-    CHECK_EQ(NonBeacons(host), std::size_t(0));
+    CHECK_EQ(NonBeacons(host), std::size_t(1)); // (the Logoff to alice above; nobody remains now to be told)
 
     // A client (spec U4): the departed client's node goes locally, the session stays a client's.
     CHECK_EQ(alice.e().DisconnectNetwork(), 0u);
@@ -4988,14 +5316,15 @@ static void TestRoomMemberStopsPlaying() {
     host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "Kirby Battle Royale", kGame}, {&bob, "", 0}}));
     host.e().Tick(In(2500));
     CHECK_EQ(host.Status().total_nodes, 3);
-    // ... and after it his node goes: once, the game told once, nothing on the wire.
+    // ... and after it his node goes: once, the game told once, and (GB-01) the Logoff that tells alice, who remains: the one frame on the wire.
     host.e().Tick(In(4000));
     ConnectionStatus st = host.Status();
     CHECK_EQ(st.total_nodes, 2);
     CHECK_EQ(st.node_bitmask, 3);
     CHECK_EQ(st.changed_nodes, 0x0004);
     CHECK_EQ(host.Signals(host.status_event), events + 1);
-    CHECK_EQ(NonBeacons(host), std::size_t(0));
+    CHECK_EQ(NonBeacons(host), std::size_t(1));
+    CHECK_EQ(host.sent.CountTo(WifiPacket::Type::Data, alice.console.mac), 1);
     CHECK_EQ(g_stats.node_removed[3], 1u);
     // Alice stops playing and plays again within 2 s (a game started over): she stays.
     host.e().OnRoomMembers(playing({{&host, "Kirby Battle Royale", kGame}, {&alice, "", 0}}));
@@ -5240,6 +5569,117 @@ static void TestLateSecondDeauth() {
     room.WaitIdle();
     CHECK_EQ(nodes(), 1);
     CHECK_EQ(g_stats.deauth_late, 2u);
+    CHECK_RULES();
+}
+
+// 2026-11-14, Mario Party: Island Tour hosted by a console: a member of the room with Tetris open came into the network and held a place.
+// The rule of azl/one_game_host.hpp, alone: who is "another game" for a host, and for which hosts the question is asked at all.
+static void TestOneGameRule() {
+    std::printf("one game: a host of Island Tour (any region) counts as another game only a sold game that is not Island Tour\n");
+    using namespace azl::one_game;
+    const u64 kIsland[] = {0x00040000000DD400ull, 0x00040000000F8100ull, 0x00040000000F8200ull, 0x0004000000119300ull,
+                           0x0004000000119B00ull};
+    const u64 kTetris = 0x00040000000A0500ull;       // (a sold game: unique id 0x00A05, in the first range)
+    const u64 kNewOnly = 0x000400000F701200ull;      // (a sold game of the second range: unique id 0xF7012)
+    for (const u64 own : kIsland) {
+        CHECK_EQ(HostKeepsToItsGame(own), true);
+        CHECK_EQ(PlaysAnotherGame(own, kTetris), true);
+        CHECK_EQ(PlaysAnotherGame(own, kNewOnly), true);
+        CHECK_EQ(PlaysAnotherGame(own, 0), false);                        // says no game
+        CHECK_EQ(PlaysAnotherGame(own, 0x0004001000022100ull), false);    // the Download Play application
+        CHECK_EQ(PlaysAnotherGame(own, 0x00040001000F8200ull), false);    // the Download Play child
+        CHECK_EQ(PlaysAnotherGame(own, 0x000400000F83D100ull), false);    // a homebrew outside the ranges (3DS Link itself)
+        CHECK_EQ(PlaysAnotherGame(own, 0x0004000E000F8200ull), false);    // an update is not an application
+        for (const u64 other : kIsland) {
+            CHECK_EQ(PlaysAnotherGame(own, other), false);                // the same game in another region
+        }
+    }
+    CHECK_EQ(HostKeepsToItsGame(0x00040001000F8200ull), false); // a child never hosts by the rule
+    CHECK_EQ(HostKeepsToItsGame(0x0004000000030800ull), false); // another game: the rule does not apply ...
+    CHECK_EQ(PlaysAnotherGame(0x0004000000030800ull, kTetris), false); // ... and nobody is another game for it
+    CHECK_EQ(HostKeepsToItsGame(0x00040000000F8300ull), false); // one step from a listed id is another title
+    CHECK_EQ(HostKeepsToItsGame(0), false);
+    // every row of azl/title_rules.hpp, whatever it holds (a row added later is run here with no new line): its application keeps to its
+    // game exactly when the row says so, its child never, and for such a host its own game in any region is never another game
+    for (std::size_t r = 0; r < azl::title_rules::kRowCount; ++r) {
+        const azl::title_rules::Row& row = azl::title_rules::kRows[r];
+        for (const u32 low : row.low) {
+            if (low == 0) {
+                continue;
+            }
+            const u64 app = 0x0004000000000000ull | low;
+            CHECK_EQ(HostKeepsToItsGame(app), row.rules.host_keeps_to_its_game);
+            CHECK_EQ(HostKeepsToItsGame(0x0004000100000000ull | low), false);
+            CHECK_EQ(PlaysAnotherGame(app, kTetris), row.rules.host_keeps_to_its_game && !azl::title_rules::SameGame(app, kTetris));
+            for (const u32 same : row.low) {
+                if (same != 0) {
+                    CHECK_EQ(PlaysAnotherGame(app, 0x0004000000000000ull | same), false);
+                }
+            }
+        }
+    }
+    // the edges of the ranges (ConfigApp/source/games.hpp)
+    CHECK_EQ(IsSoldGame(0x0004000000030000ull), true);
+    CHECK_EQ(IsSoldGame(0x000400000002FF00ull), false);
+    CHECK_EQ(IsSoldGame(0x00040000001FFF00ull), true);
+    CHECK_EQ(IsSoldGame(0x0004000000200000ull), false);
+    CHECK_EQ(IsSoldGame(0x000400000F700000ull), true);
+    CHECK_EQ(IsSoldGame(0x000400000F71FF00ull), true);
+    CHECK_EQ(IsSoldGame(0x000400000F6FFF00ull), false);
+    CHECK_EQ(IsSoldGame(0x000400000F720000ull), false);
+}
+
+// The engine side of it: a newcomer the plugin lists as playing another game gets no answer to its Authentication (as when the network
+// is full), a node already in the network stays, an empty list and the end of the room link let everybody in again.
+static void TestOtherGameNewcomer() {
+    std::printf("host: a newcomer that plays another game in the room is not answered; the others are, and nobody is put out\n");
+    g_rules.Reset();
+    std::memset(&g_stats, 0, sizeof(g_stats));
+    MockRoom room;
+    Bench host(room, 1);
+    CHECK_EQ(host.Init(), 0u);
+    CHECK_EQ(host.BeginHosting(4), 0u);
+    host.Status();
+    RawClient a(room, 2), b(room, 3), c(room, 4);
+    const Mac H = host.console.mac;
+    auto join = [&](RawClient& x) {
+        x.Auth(H);
+        room.WaitIdle();
+        x.Start(H);
+        room.WaitIdle();
+    };
+    auto nodes = [&] { return host.Status().total_nodes; };
+
+    host.e().SetOtherGameMembers({a.mac});
+    join(a); // in the room with Tetris: no answer, no node
+    CHECK_EQ(nodes(), 1);
+    CHECK_EQ(g_stats.auth_other_game, 1u);
+    join(a); // it tries again: still nothing
+    CHECK_EQ(nodes(), 1);
+    CHECK_EQ(g_stats.auth_other_game, 2u);
+    join(b); // not listed: in
+    CHECK_EQ(nodes(), 2);
+    CHECK_EQ(g_stats.auth_other_game, 2u);
+
+    // b opens another game while in the network (the list says so now): it is not put out, and a new Authentication of a node
+    // already in is not refused either (the rule is for newcomers)
+    host.e().SetOtherGameMembers({a.mac, b.mac});
+    room.WaitIdle();
+    CHECK_EQ(nodes(), 2);
+    CHECK_EQ(host.Status().node_bitmask, 3);
+
+    // a closes Tetris: the next list no longer has it, and it joins
+    host.e().SetOtherGameMembers({});
+    join(a);
+    CHECK_EQ(nodes(), 3);
+    CHECK_EQ(g_stats.auth_other_game, 2u);
+
+    // the room link begins anew: what was known of who plays what is void
+    host.e().SetOtherGameMembers({c.mac});
+    host.e().ResetRoomPresence();
+    join(c);
+    CHECK_EQ(nodes(), 4);
+    CHECK_EQ(g_stats.auth_other_game, 2u);
     CHECK_RULES();
 }
 
@@ -6281,6 +6721,9 @@ static void TestJoinsInOneRoundTrip() {
         return done();
     };
     CHECK(spin([&] { return alice.e().status() == NetworkStatus::Connecting; }));
+    // (the host's association first: since 2026-11-15 a client takes no Logoff before it, in every network - the departure notice of GB-01
+    // names a client's own node, and a client that is Connecting again must not take it for its admission)
+    alice.e().OnWifiPacket(MakePkt(WifiPacket::Type::AssociationResponse, X, alice.console.mac, GenerateAssocResponseFrame(0, 1, 0xDEADBEEF)));
 
     std::vector<NodeInfo> nodes(4);
     nodes[0] = MakeNode(0x1111, "AzHost", 1);
@@ -6318,6 +6761,7 @@ static void TestJoinsInOneRoundTrip() {
         returned2 = true;
     });
     CHECK(spin([&] { return carol.e().status() == NetworkStatus::Connecting; }));
+    carol.e().OnWifiPacket(MakePkt(WifiPacket::Type::AssociationResponse, X, carol.console.mac, GenerateAssocResponseFrame(0, 1, 0xDEADBEEF)));
     std::vector<NodeInfo> only_host(4);
     only_host[0] = MakeNode(0x1111, "AzHost", 1);
     WifiPacket unlisted;
@@ -6443,6 +6887,7 @@ int main() {
     TestAzaharHostModel();
     TestDebugCapture();
     TestCaptureOfDroppedFrames();
+    TestCaptureDietOnTheWire();
     TestNodeMapLines();
     TestRoleLines();
     TestEngineBeforeInitialize();
@@ -6482,6 +6927,7 @@ int main() {
     TestSignalsAfterUnlock();
     TestTickWithoutLock();
     TestServiceTimeoutRule();
+    TestSlowRoundsAndErrorPauses();
     TestStatsSinks();
     TestPrefilterEquivalence();
     TestEngineEventCounters();
@@ -6491,6 +6937,8 @@ int main() {
     TestRoomMemberStopsPlaying();
     TestBeaconSchedule();
     TestLateSecondDeauth();
+    TestOneGameRule();
+    TestOtherGameNewcomer();
     TestForeignLobbyHost();
     TestForeignLobbyClient();
     TestForeignLobbyLegit();

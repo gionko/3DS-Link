@@ -181,7 +181,7 @@ static void TestUnknownKeysAndRoundTrip() {
 
 static const char* const kGoldenDefault =
     "enabled=1\nhost=\nport=24872\nnickname=\npassword=\ntunnel=1\nautoconnect=1\nradio_like=1\nsocket_buffers=1\n"
-    "net_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\nsleep_stop=0\nchat=1\nchat_key=L+Left+Select\n"
+    "net_thread_core=-1\nmenu_key=off\ngame_name=\ndebug=0\nrcvbuf_kb=64\nsleep_stop=0\nchat=0\nchat_key=L+Left+Select\n"
     "chat_pos=bottom-left\n";
 
 // The file of PROVA 1 as it was on the card: the 13 keys of 0.1.14, written by the Setup app (LF), and a last line that
@@ -326,6 +326,10 @@ static void TestChatPosRow() {
         const setup::Settings read = LoadFrom(std::string("chat_pos=") + c.value + "\n");
         CHECK(read.chat_pos == c.want && read.unknown_lines.empty());
     }
+    // (2026-11-19, the build 2h: the user's choice) the chat is OFF by default - a new file, a file without the key, a word that is not one;
+    // a file that says chat=1 keeps it on (the user's choice is never changed)
+    CHECK(!setup::Settings().chat && !azl::ini::kChatDefault && !azl::ini::Fields().chat);
+    CHECK(LoadFrom("enabled=1\nchat=1\n").chat && !LoadFrom("enabled=1\n").chat && !LoadFrom("chat=maybe\n").chat);
     // a file without the key (every file before the chat): the default, and the app completes it
     setup::Settings old = LoadFrom("enabled=1\nhost=h\nchat=0\nchat_key=L+Up+Select\n");
     CHECK(old.chat_pos == azl::ini::kChatPosBottomLeft && !old.chat && !setup::HasAllKeys(old));
@@ -410,7 +414,7 @@ static void TestHandEdits() {
     CHECK(setup::SaveSettings(other));
     const std::string saved = ReadIni();
     CHECK(Has(saved, "# my notes") && Has(saved, "future_key=7") && Has(saved, "sleep_stop=1"));
-    CHECK(saved.find("sleep_stop=1\nchat=1\nchat_key=L+Left+Select\nchat_pos=bottom-left\n# my notes\nfuture_key=7\n") != std::string::npos); // after the keys, in order
+    CHECK(saved.find("sleep_stop=1\nchat=0\nchat_key=L+Left+Select\nchat_pos=bottom-left\n# my notes\nfuture_key=7\n") != std::string::npos); // after the keys, in order (a file without chat: off, 2026-11-19)
     // a BOM in front of a comment stays out of the line that is kept
     setup::Settings bom_comment = LoadFrom("\xEF\xBB\xBF" "# my notes\nhost=h\n");
     CHECK(bom_comment.unknown_lines.size() == 1 && bom_comment.unknown_lines[0] == "# my notes");
@@ -551,6 +555,22 @@ static void TestTextFiles() {
     CHECK(!setup::WriteTextFile(file, "x") && fs::is_directory(file) && !fs::exists(file + ".tmp"));
     // a folder that is not there: nothing is written
     CHECK(!setup::WriteTextFile("sdmc:/nowhere/b.txt", "x"));
+    fs::remove_all("sdmc:");
+}
+
+// F7 (2026-11-21): the plugin saves AzaharLink.ini in the app's order too (Includes/azl/whole_file.hpp), so a save of either cut between its two
+// renames leaves AzaharLink.ini.bak alone: the app reads its keys, puts it back at its place, and does not take the file for a first run
+static void TestIniBakAlone() {
+    std::printf("F7: AzaharLink.ini.bak alone (a save cut between its renames): the settings are read from it and it goes back to its place\n");
+    fs::remove_all("sdmc:");
+    WriteIni("enabled=1\nhost=bak.example\nport=24999\nnickname=Saved\npassword=pw-bak\n");
+    const std::string bak = std::string(setup::kIniPath) + ".bak";
+    fs::rename(setup::kIniPath, bak);
+    setup::Settings cfg;
+    CHECK(setup::LoadSettings(cfg) == setup::LoadResult::Loaded);
+    CHECK(cfg.host == "bak.example" && cfg.port == 24999 && cfg.nickname == "Saved" && cfg.password == "pw-bak");
+    CHECK(cfg.keys_seen != 0 && !cfg.moved_from_old_place);
+    CHECK(fs::exists(setup::kIniPath) && !fs::exists(bak) && Has(ReadIni(), "host=bak.example"));
     fs::remove_all("sdmc:");
 }
 
@@ -820,6 +840,7 @@ int main() {
     TestUnreadableIsNeverWrittenOver();
     TestOldPlaceIsMoved();
     TestTextFiles();
+    TestIniBakAlone();
     TestServerParse();
     TestServerList();
     TestServerFile();

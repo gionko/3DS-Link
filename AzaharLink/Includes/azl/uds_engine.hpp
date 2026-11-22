@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "azl/flow_relief.hpp"
 #include "azl/platform.hpp"
 #include "azl/uds_dedupe.hpp"
 #include "azl/uds_frames.hpp"
@@ -146,6 +147,10 @@ public:
     /// beacons of its hosts, spec C7, and the count-only mode let the game list the emulator's Tekken lobby in the same
     /// room and join it, in a loop). Off: they are only counted and logged (the tests keep that mode).
     void SetScanFilterEnforced(bool enforced);
+    /// The same-frame filter of the dense-broadcast titles (azl/flow_relief.hpp): a frame SendTo is given for ALL nodes (the broadcast node id) that is
+    /// byte for byte the one last sent on its data channel, less than `window_ms` ago, is not sent again; the game gets success, as for a frame the
+    /// radio loses. 0 (the default, every other game): every frame is sent. Never applied to the frames of a Download Play lobby's network.
+    void SetSameFrameWindow(u32 window_ms);
 
     u32 SetApplicationData(const u8* data, u32 size);
     /// Copies up to `capacity` bytes; `*actual` is 0 if the game's buffer is too small.
@@ -199,6 +204,10 @@ public:
     /// stays out of the lists for 3 s has left: a host removes its node, a client its node or, if it was the host, the
     /// network. The first list of a join says who is there and concludes nothing. Nothing is sent.
     void OnRoomMembers(const std::vector<Mac>& members);
+    /// The members of the room that play another game than the host's, for a host that keeps its network to its game
+    /// (azl/one_game_host.hpp; empty for every other title): a newcomer among them gets no answer to its Authentication,
+    /// as when the network is full. Replaces the list before; a node already in the network is not touched. Nothing is sent.
+    void SetOtherGameMembers(const std::vector<Mac>& members);
     /// The room link ended or begins anew: what is known of who was in the room is void.
     void ResetRoomPresence();
     void OnWifiPacket(const WifiPacket& packet);
@@ -233,7 +242,7 @@ public:
     /// One lobby heard lately: whose beacon it is, on which channel, how many nodes it says it has and the first bytes of its
     /// application data (`size` counts what is copied, at most kHeardDataMax).
     static constexpr u32 kHeardDataMax = 32;
-    static constexpr u32 kHeardLobbies = 4; ///< a room of 4 players holds at most 4 hosts: the engine keeps the 4 newest
+    static constexpr u32 kHeardLobbies = 4; ///< hosts, not players (a lobby may have eight): the engine keeps the 4 newest, as many as a searcher lists
     struct HeardLobby {
         Mac host;
         u8 channel;
@@ -275,7 +284,14 @@ public:
     /// same room has the same node ids and would rewrite its roster).
     static constexpr u8 kLobbyChannel = 0xD1;
     static constexpr u32 kLobbyMessageMax = 16;
-    static constexpr u32 kLobbyInbox = 8;
+    static constexpr u32 kLobbyInbox = 16; // (2026-11-15, D5: 8 -> 16, +144 bytes of the lobby only: with seven clients, a room of 100 ms and the host stalled 1.1 s after START, 2-5 of 7 were ejected)
+    /// GB-01 (2026-11-15): a host of a game's own network tells the clients that remain about every departure, as a console does (true, always, in
+    /// the plugin). false is AZAHAR's host, which tells nobody (nwm_uds.cpp HandleDeauthenticationFrame, "TODO broadcast new connection_status"): for
+    /// the tests' model of an Azahar host only (Tests/azahar_dlp_host.hpp), never called by the plugin (Tests/policy_check.sh).
+    void SetHostTellsDepartures(bool on) {
+        Guard lock(this);
+        tells_departures_ = on;
+    }
     void SetLobbyInbox(bool on);
     /// Allocates what a lobby keeps (the lobbies heard, the ring) if it is not there yet; false = no memory. Idempotent.
     bool PrepareLobby();
@@ -287,6 +303,17 @@ public:
     /// and the mask of the nodes present (bit n-1 = node n). False, with both 0, when we are not in a network (a host, a client or
     /// a spectator).
     bool NodeSnapshot(u16* my_node, u16* node_bitmask) const;
+    /// 1.1.4 (H5, the host of the real Download Play): the MAC of node `node_id` of the network this engine is in (the host's for 1); false if
+    /// it is not known. Under the lock; nothing is sent.
+    bool NodeMac(u16 node_id, Mac* out) const;
+    /// True if the room's last member list has `mac` and it has not left it since (false at once for a member that is out of the list, before
+    /// the debounce time: InRoomLocked). False before any list.
+    bool InRoom(const Mac& mac) const;
+    /// The members of the room that are in the system's Download Play application (their game id is one of its ids: the plugin's OnRoomInfo,
+    /// only for a host that waits for its guests' children, H5); replaces the list before, voided with the room link (ResetRoomPresence).
+    void SetDownloadPlayMembers(const std::vector<Mac>& members);
+    /// True if the last list of SetDownloadPlayMembers has `mac`.
+    bool InDownloadPlay(const Mac& mac) const;
 
     // ---- The REAL Download Play (1.1.3, the RealDlp mode: analysis/luigi-azahar-2026-11-09/PROGETTO-DLP-VERO-1.1.3.md) ----------
     // The games of that mode find their group with the Download Play that Azahar emulates: a network of the Download Play's
@@ -326,6 +353,15 @@ public:
     /// Whether that filter is on now (the tests of the real Download Play: its adapter turns it on for a probe and a session, and off
     /// whenever it gives the engine back).
     bool client_foreign_filter_enforced() const;
+
+    /// A switch of the TITLE, off for every game that does not ask (the plugin sets it once, for Mario Kart 7; not reset by Shutdown).
+    /// On, a host sends the Logoff of an admission to the members of its network one by one - a client's to every member, a
+    /// spectator's to the spectator alone - also in the GAME's own network, as it does in the real Download Play's (design D16),
+    /// instead of broadcasting it: Azahar's nwm adopts ANY Logoff it hears while it is Connecting, and the players of Mario Kart 7
+    /// come back from the Download Play all within a tenth of a second (the capture of eight Azahar, 2026-11-13: three of seven
+    /// took another's node id, the two whose id was taken fell out). Off, every frame is what it was.
+    void SetAdmissionToMembers(bool on);
+    bool admission_to_members() const;
 
     // ---- Introspection (for the UI) -------------------------------------------------------------
     NetworkStatus status() const;
@@ -447,7 +483,7 @@ private:
         Mac mac;
         u64 ms = 0; ///< 0: unused
     };
-    static constexpr u32 kLeftTable = 4;
+    static constexpr u32 kLeftTable = 15; // (2026-11-15, D5: the clients of a network of 16; it was 4, and six guests of a network of 8 that said goodbye twice lost the guard)
     LeftNode left_[kLeftTable];
     u32 left_next_ = 0;
     void HandleNodeMapPacket(const WifiPacket& packet);
@@ -476,7 +512,8 @@ private:
     /// A node left: its unread lobby messages go with it.
     void PurgeLobbyMessagesLocked(u16 node);
     /// The creator's remaining clients are told who is left, with the unicast Logoff of the admission handshake (the engine's hosts
-    /// send no other news of a departure, and a client's roster would show the one that left until the next admission).
+    /// send no other news of a departure, and a client's roster would show the one that left until the next admission). In a lobby
+    /// of the dialect, and - for a client that left, never for a spectator - in the network of the real Download Play (design D17).
     void RefreshClientsLocked();
     struct LobbyMessage {
         u8 from;
@@ -504,6 +541,9 @@ private:
     /// Download Play and the plugin, says goodbye ONCE: the guard of a late second goodbye would swallow the real one of a searcher
     /// that came in as a spectator and joins at once, or of a client that leaves, rejoins and leaves again).
     bool dlp_net_ = false;
+    bool quiet_removals_ = false; // (2026-11-15, GB-01) the removals of an EjectClient of everybody: nobody remains to be told
+    bool tells_departures_ = true; // (2026-11-15, GB-01) false only in the tests' model of an AZAHAR host (SetHostTellsDepartures)
+    bool admission_to_members_ = false; ///< SetAdmissionToMembers: the title's, kept across Shutdown
     LobbyBeaconKind lobby_beacon_kind_ = LobbyBeaconKind::Ours;
     /// The one place connection_status_.status changes (the mirror Tick reads without the lock follows it).
     void SetStatusLocked(NetworkStatus status);
@@ -512,6 +552,24 @@ private:
     void ForgetChangedNodesLocked(const std::vector<NodeInfo>& before);
     void SendAssociationResponseFrame(const Mac& address);
     void SendBeaconLocked();
+    /// 2026-11-10 (LAT-7 / UDS-BEACON, written against 1.0.4 and carried over by hand): the host's beacon is a pure function of
+    /// network_info_ and node_info_ (the "uptime" it carries is a constant; the channel and the addresses go in the WifiPacket
+    /// around it, not in these bytes), and it costs a SHA-1, an MD5 and an AES-CTR in software (0.25 to 1 ms at 268 MHz, ten times
+    /// a second, under mu_, for bytes that are almost always the ones of the beacon before). So the last one is kept together
+    /// with the exact inputs it was made from and handed out again for as long as they are the same.
+    /// The key is the inputs themselves, not a "dirty" flag raised at the places that change them: a place that was forgotten
+    /// (the real Download Play's network, the spectators' count, whatever comes next) could only make a beacon that lies, this
+    /// cannot. Network thread only (Tick), mu_ held.
+    void BeaconFrameLocked(std::vector<u8>* out);
+    struct BeaconCache {
+        NetworkInfo network;
+        std::vector<NodeInfo> nodes;
+        std::vector<u8> frame;
+    };
+    /// Only while hosting (Teardown frees it). The plugin's heap: 0.7 to 1 KB as a rule, about 1.6 KB at the most (the struct, a node
+    /// table that always has max_nodes places - 16 x 32 bytes - and a frame of up to 795 bytes with 16 nodes and 200 bytes of application
+    /// data); while a beacon is made again the old frame, the new one and the copy that goes out live side by side for a moment.
+    std::unique_ptr<BeaconCache> beacon_cache_;
 
     /// Logs one line (main log and debug capture) whenever the role the game sees changes:
     /// off / idle / connecting / host / client / spectator. mu_ held.
@@ -574,6 +632,8 @@ private:
     ForwardDedupe fwd_dedupe_; // client side: drops the host's re-broadcast of a frame already delivered (1 KB)
     CopyDedupe copy_dedupe_;   // drops the copy a radio_like=2 sender adds to a unicast frame (by its sequence number; 1.2 KB)
     u16 tx_seq_ = 0;           // the sequence number of the last frame SendTo built (1, 2, 3 ...; the real nwm numbers its frames)
+    std::atomic<u32> same_frame_ms_{0}; // SetSameFrameWindow: 0 = every frame is sent (read by SendTo before it takes the lock)
+    flow::SameFrame same_frame_; // the broadcast frame last sent on each data channel (32 bytes)
     /// The newest beacon of every transmitter heard lately (also before Initialize and between scans:
     /// a scan reports what was heard while it listened, it does not consume anything).
     struct HeardBeacon {
@@ -614,6 +674,10 @@ private:
     };
     std::vector<Mac> present_;
     std::vector<Absent> absent_;
+    std::vector<Mac> other_game_;    ///< SetOtherGameMembers: the newcomers a host of a title that keeps to its game does not answer
+    std::vector<Mac> download_play_; ///< SetDownloadPlayMembers: the members in the system's Download Play application (H5)
+    Mac other_game_logged_{};        ///< the last of them a refusal was logged for ...
+    u64 other_game_logged_ms_ = 0;   ///< ... and when (one line per newcomer every 5 s)
 
     u32 traced_role_ = 0; // 0 = off, else the NetworkStatus last logged by TraceRoleLocked
 };

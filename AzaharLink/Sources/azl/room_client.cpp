@@ -5,6 +5,7 @@
 #include <cerrno>
 
 #include "azl/chat_core.hpp"
+#include "azl/flow_relief.hpp"
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
 #include "azl/ticks.h"
@@ -36,6 +37,12 @@ constexpr u32 kMaxReliableBacklog = 65536;
 // full soc ring (256 datagrams of ~416 B) can deliver in one go.
 constexpr std::size_t kMaxPacketSize = 64 * 1024;
 constexpr std::size_t kMaxWaitingData = 192 * 1024;
+// (2026-11-14: at this limit ENet used to refuse everything, the command that closes a hole too, for good. The limit is what it
+// was; the way out of it is ENet's - Includes/enet/enet.h, ENetHost::azlCapRefused - and the waiting data stays below this plus
+// two packets of kMaxPacketSize whatever arrives. The statistics line "room stream flow" says how near a window came.)
+static_assert(kMaxWaitingData == flow::kWaitingLimitBytes, "the statistics line names the limit the client gives ENet");
+static_assert(flow::kAwayMs == ENET_AZL_AWAY_MS, "the line of the losses names ENet's own number");
+static_assert(title_rules::kHandOverBurstMax == ENET_AZL_READ_MAX_DATAGRAMS, "a round hands over one read pass of ENet at the most");
 static_assert(chat::kIdChatMessage == room::IdChatMessage, "the chat decodes and sends the room's own chat message");
 
 u32 Ms(u64 v) {
@@ -274,6 +281,7 @@ bool RoomClient::Start(const Config& config) {
     const u32 generation = generation_.fetch_add(1) + 1;
     stop_requested_.store(false);
     quick_stop_.store(false);
+    leave_ack_.store(false);
     error_.store(static_cast<int>(Error::None));
     last_errno_.store(0); // (this attempt's: an errno of an earlier one says nothing about it)
     {
@@ -293,11 +301,12 @@ bool RoomClient::Start(const Config& config) {
     return true;
 }
 
-void RoomClient::Stop() {
+bool RoomClient::Stop() {
     stop_requested_.store(true);
     // Bounded: a network thread that is stuck in a service call (or starved) must not hang whoever stops the client - the
     // menu, the next attempt, the end of the game. It is left to finish on its own, its session void.
-    if (!thread_.JoinTimeout(kStopJoinMs)) {
+    const bool ended = thread_.JoinTimeout(kStopJoinMs);
+    if (!ended) {
         generation_.fetch_add(1);
         Log("room: the network thread did not stop within %lu ms: abandoned (it leaves on its own when it wakes up)",
             static_cast<unsigned long>(kStopJoinMs));
@@ -305,6 +314,7 @@ void RoomClient::Stop() {
     if (state() != State::Idle) {
         SetState(State::Idle);
     }
+    return ended;
 }
 
 void RoomClient::RequestStop(bool quick) {
@@ -350,7 +360,9 @@ void RoomClient::SendWifiPacket(const WifiPacket& packet) {
     platform::LockGuard lock(mutex_);
     if (tx_.Push(std::move(item), now, &drops)) {
         tx_pending_.store(1, std::memory_order_release);
-        last_enqueue_ms_.store(static_cast<u32>(now), std::memory_order_relaxed);
+        if (StartsQuickPoll(packet.type)) { // (not the host's own beacon: nothing of the game follows it)
+            last_enqueue_ms_.store(static_cast<u32>(now), std::memory_order_relaxed);
+        }
         if (type_index < 6) {
             ++g_stats.tx_frames[type_index];
         }
@@ -469,6 +481,15 @@ void RoomClient::Run(Config config, u32 generation) {
             connect_errors = 0;
         }
     }
+    // (2026-11-15) The connect loop's polls of 100 ms are not an absence of the thread (ENET_AZL_AWAY_MS is 100 too): what they made of the
+    // ring's backlog and its counters starts from nothing once the room answered (the review of 2026-11-15: a phantom "away" in the first window).
+    if (connected) {
+        client->azlAwayBacklog = 0;
+        client->azlCounters.awayEpisodes = 0;
+        client->azlCounters.awayDatagramsMax = 0;
+        client->azlCounters.awayBytesMax = 0;
+        client->azlCounters.awayDupMax = 0;
+    }
     if (!connected) {
         enet_peer_reset(server);
         if (!stopping()) {
@@ -522,6 +543,7 @@ void RoomClient::Run(Config config, u32 generation) {
     u64 chat_sent_ms = 0;     // when ENet took our last chat message (0: none): the goodbye waits for it (kChatGoodbyeMs)
     u32 cb_generation = ~0u;
     std::deque<TxQueue::Item> to_send;
+    u64 away_since = 0;          // the first round that found the ring's backlog after an absence (flow::NoteAwayBacklog; 0 = none)
     std::deque<std::vector<u8>> repeat; // the copies of the last round's doubled frames (radio_like=2): sent first thing next round
     constexpr std::size_t kRepeatMax = 64;
     static_assert(kRepeatMax * 2 <= CopyDedupe::kSeen, "the receiver remembers a whole batch of copies and what came between");
@@ -569,6 +591,9 @@ void RoomClient::Run(Config config, u32 generation) {
 
         ENetEvent event;
         client->azlDeliverOutOfOrder = fast_level_.load() >= 2 ? 1u : 0u; // (the room's reliable stream handed over as it arrives)
+        const u32 cap_drop_max = cap_drop_max_.load(std::memory_order_relaxed);
+        client->azlCapDrop = cap_drop_max != 0 ? EarlyFilter : nullptr; // (at the limit: a game frame dropped, not refused)
+        client->azlCapDropMax = cap_drop_max;                          // (... with the title's bound of the placeholders, never ENet's default)
         const u32 timeout_ms = ServiceTimeoutFor(tx_pending_.load(std::memory_order_acquire) != 0 || !repeat.empty(),
                                                  static_cast<u32>(loop_start_ms), last_enqueue_ms_.load(std::memory_order_relaxed));
         if (timeout_ms == 0) {
@@ -613,6 +638,34 @@ void RoomClient::Run(Config config, u32 generation) {
             if (c.passMsMax > g_stats.enet_pass_ms_max) {
                 g_stats.enet_pass_ms_max = c.passMsMax;
             }
+            // (the flow of the room's stream: what the limit of waiting data refused and let through, how much waited - in the call, and
+            // now that it is over - and how late the packets handed over since the last round were)
+            StatsAdd(g_stats.enet_cap_refused, c.capRefused);
+            StatsAdd(g_stats.enet_cap_admitted, c.capAdmitted);
+            StatsAdd(g_stats.enet_cap_dropped, c.capDropped);
+            StatsAdd(g_stats.enet_cap_full, c.capDropFull);
+            StatsAdd(g_stats.enet_seq_skipped, c.seqSkipped);
+            StatsAdd(g_stats.enet_seq_skipped_away, c.seqSkippedAway);
+            StatsAdd(g_stats.enet_away_episodes, c.awayEpisodes);
+            if (c.awayDatagramsMax > g_stats.enet_away_dgrams_max) {
+                g_stats.enet_away_dgrams_max = c.awayDatagramsMax;
+            }
+            if (c.awayBytesMax > g_stats.enet_away_bytes_max) {
+                g_stats.enet_away_bytes_max = c.awayBytesMax;
+            }
+            if (c.awayDupMax > g_stats.enet_away_dup_max) {
+                g_stats.enet_away_dup_max = c.awayDupMax;
+            }
+            if (c.capDropHeldMax > g_stats.enet_cap_held_max) {
+                g_stats.enet_cap_held_max = c.capDropHeldMax;
+            }
+            const u32 waiting = c.waitingMaxBytes > server->totalWaitingData ? c.waitingMaxBytes : static_cast<u32>(server->totalWaitingData);
+            if (waiting > g_stats.enet_waiting_max) {
+                g_stats.enet_waiting_max = waiting;
+            }
+            if (c.streamLagMaxMs > g_stats.enet_lag_max_ms) {
+                g_stats.enet_lag_max_ms = c.streamLagMaxMs;
+            }
         }
         cut(g_stats.t_net_service, service_end - round_start);
         if (!Live(generation)) {
@@ -632,6 +685,7 @@ void RoomClient::Run(Config config, u32 generation) {
         }
         const u32 drained = StatsServiceCall(static_cast<u32>(service_end - round_start));
         u64 pause_to_note = 0; // the pause after a failing call: noted after the events section, because it lies in the send one
+        u32 pause_asked_ms = 0; // (2m-rev) ... and what SleepMs was asked for: the most ClassifyRound takes off the round (PauseTakenOff)
         if (service_result < 0) {
             ++g_stats.service_errors;
             last_errno_.store(service_errno);
@@ -650,6 +704,7 @@ void RoomClient::Run(Config config, u32 generation) {
             const u64 pause_began = platform::NowTicks();
             platform::SleepMs(ServiceErrorPauseMs(errors_in_a_row));
             pause_to_note = platform::NowTicks() - pause_began;
+            pause_asked_ms = ServiceErrorPauseMs(errors_in_a_row);
             StatsAdd64(g_stats.t_net_pause, pause_to_note);
         } else if (errors_in_a_row != 0) {
             if (error_episode_logged) {
@@ -672,7 +727,14 @@ void RoomClient::Run(Config config, u32 generation) {
                 StatsAdd(g_stats.enet_silence_probes);
             }
         }
-        if (service_result > 0) {
+        // The packet the service call handed over - and, for a title of the dense-broadcast relief (azl/flow_relief.hpp), the ones that
+        // are ready behind it, up to the round's share: enet_host_check_events hands over what ENet already holds and makes no soc
+        // call. For every other game the share is 1 and the loop below is the `if (service_result > 0)` it was: one packet, then the
+        // queue and the flush; ENet is not asked a second time.
+        const u32 hand_over = hand_over_burst_.load(std::memory_order_relaxed);
+        u32 handed = 0;
+        for (int have = service_result; have > 0;
+             have = flow::MoreThisRound(++handed, hand_over, keep_running && Live(generation)) ? enet_host_check_events(client, &event) : 0) {
             switch (event.type) {
             case ENET_EVENT_TYPE_RECEIVE: {
                 const u8* data = event.packet->data;
@@ -793,6 +855,12 @@ void RoomClient::Run(Config config, u32 generation) {
                 break;
             }
         }
+        if (handed > 1) {
+            StatsAdd(g_stats.rx_same_round, handed - 1);
+        }
+        if (handed > g_stats.rx_round_max) {
+            g_stats.rx_round_max = handed;
+        }
 
         // The callbacks above (the game's frame handler, the room list, a Log() that waits for the SD card) are where a thread
         // gets stuck: if Stop() gave up on this one meanwhile it must not go on to the queue of the session that replaced it, and
@@ -833,12 +901,24 @@ void RoomClient::Run(Config config, u32 generation) {
                 chat->SentOutgoing(config.nickname.c_str(), config.nickname.size(), static_cast<u32>(now_ms), chat_sent);
             }
         }
+        flow::NoteAwayBacklog(client->azlAwayBacklog != 0, now_ms, &away_since); // (the ring's backlog after an absence: its start)
         if (tx_pending_.load(std::memory_order_acquire) != 0) { // (the game's thread sets it under the lock: nothing pushed, no lock)
             platform::LockGuard lock(mutex_);
             tx_pending_.store(0, std::memory_order_relaxed);
             if (!tx_.empty()) {
                 TxQueue::Drops drops;
-                tx_.Take(&to_send, now_ms, &drops);
+                const u32 budget = send_budget_.load(std::memory_order_relaxed);
+                if (budget == 0) {
+                    tx_.Take(&to_send, now_ms, &drops);
+                } else if (flow::HoldsForTheRing(away_since, now_ms)) {
+                    // (a title with a send budget, back from an absence: what waited in the ring is read first, its acknowledgements go)
+                    tx_pending_.store(1, std::memory_order_relaxed);
+                    ++g_stats.tx_drain_rounds;
+                } else if (tx_.TakeUpTo(&to_send, now_ms, &drops, budget)) {
+                    // (the titles with a send budget: the rest waits for the next round, which reads the socket first and comes at once)
+                    tx_pending_.store(1, std::memory_order_relaxed);
+                    ++g_stats.tx_budget_rounds; // (under the lock, as the game thread's counts)
+                }
                 StatsAdd(g_stats.tx_stale_drops, drops.stale); // waited more than a second: the newest state wins
             }
         }
@@ -907,11 +987,17 @@ void RoomClient::Run(Config config, u32 generation) {
         const u64 done_ms = azl_ticks_to_ms(done_ticks);
         cut(g_stats.t_net_send, done_ticks - events_end);
         StatsAdd64(g_stats.t_net_wall, done_ticks - round_start);
-        const u32 round_ticks = static_cast<u32>(done_ticks - round_start);
-        if (round_ticks > kSlowTicks) {
+        // (2m-rev) 64 bits: a round of 16 s or more (the thread held) no longer wraps to a short one in 32 bits of ticks
+        const u64 round_ticks = done_ticks - round_start;
+        const RoundKind round_kind = ClassifyRound(round_ticks, PauseTakenOff(pause_to_note, pause_asked_ms));
+        if (round_kind == RoundKind::PauseOnly) {
+            // (2m-diag D1) long only by the pause after a socket error: the loop waiting on purpose, counted apart and without a line
+            ++g_stats.net_pause_rounds;
+        } else if (round_kind == RoundKind::Slow) {
             // A round this long stalls the whole data path (frames in both directions wait): say where
             // the time went. Inside enet_host_service = the soc service / the WiFi, in "frames+engine" =
             // the engine's lock (a game thread holds it), in neither = the thread was not scheduled.
+            // (A pause after a socket error, when there is one, is in "queue+tick": it is not what made the round slow.)
             ++g_stats.net_slow_rounds;
             static u32 slow_logged = 0;
             if (g_debug_level > 0 && (++slow_logged <= 12 || (slow_logged % 25) == 0)) {
@@ -1005,6 +1091,9 @@ void RoomClient::Run(Config config, u32 generation) {
                         done = true;
                     }
                 }
+            }
+            if (Live(generation)) {
+                leave_ack_.store(done);  // (1.1.4, route B D-B10: only what it tells; nothing else of the leave changes)
             }
         }
     }

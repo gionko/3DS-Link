@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "dlp_guest_store.hpp"
 #include "settings.hpp"
 
 namespace setup {
@@ -175,9 +176,22 @@ SeedReading ReadSeedDb() {
     reading.rc = 0;
     return reading;
 #endif
-    // The ID0 of the console is the name of the folder its titles are in on the card: sdmc:/Nintendo 3DS/<ID0>, 32 hex digits.
+    // The ID0 of the console is the name of the folder its titles are in on the card: sdmc:/Nintendo 3DS/<ID0>, 32 hex digits. (DPAPP-2j, R-B) As
+    // the system names it (FSUSER_GetSdmcCtrRootPath): a card that was in two consoles has two such folders, and the first one read may be the
+    // other console's. The first folder only when the system does not answer.
     std::string id0;
-    if (DIR* dir = opendir("sdmc:/Nintendo 3DS")) {
+    {
+        u16 root[256] = {};
+        if (R_SUCCEEDED(FSUSER_GetSdmcCtrRootPath(reinterpret_cast<u8*>(root), sizeof(root)))) {
+            std::string ascii;
+            for (std::size_t k = 0; k < 255 && root[k] != 0; ++k) {
+                ascii += root[k] < 0x80 ? static_cast<char>(root[k]) : '?';
+            }
+            id0 = dlpguest::Id0OfRoot(ascii);
+        }
+    }
+    DIR* const dir = id0.empty() ? opendir("sdmc:/Nintendo 3DS") : nullptr;
+    if (dir != nullptr) {
         while (const dirent* entry = readdir(dir)) {
             const std::string name = entry->d_name;
             bool hex = name.size() == 32;

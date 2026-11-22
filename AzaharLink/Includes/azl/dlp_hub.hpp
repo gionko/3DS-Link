@@ -33,11 +33,8 @@
 
 namespace azl {
 
-/// What the plugin does for a game (the table of plugin.cpp): nothing, answer the wireless check only (azl/dlp_fkcl_hle.hpp:
-/// Kirby Battle Royale), carry the Download Play lobby over the room in the plugin's own dialect (Kirby Triple Deluxe, Planet Robobot),
-/// or carry the same lobby speaking the REAL Download Play on the wire (1.1.3, Luigi's Mansion: azl/dlp_real_net.hpp, the same hub on
-/// another LobbyNet, so that Azahar's Download Play and ours see each other).
-enum class DlpGameMode : u8 { None = 0, ProbeOnly = 1, Lobby = 2, RealDlp = 3 };
+// (DlpGameMode, what the plugin does with the Download Play services of a game, is azl/dlp_mode.hpp's, through azl/dlp_types.hpp: the
+// Download Play column of azl/title_rules.hpp names it.)
 
 class DlpHub {
 public:
@@ -90,6 +87,11 @@ public:
     bool EngineHeld() const {
         return engine_held_.load(std::memory_order_relaxed);
     }
+    /// 1.1.4 (G1, the system's Download Play application): HOME or the swap of the plugin's block came while the application may be in a session
+    /// of dlp:CLNT - the next Tick leaves it (DlpService::ClntLeave) and the application sees 0x80. One atomic operation: no lock, no wait, any thread.
+    void RequestClntLeave() {
+        closing_.fetch_or(kClntLeave, std::memory_order_release);
+    }
 
     // ---- the network thread --------------------------------------------------------------------------------------------------
     /// Once per round of the network thread, after the engine's own Tick: serves the request in the slot and pumps the lobby.
@@ -139,6 +141,8 @@ private:
     static constexpr u32 kDone = 3;
     static constexpr u32 kClosingFkcl = 1;  // closing_: the client role's session was closed
     static constexpr u32 kClosingSrvr = 2;  // ... the creator's
+    static constexpr u32 kClntDeferred = 4; // ... (1.1.4, G1) dlp:CLNT deferred a posted command no network thread ran: the next Tick does it
+    static constexpr u32 kClntLeave = 8;    // ... (1.1.4, G1) HOME / the swap: the next Tick leaves the session of dlp:CLNT
 
     struct Slot {  // the one request in flight (post_mutex_)
         u32* cmd;
@@ -157,6 +161,8 @@ private:
     /// Answers a request that was never run (the network thread could not serve it): the success of the commands that cannot fail, the failure of
     /// the others. Out of line: its locals are not paid by the commands the game thread serves.
     DlpOutcome AnswerUnserved(DlpKind kind, u32* cmd);
+    /// ... the same for dlp:CLNT (1.1.4, G1): what can wait is deferred to the next Tick (answered 0), the rest is "wireless off". Out of line too.
+    DlpOutcome AnswerUnservedClnt(u32* cmd);
     /// True while a requester holds post_mutex_ (a request is in flight). Out of line, like the one above.
     bool RequestInFlight();
     /// The failure reply of a command: [(id << 16) | 0x40, ResultWirelessOff].

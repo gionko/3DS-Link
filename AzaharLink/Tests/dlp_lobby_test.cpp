@@ -152,14 +152,14 @@ static u32 SSt(Con& c) {
 }
 static u32 NClients(Con& c) {
     c.lobby.Pump();
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 99;
     const u32 r = c.lobby.ServerConnectingClients(ids, 4, &total);
     return r == 0 ? total : 0xFFFFFFFFu;
 }
 static u32 NNodes(Con& c) {
     c.lobby.Pump();
-    u16 ids[4] = {};
+    u8 ids[4] = {};
     u32 total = 99;
     c.lobby.ClientConnectingNodes(ids, 4, &total);
     return total;
@@ -313,12 +313,13 @@ static void TestCodec() {
         if (k == 3) bad[2] = 2;
         CHECK(!DecodeAnnounce(bad, 29, &r));
     }
-    // max_nodes 0, 1, 5, 17 refused; 2, 3, 4 accepted
-    const int mn[7] = {0, 1, 2, 3, 4, 5, 17};
-    for (int k = 0; k < 7; ++k) {
+    // max_nodes 0, 1, 9, 17, 255 refused; 2..8 accepted (2026-11-13: the codec reads what the format can say, a lobby of up to eight; that a
+    // title of four never LISTS a lobby of five is the lobby's, and is held below and in Tests/dlp_cap_guard_test.cpp)
+    const int mn[13] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 255};
+    for (int k = 0; k < 13; ++k) {
         std::memcpy(bad, out, 29);
         bad[8] = static_cast<u8>(mn[k]);
-        CHECK_EQ(DecodeAnnounce(bad, 29, &r), (mn[k] >= 2 && mn[k] <= 4) ? 1 : 0);
+        CHECK_EQ(DecodeAnnounce(bad, 29, &r), (mn[k] >= 2 && mn[k] <= 8) ? 1 : 0);
     }
     // flags: only bit 0 is "accepting"
     std::memcpy(bad, out, 29);
@@ -409,14 +410,15 @@ static void TestSizes() {
                 "HeardGroup=%zu  GroupView=%zu  pointer=%zu\n",
                 sizeof(DlpLobby), sizeof(Group), sizeof(DlpLobby::Track), sizeof(DlpLobby::Tables), sizeof(NodeEntry),
                 sizeof(Identity), sizeof(HostAnnounce), sizeof(HeardGroup), sizeof(GroupView), sizeof(void*));
-    CHECK(sizeof(DlpLobby) <= 320);
+    CHECK(sizeof(DlpLobby) <= 400);
     CHECK_EQ(sizeof(Group), 40);
     CHECK_EQ(sizeof(DlpLobby::Track), 8);
     CHECK_EQ(sizeof(NodeEntry), 32);
-    CHECK_EQ(sizeof(DlpLobby::Tables), 168);
+    CHECK_EQ(sizeof(DlpLobby::Tables), 296);
     CHECK(sizeof(HeardGroup) <= 48);
-    CHECK_EQ(kMaxPlayers, 4);
-    CHECK_EQ(kMaxClients, 3);
+    CHECK_EQ(kMaxPlayers, 8);
+    CHECK_EQ(kMaxClients, 7);
+    CHECK_EQ(kTitlePlayers, 4);  // (2026-11-13: the tables hold eight, a title that says nothing still has four: everything below runs as such a title)
     CHECK_EQ(kMaxGroups, 4);
     DlpLobby::Tables tabs;
     CHECK_EQ(sizeof(tabs.scan.g) / sizeof(tabs.scan.g[0]), kMaxGroups);
@@ -1015,7 +1017,7 @@ static void TestSession() {
         CHECK_EQ(r[3].lobby.ClientStatusWord(), 0x05010004u);
         r.Run(400);
         // the host sees 3 clients, ascending, host excluded
-        u16 ids[4] = {};
+        u8 ids[4] = {};
         u32 total = 0;
         CHECK_EQ(r[0].lobby.ServerConnectingClients(ids, 4, &total), 0);
         CHECK_EQ(total, 3);
@@ -1052,10 +1054,10 @@ static void TestSession() {
         CHECK_EQ(r[1].lobby.ClientNodeInfo(0, &e), R_NO_DATA);
         CHECK_EQ(r[1].lobby.ClientNodeInfo(5, &e), R_NO_DATA);
         // capacity smaller than the total: writes capacity ids, reports the total
-        u16 two[4] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+        u8 two[4] = {0xAA, 0xAA, 0xAA, 0xAA};
         CHECK_EQ(r[1].lobby.ClientConnectingNodes(two, 2, &st), 0);
         CHECK_EQ(st, 4);
-        CHECK(two[0] == 1 && two[1] == 2 && two[2] == 0xAAAA);
+        CHECK(two[0] == 1 && two[1] == 2 && two[2] == 0xAA);
         // the host's entry in the session
         GroupView v;
         CHECK_EQ(r[1].lobby.ClientServerInfo(MacOf(r[0]), &v), 0);
@@ -1227,7 +1229,7 @@ static void TestSession() {
         r[1].net.FailReadNode(3, true);  // console 1 cannot read node 3
         CHECK(Enter(r, 2, 0));
         r.Run(300);
-        u16 ids[4] = {};
+        u8 ids[4] = {};
         u32 total = 0;
         r[1].lobby.ClientConnectingNodes(ids, 4, &total);
         CHECK_EQ(total, 3);
@@ -1429,7 +1431,7 @@ static void TestCreator2() {
             CHECK(!h.lobby.active());
             CHECK_EQ(h.lobby.ServerFinalize(), 0);  // again
             CHECK_EQ(h.net.HostCloseCalls(), open ? 1 : 0);
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 0;
             CHECK_EQ(h.lobby.ServerConnectingClients(ids, 4, &total), R_INVALID_STATE);
         }
@@ -1866,7 +1868,10 @@ static void TestTimes3() {
         q.air.Advance(1000);  // less than the grace
         q[0].lobby.Poll(true);
         CHECK_EQ(q[0].net.Sent(T_START, 3) - before, 1);
-        q.air.Advance(1000);  // now past the grace: the silent client is removed, not resent to
+        q.air.Advance(1000);  // now past the grace: the silent client is removed, not resent to - in the first poll that does not come
+        q[0].lobby.Poll(true);  // after a stall (2026-11-15, D5: a second without a poll is one; the acks that waited are read first)
+        CHECK_EQ(q[0].lobby.ServerState(), 6);
+        q.air.Advance(50);
         q[0].lobby.Poll(true);
         CHECK_EQ(q[0].lobby.ServerState(), 8);
         CHECK_EQ(q[0].net.Kicked(3), 1);
@@ -1985,7 +1990,7 @@ static std::string Trace(u64 start) {
     for (int ms = 0; ms < 1000 && roster_at < 0; ++ms) {
         q3.air.Advance(1);
         q3.PollAll();
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 0;
         q3[1].lobby.ClientConnectingNodes(ids, 4, &total);
         if (total == 3) roster_at = ms;
@@ -2843,7 +2848,7 @@ static void TestSearcherMatrix() {
         {  // list S: success in any state (Finalize, StopScan, StopSession, GetConnectingNodes, Passphrase, Initialize)
             auto r = make();
             Con& s = (*r)[1];
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 77;
             u8 p[9];
             CHECK_EQ(s.lobby.ClientConnectingNodes(ids, 4, &total), 0);
@@ -3003,7 +3008,7 @@ static void TestCreatorMatrix() {
         {  // the commands that need an initialised creator: kInvalidState from 0
             auto r = BuildCreator(st);
             Con& h = (*r)[0];
-            u16 ids[4];
+            u8 ids[4];
             u32 total = 77;
             NodeEntry e;
             u32 w = 0;
@@ -3048,7 +3053,7 @@ static void TestAzaharDefects() {
         CHECK(r[1].lobby.ClientJoinPoll(&res));
         CHECK_EQ(res, R_TIMEOUT);
         CHECK_EQ(r[1].lobby.ClientStatusWord(), 0x01000000u);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 9;
         r[1].lobby.ClientConnectingNodes(ids, 4, &total);
         CHECK_EQ(total, 0);
@@ -3143,7 +3148,7 @@ struct HostGame {
             const u32 st = h.lobby.ServerState();
             if (st == 0 || st == 10) ++bad_results;
             if (st == 2) {
-                u16 ids[4] = {};
+                u8 ids[4] = {};
                 u32 total = 0;
                 if (h.lobby.ServerConnectingClients(ids, 4, &total) != 0) ++bad_results;
                 seen_names.clear();
@@ -3272,7 +3277,7 @@ struct ClientGame {
             const u32 st = w >> 24;
             if (st == 0 || st == 0x80) ++bad_results;
             if (st == 3 || st == 4 || st == 5 || st == 6 || st == 9) {
-                u16 ids[4] = {};
+                u8 ids[4] = {};
                 u32 total = 0;
                 s.lobby.ClientConnectingNodes(ids, 4, &total);
                 names.clear();
@@ -3719,7 +3724,7 @@ static void TestCreatorTables() {
         CHECK_EQ(c.lobby.ServerClientState(2, &w), R_NO_DATA);
         // taking the network discards the searcher's table: the first look, before any Poll, finds no client
         CHECK_EQ(c.lobby.ServerStartAccepting(false, 6), 0);
-        u16 ids[4];
+        u8 ids[4];
         u32 total = 99;
         CHECK_EQ(c.lobby.ServerConnectingClients(ids, 4, &total), 0);
         CHECK_EQ(total, 0);
@@ -4132,7 +4137,7 @@ static void TestSessionGaps() {
         r.Run(400);
         for (int i = 1; i <= 3; ++i) {
             CHECK_EQ(NNodes(r[i]), 4);
-            u16 ids[4] = {};
+            u8 ids[4] = {};
             u32 total = 0;
             CHECK_EQ(r[i].lobby.ClientConnectingNodes(ids, 4, &total), 0);
             CHECK(ids[0] == 1 && ids[1] == 2 && ids[2] == 3 && ids[3] == 4);
@@ -4203,7 +4208,7 @@ static void TestSessionGaps() {
         CHECK_EQ(s.lobby.ClientServerInfo(MacOf(r[0]), &v), 0);
         CHECK_EQ(v.group->max_nodes, 3);
         CHECK_EQ(v.group->total_nodes, 3);
-        u16 ids[4] = {};
+        u8 ids[4] = {};
         u32 total = 0;
         CHECK_EQ(s.lobby.ClientConnectingNodes(ids, 4, &total), 0);
         CHECK_EQ(total, 4);  // the roster itself lists what the engine lists
@@ -4273,7 +4278,7 @@ static void TestEnterSessionSwap() {
                 CHECK_EQ(s.lobby.ClientServerInfo(MacOf(r[other]), &v), R_NO_DATA);
             }
         }
-        u16 ids[4] = {};
+        u8 ids[4] = {};
         u32 total = 0;
         CHECK_EQ(s.lobby.ClientConnectingNodes(ids, 4, &total), 0);
         CHECK_EQ(total, 2);
@@ -4375,7 +4380,110 @@ static void TestJoinWithCreatorActive() {
     CHECK_EQ(c.net.AllCalls(), calls);
 }
 
+/// 1.1.4 (H5): the clients the adapter still waits for are the lobby's answer in state 9 only - GetConnectingClients (ids ascending, the capacity
+/// kept), GetClientInfo (0, node, no seed, no name) and GetClientState (0x09, joined) for each of them - and in every other state the mask is
+/// not even asked.
+static u32 Listed(Con& h, u8* ids, u32 capacity) {
+    u32 total = 99;
+    const u32 r = h.lobby.ServerConnectingClients(ids, capacity, &total);
+    return r == 0 ? total : 0xFFFFFFFFu;
+}
+static void TestChildrenAwaited() {
+    std::printf("children awaited in state 9 (H5)\n");
+    {  // states 1, 2, 8 and 9 with no client; the mask is set from the start
+        Rig r(1);
+        Con& h = r[0];
+        h.net.awaited = 0x05;  // nodes 2 and 4
+        u8 ids[7] = {};
+        u32 w = 0xABCD;
+        NodeEntry e;
+        CHECK_EQ(h.lobby.ServerInitialize(3, 0, nullptr), 0);
+        CHECK_EQ(Listed(h, ids, 7), 0u);  // state 1
+        CHECK_EQ(h.lobby.ServerStartAccepting(false, 6), 0);
+        CHECK_EQ(Listed(h, ids, 7), 0u);  // state 2
+        CHECK_EQ(h.lobby.ServerClientState(2, &w), R_NO_DATA);
+        CHECK_EQ(h.lobby.ServerClientInfo(4, &e), R_NO_DATA);
+        CHECK_EQ(h.lobby.ServerStartDistribution(), 0);
+        CHECK_EQ(h.lobby.ServerState(), 8);
+        CHECK_EQ(Listed(h, ids, 7), 0u);  // state 8
+        CHECK_EQ(h.lobby.ServerClientState(4, &w), R_NO_DATA);
+        CHECK_EQ(h.net.awaited_asks, 0);  // (not asked once before 9)
+        CHECK_EQ(w, 0xABCDu);
+        CHECK_EQ(h.lobby.ServerSendPassphrase(kPass1), 0);
+        CHECK_EQ(h.lobby.ServerState(), 9);
+        std::memset(ids, 0xEE, sizeof(ids));
+        CHECK_EQ(Listed(h, ids, 7), 2u);  // state 9: the two awaited, ascending
+        CHECK_EQ(ids[0], 2);
+        CHECK_EQ(ids[1], 4);
+        CHECK_EQ(ids[2], 0xEE);
+        CHECK(h.net.awaited_asks > 0);
+        std::memset(ids, 0xEE, sizeof(ids));
+        CHECK_EQ(Listed(h, ids, 1), 2u);  // the capacity is kept, the total is whole
+        CHECK_EQ(ids[0], 2);
+        CHECK_EQ(ids[1], 0xEE);
+        std::memset(ids, 0xEE, sizeof(ids));
+        CHECK_EQ(Listed(h, ids, 0), 2u);
+        CHECK_EQ(ids[0], 0xEE);
+        // GetClientInfo / GetClientState of an awaited id: an answer; of any other id: kNoData as before
+        std::memset(&e, 0x5A, sizeof(e));
+        CHECK_EQ(h.lobby.ServerClientInfo(2, &e), 0);
+        CHECK_EQ(e.node, 2);
+        CHECK_EQ(e.seed, 0u);
+        CHECK_EQ(e.name[0], 0);
+        CHECK_EQ(e.name[9], 0);
+        CHECK_EQ(h.lobby.ServerClientInfo(3, &e), R_NO_DATA);
+        CHECK_EQ(e.node, 0);
+        CHECK_EQ(h.lobby.ServerClientState(4, &w), 0);
+        CHECK_EQ(w, 0x09010004u);
+        CHECK_EQ(h.lobby.ServerClientState(3, &w), R_NO_DATA);
+        CHECK_EQ(h.lobby.ServerClientState(1, &w), R_NO_DATA);   // the host
+        CHECK_EQ(h.lobby.ServerClientState(0, &w), R_NO_DATA);
+        CHECK_EQ(h.lobby.ServerClientState(9, &w), R_NO_DATA);   // past the tables
+        CHECK_EQ(h.lobby.ServerClientState(0x0102, &w), R_NO_DATA);
+        CHECK_EQ(h.lobby.ServerClientInfo(1, &e), R_NO_DATA);    // the host's record, as before
+        CHECK_EQ(e.node, 1);
+        // every client of a host of eight; then nobody
+        h.net.awaited = 0x7F;
+        CHECK_EQ(Listed(h, ids, 7), 7u);
+        for (u32 i = 0; i < 7; ++i) {
+            CHECK_EQ(ids[i], i + 2);
+        }
+        CHECK_EQ(h.lobby.ServerClientState(8, &w), 0);
+        CHECK_EQ(w, 0x09010008u);
+        h.net.awaited = 0x80;  // (a bit past the clients: no id)
+        CHECK_EQ(Listed(h, ids, 7), 0u);
+        h.net.awaited = 0;
+        CHECK_EQ(Listed(h, ids, 7), 0u);  // the wait is over: what the game waits for
+        CHECK_EQ(h.lobby.ServerClientState(2, &w), R_NO_DATA);
+        CHECK(!h.lobby.active());
+        // Finalize: state 0, the mask says nothing
+        h.net.awaited = 0x05;
+        CHECK_EQ(h.lobby.ServerFinalize(), 0);
+        CHECK_EQ(h.lobby.ServerConnectingClients(ids, 7, &w), R_INVALID_STATE);
+        CHECK_EQ(h.lobby.ServerInitialize(3, 0, nullptr), 0);
+        CHECK_EQ(Listed(h, ids, 7), 0u);  // state 1 again
+    }
+    {  // state 6 with one client: the tracked client only, the mask not asked
+        Rig r(2);
+        Con& h = r[0];
+        OpenHost(h, 3);
+        CHECK(Enter(r, 1, 0));
+        r.Run(60);
+        h.net.awaited = 0x7E;
+        const int asks = h.net.awaited_asks;
+        CHECK_EQ(h.lobby.ServerStartDistribution(), 0);
+        CHECK_EQ(h.lobby.ServerState(), 6);
+        u8 ids[7] = {};
+        CHECK_EQ(Listed(h, ids, 7), 1u);
+        CHECK_EQ(ids[0], 2);
+        u32 w = 0;
+        CHECK_EQ(h.lobby.ServerClientState(3, &w), R_NO_DATA);
+        CHECK_EQ(h.net.awaited_asks, asks);
+    }
+}
+
 int main() {
+    TestChildrenAwaited();
     TestCodec();
     TestSizes();
     TestScanTable();

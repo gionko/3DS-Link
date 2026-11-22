@@ -77,9 +77,9 @@ mutants = [
      '        g_apt_observer(header == kAptReplySleepQuery ? kAptNoteReplyQuery : kAptNoteReplyComplete, reply);\n'),
     # ---- 0.1.16: the capture's producers (the ring's lanes, the lost markers, the diet, the raw command records) ----
     ('snprintf in the diet (DebugIpc -> DietLocked)', 'Sources/azl/log.cpp',
-     '    if (++slot->calls <= kDietFullCalls) {\n        return false;\n    }\n',
+     '    if (++slot->calls <= full) {\n        return false;\n    }\n',
      '    { char t[8]; __builtin_snprintf(t, sizeof(t), "%u", (unsigned)slot->calls); volatile char sink = t[0]; (void)sink; }\n'
-     '    if (++slot->calls <= kDietFullCalls) {\n        return false;\n    }\n'),
+     '    if (++slot->calls <= full) {\n        return false;\n    }\n'),
     ('Log in the marker of a hole (every producer -> AdmitLocked -> EmitLostLocked)', 'Sources/azl/log.cpp',
      '    Lost& lost = g_dbg_lost[lane];\n    u32 head = g_dbg_head;\n    PutWord(head, 16u',
      '    Lost& lost = g_dbg_lost[lane];\n    Log("lost %u", (unsigned)lost.full);\n    u32 head = g_dbg_head;\n    PutWord(head, 16u'),

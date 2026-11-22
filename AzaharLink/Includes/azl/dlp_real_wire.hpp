@@ -96,6 +96,14 @@ void Seal(const u8 seed[4], u8* p, std::size_t len);
 /// Frame 0: +0x10 child_tid, +0x18 00 10, +0x1A 01 01, +0x1C 00 03 ff c0, +0x20 max_nodes, the rest zero (no title, no icon, no sizes).
 std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4]);
 
+/// The child's names, icon and sizes in the wire's order (azl/dlp_title_block.hpp, 2026-11-14): what a real host announces besides.
+struct TitleBlock;
+/// The same frame WITH the title of the child, for the games whose guests are the system's Download Play application (Mario Party:
+/// Island Tour): frame 0 gets +0x38 transfer_size and +0x3C required_size (big-endian), +0x40 the short name (128 bytes), +0xC0 the
+/// long name (256), +0x1C0 the first 312 bytes of the icon; frames 1..3 the rest of the icon from +0x10 (1432 bytes each: 4608 in
+/// all); frame 4 nothing. `title` null: the frame above, byte for byte (Luigi's Mansion and Mario Kart 7 never have one).
+std::size_t AnnounceFrame(u8* buf, unsigned index, u64 child_tid, u8 max_nodes, const u8 seed[4], const TitleBlock* title);
+
 // host -> client, channel 2. `buf` holds kBufferBytes. Each returns the length.
 std::size_t Auth(u8* buf, const u8 seed[4]);
 std::size_t StartDist(u8* buf, const u8 seed[4], u8 seq, const u8 rid[2]);

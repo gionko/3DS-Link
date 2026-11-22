@@ -30,8 +30,20 @@ typedef struct {
     /* knobs of the plugin's ENet (the patched tree): -1 = leave the default */
     int skip_empty, max_dgrams, ack_hold_events, ack_hold_ms;
     int debatch;
+    /* the loop's two reliefs for a dense broadcast stream (azl/flow_relief.hpp); the defaults are the loop every other game has */
+    int burst;                /* packets of the room handed over in one round (1: one, then the queue and the flush) */
+    double same_ms;           /* a frame of the game equal to the last one sent and younger than this is not sent (0: all are sent) */
+    /* the closed-loop game (game=1): see the block "the game" below */
+    int game;
+    double game_from_s, game_secs, game_frame_us, game_step_us, game_timeout_s;
+    int game_window, game_head_b, game_block_b, game_wrap_b;
+    int game_players;         /* players of the game, the console included (2: the console and the other side) */
+    int cap_drop;             /* (plugin-causa) 1: ENet acknowledges and drops a frame at the limit instead of refusing it (ENetHost::azlCapDrop; a tree that has it) */
+    int cap_drop_max;         /* (plugin-causa) the bound of the placeholders of dropped frames (ENetHost::azlCapDropMax; 0 = ENet's default, 512) */
+    int send_budget;          /* (2026-11-15) bytes of the game's queue handed to ENet in a round, the first frame always (RoomClient::SetSendBudget; 0 = all of it) */
+    double ring_first_ms;     /* (2026-11-15) with a budget: after an absence the queue waits while the ring's backlog is read, this long at the most (flow::kAwayDrainMaxMs; 0 = off) */
 } Cfg;
-static Cfg cfg = {"run", "", 60, 1, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, 0};
+static Cfg cfg = {"run", "", 60, 1, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, 0, 1, 0, 0, 2, 30, 5556, 33333, 10, 12, 32, 46, 41, 2, 0};
 
 static void cfg_set(const char* k, const char* v) {
     const double d = atof(v);
@@ -51,6 +63,25 @@ static void cfg_set(const char* k, const char* v) {
     else if (!strcmp(k, "max_dgrams")) cfg.max_dgrams = (int)d;
     else if (!strcmp(k, "ack_hold_events")) cfg.ack_hold_events = (int)d;
     else if (!strcmp(k, "ack_hold_ms")) cfg.ack_hold_ms = (int)d;
+    else if (!strcmp(k, "burst")) cfg.burst = (int)d;
+    else if (!strcmp(k, "same_ms")) cfg.same_ms = d;
+    else if (!strcmp(k, "game")) cfg.game = (int)d;
+    else if (!strcmp(k, "game_from_s")) cfg.game_from_s = d;
+    else if (!strcmp(k, "game_secs")) cfg.game_secs = d;
+    else if (!strcmp(k, "game_frame_us")) cfg.game_frame_us = d;
+    else if (!strcmp(k, "game_step_us")) cfg.game_step_us = d;
+    else if (!strcmp(k, "game_timeout_s")) cfg.game_timeout_s = d;
+    else if (!strcmp(k, "game_window")) cfg.game_window = (int)d;
+    else if (!strcmp(k, "game_head_b")) cfg.game_head_b = (int)d;
+    else if (!strcmp(k, "game_block_b")) cfg.game_block_b = (int)d;
+    else if (!strcmp(k, "game_wrap_b")) cfg.game_wrap_b = (int)d;
+    else if (!strcmp(k, "game_players")) cfg.game_players = (int)d;
+    else if (!strcmp(k, "cap_drop")) cfg.cap_drop = (int)d;
+    else if (!strcmp(k, "cap_drop_max")) cfg.cap_drop_max = (int)d;
+    else if (!strcmp(k, "send_budget")) cfg.send_budget = (int)d;
+    else if (!strcmp(k, "ring_first_ms")) cfg.ring_first_ms = d;
+    else if (!strcmp(k, "rcvbuf_bytes")) g_rcvbuf_bytes = (uint32_t)d;
+    else if (!strcmp(k, "send_kb_us")) g_prof.send_kb_us = d;
     else if (!strcmp(k, "recv_us")) g_prof.recv_us = d;
     else if (!strcmp(k, "recvE_us")) g_prof.recvE_us = d;
     else if (!strcmp(k, "send_us")) g_prof.send_us = d;
@@ -92,11 +123,15 @@ static void load_cfg(const char* path) {
     fclose(f);
 }
 
+#ifdef VSIM_CAPDROP
+static int vsim_every_frame(const enet_uint8* data, size_t length) { (void)data; (void)length; return 1; }
+#endif
+
 /* ---------------------------------------------------------------- the trace */
 typedef struct { uint64_t t_us; uint32_t size, id; } InjEv;
 typedef struct { uint64_t t_us; uint32_t size; int rel; uint32_t id; } TxEv;
 static InjEv* inj; static size_t n_inj, inj_next;
-static TxEv* txe; static size_t n_tx, tx_next;
+static TxEv* txe; static size_t n_tx, tx_next, tx_cap;
 static uint64_t t_base_us = 3000000; /* the traffic starts 3 s into the run: the connection is up by then */
 
 static void load_trace(const char* path) {
@@ -105,6 +140,7 @@ static void load_trace(const char* path) {
     size_t cap_i = 1 << 16, cap_t = 1 << 16;
     inj = (InjEv*)malloc(cap_i * sizeof(InjEv));
     txe = (TxEv*)malloc(cap_t * sizeof(TxEv));
+    tx_cap = cap_t;
     char line[256];
     while (fgets(line, sizeof line, f)) {
         char kind;
@@ -113,7 +149,7 @@ static void load_trace(const char* path) {
             if (n_inj == cap_i) { cap_i *= 2; inj = (InjEv*)realloc(inj, cap_i * sizeof(InjEv)); }
             inj[n_inj].t_us = t_base_us + (uint64_t)t; inj[n_inj].size = size; inj[n_inj].id = (uint32_t)n_inj; ++n_inj;
         } else if (line[0] == 'T' && sscanf(line, "%c %lf %u %d", &kind, &t, &size, &rel) >= 3) {
-            if (n_tx == cap_t) { cap_t *= 2; txe = (TxEv*)realloc(txe, cap_t * sizeof(TxEv)); }
+            if (n_tx == cap_t) { cap_t *= 2; txe = (TxEv*)realloc(txe, cap_t * sizeof(TxEv)); tx_cap = cap_t; }
             txe[n_tx].t_us = t_base_us + (uint64_t)t; txe[n_tx].size = size; txe[n_tx].rel = rel; txe[n_tx].id = 0x80000000u | (uint32_t)n_tx; ++n_tx;
         }
     }
@@ -121,10 +157,65 @@ static void load_trace(const char* path) {
     if (n_inj >= VS_MAX_FRAMES) { fprintf(stderr, "vsim: trace too long\n"); exit(2); }
 }
 
+/* ---------------------------------------------------------------- the game (game=1): a closed loop
+   The dense broadcast phase of Mario Party: Island Tour (the dice), as the captures of 2026-11-13/14 show it on data channel 1: each side makes
+   2 new blocks every step (33 ms) and sends a frame every 5.5 ms, 180 a second, with ALL its blocks the other has not confirmed yet (2 at
+   the least, 12 at the most: at 12 it makes no new ones and waits) and the number of the last block it has from the other. A frame is
+   head + blocks * block bytes (124 B with 2 blocks, 584 B with 12) and travels in the room's envelope. So the bytes follow the delay: the later
+   the confirmations, the larger every frame, 180 times a second in both directions. Here the console's game (its frames are queued for the loop
+   as the T lines of a trace are) and the other player's (an Azahar beside the room: its frames are handed to the room as the R lines are, and it
+   hears the console's when the room has them) run that rule on the model's clock. A frame's bytes are told by (blocks made, blocks confirmed,
+   last block heard): equal numbers, equal frame - what the same-frame filter looks at. The console's game is told of a frame when the loop
+   hands it over (it reads its bind at once); a side that hears nothing for game_timeout_s has lost the other (the game's own 10 s). */
+typedef struct { uint32_t made, confirmed, heard; } GameMeta; /* of a frame: the blocks its sender had made and had confirmed, the last block of the other it had heard */
+typedef struct {
+    uint32_t made, confirmed, heard; /* blocks made; of them, confirmed by the other; the last block of the other heard */
+    uint64_t next_step_us, next_frame_us, last_heard_us;
+    uint64_t steps, frames, bytes, dead_at_us, gap_max_us;
+} GameSide;
+static GameSide g_con, g_azh;
+static GameMeta* g_meta_r; /* by the id of a frame of the room (0 ..) */
+static GameMeta* g_meta_t; /* by the index of a frame of the console */
+static size_t g_meta_t_cap;
+static uint64_t g_game_from_us, g_game_to_us, g_same_dropped;
+static uint32_t g_room_ids;
+static GameMeta g_last_sent;
+static uint64_t g_last_sent_us;
+static int g_last_sent_any;
+static uint64_t g_room_now_us; /* the room's clock while its events run */
+static void game_steps(GameSide* s, uint64_t t) {
+    for (; s->next_step_us <= t; s->next_step_us += (uint64_t)cfg.game_step_us) {
+        if (s->made - s->confirmed + 2 <= (uint32_t)cfg.game_window) { s->made += 2; ++s->steps; }
+    }
+}
+static uint32_t game_frame_size(const GameSide* s) {
+    uint32_t blocks = s->made - s->confirmed;
+    if (blocks < 2) blocks = 2;
+    if (blocks > (uint32_t)cfg.game_window) blocks = (uint32_t)cfg.game_window;
+    return (uint32_t)(cfg.game_head_b + cfg.game_block_b * (int)blocks + cfg.game_wrap_b);
+}
+static void game_hears(GameSide* s, GameMeta m, uint64_t t) {
+    if (s->dead_at_us) return;
+    if (s->last_heard_us && t - s->last_heard_us > s->gap_max_us) s->gap_max_us = t - s->last_heard_us;
+    s->last_heard_us = t;
+    if (m.heard > s->confirmed) s->confirmed = m.heard;
+    if (m.made > s->heard) s->heard = m.made;
+}
+static void game_silence(GameSide* s, uint64_t t) {
+    if (!s->dead_at_us && s->last_heard_us && t > s->last_heard_us && t - s->last_heard_us >= (uint64_t)(cfg.game_timeout_s * 1e6))
+        s->dead_at_us = s->last_heard_us + (uint64_t)(cfg.game_timeout_s * 1e6);
+}
+void vsim_on_room_rx(uint32_t id) {
+    if (!cfg.game || !(id & 0x80000000u)) return;
+    const size_t i = id & 0x7FFFFFFFu;
+    if (i < g_meta_t_cap) game_hears(&g_azh, g_meta_t[i], g_room_now_us);
+}
+
 /* ---------------------------------------------------------------- the room's events in time order */
 static uint64_t room_last_run = 0;
 uint64_t vsim_next_room_event_us(void) {
     uint64_t t = room_last_run + 16000ull; /* ServerLoop: enet_host_service(server, &event, 16) */
+    if (cfg.game && g_azh.next_frame_us < g_game_to_us && !g_azh.dead_at_us && g_azh.next_frame_us < t) t = g_azh.next_frame_us;
     if (inj_next < n_inj && inj[inj_next].t_us < t) t = inj[inj_next].t_us;
     const uint64_t a = vnet_room_next_arrival();
     if (a < t) t = a;
@@ -135,6 +226,35 @@ void vsim_run_room_until(uint64_t T) {
         const uint64_t t = vsim_next_room_event_us();
         if (t > T) break;
         room_set_now(t);
+        g_room_now_us = t;
+        /* the other player's frames of this instant: handed to the room as the trace's are */
+        while (cfg.game && g_azh.next_frame_us <= t && g_azh.next_frame_us < g_game_to_us && !g_azh.dead_at_us) {
+            game_silence(&g_azh, g_azh.next_frame_us);
+            if (g_azh.dead_at_us) break;
+            game_steps(&g_azh, g_azh.next_frame_us);
+            if (g_room_ids < VS_MAX_FRAMES) {
+                const uint32_t id = g_room_ids++;
+                const uint32_t size = game_frame_size(&g_azh);
+                g_meta_r[id].made = g_azh.made;
+                g_meta_r[id].confirmed = g_azh.confirmed;
+                g_meta_r[id].heard = g_azh.heard;
+                t_inject[id] = g_azh.next_frame_us;
+                room_inject(id, size);
+                ++g_frames_injected;
+                ++g_azh.frames;
+                g_azh.bytes += size;
+                /* a game of more than two (game_players): every other player sends what the modelled one sends, at its pace and size - a
+                   stand-in, never seen on a console: the room's stream to the console grows by 180 frames a second for each */
+                for (int extra = 2; extra < cfg.game_players && g_room_ids < VS_MAX_FRAMES; ++extra) {
+                    const uint32_t id2 = g_room_ids++;
+                    g_meta_r[id2] = g_meta_r[id];
+                    t_inject[id2] = g_azh.next_frame_us;
+                    room_inject(id2, size);
+                    ++g_frames_injected;
+                }
+            }
+            g_azh.next_frame_us += (uint64_t)cfg.game_frame_us;
+        }
         while (inj_next < n_inj && inj[inj_next].t_us <= t) {
             t_inject[inj[inj_next].id] = inj[inj_next].t_us;
             room_inject(inj[inj_next].id, inj[inj_next].size);
@@ -143,6 +263,44 @@ void vsim_run_room_until(uint64_t T) {
         }
         room_service();
         room_last_run = t;
+    }
+}
+
+/* The console's game up to `t`: the frames it sends are queued for the loop (appended to the trace's T events, in time order). With same_ms the frame
+   that is equal to the last one SENT and younger than same_ms is not queued (azl/flow_relief.hpp, SameFrame: the engine drops it in SendTo). */
+static void game_console_until(uint64_t t) {
+    if (!cfg.game) return;
+    while (g_con.next_frame_us <= t && g_con.next_frame_us < g_game_to_us && !g_con.dead_at_us) {
+        const uint64_t te = g_con.next_frame_us;
+        game_silence(&g_con, te);
+        if (g_con.dead_at_us) break;
+        game_steps(&g_con, te);
+        g_con.next_frame_us += (uint64_t)cfg.game_frame_us;
+        ++g_con.frames;
+        const GameMeta m = {g_con.made, g_con.confirmed, g_con.heard};
+        if (cfg.same_ms > 0 && g_last_sent_any && m.made == g_last_sent.made && m.confirmed == g_last_sent.confirmed && m.heard == g_last_sent.heard &&
+            te - g_last_sent_us < (uint64_t)(cfg.same_ms * 1000.0)) {
+            ++g_same_dropped;
+            continue;
+        }
+        g_last_sent = m;
+        g_last_sent_us = te;
+        g_last_sent_any = 1;
+        if (n_tx == tx_cap) {
+            tx_cap = tx_cap ? tx_cap * 2 : 1 << 16;
+            txe = (TxEv*)realloc(txe, tx_cap * sizeof(TxEv));
+        }
+        if (n_tx >= g_meta_t_cap) {
+            g_meta_t_cap = g_meta_t_cap ? g_meta_t_cap * 2 : 1 << 16;
+            g_meta_t = (GameMeta*)realloc(g_meta_t, g_meta_t_cap * sizeof(GameMeta));
+        }
+        g_meta_t[n_tx] = m;
+        txe[n_tx].t_us = te;
+        txe[n_tx].size = game_frame_size(&g_con);
+        txe[n_tx].rel = 0;
+        txe[n_tx].id = 0x80000000u | (uint32_t)n_tx;
+        g_con.bytes += txe[n_tx].size;
+        ++n_tx;
     }
 }
 
@@ -165,9 +323,17 @@ static void pct(const char* name, uint64_t* v, size_t n) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: vsim <config> <trace>\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: vsim <config> <trace> [key=value ...]\n"); return 2; }
     for (int k = 0; k < SOC_KINDS_N; ++k) g_prof.s20[k] = g_prof.s100[k] = -1.0;
     load_cfg(argv[1]);
+    for (int i = 3; i < argc; ++i) { /* (keys given after the two files replace the configuration's: a variant of a run without a second file) */
+        char pair[256];
+        snprintf(pair, sizeof pair, "%s", argv[i]);
+        char* eq = strchr(pair, '=');
+        if (!eq) { fprintf(stderr, "vsim: %s is not key=value\n", argv[i]); return 2; }
+        *eq = 0;
+        cfg_set(pair, eq + 1);
+    }
     load_trace(argv[2]);
     rnd_seed(cfg.seed);
     vt_us = 1000000;
@@ -190,6 +356,10 @@ int main(int argc, char** argv) {
     if (cfg.max_dgrams >= 0) client->azlMaxDatagrams = (enet_uint32)cfg.max_dgrams;
     if (cfg.ack_hold_events >= 0) client->azlAckHoldEvents = (enet_uint32)cfg.ack_hold_events;
     if (cfg.ack_hold_ms >= 0) client->azlAckHoldMs = (enet_uint32)cfg.ack_hold_ms;
+#endif
+#ifdef VSIM_CAPDROP
+    if (cfg.cap_drop) client->azlCapDrop = vsim_every_frame; /* (in the model every packet of the room is a game frame) */
+    if (cfg.cap_drop_max > 0) client->azlCapDropMax = (enet_uint32)cfg.cap_drop_max;
 #endif
     ENetAddress addr;
     enet_address_set_host_ip(&addr, "10.0.0.1");
@@ -220,9 +390,23 @@ int main(int argc, char** argv) {
     double tx_delay_sum = 0, tx_delay_max = 0;
     double handler_total_us = 0, round_total_us = 0;
     uint64_t svc_max_us = 0, round_max_us = 0, last_round_start = vt_us, loop_gap_max_us = 0, pings_sent = 0, recoveries = 0;
-    uint64_t* tx_wait = (uint64_t*)malloc((n_tx + 1) * sizeof(uint64_t));
+    /* (the frames of the trace, and with game=1 the ones the console's game will make) */
+    uint64_t* tx_wait = (uint64_t*)malloc((n_tx + 1 + (cfg.game ? (size_t)(cfg.game_secs * 1e6 / cfg.game_frame_us) + 16 : 0)) * sizeof(uint64_t));
     size_t n_txwait = 0;
     uint64_t drained_max = 0, drained_hist_gt8 = 0;
+    uint64_t burst_extra = 0, burst_max = 0;
+    size_t tx_queue_max = 0;
+    uint64_t budget_rounds = 0, drain_rounds = 0, away_since = 0; /* (2026-11-15: the send budget and the ring read first) */
+    (void)away_since;
+    if (cfg.game) {
+        if (n_inj || n_tx) { fprintf(stderr, "vsim: game=1 wants an empty trace\n"); return 2; }
+        g_meta_r = (GameMeta*)calloc(VS_MAX_FRAMES, sizeof(GameMeta));
+        g_game_from_us = t_base_us + (uint64_t)(cfg.game_from_s * 1e6);
+        g_game_to_us = g_game_from_us + (uint64_t)(cfg.game_secs * 1e6);
+        g_con.next_step_us = g_con.next_frame_us = g_game_from_us;
+        g_azh.next_step_us = g_azh.next_frame_us = g_game_from_us + (uint64_t)(cfg.game_frame_us / 2); /* (the two consoles' clocks are not in step) */
+        g_con.last_heard_us = g_azh.last_heard_us = g_game_from_us;
+    }
     /* windows of 5 s, like the plugin's statistics: the longest pause between two rounds, the most datagrams one service call read, the backlog */
     enum { MAXWIN = 4096 };
     static uint64_t win_gap[MAXWIN], win_dg[MAXWIN], win_backlog[MAXWIN];
@@ -235,7 +419,34 @@ int main(int argc, char** argv) {
     int done = 0;
     uint32_t datagrams_seen = client->totalReceivedPackets;
     uint64_t last_probe_ms = 0, probes = 0;
+    /* (plugin-causa) the room's side of the console's hole, sampled every 100 ms; with VSIM_TL a line every 500 ms */
+    uint64_t tl_next = t_base_us, tl_delivered = 0, delivered = 0, last_deliver_us = 0, deliver_gap_max_us = 0, deliver_gap_at_us = 0;
+    uint32_t hole_attempts_max = 0, room_attempts_max = 0, room_rto_max_cmd = 0, hole_next_max = 0;
+    const int tl_print = getenv("VSIM_TL") != NULL;
     while (vt_us < t_end && !done) {
+        if (vt_us >= tl_next) {
+            RoomProbe rp;
+            const uint16_t hole = (uint16_t)(server->channels[0].incomingReliableSequenceNumber + 1);
+            room_probe(hole, &rp);
+            if (rp.hole_attempts > hole_attempts_max) hole_attempts_max = rp.hole_attempts;
+            if (rp.max_attempts > room_attempts_max) room_attempts_max = rp.max_attempts;
+            if (rp.max_rto_ms > room_rto_max_cmd) room_rto_max_cmd = rp.max_rto_ms;
+            if (rp.hole_where == 1 && rp.hole_next_ms > hole_next_max) hole_next_max = rp.hole_next_ms;
+            if (tl_print && (tl_next - t_base_us) % 500000ull == 0) {
+#ifdef VSIM_CAP
+                const unsigned refused = client->azlCounters.capRefused, admitted = client->azlCounters.capAdmitted;
+#else
+                const unsigned refused = 0, admitted = 0;
+#endif
+                printf("tl t=%.1f waiting=%zu ready=%d delivered=%llu refused=%u admitted=%u | room unacked=%u resend_waiting=%u in_transit=%u thr=%u max_att=%u max_rto=%u"
+                       " | awaited seq=%u where=%d att=%u rto=%u next_in=%u%s\n",
+                       (tl_next - t_base_us) / 1e6, server->totalWaitingData, !enet_list_empty(&server->dispatchedCommands), (unsigned long long)(delivered - tl_delivered),
+                       refused, admitted, rp.unacked, rp.resend_waiting, rp.in_transit, rp.throttle, rp.max_attempts, rp.max_rto_ms, hole, rp.hole_where, rp.hole_attempts,
+                       rp.hole_rto_ms, rp.hole_next_ms, room_connected() ? "" : " | ROOM HAS DROPPED THE CONSOLE");
+                tl_delivered = delivered;
+            }
+            tl_next += 100000ull;
+        }
         const uint64_t round_start = vt_us;
         const uint64_t gap = round_start - last_round_start;
         if (gap > loop_gap_max_us) loop_gap_max_us = gap;
@@ -245,6 +456,7 @@ int main(int argc, char** argv) {
         if (gap > 40000 && getenv("VSIM_TRACE")) fprintf(stderr, "gap %.1f ms before t=%.3f s (backlog %u)\n", gap / 1000.0, (vt_us - t_base_us) / 1e6, vnet_client_backlog(vt_us));
         { const uint32_t bl = vnet_client_backlog(vt_us); if (bl > wbl) wbl = bl; }
         if (vt_us - win_start >= 5000000ull && nwin < MAXWIN) { win_gap[nwin] = wgap; win_dg[nwin] = wdg; win_backlog[nwin] = wbl; ++nwin; wgap = wdg = wbl = 0; win_start = vt_us; }
+        game_console_until(vt_us);
         /* the frames the game queued before this round */
         size_t queued_to = tx_next;
         while (queued_to < n_tx && txe[queued_to].t_us <= vt_us) ++queued_to;
@@ -283,26 +495,68 @@ int main(int argc, char** argv) {
             }
         }
         if (r > 0) {
-            if (ev.type == ENET_EVENT_TYPE_RECEIVE) {
-                uint32_t id = 0xFFFFFFFFu;
-                if (ev.packet->dataLength >= 4) memcpy(&id, ev.packet->data, 4);
-                const double h = rnd_logn(g_prof.handler_us, 0.5);
-                handler_total_us += h;
-                vt_us += (uint64_t)h;
-                if (id < VS_MAX_FRAMES) t_deliver[id] = vt_us;
-                enet_packet_destroy(ev.packet);
-            } else if (ev.type == ENET_EVENT_TYPE_DISCONNECT) {
-                lost_at = vt_us;
-                done = 1;
+            /* the packet the call handed over, and with `burst` the ones that are ready behind it: enet_host_check_events makes no soc call */
+            int handed = 0;
+            for (int have = r; have > 0 && !done; have = (++handed < cfg.burst) ? enet_host_check_events(client, &ev) : 0) {
+                if (ev.type == ENET_EVENT_TYPE_RECEIVE) {
+                    uint32_t id = 0xFFFFFFFFu;
+                    if (ev.packet->dataLength >= 4) memcpy(&id, ev.packet->data, 4);
+                    const double h = rnd_logn(g_prof.handler_us, 0.5);
+                    handler_total_us += h;
+                    vt_us += (uint64_t)h;
+                    if (id < VS_MAX_FRAMES) t_deliver[id] = vt_us;
+                    ++delivered;
+                    if (last_deliver_us && vt_us - last_deliver_us > deliver_gap_max_us) { deliver_gap_max_us = vt_us - last_deliver_us; deliver_gap_at_us = vt_us; }
+                    last_deliver_us = vt_us;
+                    if (cfg.game && id < g_room_ids) {
+                        game_console_until(vt_us); /* (what the game sent before it had this frame) */
+                        game_hears(&g_con, g_meta_r[id], vt_us);
+                    }
+                    enet_packet_destroy(ev.packet);
+                    if (handed > 0) ++burst_extra;
+                } else if (ev.type == ENET_EVENT_TYPE_DISCONNECT) {
+                    lost_at = vt_us;
+                    done = 1;
+                }
             }
+            if ((uint64_t)handed > burst_max) burst_max = (uint64_t)handed;
         }
         if (done) break;
         /* the game's frames into ENet, then a flush */
         int sent_any = 0;
-        while (tx_next < n_tx && txe[tx_next].t_us <= vt_us) {
-            const TxEv* t = &txe[tx_next++];
-            uint8_t buf[1600];
+        game_console_until(vt_us);
+        if (tx_next < n_tx && n_tx - tx_next > tx_queue_max) {
+            size_t waiting = 0;
+            for (size_t i = tx_next; i < n_tx && txe[i].t_us <= vt_us; ++i) ++waiting;
+            if (waiting > tx_queue_max) tx_queue_max = waiting;
+        }
+        /* (2026-11-15) the titles with a send budget: after an absence, the ring's backlog first (RoomClient::Run, flow::HoldsForTheRing) */
+        int hold = 0;
+#ifdef VSIM_AWAY
+        if (client->azlAwayBacklog) {
+            if (!away_since) away_since = vt_us ? vt_us : 1;
+        } else {
+            away_since = 0;
+        }
+        if (cfg.send_budget > 0 && cfg.ring_first_ms > 0 && away_since && vt_us - away_since < (uint64_t)(cfg.ring_first_ms * 1000.0) &&
+            tx_next < n_tx && txe[tx_next].t_us <= vt_us) {
+            hold = 1;
+            ++drain_rounds;
+        }
+#endif
+        uint32_t budget_used = 0;
+        int took = 0;
+        while (!hold && tx_next < n_tx && txe[tx_next].t_us <= vt_us) {
+            const TxEv* t = &txe[tx_next];
             const uint32_t size = t->size < 8 ? 8 : (t->size > 1500 ? 1500 : t->size);
+            if (cfg.send_budget > 0 && took && budget_used + size > (uint32_t)cfg.send_budget) {
+                ++budget_rounds; /* (TxQueue::TakeUpTo: the rest waits for the next round, which reads first) */
+                break;
+            }
+            budget_used += size;
+            took = 1;
+            ++tx_next;
+            uint8_t buf[1600];
             memset(buf, 0x5A, size);
             memcpy(buf, &t->id, 4);
             ENetPacket* p = enet_packet_create(buf, size, t->rel ? (enet_uint32)ENET_PACKET_FLAG_RELIABLE : (enet_uint32)(ENET_PACKET_FLAG_UNSEQUENCED | ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT));
@@ -395,8 +649,45 @@ int main(int argc, char** argv) {
                c.dupCommands, c.ackOnlyDatagrams, c.ackDataDatagrams, c.recvSkipped);
         printf("enet_passes_capped=%u\nenet_events_before_ack=%u\nenet_ack_limit_hits=%u\nenet_ack_hold_max_ms=%u\nenet_hol_max_ms=%u\n", c.passesCapped, c.eventsBeforeAck, c.ackHoldLimitHits,
                c.ackHoldMaxMs, c.holWaitMaxMs);
+#ifdef VSIM_CAP
+        printf("enet_cap_refused=%u\nenet_cap_admitted=%u\nenet_waiting_max=%u\nenet_stream_lag_max_ms=%u\n", c.capRefused, c.capAdmitted, c.waitingMaxBytes, c.streamLagMaxMs);
+#endif
+#ifdef VSIM_CAPDROP
+        printf("enet_cap_dropped=%u\nenet_cap_drop_held_now=%u\n", c.capDropped, client->azlCapDropHeld);
+#ifdef ENET_AZL_AWAY_MS
+        printf("enet_cap_full=%u\nenet_cap_held_max=%u\nenet_seq_skipped=%u\nenet_seq_skipped_away=%u\n", c.capDropFull, c.capDropHeldMax, c.seqSkipped, c.seqSkippedAway);
+#endif
+#endif
     }
 #endif
     printf("client_state=%d\npackets_lost_client=%u\n", (int)server->state, server->packetsLost);
+    /* (plugin-causa) the room's side of the holes; the longest the console's game went without a frame of the room (from the end too, if it never came back) */
+    if (last_deliver_us && t_end > last_deliver_us && (vt_us - last_deliver_us) > deliver_gap_max_us && inj_next > 0) { deliver_gap_max_us = vt_us - last_deliver_us; deliver_gap_at_us = vt_us; }
+    printf("room_hole_attempts_max=%u\nroom_cmd_attempts_max=%u\nroom_cmd_rto_max=%u\nroom_hole_next_max=%u\ndeliver_gap_max_ms=%.1f\ndeliver_gap_at_s=%.3f\ndelivered=%llu\n",
+           hole_attempts_max, room_attempts_max, room_rto_max_cmd, hole_next_max, deliver_gap_max_us / 1000.0,
+           deliver_gap_at_us ? (deliver_gap_at_us - t_base_us) / 1e6 : -1.0, (unsigned long long)delivered);
+    if (cfg.send_budget > 0) printf("send_budget=%d\nring_first_ms=%.1f\nbudget_rounds=%llu\ndrain_rounds=%llu\n", cfg.send_budget, cfg.ring_first_ms,
+                                    (unsigned long long)budget_rounds, (unsigned long long)drain_rounds);
+#ifdef VSIM_AWAY
+    {
+        ENetAzlCounters c2 = client->azlCounters; /* (the away counters of N1; the window above took the others) */
+        printf("enet_away_episodes=%u\nenet_away_dgrams_max=%u\nenet_away_bytes_max=%u\nenet_away_dup_max=%u\n", c2.awayEpisodes, c2.awayDatagramsMax, c2.awayBytesMax, c2.awayDupMax);
+    }
+#endif
+    if (cfg.burst > 1 || cfg.same_ms > 0 || cfg.game || g_rcvbuf_bytes) {
+        printf("burst=%d\nburst_extra=%llu\nburst_max=%llu\nsame_ms=%.1f\nsame_dropped=%llu\ntx_queue_max=%zu\nring_drops=%llu\nring_peak_bytes=%u\nwaiting_now=%zu\n", cfg.burst,
+               (unsigned long long)burst_extra, (unsigned long long)burst_max, cfg.same_ms, (unsigned long long)g_same_dropped, tx_queue_max, (unsigned long long)g_ns.ring_drops,
+               g_ns.ring_peak_bytes, server->totalWaitingData);
+    }
+    if (cfg.game) {
+        const double gs = cfg.game_secs;
+        game_silence(&g_con, vt_us < g_game_to_us ? vt_us : g_game_to_us);
+        game_silence(&g_azh, vt_us < g_game_to_us ? vt_us : g_game_to_us);
+        printf("game_secs=%.1f\ngame_con_steps_s=%.2f\ngame_azh_steps_s=%.2f\ngame_con_frames=%llu\ngame_azh_frames=%llu\ngame_con_frame_b=%.0f\ngame_azh_frame_b=%.0f\n", gs, g_con.steps / gs,
+               g_azh.steps / gs, (unsigned long long)g_con.frames, (unsigned long long)g_azh.frames, g_con.frames ? (double)g_con.bytes / (double)(g_con.frames - g_same_dropped) : 0.0,
+               g_azh.frames ? (double)g_azh.bytes / (double)g_azh.frames : 0.0);
+        printf("game_con_gap_max_ms=%.1f\ngame_azh_gap_max_ms=%.1f\ngame_con_dead_at_s=%.3f\ngame_azh_dead_at_s=%.3f\n", g_con.gap_max_us / 1000.0, g_azh.gap_max_us / 1000.0,
+               g_con.dead_at_us ? (g_con.dead_at_us - g_game_from_us) / 1e6 : -1.0, g_azh.dead_at_us ? (g_azh.dead_at_us - g_game_from_us) / 1e6 : -1.0);
+    }
     return 0;
 }

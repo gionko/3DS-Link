@@ -33,6 +33,8 @@ constexpr int kSleepStopDefault = 0;
 enum ChatPos : int { kChatPosTopLeft = 0, kChatPosTopRight = 1, kChatPosBottomLeft = 2, kChatPosBottomRight = 3, kChatPosCount = 4 };
 /// Bottom left, the user's choice (2026-11-04): what a new file holds and what a missing key or a word that is none of the four means.
 constexpr int kChatPosDefault = kChatPosBottomLeft;
+/// (2026-11-19, the user's choice for the build 2h) the chat is OFF in a new file, and for a file without the key; a file that says chat=1 keeps it.
+inline constexpr bool kChatDefault = false;
 constexpr const char* kChatPosWords[kChatPosCount] = {"top-left", "top-right", "bottom-left", "bottom-right"};
 constexpr const char* kChatPosLabels[kChatPosCount] = {"Top left", "Top right", "Bottom left", "Bottom right"};
 
@@ -157,12 +159,6 @@ inline bool MenuKeyIsOff(const std::string& value) {
     return word == "off" || word == "none";
 }
 
-/// ini key `menu_key` as the plugin and the app take it from the file: the old default chord (any case, blanks around) becomes the
-/// new one, every other value - a chord the user wrote, off - stays as it is.
-inline std::string MenuKeyFromFile(const std::string& value) {
-    return Word(value) == Word(kOldDefaultMenuKey) ? std::string(kDefaultMenuKey) : value;
-}
-
 /// The keys of a chord as the plugin takes them (ParseKeys in Sources/main.cpp: the twelve words in any case, '+', ' ' or ',' between
 /// them, a word it does not know is no key), one bit a word, Select always among them (the plugin adds it to both chords).
 inline unsigned ChordBits(const std::string& chord) {
@@ -183,6 +179,17 @@ inline unsigned ChordBits(const std::string& chord) {
         }
     }
     return bits;
+}
+
+/// ini key `menu_key` as the plugin and the app take it from the file: the old default chord (any case, blanks around) becomes the
+/// new one; (DPAPP-2j, the user: chat, debug and menu off by default) a value with no key the plugin knows besides Select ("xyz",
+/// "Select" alone) is OFF - before, the plugin opened the menu on its default chord for it; every other value - a chord the user
+/// wrote, off - stays as it is.
+inline std::string MenuKeyFromFile(const std::string& value) {
+    if (Word(value) == Word(kOldDefaultMenuKey)) {
+        return std::string(kDefaultMenuKey);
+    }
+    return !MenuKeyIsOff(value) && ChordBits(value) == 1u ? std::string(kMenuKeyOff) : value;
 }
 
 /// Two chords one of which holds every key of the other (the same chord too): the menu's and the chat's cannot be such a pair, since
@@ -255,7 +262,7 @@ struct Fields {
     int debug = 0;
     int rcvbuf_kb = kRcvbufKbDefault;
     int sleep_stop = kSleepStopDefault;
-    bool chat = true;                       // the chat of the room shown over the title (on: the user's choice; it can be switched off)
+    bool chat = kChatDefault;               // the chat of the room shown over the title (off until the user switches it on: 2026-11-19)
     std::string chat_key = kDefaultChatKey; // the chord that opens it
     int chat_pos = kChatPosDefault;         // the corner of its lines (ParseChatPos; the file holds the word)
 };

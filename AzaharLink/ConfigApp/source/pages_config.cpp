@@ -263,17 +263,6 @@ protected:
                      "(64 MiB a file, 8 files). OFF: no log file at all. Logging slows a title: judge the speed with it OFF.";
         add(debug);
 
-        // The emergency switch of 3DS Link Delivery, in the app's own file (3DSLink.cfg), never in the plugin's ini. It is here, on a page of its own, so that it is
-        // reachable whatever the Download Play part does.
-        Row dlp_switch;
-        dlp_switch.id = kDlpDelivery;
-        dlp_switch.kind = Kind::Toggle;
-        dlp_switch.label = dlp::kSwitchLabel;
-        dlp_switch.on = g.app_cfg.dlp_delivery;
-        dlp_switch.note_title = dlp::kSwitchNoteTitle;
-        dlp_switch.note = dlp::kSwitchNote;
-        add(dlp_switch);
-
         Row menu;
         menu.id = kMenu;
         menu.kind = Kind::Toggle;
@@ -445,15 +434,6 @@ protected:
             }
             break;
         }
-        case kDlpDelivery: {
-            bool on = g.app_cfg.dlp_delivery;
-            if (SetSwitch(on, step)) {
-                g.app_cfg.dlp_delivery = on;
-                g.SaveAppConfig();
-                g.ShowToast(dlp::SwitchToast(on), on ? col::kOn : col::kWarn, 3000);
-            }
-            break;
-        }
         case kTest:
             if (step != 0) {
                 break;
@@ -495,7 +475,7 @@ protected:
     }
 
 private:
-    enum Id { kAutoconnect = 1, kDebug, kMenu, kMenuKeys, kChat, kChatKeys, kChatPos, kTest, kCheck, kAbout, kNickname, kDlpDelivery, kCheckUpdates, kUpdateAtStart };
+    enum Id { kAutoconnect = 1, kDebug, kMenu, kMenuKeys, kChat, kChatKeys, kChatPos, kTest, kCheck, kAbout, kNickname, kCheckUpdates, kUpdateAtStart };
 
     void EditNickname() {
         std::string input = g.cfg.nickname;

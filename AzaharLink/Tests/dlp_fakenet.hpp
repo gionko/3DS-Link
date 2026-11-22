@@ -5,7 +5,7 @@
 // What it does like the engine does it:
 //   * a client shows up in Members() of the host the moment the engine admits it, BEFORE any message;
 //   * a host that is full or whose admissions are blocked (accepting = 0) does NOT refuse: ConnectPoll() stays 0 until
-//     Disconnect(); nodes are given from the lowest free id (2..4);
+//     Disconnect(); nodes are given from the lowest free id (2..what the lobby announced, as the engine: 2..4 for a lobby of four);
 //   * HostClose() / Kick() empty Members() of the client (Kick can be delayed with SetKickLag);
 //   * ScanRead() may omit a lobby for a while (HideBeacon); ReadNode() returns the identity the node joined with;
 //   * messages carry the engine's from_node and travel only inside their own lobby (two lobbies on one air never touch).
@@ -14,7 +14,7 @@
 // FailScanOpen, FailConnectBegin, ConnectDelay, ConnectResult(-1), ConnectPollCost; Phantom nodes, silent Leave, Flap
 // (presence independent of messages); synthetic lobbies in the air (AddAir) for the scan tests; Inject. The knobs of a FAULTY
 // engine: MyNodeZero (MyNode() says 0 while Members() still lists us), ForceMembers (Members() answers exactly this list, which
-// may be longer than the array: the count is returned, at most four ids are written), FailReadNode.
+// may be longer than the array: the count is returned, at most kMaxPlayers ids are written), FailReadNode.
 // Counters: Sent(type, to), Kicked(node), HostCloseCalls / DisconnectCalls / ScanCloseCalls, ReadNodeCalls, the order of the
 // closing calls (CloseOrder), the channel and the announcements of HostOpen / HostUpdate.
 // It is NOT thread-safe: the test locks a mutex around every call into a lobby. It detects two threads inside it at the
@@ -36,8 +36,8 @@ class FakeLobbyNet;
 
 class FakeAir {
 public:
-    static constexpr int kPorts = 8;
-    static constexpr int kNodes = 8;  // node ids 0..7 (0 unused; 5..7 only for phantoms)
+    static constexpr int kPorts = 12;  // consoles on one air (2026-11-13: a lobby of eight, a ninth that knocks and spares)
+    static constexpr int kNodes = 12;  // node ids 0..11 (0 unused; the ids above what a lobby announced only for phantoms)
     static constexpr int kAnyType = 0;
     static constexpr int kAny = 0xFF;
     static constexpr int kForever = -1;
@@ -340,7 +340,7 @@ public:
         Port& P = port_[p];
         ++P.members_calls;
         Settle();
-        if (P.members_forced) {  // a faulty engine: the count may exceed what fits in the array (only four ids are written)
+        if (P.members_forced) {  // a faulty engine: the count may exceed what fits in the array (only kMaxPlayers ids are written)
             for (size_t i = 0; i < P.members_list.size() && i < azl::kMaxPlayers; ++i) {
                 nodes[i] = P.members_list[i];
             }
@@ -372,7 +372,7 @@ public:
         Port& P = port_[p];
         ++P.send_calls;
         Settle();
-        if (to < 1 || to > 4 || data == nullptr || size == 0 || size > azl::kMaxMessage) {
+        if (to < 1 || to > azl::kMaxPlayers || data == nullptr || size == 0 || size > azl::kMaxMessage) {
             return false;
         }
         if ((P.role != 1 && P.role != 4) || !lobby_[P.lobby].open || !lobby_[P.lobby].slot[to].used) {
@@ -533,7 +533,8 @@ private:
             if (!L.ann.accepting || used >= L.ann.max_nodes) {
                 return false;  // the engine stays silent
             }
-            for (int node = 2; node <= 4; ++node) {
+            // (the lowest free id: with fewer nodes than the lobby announced there is always one in 2..max_nodes, as in the engine)
+            for (int node = 2; node < kNodes; ++node) {
                 if (!L.slot[node].used) {
                     Slot& s = L.slot[node];
                     s = Slot();
@@ -696,6 +697,15 @@ public:
         FakeAir::Guard g(air_);
         return air_.Receive(i_, from_node, data, capacity, size);
     }
+    /// 1.1.4 (G1): the book of dlp:CLNT a test gives this console (Tests/dlp_ipc_test.cpp); null by default, as every network but the
+    /// adapter of the Download Play application.
+    azl::DlpClntBook* book = nullptr;
+    azl::DlpClntBook* ClntBook() override { return book; }
+    /// 1.1.4 (H5): the clients a test says the adapter still waits for (bit s = node s + 2); 0 by default, as every network but the real
+    /// Download Play's adapter with its wait on. `awaited_asks` counts the lobby's questions (it asks in its state 9 only).
+    azl::u8 awaited = 0;
+    mutable int awaited_asks = 0;
+    azl::u8 ChildrenAwaited() const override { ++awaited_asks; return awaited; }
 
     // knobs and counters of this console
     void FailSend(int n) { st().fail_send = n; }
@@ -708,7 +718,7 @@ public:
     void FailReadNode(int node, bool on) { st().fail_read[node] = on; }
     /// A faulty engine: MyNode() answers 0 while Members() still lists us.
     void MyNodeZero(bool on) { st().my_node_zero = on; }
-    /// A faulty engine: Members() answers exactly these ids (the count may be above four: four are written).
+    /// A faulty engine: Members() answers exactly these ids (the count may be above kMaxPlayers: kMaxPlayers are written).
     void ForceMembers(std::initializer_list<int> ids) {
         st().members_forced = true;
         st().members_list.clear();

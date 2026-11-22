@@ -1,7 +1,9 @@
 // The rules of the "Enable titles for Azahar" page and of the installation check of the 3DS Link app (ConfigApp/source/games.cpp and
 // status.cpp, the very files, built on a PC with a stand-in for <3ds.h>), run by Tests/run.sh. The files live in a directory
 // called "sdmc:" under a temporary directory, so the app's own paths work unchanged. What it pins: the title id as Luma spells it
-// and which titles are games at all; the SMDH (the name in the console's language, the fallbacks, line breaks, surrogates, a title
+// and which titles are games at all, which of those were sold (the two ranges of unique ids, held against every title of the list of the
+// public lobbies) and which rows the page makes of them (a homebrew is a row only while a plugin is in its folder), with the two exceptions of the page: the Download Play
+// application of the system, picked out of a made-up NAND and a row like a game's (and the whole of what the scan makes of that NAND: the questions it asks, the cache, a system that refuses), and the homebrew known to carry the id of a sold game, told by its name; the SMDH (the name in the console's language, the fallbacks, line breaks, surrogates, a title
 // without a name is left out) and the layout of its icon for the GPU; the cache of the games (written whole, read back whole, a
 // changed, cut, longer or foreign file is no cache); the order of the list; what a game's folder says (off, on,
 // another plugin); enabling (the folder and the copy, the same size as the source, never a half copy), disabling (the copy and
@@ -474,6 +476,433 @@ static void TestOtherPlugin() {
     CHECK(setup::ReadSlot(id).slot == setup::Slot::Off);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The sold games (2026-11-14): Enable Titles lists the games that were sold and not the homebrew - 3DS Link itself the first - unless a plugin is
+// already in the folder of one, which then can only be switched off.
+
+// The low word of every title of the list the public lobbies use (titles.txt, "#titles 2026-11-03"): Tests/make_sold_catalog.py makes the file.
+static const u32 kSoldCatalog[] = {
+#include "sold_catalog.inc"
+};
+
+// The application title with this unique id.
+static u64 App(u32 unique_id) {
+    return 0x0004000000000000ull | (static_cast<u64>(unique_id) << 8);
+}
+
+static void TestSoldGame() {
+    // the two ranges, at their edges
+    CHECK(!setup::IsSoldGameTid(App(0x002FF)));
+    CHECK(setup::IsSoldGameTid(App(0x00300)));
+    CHECK(setup::IsSoldGameTid(App(0x01FFF)));
+    CHECK(!setup::IsSoldGameTid(App(0x02000)));
+    CHECK(!setup::IsSoldGameTid(App(0xF6FFF)));
+    CHECK(setup::IsSoldGameTid(App(0xF7000)));
+    CHECK(setup::IsSoldGameTid(App(0xF71FF)));
+    CHECK(!setup::IsSoldGameTid(App(0xF7200)));
+    CHECK(!setup::IsSoldGameTid(App(0xF7FFF)));
+    CHECK(!setup::IsSoldGameTid(App(0xF8000)));
+    CHECK(!setup::IsSoldGameTid(App(0x00000)) && !setup::IsSoldGameTid(App(0xFFFFFF)));
+    CHECK(setup::kSoldIdFirst == 0x00300u && setup::kSoldIdLast == 0x01FFFu && setup::kSoldNewIdFirst == 0xF7000u && setup::kSoldNewIdLast == 0xF71FFu);
+    // the unique id is the three bytes in the middle of the low word: the last byte is not part of it, the high word neither
+    CHECK(setup::UniqueIdOf(0x000400000F83D1AAull) == 0xF83D1u && setup::UniqueIdOf(0xFFFFFFFF00030000ull) == 0x00300u);
+    CHECK(setup::IsSoldGameTid(App(0x00300) | 0xFF) && !setup::IsSoldGameTid(App(0x002FF) | 0xFF));
+    CHECK(!setup::IsSoldGameTid(App(0x100300))); // (all 24 bits of the unique id: this is not 0x00300 with something above it)
+    // an application title only: the demo, the update, the DLC, the Download Play child, a system title and DSiWare with the id of a sold game are not
+    CHECK(setup::IsSoldGameTid(0x000400000016E700ull));
+    CHECK(!setup::IsSoldGameTid(0x000400020016E700ull)); // demo (the high word nearest to an application's)
+    CHECK(!setup::IsSoldGameTid(0x0004000E0016E700ull)); // update
+    CHECK(!setup::IsSoldGameTid(0x0004008C0016E700ull)); // DLC
+    CHECK(!setup::IsSoldGameTid(0x000400010016E700ull)); // Download Play child
+    CHECK(!setup::IsSoldGameTid(0x000400100016E700ull)); // system application
+    CHECK(!setup::IsSoldGameTid(0x000480040016E700ull)); // DSiWare
+    CHECK(!setup::IsSoldGameTid(0x000000000016E700ull));
+
+    // every title of the list is a sold game, and the list is where the comment of the four numbers says it is
+    const std::size_t count = sizeof(kSoldCatalog) / sizeof(kSoldCatalog[0]);
+    std::size_t sold = 0, first = 0, second = 0;
+    u32 top_first = 0, top_second = 0, low_first = 0xFFFFFFu, low_second = 0xFFFFFFu;
+    for (std::size_t i = 0; i < count; ++i) {
+        const u64 tid = 0x0004000000000000ull | kSoldCatalog[i];
+        const u32 id = setup::UniqueIdOf(tid);
+        sold += setup::IsSoldGameTid(tid) ? 1 : 0;
+        if (id <= setup::kSoldIdLast) {
+            ++first;
+            top_first = id > top_first ? id : top_first;
+            low_first = id < low_first ? id : low_first;
+        } else {
+            ++second;
+            top_second = id > top_second ? id : top_second;
+            low_second = id < low_second ? id : low_second;
+        }
+        CHECK(i == 0 || kSoldCatalog[i] > kSoldCatalog[i - 1]); // sorted, no id twice
+    }
+    CHECK(count == 5217);
+    CHECK(sold == count);
+    CHECK(first == 4960 && second == 257);
+    CHECK(low_first == 0x00300u && top_first == 0x01E46u);
+    CHECK(low_second == 0xF7000u && top_second == 0xF715Fu);
+
+    // What a console of the project holds (2026-11-14: 157 application titles, 126 of them in the list above, 31 homebrew): a few of each.
+    static const struct {
+        u64 tid;
+        bool sold;
+        const char* what;
+    } kCases[] = {
+        {0x0004000000030200ull, true, "cartridge of 2012, the lowest id on the console"},
+        {0x0004000000030700ull, true, "cartridge of 2011"},
+        {0x0004000000040A00ull, true, "Game Boy Virtual Console"},
+        {0x000400000006E600ull, true, "NES Virtual Console"},
+        {0x0004000000074A00ull, true, "Game Boy Advance, the ambassador titles"},
+        {0x00040000000F8200ull, true, "cartridge of 2013"},
+        {0x000400000015CE00ull, true, "eShop only"},
+        {0x000400000016E700ull, true, "cartridge of 2016"},
+        {0x00040000001D1A00ull, true, "cartridge of 2018, the highest id of the first range on the console"},
+        {0x000400000F700200ull, true, "New 3DS only cartridge"},
+        {0x000400000F700E00ull, true, "Super Nintendo Virtual Console"},
+        {0x000400000F703100ull, true, "Super Nintendo Virtual Console, the highest id on the console"},
+        {0x000400000F83D100ull, false, "3DS Link itself"},
+        {0x000400000F800100ull, false, "title manager"},
+        {0x0004000000384900ull, false, "emulator, just above the first range"},
+        {0x0004000001610000ull, false, "identity tool"},
+        {0x0004000003070C00ull, false, "a mod of a cartridge under an id of its own"},
+        {0x0004000003DF1000ull, false, "shop client"},
+        {0x000400000ABA5E00ull, false, "game broadcaster"},
+        {0x000400000BAC0000ull, false, "emulator front end"},
+        {0x000400000BACEA00ull, false, "emulator core"},
+        {0x000400000BCFFF00ull, false, "save manager"},
+        {0x000400000D921E00ull, false, "homebrew launcher"},
+        {0x000400000EC50000ull, false, "benchmark"},
+        {0x000400000F657400ull, false, "StreetPass relay, just under the second range"},
+        {0x000400000F7A3E00ull, false, "chat homebrew of another console, above the last title of the second range"},
+        {0x000400000FF32100ull, false, "adventure game engine"},
+        {0x000400000FF3FF00ull, false, "a port of a console game"},
+    };
+    std::size_t games = 0, homebrew = 0;
+    for (const auto& c : kCases) {
+        if (setup::IsSoldGameTid(c.tid) != c.sold) {
+            std::fprintf(stderr, "  the rule is wrong about %s (%s)\n", setup::TidText(c.tid).c_str(), c.what);
+        }
+        CHECK(setup::IsSoldGameTid(c.tid) == c.sold);
+        CHECK(setup::IsApplicationTid(c.tid)); // (an application title either way: the scan keeps it, Titles Delivery and the lobbies show it)
+        (c.sold ? games : homebrew) += 1;
+    }
+    CHECK(games == 12 && homebrew == 16);
+    // KNOWN LIMITS, what the rule cannot see: a title that is not a sold game but took an id inside the first range passes for one. These were
+    // seen on the consoles of the project (2026-11-14: 402 titles of 60 lists of eight consoles; only the first id is in the list above, where it
+    // is a Japanese game's). They are held so that whoever moves the ranges meets them: it is what a rule on the id alone does, not a wish.
+    static const struct {
+        u64 tid;
+        const char* what;
+    } kPassing[] = {
+        {0x00040000000F9800ull, "coin tool under the id of a sold game"},
+        {0x0004000000097800ull, "an old game wrapped as a title"},
+        {0x0004000000124200ull, "Super Nintendo emulator"},
+        {0x00040000000EC500ull, "a title of unknown origin that carries the name of a sold game"},
+    };
+    std::size_t passing = 0;
+    for (const auto& c : kPassing) {
+        CHECK(setup::IsSoldGameTid(c.tid));
+        passing += std::strlen(c.what) != 0 ? 1 : 0;
+    }
+    CHECK(passing == 4);
+    // (Later the same day: the first three are told by their NAME, and the page asks setup::IsEnableTitle - TestExceptions below. IsSoldGameTid is what it was.)
+}
+
+// The rows of the page, from the folders of a card (the very function the page asks: setup::EnableRows).
+static void TestEnableRows() {
+    using setup::Listing;
+    using setup::Slot;
+    // the decision by itself
+    const u64 a_game = 0x000400000016E700ull, a_tool = 0x000400000F800100ull, self = 0x000400000F83D100ull;
+    CHECK(setup::ListingOf(a_game, Slot::Off) == Listing::Game && setup::ListingOf(a_game, Slot::On) == Listing::Game);
+    CHECK(setup::ListingOf(a_game, Slot::Other) == Listing::Game);
+    CHECK(setup::ListingOf(a_tool, Slot::Off) == Listing::Hidden);
+    CHECK(setup::ListingOf(a_tool, Slot::On) == Listing::OffOnly && setup::ListingOf(a_tool, Slot::Other) == Listing::OffOnly);
+    CHECK(setup::ListingOf(self, Slot::Off) == Listing::Hidden && setup::ListingOf(self, Slot::On) == Listing::OffOnly);
+    // the question the switch asks is about the TITLE (a row carries no leave to be switched on): never for a homebrew, never for 3DS Link itself
+    CHECK(setup::IsSoldGameTid(a_game) && !setup::IsSoldGameTid(a_tool) && !setup::IsSoldGameTid(self));
+
+    Fresh();
+    const std::string source = "sdmc:/3ds/AzaharLink.3gx";
+    const std::string content = Plugin(5000, 'a');
+    Put(source, content);
+    const u64 game_off = 0x000400000016E700ull;   // a sold game, no folder
+    const u64 tool_off = 0x000400000F800100ull;   // a homebrew, no folder
+    const u64 game_on = 0x0004000000177000ull;    // a sold game with the plugin
+    const u64 tool_on = 0x000400000BAC0000ull;    // a homebrew with the plugin (an older 3DS Link listed it)
+    const u64 self_on = 0x000400000F83D100ull;    // 3DS Link itself with the plugin
+    const u64 game_new = 0x000400000F700E00ull;   // a sold game of the second range, no folder
+    const u64 tool_other = 0x000400000D921E00ull; // a homebrew with another plugin in its folder
+    const u64 tool_notes = 0x000400000BCFFF00ull; // a homebrew whose folder holds no plugin at all
+    const u64 game_other = 0x0004000000055D00ull; // a sold game with another plugin in its folder
+    const u64 card_game = 0x0004000000030700ull;  // the title in the card slot is one more title of the list: the same rule
+    for (u64 tid : {game_on, tool_on, self_on}) {
+        CHECK(setup::EnableGame(tid, source.c_str()) == setup::EnableResult::Ok); // (the file functions take any title: the page is what decides)
+    }
+    for (u64 tid : {tool_other, game_other}) {
+        mkdir(setup::GamePluginDir(tid).c_str(), 0777);
+        Put(setup::GamePluginDir(tid) + "/Cheats.3gx", Plugin(300, 'q'));
+    }
+    mkdir(setup::GamePluginDir(tool_notes).c_str(), 0777);
+    Put(setup::GamePluginDir(tool_notes) + "/notes.txt", "mine");
+
+    const std::vector<u64> tids = {game_off, tool_off, game_on, tool_on, self_on, game_new, tool_other, tool_notes, game_other, card_game};
+    const std::vector<setup::EnableRow> rows = setup::EnableRows(tids);
+    // the two homebrew with no plugin are not rows; the others are, in the order given
+    CHECK(rows.size() == 8);
+    const struct {
+        std::size_t index;
+        Slot slot;
+        Listing listing;
+    } kWant[] = {{0, Slot::Off, Listing::Game},      {2, Slot::On, Listing::Game},      {3, Slot::On, Listing::OffOnly},  {4, Slot::On, Listing::OffOnly},
+                 {5, Slot::Off, Listing::Game},      {6, Slot::Other, Listing::OffOnly}, {8, Slot::Other, Listing::Game}, {9, Slot::Off, Listing::Game}};
+    for (std::size_t i = 0; i < rows.size() && i < 8; ++i) {
+        CHECK(rows[i].index == kWant[i].index && rows[i].info.slot == kWant[i].slot && rows[i].listing == kWant[i].listing);
+        CHECK((rows[i].listing == Listing::Game) == setup::IsSoldGameTid(tids[rows[i].index])); // (a row is a game's exactly when its switch goes on)
+        CHECK(rows[i].info.copy_size == (kWant[i].slot == Slot::On ? content.size() : 0)); // (the page makes a stale copy again from this)
+    }
+    // "switch on everything the page may": the sold games that are off, and nothing else
+    std::size_t switched = 0;
+    for (const setup::EnableRow& row : rows) {
+        if (setup::IsSoldGameTid(tids[row.index]) && row.info.slot == Slot::Off) {
+            CHECK(setup::EnableGame(tids[row.index], source.c_str()) == setup::EnableResult::Ok);
+            ++switched;
+        }
+    }
+    CHECK(switched == 3);
+    CHECK(setup::ReadSlot(game_off).slot == Slot::On && setup::ReadSlot(game_new).slot == Slot::On && setup::ReadSlot(card_game).slot == Slot::On);
+    CHECK(!Exists(setup::GamePluginDir(tool_off)));                                                  // the hidden homebrew has no folder still
+    CHECK(Get(setup::GamePluginDir(tool_notes) + "/notes.txt") == "mine" && !Exists(setup::GamePluginPath(tool_notes)));
+    CHECK(Get(setup::GamePluginDir(tool_other) + "/Cheats.3gx") == Plugin(300, 'q') && !Exists(setup::GamePluginPath(tool_other)));
+    CHECK(Get(setup::GamePluginPath(tool_on)) == content && Get(setup::GamePluginPath(self_on)) == content); // what was on is as it was
+    // making the rows writes nothing and removes nothing: the folder of a hidden title is never touched by the list
+    CHECK(setup::ListPluginFolders().size() == 9);
+    CHECK(setup::EnableRows(tids).size() == 8 && setup::ListPluginFolders().size() == 9);
+
+    // 3DS Link itself and the homebrew are switched off (the one thing their rows do): the next list has neither
+    CHECK(setup::DisableGame(self_on) && setup::DisableGame(tool_on));
+    const std::vector<setup::EnableRow> after = setup::EnableRows(tids);
+    CHECK(after.size() == 6);
+    for (const setup::EnableRow& row : after) {
+        CHECK(tids[row.index] != self_on && tids[row.index] != tool_on && tids[row.index] != tool_off && tids[row.index] != tool_notes);
+        CHECK(row.listing == Listing::Game || tids[row.index] == tool_other);
+    }
+    // put back by hand, a plugin makes its title a row again (the way in for a game that is installed under a made-up id)
+    mkdir(setup::GamePluginDir(tool_off).c_str(), 0777);
+    Put(setup::GamePluginPath(tool_off), content);
+    const std::vector<setup::EnableRow> by_hand = setup::EnableRows(tids);
+    CHECK(by_hand.size() == 7 && by_hand[1].index == 1 && by_hand[1].listing == Listing::OffOnly && by_hand[1].info.slot == Slot::On);
+
+    // no titles, no rows; and a card with no plugins folder at all lists the sold games
+    CHECK(setup::EnableRows({}).empty());
+    Fresh();
+    rmdir("sdmc:/luma/plugins");
+    const std::vector<setup::EnableRow> bare = setup::EnableRows(tids);
+    CHECK(bare.size() == 5);
+    for (const setup::EnableRow& row : bare) {
+        CHECK(row.listing == Listing::Game && row.info.slot == Slot::Off && setup::IsSoldGameTid(tids[row.index]));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The exception of the Enable Titles page (2026-11-14, after the list was looked at on a console): a homebrew that is known to carry the id of a sold game is not a
+// game. The page asks setup::IsEnableTitle; IsSoldGameTid is what it was. The Download Play application of the system was a second exception, a row like a game's,
+// until spec 9 of 1.1.4 (2026-11-17): it is no row any more, and a copy of the plugin an earlier build put in its folder is a leftover (IsDownloadPlayLeftover).
+
+// The system application with this low word.
+static u64 Sys(u32 low) {
+    return 0x0004001000000000ull | low;
+}
+
+// A NAND as a console lists it (AM_GetTitleList, MEDIATYPE_NAND): the KINDS of titles one holds, with the Download Play application of `region_digit` among them
+// (0 JPN, 1 USA, 2 EUR, 6 CHN, 7 KOR, 8 TWN; 0xF for a NAND without it). The ids are of the well-known titles of each kind or stand for one; none is a claim about
+// what a given console holds.
+static std::vector<u64> FakeNand(u32 region_digit) {
+    const u32 r = region_digit << 12;
+    std::vector<u64> nand = {
+        0x0004013800000002ull,            // the firmware
+        0x0004013000001702ull,            // a module (cfg)
+        0x0004013000002802ull,            // the module of the Download Play (dlp): a module, not the application
+        0x0004003000008002ull | (r >> 4), // an applet
+        0x0004009B00010202ull,            // a shared data archive
+        0x000400DB00016302ull,            // a system data archive
+        Sys(0x00020000 | r),              // System Settings: the application just before
+        Sys(0x00020200 | r),              // the application just after
+        Sys(0x00020900 | r),              // another system application
+        0x00040001000F8200ull,            // a Download Play CHILD that was received (it is installed in the NAND): not the application, and never a row
+        0x0004800542383841ull,            // a title of the DS side
+        0x000400000F83D100ull,            // (no application title is in the NAND; if one were listed there, it is not taken)
+        0x000400000016E700ull,
+    };
+    if (region_digit != 0xF) {
+        nand.insert(nand.begin() + 7, Sys(0x00020100 | r)); // the Download Play application, where the system would list it: among its neighbours
+    }
+    return nand;
+}
+
+static void TestExceptions() {
+    using setup::Listing;
+    using setup::Slot;
+    // ---- 1. the Download Play application of the system: NOT a row any more (1.1.4, spec 9) ----
+    const u64 dlp_eur = 0x0004001000022100ull; // the one seen on the consoles of the project
+    static const u64 kSix[] = {0x0004001000020100ull, 0x0004001000021100ull, 0x0004001000022100ull,
+                               0x0004001000026100ull, 0x0004001000027100ull, 0x0004001000028100ull}; // JPN USA EUR CHN KOR TWN
+    CHECK(sizeof(setup::kDownloadPlayTids) / sizeof(setup::kDownloadPlayTids[0]) == 6);
+    for (std::size_t i = 0; i < 6; ++i) {
+        CHECK(setup::kDownloadPlayTids[i] == kSix[i]);
+        CHECK(setup::IsDownloadPlayTid(kSix[i]));
+        // it is no game: not an application title, not a sold game (the scan of the SD card, Titles Delivery and "Enable the game?" never take it for one)
+        CHECK(!setup::IsApplicationTid(kSix[i]) && !setup::IsSoldGameTid(kSix[i]));
+        // ... and the page's question says no, whatever name it is given: the switch never goes on for it
+        CHECK(!setup::IsEnableTitle(kSix[i], "Download Play") && !setup::IsEnableTitle(kSix[i], "") && !setup::IsEnableTitle(kSix[i], "Fast PlayCoin"));
+        CHECK(setup::ListingOf(kSix[i], Slot::Off, "Download Play") == Listing::Hidden && setup::ListingOf(kSix[i], Slot::Off) == Listing::Hidden);
+        CHECK(!setup::IsGuestGame(kSix[i], "Download Play") && !setup::IsGuestGame(kSix[i], ""));
+        // the copy an earlier 3DS Link put in its folder: ours alone is a leftover, another plugin of the user's never is, and an empty folder is nothing
+        CHECK(setup::IsDownloadPlayLeftover(kSix[i], Slot::On));
+        CHECK(!setup::IsDownloadPlayLeftover(kSix[i], Slot::Other) && !setup::IsDownloadPlayLeftover(kSix[i], Slot::Off));
+    }
+    // the whole id, nothing near it: the neighbours among the system applications, a region that does not exist, another high word, another last byte
+    const u64 kNear[] = {Sys(0x00022000), Sys(0x00022200), Sys(0x00023100), Sys(0x00024100), Sys(0x00025100), Sys(0x00029100), Sys(0x00002100), Sys(0x00122100),
+                         0x0004001000022101ull, 0x0004001000022000ull, 0x0004000000022100ull, 0x0004003000022100ull, 0x0004001B00022100ull, 0x0004013000002802ull,
+                         0x00040001000F8200ull, 0x0000000000022100ull, 0x0004001100022100ull};
+    for (const u64 other : kNear) {
+        CHECK(!setup::IsDownloadPlayTid(other));
+        CHECK(!setup::IsEnableTitle(other, "Download Play")); // (and none of them is a sold game: no title of the NAND can be switched on)
+        CHECK(setup::ListingOf(other, Slot::Off, "Download Play") == Listing::Hidden);
+        CHECK(!setup::IsDownloadPlayLeftover(other, Slot::On)); // (the one-time removal never reaches another title's folder)
+    }
+    // no title of the system a NAND lists is a row of the page, the Download Play application of every region the first (the app reads nothing of the NAND for the
+    // page any more; the application title the made-up NAND also lists is a sold game, and only the scan of the SD card could ever hand it over)
+    static const u32 kDigits[] = {0, 1, 2, 6, 7, 8};
+    for (std::size_t i = 0; i < 6; ++i) {
+        const std::vector<u64> nand = FakeNand(kDigits[i]);
+        std::size_t dlp_in_nand = 0, rows_of_nand = 0;
+        for (u64 tid : nand) {
+            dlp_in_nand += setup::IsDownloadPlayTid(tid) ? 1 : 0;
+            rows_of_nand += !setup::IsApplicationTid(tid) && setup::ListingOf(tid, Slot::Off, "Download Play") != Listing::Hidden ? 1 : 0;
+        }
+        CHECK(nand.size() == 14 && dlp_in_nand == 1 && rows_of_nand == 0);
+    }
+    // a sold game with our plugin is never a leftover of the Download Play application (its copy stays: the look at the copies brings it up to date)
+    CHECK(!setup::IsDownloadPlayLeftover(0x000400000016E700ull, Slot::On) && !setup::IsDownloadPlayLeftover(0x000400000F83D100ull, Slot::On));
+
+    // ---- 2. the impostors ----
+    const u64 coin = 0x00040000000F9800ull, snes = 0x0004000000124200ull, pac = 0x0004000000097800ull, unknown = 0x00040000000EC500ull;
+    const std::string coin_name = "Fast PlayCoin - 300 coins NOW"; // as the list of console 63 has it
+    const std::string japanese = "\xE3\x82\xB2\xE3\x83\xBC\xE3\x83\xA0"; // the real game under 0x00F98 is a Japanese one: a name in kana stands for it
+    CHECK(sizeof(setup::kImpostors) / sizeof(setup::kImpostors[0]) == 3);
+    CHECK(setup::IsImpostor(coin, coin_name) && setup::IsImpostor(snes, "blargSnes") && setup::IsImpostor(pac, "Pac-In-Time"));
+    CHECK(!setup::IsEnableTitle(coin, coin_name) && !setup::IsEnableTitle(snes, "blargSnes") && !setup::IsEnableTitle(pac, "Pac-In-Time"));
+    // the id is still a sold game's for the rule on the id (the public lobbies, the known limits above): only the page's question changed
+    CHECK(setup::IsSoldGameTid(coin) && setup::IsSoldGameTid(snes) && setup::IsSoldGameTid(pac));
+    // the same id with another name is the game: the real title under 0x00F98 stays, and a title with no name given is asked by its id alone
+    CHECK(!setup::IsImpostor(coin, japanese) && setup::IsEnableTitle(coin, japanese));
+    CHECK(!setup::IsImpostor(coin, "") && setup::IsEnableTitle(coin, ""));
+    CHECK(!setup::IsImpostor(coin, "Coin Rush") && !setup::IsImpostor(coin, "Play") && !setup::IsImpostor(coin, "blargSnes") && !setup::IsImpostor(snes, coin_name));
+    CHECK(setup::IsEnableTitle(snes, "Some Game") && setup::IsEnableTitle(pac, "Pac-Man Party 3D"));
+    // the name is compared without case, spaces and signs (the SMDH of another build of the same homebrew, a name on two lines, what a user reads out)
+    CHECK(setup::IsImpostor(coin, "FAST PLAYCOIN") && setup::IsImpostor(coin, "fast play coin 300 coins now") && setup::IsImpostor(coin, "Play-Coin"));
+    CHECK(setup::IsImpostor(coin, "\xE2\x98\x85 Fast PlayCoin \xE2\x98\x85") && setup::IsImpostor(snes, "BlargSNES v1.3b") && setup::IsImpostor(pac, "Pac In Time"));
+    CHECK(setup::IsImpostor(pac, "PAC-IN-TIME (SNES)") && !setup::IsImpostor(pac, "Pac-Man in Time"));
+    // the name alone is nothing: under another id the title is what its id says (a sold game stays one, a homebrew is one already)
+    CHECK(!setup::IsImpostor(0x000400000016E700ull, coin_name) && setup::IsEnableTitle(0x000400000016E700ull, coin_name));
+    CHECK(!setup::IsImpostor(0x000400000F800100ull, "blargSnes") && !setup::IsEnableTitle(0x000400000F800100ull, "blargSnes"));
+    CHECK(!setup::IsImpostor(0x00040000000F9900ull, coin_name) && !setup::IsImpostor(0x00040000001F9800ull, coin_name)); // the id next to it, the id with a bit above
+    CHECK(setup::IsImpostor(coin | 0xFF, coin_name)); // (the unique id: the last byte of the title is not part of it)
+    // an application title only: the update and the DLC of the id are not asked
+    CHECK(!setup::IsImpostor(0x0004000E000F9800ull, coin_name) && !setup::IsImpostor(0x0004008C000F9800ull, coin_name) && !setup::IsImpostor(0x00040010000F9800ull, coin_name));
+    // the fourth title that passes for a game without being in the list - nobody knows what it is - is left a game
+    CHECK(!setup::IsImpostor(unknown, "Pok\xC3\xA9mon X") && setup::IsEnableTitle(unknown, "Pok\xC3\xA9mon X"));
+    // the table: every entry is an id the rule on the id lets through (an entry outside the ranges would hide nothing), spelled as the comparison spells a name
+    bool in_list[3] = {false, false, false};
+    for (std::size_t i = 0; i < 3; ++i) {
+        const setup::Impostor& entry = setup::kImpostors[i];
+        CHECK(setup::IsSoldGameTid(App(entry.unique_id)));
+        CHECK(std::strlen(entry.name_part) >= 8); // (a short part would catch real names)
+        for (const char* c = entry.name_part; *c; ++c) {
+            CHECK((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9'));
+        }
+        for (std::size_t k = 0; k < sizeof(kSoldCatalog) / sizeof(kSoldCatalog[0]); ++k) {
+            in_list[i] = in_list[i] || kSoldCatalog[k] == (entry.unique_id << 8);
+        }
+    }
+    CHECK(setup::kImpostors[0].unique_id == 0x00F98u && setup::kImpostors[1].unique_id == 0x01242u && setup::kImpostors[2].unique_id == 0x00978u);
+    CHECK(in_list[0] && !in_list[1] && !in_list[2]); // 0x00F98 IS a title of the list (why the id cannot leave the ranges); the other two are not
+    // the listing: an impostor is a homebrew (hidden; with a plugin in its folder, a row that can only go off); with no name given the id decides, as before
+    CHECK(setup::ListingOf(coin, Slot::Off, coin_name) == Listing::Hidden);
+    CHECK(setup::ListingOf(coin, Slot::On, coin_name) == Listing::OffOnly && setup::ListingOf(coin, Slot::Other, coin_name) == Listing::OffOnly);
+    CHECK(setup::ListingOf(coin, Slot::Off, japanese) == Listing::Game && setup::ListingOf(coin, Slot::Off) == Listing::Game);
+
+    // ---- the rows of a console: an SD card, and the Download Play application among the titles asked about (it is never a game's row) ----
+    Fresh();
+    const std::string source = "sdmc:/3ds/AzaharLink.3gx";
+    const std::string content = Plugin(5000, 'a');
+    Put(source, content);
+    const u64 dlp = dlp_eur;
+    const u64 a_game = 0x000400000016E700ull, a_tool = 0x000400000F800100ull;
+    const std::vector<u64> tids = {a_game, dlp, coin, snes, pac, unknown, a_tool};
+    const std::vector<std::string> names = {"Final Fantasy Explorers", "Download Play", coin_name, "blargSnes", "Pac-In-Time", "Pok\xC3\xA9mon X", "FBI"};
+    CHECK(setup::EnableGame(snes, source.c_str()) == setup::EnableResult::Ok); // an older 3DS Link listed the emulator as a game, and it was switched on
+    mkdir(setup::GamePluginDir(pac).c_str(), 0777);
+    Put(setup::GamePluginDir(pac) + "/Cheats.3gx", Plugin(300, 'q'));
+    const std::vector<setup::EnableRow> page = setup::EnableRows(tids, names);
+    // the coin tool, the title manager and the Download Play application are not rows; the emulator and the wrapped game are, to be switched off
+    CHECK(page.size() == 4);
+    const struct {
+        std::size_t index;
+        Slot slot;
+        Listing listing;
+    } kPage[] = {{0, Slot::Off, Listing::Game}, {3, Slot::On, Listing::OffOnly}, {4, Slot::Other, Listing::OffOnly}, {5, Slot::Off, Listing::Game}};
+    for (std::size_t i = 0; i < page.size() && i < 4; ++i) {
+        CHECK(page[i].index == kPage[i].index && page[i].info.slot == kPage[i].slot && page[i].listing == kPage[i].listing);
+        CHECK((page[i].listing == Listing::Game) == setup::IsEnableTitle(tids[page[i].index], names[page[i].index])); // (a game's row exactly when its switch goes on)
+    }
+    // without the names the id alone decides (what EnableRows did before the names): the coin tool is back, and the two with a plugin are games' rows
+    const std::vector<setup::EnableRow> by_id = setup::EnableRows(tids);
+    CHECK(by_id.size() == 5 && by_id[1].index == 2 && by_id[1].listing == Listing::Game && by_id[2].listing == Listing::Game && by_id[3].listing == Listing::Game);
+    // names for some of the titles only: the others are asked by their id
+    CHECK(setup::EnableRows(tids, {"Final Fantasy Explorers", "Download Play"}).size() == 5);
+    // "switch on everything the page may": the game and the title nobody knows; no impostor, no homebrew, not the Download Play application
+    std::size_t turned_on = 0;
+    for (const setup::EnableRow& row : page) {
+        if (setup::IsEnableTitle(tids[row.index], names[row.index]) && row.info.slot == Slot::Off) {
+            CHECK(setup::EnableGame(tids[row.index], source.c_str()) == setup::EnableResult::Ok);
+            ++turned_on;
+        }
+    }
+    CHECK(turned_on == 2);
+    CHECK(!Exists(setup::GamePluginDir(dlp)) && !Exists(setup::GamePluginDir(coin)) && !Exists(setup::GamePluginDir(a_tool)) && !Exists(setup::GamePluginPath(pac)));
+    // the copy an earlier 3DS Link put in the Download Play application's folder (its row of Enable Titles, before spec 9): ours and nothing else, a leftover that the
+    // look at the copies takes away once (App::QueuePluginCopyRefresh hands it to DisableGame); the folder goes with it
+    CHECK(setup::EnableGame(dlp, source.c_str()) == setup::EnableResult::Ok && Get("sdmc:/luma/plugins/0004001000022100/AzaharLink.3gx") == content);
+    CHECK(setup::ListPluginFolders().count("0004001000022100") == 1);
+    CHECK(setup::IsDownloadPlayLeftover(dlp, setup::ReadSlot(dlp).slot));
+    CHECK(!setup::IsDownloadPlayLeftover(a_game, setup::ReadSlot(a_game).slot) && setup::ReadSlot(a_game).slot == Slot::On); // (a game's copy is not one)
+    CHECK(setup::DisableGame(dlp) && !Exists(setup::GamePluginDir(dlp)));
+    CHECK(setup::EnableRows(tids, names).size() == 4);
+    // another plugin of the user's in that folder, with ours or without: not a leftover, and nothing of the folder is touched
+    mkdir(setup::GamePluginDir(dlp).c_str(), 0777);
+    Put(setup::GamePluginDir(dlp) + "/Other.3gx", Plugin(300, 'q'));
+    CHECK(setup::ReadSlot(dlp).slot == Slot::Other && !setup::IsDownloadPlayLeftover(dlp, setup::ReadSlot(dlp).slot));
+    Put(setup::GamePluginPath(dlp), content);
+    CHECK(setup::ReadSlot(dlp).slot == Slot::Other && !setup::IsDownloadPlayLeftover(dlp, setup::ReadSlot(dlp).slot));
+    CHECK(Exists(setup::GamePluginDir(dlp) + "/Other.3gx") && Exists(setup::GamePluginPath(dlp)));
+    // the emulator is switched off (the one thing its row does): the next list has not got it
+    CHECK(setup::DisableGame(snes));
+    const std::vector<setup::EnableRow> last = setup::EnableRows(tids, names);
+    CHECK(last.size() == 4 && last[1].index == 1 && last[1].listing == Listing::OffOnly && last[2].index == 4 && last[3].index == 5);
+
+    // ---- an old cache of the titles may hold the record of the Download Play application (the scan of 1.1.4 builds before spec 9 put it there): it is read as a
+    // record like any other, and the scan, which never asks the NAND any more, writes the cache again without it ----
+    Fresh();
+    std::vector<setup::GameInfo> in, out;
+    in.push_back(MakeGame(a_game, 3, "Final Fantasy Explorers", 1));
+    in.push_back(MakeGame(dlp_eur, 2051, "Download Play", 2));
+    CHECK(setup::SaveGameCache("sdmc:/3ds/titles.cache", 1, in));
+    CHECK(setup::LoadGameCache("sdmc:/3ds/titles.cache", 1, out) && out.size() == 2 && SameGame(out[1], in[1]) && setup::IsDownloadPlayTid(out[1].tid));
+}
+
 static void TestCopyIsNeverHalf() {
     Fresh();
     // the source cannot be read: no destination, no leftover
@@ -492,6 +921,20 @@ static void TestCopyIsNeverHalf() {
     CHECK(setup::CopyPluginFile("sdmc:/3ds/p.3gx", "sdmc:/luma/plugins/old.3gx"));
     CHECK(Get("sdmc:/luma/plugins/old.3gx") == Plugin(100, 'a'));
     CHECK(!Exists("sdmc:/luma/plugins/old.3gx.part"));
+    // (DPAPP-2h-sec) the copy that was there goes aside (.old) and is gone once the new one is in place; what a copy cut between its two renames
+    // left (.old) goes with the next copy, and with a Disable
+    CHECK(!Exists("sdmc:/luma/plugins/old.3gx.old"));
+    Put("sdmc:/luma/plugins/old.3gx.old", "cut");
+    Put("sdmc:/3ds/q.3gx", Plugin(120, 'b'));
+    CHECK(setup::CopyPluginFile("sdmc:/3ds/q.3gx", "sdmc:/luma/plugins/old.3gx"));
+    CHECK(Get("sdmc:/luma/plugins/old.3gx") == Plugin(120, 'b') && !Exists("sdmc:/luma/plugins/old.3gx.old") && !Exists("sdmc:/luma/plugins/old.3gx.part"));
+    // a first copy (nothing there before): nothing set aside
+    CHECK(setup::CopyPluginFile("sdmc:/3ds/q.3gx", "sdmc:/luma/plugins/first.3gx"));
+    CHECK(Get("sdmc:/luma/plugins/first.3gx") == Plugin(120, 'b') && !Exists("sdmc:/luma/plugins/first.3gx.old"));
+    const u64 cut = 0x000400000016E800ull;
+    CHECK(setup::EnableGame(cut, "sdmc:/3ds/q.3gx") == setup::EnableResult::Ok);
+    Put(setup::GamePluginPath(cut) + ".old", "cut");
+    CHECK(setup::DisableGame(cut) && !Exists(setup::GamePluginPath(cut) + ".old") && !Exists(setup::GamePluginDir(cut)));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -939,6 +1382,9 @@ int main() {
     TestClassifyFolder();
     TestEnableDisable();
     TestOtherPlugin();
+    TestSoldGame();
+    TestEnableRows();
+    TestExceptions();
     TestCopyIsNeverHalf();
     TestInstallCheck();
     TestTitlesRow();

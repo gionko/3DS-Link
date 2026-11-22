@@ -81,6 +81,16 @@ export PYTHONIOENCODING=utf-8
 python AzaharLink/Tests/set_version.py --check
 echo "== versione di 3DS Link per questo giro: $(python AzaharLink/Tests/set_version.py --show)"
 
+if [ "$PLUGIN" = 0 ]; then
+  # (DPAPP-2h-rev) --no-plugin impacchetta l'AzaharLink.3gx che c'e': mai uno piu' vecchio dei sorgenti del plugin (la 2h ha cambiato title_rules.hpp e
+  # plugin.cpp: un .3gx di prima non riconosce il figlio 00040010 e i giochi del Download Play non partirebbero)
+  test -s AzaharLink/AzaharLink.3gx || { echo "ERRORE: --no-plugin senza AzaharLink/AzaharLink.3gx" >&2; exit 1; }
+  newer="$(find AzaharLink/Sources AzaharLink/Includes -type f -newer AzaharLink/AzaharLink.3gx | head -3)"
+  if [ -n "$newer" ]; then
+    echo "ERRORE: --no-plugin, ma il plugin e' piu' vecchio dei suoi sorgenti (es. $(echo "$newer" | tr '\n' ' ')): togliere --no-plugin" >&2
+    exit 1
+  fi
+fi
 if [ "$PLUGIN" = 1 ]; then
   echo "== 0. il plugin (da zero: il Makefile del plugin non sempre ricollega l'ELF)"
   rm -rf AzaharLink/AzaharLink.elf AzaharLink/AzaharLink.3gx AzaharLink/Build

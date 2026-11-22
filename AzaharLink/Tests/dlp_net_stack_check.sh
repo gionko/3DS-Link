@@ -27,9 +27,9 @@ FRAME_HUB=40       # bytes: a function of DlpHub (Serve and AnswerUnserved, 40 a
 FRAME_HUB_UNIT=64  # bytes: any function of the hub's translation unit (the hub, and the lobby and the service compiled into it: PollScan holds the lobby heard)
 FRAME_REAL=288     # bytes: any function of the real Download Play's adapter and codec (1.1.3, design 6.4: the network thread runs them; ScanRead 88 measured)
 FRAME_REAL_GAME=80 # bytes: the functions of that adapter a game thread runs (the hub's RunHere at the game's nwm::UDS Initialize, the clock): as the dialect's adapter
-REAL_GAME_FUNCTIONS='NowMs|NowTicks|Holds|HostClose|Disconnect|ScanClose|Release|ClearHost|ClearClient'
+REAL_GAME_FUNCTIONS='NowMs|NowTicks|Holds|HostClose|Disconnect|ScanClose|Release|ClearHost|ClearClient|ChildrenAwaited|ClntBook'
 # (Phase 3: the hub, Sources/azl/dlp_hub.cpp, is compiled strictly like the adapter and its frames and static storage are held the same way)
-ENGINE_FUNCTIONS='BeginHostingLobby|HeardLobbyAt|ConnectBegin|ConnectBeginLobby|ConnectPoll|InitializeForLobby|SetLobbyInbox|PopLobbyMessage|NodeSnapshot|StartHostingLocked|StartConnectLocked|BeginServiceLocked|PrepareLobby|EnsureLobbyLocked|BeginHostingDlp|ConnectBeginDlp|SetLobbyBeaconKind|SpectatorCount'
+ENGINE_FUNCTIONS='BeginHostingLobby|HeardLobbyAt|ConnectBegin|ConnectBeginLobby|ConnectPoll|InitializeForLobby|SetLobbyInbox|PopLobbyMessage|NodeSnapshot|StartHostingLocked|StartConnectLocked|BeginServiceLocked|PrepareLobby|EnsureLobbyLocked|BeginHostingDlp|ConnectBeginDlp|SetLobbyBeaconKind|SpectatorCount|NodeMac|InRoom|InDownloadPlay'
 # (1.1.3: the last four are the real Download Play's, phase F2; the network thread runs them, and they are held to the same budget)
 
 ARM_FLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -Os -mword-relocations -fomit-frame-pointer -ffunction-sections -fno-strict-aliasing -Wall -Wno-psabi -fno-rtti -fno-exceptions -std=gnu++17 -D__3DS__ -DAZL_USE_CTRPF"

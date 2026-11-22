@@ -9,7 +9,7 @@
 //   - the announcement, a group of 5 frames on channel 1 to 0xFFFF, ONLY while the host accepts and a spectator is connected (a
 //     searcher reads it as a spectator: Azahar's client, and ours in F4): a group at once when a spectator comes, then one every
 //     kAnnounceMs, ONE frame per Pump (the network thread holds the hub's mutex that the game threads wait for);
-//   - per client node (2..4) the dialogue: Auth (A1) as soon as the node is in, StartDistribution (A3) when the lobby says START,
+//   - per client node (2..the title's ceiling) the dialogue: Auth (A1) as soon as the node is in, StartDistribution (A3) when the lobby says START,
 //     FinishContentUpload (A5) at its answer, then a START_ACK for the lobby; the final with the passphrase (A7) when the lobby says GO,
 //     the notice (A8) every kNoticeMs, and at its answer (A9) a GO_ACK for the lobby. Each packet is resent on its own timer.
 // The lobby's Send(START / GO) only records what it wants (no frame leaves on the caller's thread: a game thread runs StartDistribution
@@ -37,7 +37,7 @@
 // final its GO with the passphrase (the FIRST final's), each handed once through Receive(); the lobby's START_ACK / GO_ACK send nothing.
 // Disconnect = Release.
 //
-// IN THE PLUGIN (phase F5). Only a game whose row of kDlpGames (Sources/ctr/plugin.cpp) says DlpGameMode::RealDlp gets one: the plugin makes it
+// IN THE PLUGIN (phase F5). Only a game whose Download Play column (azl/title_rules.hpp) says DlpGameMode::RealDlp gets one: the plugin makes it
 // once, at start, and gives it to its DlpHub as the lobby's network (the backend; every other game keeps the hub's own EngineLobbyNet and never
 // has one of these). The hub pumps it on the network thread (its Tick: this Pump, then the lobby's) and asks it whether the engine is held
 // (Holds); on a game thread with no network thread (the hub's RunHere at the game's nwm::UDS Initialize) only Holds, ScanClose, Disconnect and
@@ -47,16 +47,32 @@
 // takes its own lock inside each call. On a game thread the lobby calls only the clock, HostOpen / HostUpdate / HostClose / Kick, Send /
 // Receive (no frame), Members / ReadNode / MyNode, ScanOpen / ScanClose / ScanRead / ConnectBegin / ConnectPoll / Disconnect (no frame
 // of the dialogue: the connection's handshake is the engine's) and, with the hub's RunHere, HostClose / Disconnect = Release. Nothing blocks.
+// EIGHT PLAYERS (2026-11-13, Mario Kart 7). The table of dialogues holds host + 7 clients (kRealPlayers = the lobby's kMaxPlayers); how many
+// of them a game may have is the ceiling of ITS title (SetPlayers, from the Download Play column of its row of azl/title_rules.hpp through the plugin's MakeRealDlpHub: the same
+// number the lobby above has in LobbyConfig::max_players): four for an adapter nobody told - Luigi's Mansion, whose host still refuses a
+// network of more than four and walks three dialogues, as before - and eight for Mario Kart 7, whose creator asks for seven clients. The
+// capture of eight Azahar that is the contract of that game: analysis/mk7-azahar-2026-11-13 (Tests/dlp_real_mk7_golden.inc, Tests/dlp_real_mk7_test.cpp).
 // MEMORY. One object (heap, once, only for a game of that mode), about 1.8 KB: the one frame buffer (kBufferBytes), the probes' cache
-// (kProbeCache x 36) and some words. No allocation of its own; the engine allocates as it does for the games (the ring of a bind: 2 KB for
+// (kProbeCache x 36), the dialogues (kRealClients x 12) and some words. No allocation of its own; the engine allocates as it does for the games (the ring of a bind: 2 KB for
 // the dialogue, 8 KB for a probe only while it lasts; a WifiPacket per SendTo).
+// THE TITLE (2026-11-14, Mario Party: Island Tour). A host of the real Download Play announces the child's names, icon and sizes; ours
+// carries zeros there unless the plugin gives the adapter a block for it (SetTitleBlock: azl/dlp_title_block.hpp, 5 KB that the PLUGIN
+// reads and keeps, once, only for the games listed there). The adapter keeps the pointer and a flag: nothing of it for Luigi's Mansion
+// and Mario Kart 7, whose frames stay what their captures' tests hold.
 #pragma once
 
+#include <atomic>
+
+#include "azl/dlp_child_wait.hpp"
 #include "azl/dlp_lobby.hpp"
 #include "azl/dlp_real_wire.hpp"
 #include "azl/uds_engine.hpp"
 
 namespace azl {
+
+namespace dlp_children {
+struct Table;  // azl/dlp_children.hpp: the children the app prepared (1.1.4, G1/G2: the Download Play application only)
+}
 
 // >>> game-thread code (Tests/policy_check.sh: no printf family, no Log()/DebugEvent() with a format, no big buffer)
 
@@ -91,7 +107,14 @@ public:
     static constexpr u32 kProbeCollectMs = 1500;  // the 5 frames from the bind (Azahar 1000; a group every 500 ms: at least two groups)
     static constexpr u32 kProbeRetryMs = 5000;    // a host that did not answer the connection is tried again after this
     static constexpr u32 kPullsPerProbe = 2;      // frames of the announcement taken per Pump (1.5 KB each, under the hub's mutex)
-    static constexpr u32 kProbeCache = UdsEngine::kHeardLobbies;  // hosts known (a room of 4 holds at most 4 hosts)
+    static constexpr u32 kProbeCache = UdsEngine::kHeardLobbies;  // hosts known (as many as the engine remembers)
+    // The adapter's table of dialogues holds what the lobby's tables hold, host + 7 clients (Mario Kart 7, whose capture of eight Azahar
+    // is the contract: Tests/dlp_real_mk7_golden.inc). What ONE game may use of it is players_, the ceiling of its title (SetPlayers):
+    // four unless the plugin says more, so Luigi's Mansion (which asks for ONE client) keeps a host that refuses a network of more than
+    // four and loops over three dialogues, as when the table itself held three.
+    static constexpr u32 kRealPlayers = kMaxPlayers;
+    static constexpr u32 kRealClients = kRealPlayers - 1;
+    static_assert(kRealPlayers == 8 && kRealClients == kMaxClients, "the real Download Play: host + 7 clients, the lobby's own tables");
     static constexpr u32 kProbeBind = 0x45;       // the probe's bind (channel 1 from node 1)
     static constexpr u32 kProbeRing = 8192;       // its ring: more than a group (6576 B), only for the probe
     static constexpr u32 kSessionBind = 0x46;     // the session's bind (channel 2 from node 1)
@@ -158,6 +181,59 @@ public:
     void SetIdentity(const Identity& me) {
         me_ = me;
     }
+    /// The ceiling of players of this game's title, host included, as its configuration says it (LobbyConfig::max_players: 0 = four,
+    /// TitlePlayers): the plugin gives the row's, once, before the first command (MakeRealDlpHub). An adapter nobody told is a title of four.
+    void SetPlayers(u8 said) {
+        players_ = static_cast<u8>(TitlePlayers(said));
+    }
+    u32 players() const {
+        return players_;
+    }
+    /// The title of this game's child for the announcement: given ONCE, by the plugin's own thread when it has read it, never changed
+    /// and never taken back (the block lives as long as the adapter). Until then - and for ever for a game nobody gives one - the
+    /// announcement carries zeros there. From any thread: the Pump looks at the pointer when a group starts.
+    void SetTitleBlock(const dlp_real::TitleBlock* title) {
+        title_.store(title, std::memory_order_release);
+    }
+    bool titled() const {
+        return title_.load(std::memory_order_acquire) != nullptr;
+    }
+    /// 1.1.4 (G1, the system's Download Play application only): the book of dlp:CLNT this adapter's searcher feeds - Collect notes the title and
+    /// the sizes of every frame 0 it reads - and that DlpService finds through the lobby's network (ClntBook). Given once, before the first command,
+    /// by the plugin's MakeClntHub; every other adapter has none. The book is told where the table of the children is published (SetChildren).
+    void SetClntBook(DlpClntBook* book);
+    DlpClntBook* ClntBook() override {
+        return clnt_book_;
+    }
+    /// The table of the children the app prepared (azl/dlp_children.hpp, contract K3): made by the plugin's thread from the index, published once
+    /// and never taken back; until then (and for ever with no memory for it) null, and every host is Unknown. From any thread.
+    void SetChildren(const dlp_children::Table* table) {
+        children_.store(table, std::memory_order_release);
+    }
+    const dlp_children::Table* children() const {
+        return children_.load(std::memory_order_acquire);
+    }
+    /// 1.1.4 (H5): the host waits, in its state 9, for the guests that came through the system's Download Play application and left the room to
+    /// start their child (azl/dlp_child_wait.hpp). Given once by the plugin, before the first command (MakeRealDlpHub: a game that hosts the real
+    /// Download Play); off for every adapter nobody told. Only a guest the room lists in the Download Play application at its final is waited for
+    /// (UdsEngine::InDownloadPlay): a guest that plays the game itself never is.
+    void SetChildWait(bool on) {
+        wait_.SetOn(on);
+    }
+    bool child_wait_on() const {
+        return wait_.on();
+    }
+    /// LobbyNet (the lobby in its state 9, under the hub's mutex; the hub, to stay active): the clients still awaited, bit s = node s + 2.
+    u8 ChildrenAwaited() const override {
+        return wait_.Awaited();
+    }
+    /// How the last wait ended, once per wait (the plugin's thread, for its log line; no MAC): false if none ended since the last call.
+    bool TakeChildWaitEnd(dlp_real::ChildWait::End* out);
+    /// 1.1.4 (H3): the MAC of a guest the host ejected because it asked for the content (it has no child of its own: the child never travels
+    /// through the room), one per call, oldest first, for the plugin's thread to name it on the screen (never in the log). False if none.
+    /// Up to kContentQueue guests between two calls; more are dropped (the count of count_.content still has them).
+    bool TakeContentGuest(Mac* out);
+    static constexpr u32 kContentQueue = 4;
     /// What the cache knows of `host` (tests): kHeardNone, kHeardVerified, kHeardIgnored, kHeardRetry.
     u8 HeardState(const Mac& host) const;
     static constexpr u8 kHeardNone = 0;
@@ -171,9 +247,9 @@ public:
     const Counters& counters() const {
         return count_;
     }
-    /// The state of a client's dialogue (tests): see the k* constants below; node 2..4.
+    /// The state of a client's dialogue (tests): see the k* constants below; node 2..the title's ceiling.
     u8 PeerState(u8 node) const {
-        return node >= 2 && node <= kMaxPlayers ? peers_[node - 2].st : 0;
+        return node >= 2 && node <= players_ ? peers_[node - 2].st : 0;
     }
 
     // The dialogue of one client (design 4.4).
@@ -253,6 +329,10 @@ private:
     /// The probe ends: the host's entry becomes `verdict` (kHeardNone = try again at once), the engine is given back.
     void EndProbe(u8 verdict, u32 now);
     void PumpSession();
+    // H5 and H3 on the network thread.
+    void NoteChild(u8 node);
+    void PumpChildWait(u32 now);
+    void NoteContentGuest(u8 node);
     static void Bump(u16* c) {
         if (*c != 0xFFFF) {
             ++*c;
@@ -261,7 +341,7 @@ private:
 
     UdsEngine* engine_;
     Counters count_ = {};
-    Peer peers_[kMaxClients] = {};
+    Peer peers_[kRealClients] = {};
     u64 child_tid_ = 0;     // the announcement's child title id
     u32 pump_ms_ = 0;       // last Pump (valid if pumped_)
     u32 group_ms_ = 0;      // start of the last group of the announcement (valid if grouped_)
@@ -269,6 +349,7 @@ private:
     u8 pass_[kPassphraseSize] = {};  // the FIRST passphrase the lobby gave (valid if pass_set_)
     u8 max_nodes_ = 0;      // the announcement's max_nodes
     u8 frame_ = dlp_real::kAnnounceFrames;  // next frame of the group (kAnnounceFrames = no group under way)
+    u8 players_ = kTitlePlayers;  // the ceiling of the title, host included: 2..kRealPlayers (SetPlayers; four if nobody said)
     bool held_ = false;
     bool hosting_ = false;  // HostOpen succeeded and no HostClose yet
     bool accepting_ = false;
@@ -276,6 +357,15 @@ private:
     bool pumped_ = false;
     bool grouped_ = false;
     bool group_now_ = false;  // a spectator came: the next group starts without waiting kAnnounceMs
+    bool group_titled_ = false;  // the group under way carries the title (decided at its frame 0: no group is half with it)
+    std::atomic<const dlp_real::TitleBlock*> title_{nullptr};  // the child's title for the announcement, or none (SetTitleBlock)
+    DlpClntBook* clnt_book_ = nullptr;  // 1.1.4 (G1): the book of dlp:CLNT, the Download Play application's adapter only (SetClntBook)
+    std::atomic<const dlp_children::Table*> children_{nullptr};  // 1.1.4 (G1/G2): the children the app prepared (SetChildren)
+    dlp_real::ChildWait wait_;            // 1.1.4 (H5): the guests that went to start their child (SetChildWait; not touched by Release/ClearHost)
+    std::atomic<u32> wait_end_{0};        // the last wait's end: bit 31 valid, 0-15 ms, 16-19 back, 20-23 stayed, 24-27 missing (TakeChildWaitEnd)
+    Mac content_mac_[kContentQueue] = {}; // 1.1.4 (H3): the guests ejected for the content, a ring the network thread fills ...
+    std::atomic<u8> content_in_{0};      // ... (its writes) ...
+    std::atomic<u8> content_out_{0};     // ... and the plugin's thread empties (TakeContentGuest)
     // the searcher
     Identity me_ = {};        // the probes' identity
     Heard heard_[kProbeCache] = {};
@@ -289,6 +379,8 @@ private:
 };
 
 static_assert(sizeof(RealDlpNet) <= 2048, "the adapter of the real Download Play stays under 2 KB");
+static_assert(dlp_real::ChildWait::kSlots == RealDlpNet::kRealClients, "H5: one slot of the wait per client of the host's table");
+static_assert(RealDlpNet::kContentQueue != 0 && (256 % RealDlpNet::kContentQueue) == 0, "H3: the ring's u8 counters wrap on a whole ring");
 
 // <<< game-thread code
 

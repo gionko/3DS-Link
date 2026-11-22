@@ -10,6 +10,9 @@
 #include <map>
 
 #include "../titleshare_host/delivery.h"
+#include "dlp_guest_am.hpp"
+#include "dlp_guest_exclude.hpp"
+#include "dlp_guest_store.hpp"
 #include "ncch_icon.hpp"
 #include "paths.hpp"
 
@@ -101,7 +104,13 @@ bool ReadTitleInfos(const std::vector<u64>& ids, std::vector<AM_TitleEntry>& inf
 }
 
 // The name of the game a title belongs to, as the delivery module's catalog groups them ("" when it has none).
+// A Download Play guest 3DS Link prepared is in no group (DropGuestTitles): the Installation check names it by what it is. It may be offered for
+// deletion there like any title of no use (an installation that was cut); its .guest stays, and the next look of the app makes it again
+// (dlpguest::Decide: a title of ours that is gone is prepared, not an error).
 std::string NameInCatalog(const Scanner::Impl* impl, u64 tid) {
+    if (dlpguest::IsOwnedGuestTid(tid)) {
+        return "Download Play guest (3DS Link)";
+    }
     if (!impl->catalog_ready) {
         return std::string();
     }
@@ -233,6 +242,18 @@ void UseAppNames(Scanner::Impl* impl) {
     std::sort(cat.games, cat.games + cat.nGames, [](const ts_game& a, const ts_game& b) { return strcasecmp(a.name, b.name) < 0; });
 }
 
+// The Download Play guests 3DS Link prepared (dlp_guest_store.hpp) are titles of the SD card like any other for the module's catalog: they are taken out
+// of its groups, so Titles Delivery never lists, sends or names one (dlp_guest_exclude.hpp, tried on a PC). (DPAPP-2h-sec) Every id of the band in a
+// child's form too, ours or not by the registry (NeverSent): a receiver would put it in its NAND.
+void DropGuestTitles(Scanner::Impl* impl) {
+    if (!impl->catalog_ready) {
+        return;
+    }
+    ts_catalog& cat = impl->catalog;
+    dlpguest::DropOwnedMembers(cat.games, &cat.nGames, [&cat](int item) { return item >= 0 && item < cat.nItems ? cat.items[item].tid : 0; },
+                               [](u64 tid) { return dlpguest::NeverSent(tid); });
+}
+
 void RunScan(Scanner::Impl* impl) {
     // catalog_build saves its cache in the data folder (hostcfg.h) but does not make it: the app made it when it started, and this only covers
     // a folder that went missing since.
@@ -245,6 +266,9 @@ void RunScan(Scanner::Impl* impl) {
 
     std::vector<u64> applications;
     for (u32 i = 0; i < impl->ctx.titleCount; ++i) {
+        if (dlpguest::IsOwnedGuestTid(impl->ctx.titleIds[i])) {
+            continue; // (a Download Play guest 3DS Link prepared: no game of the lists, no title to send, no lobby's)
+        }
         if (setup::IsApplicationTid(impl->ctx.titleIds[i])) {
             applications.push_back(impl->ctx.titleIds[i]);
         }
@@ -261,6 +285,7 @@ void RunScan(Scanner::Impl* impl) {
     g_running = impl;
     impl->catalog_ready = catalog_build(&impl->ctx, &impl->catalog, OnProgress) == 0;
     g_running = nullptr;
+    DropGuestTitles(impl);
     if (impl->cancel.load()) {
         return; // (the app is closing)
     }
@@ -527,6 +552,10 @@ int DeleteUnusable(const std::vector<setup::UnusableTitle>& titles, int* failed)
     int gone = 0;
     int refused = 0;
     for (const setup::UnusableTitle& t : titles) {
+        if (!dlpguest::UnusableMayGo(t.tid)) {
+            ++refused; // (the review of the build 2h, R4: a Download Play guest of ours only behind the guard of the ids - NAND, card, process)
+            continue;
+        }
         Result rc = 0;
         switch (t.kind) {
         case setup::UnusableTitle::Kind::Unfinished:

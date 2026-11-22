@@ -7,7 +7,8 @@
 //
 // WHAT. On an Old 3DS, a thread that the framework starts while it starts up never takes core 1: it goes to core 0, begins at once, and is stopped with the others. It is an idle worker that
 // waits on an event; nothing in this plugin schedules a "SysCore" task, and a task that did would run on core 0 instead. Sources/ctr/thread_core.cpp applies the rule through two linker
-// wraps (Makefile). The plugin's own threads (azl/platform.cpp) and the game's are never touched, and on a New 3DS nothing changes: there is no swap there.
+// wraps (Makefile). The plugin's own threads (azl/platform.cpp) and the game's are never touched, and on a New 3DS nothing changes: there is no swap there. Except for the titles of
+// azl/core_plan.hpp, the early games whose own thread on core 1 the kernel refuses (0xE0A01839) while the worker holds it: for them the same move is made on a New 3DS too.
 #pragma once
 
 namespace azl {
@@ -19,8 +20,11 @@ constexpr int PlaceFrameworkStartThread(int requested_core) {
     return requested_core == 1 ? 0 : requested_core;
 }
 
-/// How many of the framework's start-up threads were moved off core 1 (0 on a New 3DS).
+/// How many of the framework's start-up threads were moved off core 1 (0 on a New 3DS, except for a title of azl/core_plan.hpp).
 unsigned FrameworkThreadsMoved();
+
+/// True when it was moved on a New 3DS because the title is on the list of azl/core_plan.hpp (the kernel would refuse the game's own thread on core 1 while the worker holds it).
+bool MovedForListedTitle();
 
 } // namespace threadcore
 } // namespace ctr

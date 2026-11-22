@@ -234,6 +234,120 @@ static void TestRejoinLaunch() {
     CHECK(!f.At(launch + 1000, State::Idle, Error::RoomIsFull).alive);
 }
 
+/// 1.1.4, route B (spec 8 D-B9): the prepared Download Play child holds its identity for HoldIdentity's ms from the launch - a name, MAC or console id
+/// collision is tried again with the console's MAC and the name unsuffixed, on the usual 2 s schedule, said once - and past it the rules of
+/// TestRejoinLaunch. Without HoldIdentity (every other title) nothing changes; a loss of our own link (OldLink) and the errors that are no collision
+/// are not held.
+static void TestRejoinHold() {
+    std::printf("rejoin policy: the prepared Download Play child keeps the console's MAC and name for 8 s (route B)\n");
+    const u64 launch = 5000;
+    {
+        Script s;
+        s.launch = launch;
+        CHECK_EQ(s.policy.hold_ms(), 0u);
+        s.policy.HoldIdentity(8000);
+        CHECK_EQ(s.policy.hold_ms(), 8000u);
+        u32 said = 0, attempts = 0;
+        u64 times[16] = {};
+        const Error errors[3] = {Error::MacCollision, Error::NameCollision, Error::ConsoleIdCollision};
+        for (u64 dt = 0; dt < 8000; dt += 100) {
+            const RejoinPolicy::Step step = s.At(launch + dt, State::Idle, dt == 0 ? Error::None : errors[(dt / 100) % 3]);
+            CHECK(step.alive);
+            CHECK(step.note != RejoinPolicy::Note::MacTaken && step.note != RejoinPolicy::Note::NameTaken);
+            said += step.note == RejoinPolicy::Note::HeldIdentity;
+            if (step.connect && attempts < 16) {
+                times[attempts++] = dt;
+            }
+            CHECK(s.policy.prefer_real_mac());   // the console's MAC all along
+            CHECK(!s.policy.nickname_suffixed());  // the name with no suffix
+        }
+        CHECK_EQ(said, 1u);
+        CHECK_EQ(attempts, 4u);  // 0, 2, 4, 6 s: the usual schedule
+        for (u32 i = 0; i < 4; ++i) {
+            CHECK_EQ(times[i], 2000u * i);
+        }
+        CHECK(!s.policy.gave_up());
+        // the edge: 7999 ms held, 8000 ms the rules of before (the MAC the room hands out, then the suffix)
+        Script e;
+        e.launch = launch;
+        e.policy.HoldIdentity(8000);
+        CHECK(e.At(launch + 7999, State::Idle, Error::MacCollision).note == RejoinPolicy::Note::HeldIdentity);
+        CHECK(e.policy.prefer_real_mac());
+        RejoinPolicy::Step step = e.At(launch + 8000, State::Idle, Error::MacCollision);
+        CHECK(step.alive && step.connect && step.note == RejoinPolicy::Note::MacTaken);
+        CHECK(!e.policy.prefer_real_mac());
+        step = e.At(launch + 8100, State::Idle, Error::NameCollision);
+        CHECK(step.alive && step.connect && step.note == RejoinPolicy::Note::NameTaken);
+        CHECK(e.policy.nickname_suffixed());
+        // at 8.5 s, from the start of the test above
+        RejoinPolicy::Step late = s.At(launch + 8500, State::Idle, Error::MacCollision);
+        CHECK(late.alive && late.note == RejoinPolicy::Note::MacTaken);
+        CHECK(!s.policy.prefer_real_mac());
+    }
+    // each collision alone at 0, 2 and 6 s: the same identity, a new attempt 2 s after the last
+    for (const Error err : {Error::MacCollision, Error::NameCollision, Error::ConsoleIdCollision}) {
+        Script s;
+        s.launch = launch;
+        s.policy.HoldIdentity(8000);
+        CHECK(s.At(launch, State::Idle, Error::None).connect);
+        for (const u64 dt : {2000u, 6000u}) {
+            const RejoinPolicy::Step step = s.At(launch + dt, State::Idle, err);
+            CHECK(step.alive && step.connect);
+            CHECK(s.policy.prefer_real_mac() && !s.policy.nickname_suffixed());
+            CHECK(!s.At(launch + dt + 100, State::Idle, err).connect);  // (not before the 2 s)
+        }
+        CHECK(!s.policy.gave_up());
+    }
+    // what is no collision and no full room is not held: a wrong password gives up at once, so does a banned host
+    for (const Error err : {Error::WrongPassword, Error::HostBanned}) {
+        Script s;
+        s.launch = launch;
+        s.policy.HoldIdentity(8000);
+        CHECK(!s.At(launch + 1000, State::Idle, err).alive);
+        CHECK(s.policy.gave_up());
+    }
+    // a full room is held like a collision: Azahar's room checks its slots before any collision, so the 3DS Link app still listed in the
+    // last slot is answered RoomIsFull. The same MAC and name, a new attempt 2 s after the last, said once; past the hold it gives up as before
+    {
+        Script s;
+        s.launch = launch;
+        s.policy.HoldIdentity(8000);
+        CHECK(s.At(launch, State::Idle, Error::None).connect);
+        RejoinPolicy::Step step = s.At(launch + 1000, State::Idle, Error::RoomIsFull);
+        CHECK(step.alive && !step.connect && step.note == RejoinPolicy::Note::HeldIdentity);  // the full room at 1 s: held, not given up
+        u32 attempts = 0;
+        for (const u64 dt : {2000u, 4000u, 6000u, 7999u}) {
+            step = s.At(launch + dt, State::Idle, Error::RoomIsFull);
+            CHECK(step.alive && step.note == RejoinPolicy::Note::None);
+            attempts += step.connect;
+            CHECK(s.policy.prefer_real_mac() && !s.policy.nickname_suffixed());
+        }
+        CHECK_EQ(attempts, 3u);  // 2, 4, 6 s (7999 ms: not before the 2 s)
+        CHECK(!s.policy.gave_up());
+        CHECK(!s.At(launch + 8000, State::Idle, Error::RoomIsFull).alive);  // past the hold: fatal, as for every other title
+        CHECK(s.policy.gave_up());
+    }
+    // a loss of our own link comes first: OldLink, not HeldIdentity
+    {
+        Script s;
+        s.launch = launch;
+        s.policy.HoldIdentity(8000);
+        s.At(launch + 100, State::Joined, Error::None);
+        s.policy.NoteJoined();
+        s.policy.NoteLoss(launch + 1000);
+        const RejoinPolicy::Step step = s.At(launch + 1500, State::Idle, Error::NameCollision);
+        CHECK(step.alive && step.note == RejoinPolicy::Note::OldLink);
+    }
+    // without HoldIdentity: as before (TestRejoinLaunch), the MAC given up at the first collision
+    {
+        Script s;
+        s.launch = launch;
+        const RejoinPolicy::Step step = s.At(launch + 1000, State::Idle, Error::MacCollision);
+        CHECK(step.note == RejoinPolicy::Note::MacTaken);
+        CHECK(!s.policy.prefer_real_mac());
+    }
+}
+
 static void TestRejoinUser() {
     std::printf("rejoin policy: the user's switch, the network layer that will not start\n");
     Script s;
@@ -687,6 +801,7 @@ int main() {
     TestRejoinSchedule();
     TestRejoinAfterLoss();
     TestRejoinLaunch();
+    TestRejoinHold();
     TestRejoinUser();
     TestRejoinWifi();
     TestAnnouncer();

@@ -80,6 +80,7 @@
 #include <unistd.h>
 
 #include "azl/dlp_hub.hpp"
+#include "azl/dlp_real_net.hpp"  // (1.1.4, G1: L16, the adapter of the real Download Play as the Download Play application's searcher and as a host)
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
 
@@ -259,6 +260,8 @@ static u8* MapAddress(void*, u32 address, u32) {
     return address >= 0x1000 ? reinterpret_cast<u8*>(address) : nullptr;
 }
 
+static const dlp_children::Table* L16Kids();
+
 static LobbyConfig MakeCfg(u8 last, const char* name) {
     LobbyConfig c;
     std::memset(&c, 0, sizeof(c));
@@ -271,6 +274,41 @@ static LobbyConfig MakeCfg(u8 last, const char* name) {
 }
 
 struct Lc {
+    /// 1.1.4 (G1, L16): Clnt = the system's Download Play application as the plugin's MakeClntHub makes it (the adapter of the real Download Play
+    /// with the book of dlp:CLNT and the children's table, a hub of any game's lobby, SetDlpClnt); RealHost = a game in RealDlp mode (Island Tour)
+    /// on the same adapter, as MakeRealDlpHub makes it.
+    enum class Kind { Clnt, RealHost };
+    Lc(MockRoom& room, u8 last, const char* name, Kind kind, bool net_on) : ds(room, last), hub_kernel(&ds.kernel) {
+        IpcResolver resolver;
+        resolver.ctx = nullptr;
+        resolver.map = &MapAddress;
+        LobbyConfig cfg = MakeCfg(last, name);
+        real.reset(new RealDlpNet(ds.console.engine.get()));
+        Identity me = {};
+        me.seed = cfg.friend_seed;
+        std::memcpy(me.name, cfg.name, sizeof(me.name));
+        real->SetIdentity(me);
+        if (kind == Kind::Clnt) {
+            cfg.game_tid = 0x0004001000022100ull;
+            cfg.max_players = 8;
+            cfg.any_title = 1;
+            book.reset(new DlpClntBook());
+            real->SetPlayers(8);
+            real->SetClntBook(book.get());
+            real->SetChildren(L16Kids());
+        } else {
+            cfg.game_tid = 0x00040000000F8200ull;
+            real->SetPlayers(4);
+        }
+        hub.reset(new DlpHub(ds.console.engine.get(), &hub_kernel, cfg, resolver, real.get()));
+        ds.hle->SetDlpHub(hub.get());
+        if (kind == Kind::Clnt) {
+            ds.hle->SetDlpClnt(true);
+        }
+        if (net_on) {
+            StartNet();
+        }
+    }
     Lc(MockRoom& room, u8 last, const char* name, bool hub_on, bool net_on, bool probe = false) : ds(room, last), hub_kernel(&ds.kernel) {
         ds.hle->SetDlpProbeFake(probe);
         if (hub_on) {
@@ -315,6 +353,8 @@ struct Lc {
 
     HleConsole ds;
     SlowSignalKernel hub_kernel;  // (what the hub's kernel calls go through: the console's kernel)
+    std::unique_ptr<DlpClntBook> book;  // (L16 only: the Download Play application's, before the adapter and the hub that point to it)
+    std::unique_ptr<RealDlpNet> real;   // (L16 only)
     std::unique_ptr<DlpHub> hub;
     std::unique_ptr<NetThread> net;  // (declared last: destroyed first)
 };
@@ -836,8 +876,8 @@ static void L1() {
         if (variant == 0) {
             // (the line names the thread that made the call - decimal - and its priority - hex; the fake kernel of shim_svc.cpp answers
             //  0x1234 = 4660 and 0x30: the numbers are written out here)
-            TCHECK_EQ(LogCount("dlp: the first command of dlp:FKCL is 0x04: the Download Play lobby is carried by the room (thread 4660, priority 0x30)"), 1);
-            TCHECK_EQ(LogCount("dlp: the first command of dlp:SRVR is 0x0e: the Download Play lobby is carried by the room (thread 4660, priority 0x30)"), 1);
+            TCHECK_EQ(LogCount("dlp: the first command of dlp:FKCL is 0x04: Download Play is served by the plugin over the room (thread 4660, priority 0x30)"), 1);
+            TCHECK_EQ(LogCount("dlp: the first command of dlp:SRVR is 0x0e: Download Play is served by the plugin over the room (thread 4660, priority 0x30)"), 1);
             TCHECK_EQ(LogCount("dlp:FKCL: command 0x04 -> 0x00000000 (first call)"), 1);
             TCHECK_EQ(LogCount("dlp:SRVR: command 0x0e -> 0x00000000 (first call)"), 1);
         }
@@ -2521,6 +2561,8 @@ static void L14() {
 //         dlpc: <dlp:FKCL|dlp:SRVR> 0x<id> req <6 words> -> 0x<result> rep[ <words>] (<n> ms[, <m> more like it since the last line])
 //     the six words are the first six words after the request header (0 beyond what the header declares), taken BEFORE the reply replaces
 //     them; the rep words are the ones after the result that the reply header declares (five at the most); n is how long the call took;
+//     a word that carries a host's MAC, a passphrase or a node's friend code seed is written as 00000000 (1.1.4: TraceHidesRequest /
+//     TraceHidesReply below), and the window below is kept on the real words;
 //   * each command (of each service) has a WINDOW of 2 s that begins at its first line and remembers the replies (result and shown words)
 //     written in it, six at the most. A call whose reply is one of them writes no line and is counted: the next line of the command says
 //     m = the calls left out since the last line. A reply that is NEW in the window - a state that changed (the result included), a group
@@ -2532,7 +2574,7 @@ static void L14() {
 //   * ids from 0x12 on make no line (the services have none), the ids below that do, the unknown ones too;
 //   * only for the commands the hub serves: not for the probe of Battle Royale, not for a game without a hub, not for nwm::UDS / ndm:u;
 //   * the first command of each dlp service, once in the life of the process, is a line of its own BEFORE the command's trace line:
-//         dlp: the first command of <service> is 0x<id>: the Download Play lobby is carried by the room (thread <n>, priority 0x<p>)
+//         dlp: the first command of <service> is 0x<id>: Download Play is served by the plugin over the room (thread <n>, priority 0x<p>)
 //     n (decimal) and p (hex) are the thread that makes the call and its priority (the hub's threads wait for each other's locks and a
 //     LightLock has no priority inheritance: the console test reads from this line where the game's dlp threads stand against the network
 //     thread's 0x2F). The fake kernel of the 32-bit tests answers thread 0x1234 = 4660 at priority 0x30.
@@ -2757,6 +2799,29 @@ static s32 MsDiff(u32 a, u32 b) {  // a - b, wrap-safe
 ///   * the lines follow the order of the calls; no line for an id the services do not have, and a line for every id that was called.
 /// The count of a line is what the journal makes of it (the call it points at must carry the line's words); a test that knows the number of
 /// calls it made says it itself (TraceCallsAdd).
+/// 1.1.4 (TRACE): the words the line writes as zeros, written out here from the layouts of the commands (SPEC-DLP.md sez. 2-5; not read from the
+/// code): a host's MAC in a request (words 1-2 of FKCL GetServerInfo 07, GetTitleInfo 08, DeleteScanInfo 0A, StartFakeSession 0B; words 4-5 of
+/// FKCL StartScan 05, its MAC filter), the passphrase (words 1-3 of SRVR SendPassphrase 08; reply words 2-4 of FKCL GetPassphrase 0F) and the
+/// friend code seed of a node (reply words 2-3, +0 of the DLPNodeInfo, of FKCL GetNodeInfo 0E and SRVR GetClientInfo 0C). Everything else of the
+/// line is the game's word as it was; the window's books are kept on the real words (the signature hashes them: SameReply).
+static bool TraceHidesRequest(bool srvr, u32 id, u32 i) {  // i = 0..5: the request's word i + 1
+    if (srvr) {
+        return id == 0x08 && i <= 2;
+    }
+    if (id == 0x07 || id == 0x08 || id == 0x0A || id == 0x0B) {
+        return i <= 1;
+    }
+    return id == 0x05 && (i == 3 || i == 4);
+}
+static bool TraceHidesReply(bool srvr, u32 id, u32 k) {  // k = 0..4: the reply's word k + 2 (TraceLine::rep[k], JCall::rep[k])
+    if (srvr) {
+        return id == 0x0C && k <= 1;
+    }
+    return (id == 0x0E && k <= 1) || (id == 0x0F && k <= 2);
+}
+/// Words the line wrote as zeros where the game's word was not zero (the proof that something was hidden, kept by CheckTraceAgainstJournal).
+static int g_trace_hidden_nonzero = 0;
+
 static constexpr s32 kWindowMs = 2000;
 static constexpr s32 kClockSlackMs = 3;  // (the clock is in whole ms, and read once inside a call whose stamps are read outside it)
 static constexpr size_t kTraceSigsHeld = 6;  // replies a command remembers per window (written out: the constant of the code is not used to check it)
@@ -2813,12 +2878,16 @@ static void CheckTraceAgainstJournal(const char* what, bool srvr, const std::vec
             const JCall& c = journal[cl[pos]];
             at[ll[j]] = cl[pos];
             for (u32 i = 0; i < 6; ++i) {
-                TCHECK_EQ(L.req[i], c.req[i]);
+                const bool hide = TraceHidesRequest(srvr, id, i);
+                TCHECK_EQ(L.req[i], hide ? 0u : c.req[i]);
+                g_trace_hidden_nonzero += hide && c.req[i] != 0 ? 1 : 0;
             }
             TCHECK_EQ(L.result, c.result);
             TCHECK_EQ(L.rep.size(), c.rep_n);
             for (size_t i = 0; i < L.rep.size() && i < c.rep_n; ++i) {
-                TCHECK_EQ(L.rep[i], c.rep[i]);
+                const bool hide = TraceHidesReply(srvr, id, static_cast<u32>(i));
+                TCHECK_EQ(L.rep[i], hide ? 0u : c.rep[i]);
+                g_trace_hidden_nonzero += hide && c.rep[i] != 0 ? 1 : 0;
             }
             TCHECK(L.ms <= (c.t1 - c.t0) + 2);  // (the line's own clock is inside the game's)
         }
@@ -3031,8 +3100,8 @@ static int L15Td() {
     // The first command of each service: ONE line each in the life of the process (this one: the first commands are SRVR Initialize and FKCL
     // InitializeWithName), before the trace line of that command, with the thread that made the call (4660 = 0x1234 of the fake kernel, in
     // decimal) and its priority (0x30, in hex) - and not a second line when the service is called again, on the same console or on the other
-    const long f_sv = LogIndexOf("dlp: the first command of dlp:SRVR is 0x01: the Download Play lobby is carried by the room (thread 4660, priority 0x30)", mark);
-    const long f_fk = LogIndexOf("dlp: the first command of dlp:FKCL is 0x11: the Download Play lobby is carried by the room (thread 4660, priority 0x30)", mark);
+    const long f_sv = LogIndexOf("dlp: the first command of dlp:SRVR is 0x01: Download Play is served by the plugin over the room (thread 4660, priority 0x30)", mark);
+    const long f_fk = LogIndexOf("dlp: the first command of dlp:FKCL is 0x11: Download Play is served by the plugin over the room (thread 4660, priority 0x30)", mark);
     TCHECK(f_sv >= 0 && f_sv < t_sv);
     TCHECK(f_fk >= 0 && f_fk < t_fk);
     TCHECK_EQ(LogCount("dlp: the first command of dlp:SRVR is ", mark), 1);
@@ -3072,16 +3141,29 @@ static int L15Td() {
     }
     // 1 (initialised), 2 (accepting), [6 (distributing: gone in one poll of the network thread)], 8 (the passphrase), 9, and 0 after Finalize
     TCHECK(states == std::vector<u32>({1, 2, 8, 9, 0}) || states == std::vector<u32>({1, 2, 6, 8, 9, 0}));
+    // (1.1.4, TRACE: the first call of a command in a journal, to show what the game sent and got where the line has zeros)
+    const auto first_call = [](const std::vector<JCall>& journal, bool srvr, u32 id) -> const JCall* {
+        for (const JCall& c : journal) {
+            if (c.srvr == srvr && c.id == id) {
+                return &c;
+            }
+        }
+        return nullptr;
+    };
     const std::vector<TraceLine> pass = OfId(sv, 0x08);  // SendPassphrase: the first call wins, the second is refused: two lines, two replies
     TCHECK_EQ(pass.size(), 2u);
     if (pass.size() == 2) {
         u32 w[3];
         PassWords(kNine, w);
-        TCHECK_EQ(pass[0].req[0], w[0]);
-        TCHECK_EQ(pass[0].req[1], w[1]);
+        for (int k = 0; k < 2; ++k) {  // 1.1.4 (TRACE): the nine bytes are never in the line (zeros), accepted or refused
+            TCHECK_EQ(pass[k].req[0], 0u);
+            TCHECK_EQ(pass[k].req[1], 0u);
+            TCHECK_EQ(pass[k].req[2], 0u);
+        }
         TCHECK_EQ(pass[0].result, 0u);
-        TCHECK_EQ(pass[1].req[0], static_cast<u32>('f') | (static_cast<u32>('f') << 8) | (static_cast<u32>('e') << 16) | (static_cast<u32>('e') << 24));
         TCHECK_EQ(pass[1].result, R_INVALID_STATE);
+        const JCall* sent = first_call(td.creator, true, 0x08);  // ... and the game did send them
+        TCHECK(sent != nullptr && sent->req[0] == w[0] && sent->req[1] == w[1] && w[0] != 0);
     }
     const std::vector<TraceLine> fin = OfId(sv, 0x02);
     TCHECK_EQ(fin.size(), 1u);
@@ -3109,11 +3191,13 @@ static int L15Td() {
             TCHECK_EQ(scan[0].req[i], want[i]);
         }
     }
-    const std::vector<TraceLine> info = OfId(fk, 0x07);  // GetServerInfo(host MAC): the two MAC words; the reply: the buffer descriptor and its address
+    const std::vector<TraceLine> info = OfId(fk, 0x07);  // GetServerInfo(host MAC): the two MAC words as zeros (1.1.4); the reply: the buffer descriptor and its address
     TCHECK_EQ(info.size(), 1u);
     if (!info.empty()) {
-        TCHECK_EQ(info[0].req[0], MacW1(td.a.mac()));
-        TCHECK_EQ(info[0].req[1], MacW2(td.a.mac()));
+        TCHECK_EQ(info[0].req[0], 0u);
+        TCHECK_EQ(info[0].req[1], 0u);
+        const JCall* asked = first_call(td.searcher, false, 0x07);  // (the game sent the host's MAC there)
+        TCHECK(asked != nullptr && asked->req[0] == MacW1(td.a.mac()) && asked->req[1] == MacW2(td.a.mac()) && asked->req[0] != 0);
         TCHECK_EQ(info[0].req[2], 0u);
         TCHECK_EQ(info[0].rep.size(), 2u);
         if (info[0].rep.size() == 2) {
@@ -3123,8 +3207,10 @@ static int L15Td() {
     const std::vector<TraceLine> join = OfId(fk, 0x0B);  // StartFakeSession(host MAC, title): the words BEFORE the reply replaced them
     TCHECK_EQ(join.size(), 1u);
     if (!join.empty()) {
-        TCHECK_EQ(join[0].req[0], MacW1(td.a.mac()));
-        TCHECK_EQ(join[0].req[1], MacW2(td.a.mac()));
+        TCHECK_EQ(join[0].req[0], 0u);  // (1.1.4: the host's MAC is not in the line)
+        TCHECK_EQ(join[0].req[1], 0u);
+        const JCall* joined = first_call(td.searcher, false, 0x0B);
+        TCHECK(joined != nullptr && joined->req[0] == MacW1(td.a.mac()) && joined->req[1] == MacW2(td.a.mac()));
         TCHECK_EQ(join[0].req[2], 0x0010C000u);
         TCHECK_EQ(join[0].req[3], 0x00040001u);
         TCHECK_EQ(join[0].result, 0u);
@@ -3153,17 +3239,39 @@ static int L15Td() {
             TCHECK_EQ(status[1], 6u);
         }
     }
-    const std::vector<TraceLine> gpass = OfId(fk, 0x0F);  // GetPassphrase: the nine characters in the reply words
+    const std::vector<TraceLine> gpass = OfId(fk, 0x0F);  // GetPassphrase: the nine characters in the reply words - zeros in the line (1.1.4)
     TCHECK(!gpass.empty());
     if (!gpass.empty()) {
         u32 w[3];
         PassWords(kNine, w);
         TCHECK_EQ(gpass[0].rep.size(), 3u);
         if (gpass[0].rep.size() == 3) {
-            TCHECK_EQ(gpass[0].rep[0], w[0]);
-            TCHECK_EQ(gpass[0].rep[1], w[1]);
+            TCHECK_EQ(gpass[0].rep[0], 0u);
+            TCHECK_EQ(gpass[0].rep[1], 0u);
+            TCHECK_EQ(gpass[0].rep[2], 0u);
+        }
+        const JCall* got = first_call(td.searcher, false, 0x0F);  // ... the game got them
+        TCHECK(got != nullptr && got->rep_n == 3 && got->rep[0] == w[0] && got->rep[1] == w[1]);
+    }
+    // GetNodeInfo (FKCL 0x0E) and GetClientInfo (SRVR 0x0C): the record's first two words, the node's friend code seed, are zeros in the line;
+    // the name after them is the game's (1.1.4, TRACE)
+    for (const bool srvr : {false, true}) {
+        const std::vector<TraceLine> node = OfId(srvr ? sv : fk, srvr ? 0x0C : 0x0E);
+        TCHECK(!node.empty());
+        bool seed_seen = false;
+        for (const JCall& c : srvr ? td.creator : td.searcher) {
+            seed_seen = seed_seen || (c.srvr == srvr && c.id == (srvr ? 0x0Cu : 0x0Eu) && c.rep_n == 5 && (c.rep[0] | c.rep[1]) != 0);
+        }
+        TCHECK(seed_seen);  // (a seed there to hide: the books of CheckTraceAgainstJournal compared every line with it)
+        for (const TraceLine& t : node) {
+            TCHECK(t.rep.size() == 5 || t.rep.empty());
+            if (t.rep.size() == 5) {
+                TCHECK_EQ(t.rep[0], 0u);
+                TCHECK_EQ(t.rep[1], 0u);
+            }
         }
     }
+    TCHECK(g_trace_hidden_nonzero >= 8);  // (the books of CheckTraceAgainstJournal above: MAC 2 x 2, the passphrase sent and got, seeds - hidden, not zero)
 
     // Ids the services do not have: below 0x12 a line (the unknown ones too), from 0x12 on none. Their replies are the dispatcher's own.
     const size_t m2 = LogSize();
@@ -3565,8 +3673,8 @@ static int L15Alt() {
     TCHECK_EQ(bad, 0u);        // (every group was a group and every end of the list the end of the list)
 
     // (e) the first command of each service: one line each in the life of the process, whoever calls it again
-    TCHECK_EQ(LogCount("dlp: the first command of dlp:SRVR is 0x01: the Download Play lobby is carried by the room (thread 4660, priority 0x30)"), 1);
-    TCHECK_EQ(LogCount("dlp: the first command of dlp:FKCL is 0x11: the Download Play lobby is carried by the room (thread 4660, priority 0x30)"), 1);
+    TCHECK_EQ(LogCount("dlp: the first command of dlp:SRVR is 0x01: Download Play is served by the plugin over the room (thread 4660, priority 0x30)"), 1);
+    TCHECK_EQ(LogCount("dlp: the first command of dlp:FKCL is 0x11: Download Play is served by the plugin over the room (thread 4660, priority 0x30)"), 1);
     TCHECK_EQ(LogCount("dlp: the first command of "), 2);
 
     // The books: every call is a line or a call a window holds, call by call, and the lines and their counts add up to the calls made (the
@@ -3749,7 +3857,7 @@ static int RunChildCode(const char* flag, const char* arg) {
 
 static void L15() {
     std::printf("L15: the trace of the hub's dlp commands (\"dlpc:\" lines): off at debug 0, the whole sequence, the polls, replies that alternate, the refusals, not for the probe\n");
-    for (const char* part : {"off", "td", "flood", "alt", "refused", "probe"}) {
+    for (const char* part : {"off", "td", "flood", "alt", "refused", "probe", "race"}) {
         int code = 77;
         for (int attempt = 0; attempt < 3 && code == 77; ++attempt) {  // (77: a log line was given up for the lock; the run is void)
             code = RunChildCode("--l15", part);
@@ -3759,6 +3867,47 @@ static void L15() {
         }
         TCHECK_EQ(code, 0);
     }
+}
+
+/// (f) the final review of 1.1.4: two threads of a game on ONE service. The request is kept in a slot per service and the line of a reply is written
+/// when its call ends: a SendPassphrase that comes while a Finalize of the same dlp:SRVR waits for the network thread is in the slot when the
+/// Finalize's line is written. No line carries the nine bytes (the slot keeps them blanked: DlpTraceRequest).
+static int L15Race() {
+    std::printf("L15 (race): SendPassphrase on a second thread while a command of the same service waits: no line carries the passphrase\n");
+    g_rules.Reset();
+    LogTakeBusyDrops();
+    MockRoom room;
+    Lc a(room, 1, "Alice", true, false);
+    Game g(a, false, true);
+    a.StartNet();
+    TCHECK_EQ(g.SvInit(3).res(), 0u);
+    const size_t m = LogSize();
+    a.net->Pause(true);  // (alive, and takes nothing: the Finalize waits 2 s for it)
+    const u8 nine[9] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x17, 0x28, 0x39};
+    u32 pw[3];
+    PassWords(nine, pw);
+    std::thread other([&g, &nine]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        g.SvPass(nine);  // (its request is kept while the Finalize still waits; the Game's journal is off: no vector is shared)
+    });
+    TCHECK_EQ(g.SvFinalize().res(), 0u);
+    other.join();
+    a.net->Pause(false);
+    const std::vector<TraceLine> all = ReadTrace(m);
+    TCHECK_EQ(OfId(all, 0x02).size(), 1u);
+    TCHECK_EQ(OfId(all, 0x08).size(), 1u);
+    u32 carried = 0;
+    for (const TraceLine& t : all) {
+        for (u32 i = 0; i < 6; ++i) {
+            for (u32 k = 0; k < 3; ++k) {
+                carried += pw[k] != 0 && t.req[i] == pw[k] ? 1u : 0u;
+            }
+        }
+    }
+    TCHECK_EQ(carried, 0u);
+    a.Close(g.sv());
+    CHECK_RULES();
+    return L15End("race");
 }
 
 static int L15Child(const char* part) {
@@ -3780,11 +3929,250 @@ static int L15Child(const char* part) {
     if (std::strcmp(part, "probe") == 0) {
         return L15Probe();
     }
+    if (std::strcmp(part, "race") == 0) {
+        return L15Race();
+    }
     std::fprintf(stderr, "unknown L15 part: %s\n", part);
     return 2;
 }
 
 // =====================================================================================================================
+
+
+// ---------------------------------------------------------------------------------------------------------------------
+// L16 (1.1.4, G1 of analysis/piano-1.1.4-2026-11-15/specifiche/1-G1.md section 4.3): dlp:CLNT of the system's Download Play application through
+// the front-end. The console of the application is built as the plugin's MakeClntHub builds it: the adapter of the real Download Play (with the
+// book of dlp:CLNT and the children's table, Island Tour's child ready), a hub over it of ANY game's lobby, SetDlpClnt; the host of (i) is a
+// console of Island Tour in RealDlp mode (the same adapter as a host, behind its own hub).
+//   (a) without SetDlpClnt dlp:CLNT is the real service's (the hook declines) with no hub, with the probe, with a hub of the dialect and with one
+//       of the real Download Play; SetDlpClnt(true) without a hub does nothing
+//   (b) with it, dlp:CLNT is a fake session and dlp:FKCL / dlp:SRVR stay the real ones
+//   (c) the handles of Initialize's [5] and [6] (two real events) are never closed: after Initialize, 50 commands, Finalize and the close of the
+//       session both still answer svcClearEvent; the same with no network thread
+//   (d) the application's ndm:u around it, five times: Enter(2), CLNT Initialize / Finalize, Leave, close: all 0
+//   (e) before the network thread runs: Initialize, GetChannels, StartScan answer 0, GetTitleInfoInOrder "no data", GetMyStatus 0x02000000, no
+//       "wireless off"; once the thread runs the deferred scan is the lobby's; Finalize with no network thread is 0
+//   (f) StartSession with no network thread: "wireless off" and its line
+//   (h) a session that only called 0x0F, closed: the lobby untouched, the engine free
+//   (j) the line of the close: "uds: game closed its fake dlp:CLNT session"
+//   (i) and (g) in a fresh process ("--l16"): a host of Island Tour and the application through the room to state 9; HOME in 5 (RequestClntLeave)
+//       gives 0x80 at the next round and the engine back, in 9 nothing changes; the trace's lines ("dlpc: dlp:CLNT") hold zeros where the MAC of
+//       the request and the passphrase of the reply were.
+
+static const dlp_children::Table* L16Kids() {
+    static dlp_children::Table table;
+    static u8 block[dlp_children::kBlockBytes];
+    static bool made = false;
+    if (!made) {
+        made = true;
+        dlp_children::Clear(&table);
+        dlp_children::Row& r = table.index.rows[0];
+        r.child = 0x00040001000F8200ull;
+        r.game = 0x00040000000F8200ull;
+        r.prepared = 0x000400000F8F8200ull;
+        r.where = 'S';
+        table.index.count = 1;
+        table.index_found = true;
+        table.verdict[0] = static_cast<u8>(dlp_children::Verdict::Ready);
+        dlp_children::PutBlock(&table, 0, block);
+    }
+    return &table;
+}
+
+/// dlp:CLNT as the application sends it (RAPPORTO section 1).
+struct Clnt {
+    Lc& c;
+    Handle h;
+    std::vector<u8> srv = std::vector<u8>(kServerInfoSize, 0xCC);
+    std::vector<u8> title = std::vector<u8>(kTitleInfoSize, 0xCC);
+    std::vector<u8> ids = std::vector<u8>(16, 0xCC);
+    Rep Call(u32 header, std::initializer_list<u32> args, std::vector<u8>* out = nullptr) {
+        return Do(c, h, Words(header, args), out != nullptr ? out->data() : nullptr, out != nullptr ? static_cast<u32>(out->size()) : 0, true);
+    }
+    Rep Init(u32 shm = 0, u32 ev = 0) { return Call(0x000100C3, {0x232000, 16, 0x200000, 0x04000000, shm, ev}); }
+    Rep Finalize() { return Call(0x00020000, {}); }
+    Rep Channels() { return Call(0x00040000, {}); }
+    Rep Scan() { return Call(0x00050180, {1, 0, 0, 0, 0, 0}); }
+    Rep StopScan() { return Call(0x00060000, {}); }
+    Rep ServerInfo(const Mac& m) { return Call(0x00070080, {MacW1(m), MacW2(m)}, &srv); }
+    Rep InOrder() { return Call(0x00090040, {0}, &title); }
+    Rep Start(const Mac& m) { return Call(0x000D0100, {MacW1(m), MacW2(m), 0x000F8200, 0x00040001}); }
+    Rep Status() { return Call(0x000E0000, {}); }
+    Rep Nodes() { return Call(0x000F0040, {4}, &ids); }
+    Rep Pass() { return Call(0x00110000, {}); }
+    Rep StopSession() { return Call(0x00120000, {}); }
+    u32 Shown() { return Status().w[2] >> 24; }
+};
+
+static void L16Parts() {
+    MockRoom room;
+    // (a)
+    {
+        Lc none(room, 0x61, "None", false, false);
+        Lc probe(room, 0x62, "Probe", false, false, true);
+        Lc lobby(room, 0x63, "Lobby", true, false);
+        Lc real(room, 0x64, "Real", Lc::Kind::RealHost, false);
+        Result rc = 0;
+        TCHECK_EQ(none.Open("dlp:CLNT", &rc), 0u);
+        TCHECK_EQ(static_cast<u32>(rc), R_SRV_REFUSED);
+        none.ds.hle->SetDlpClnt(true);  // (no hub: nothing)
+        TCHECK_EQ(none.Open("dlp:CLNT"), 0u);
+        TCHECK_EQ(probe.Open("dlp:CLNT"), 0u);
+        TCHECK_EQ(lobby.Open("dlp:CLNT"), 0u);
+        TCHECK_EQ(real.Open("dlp:CLNT"), 0u);
+    }
+    // (b), (c), (j)
+    {
+        Lc app(room, 0x65, "DlpApp", Lc::Kind::Clnt, true);
+        TCHECK_EQ(app.Open("dlp:FKCL"), 0u);
+        TCHECK_EQ(app.Open("dlp:SRVR"), 0u);
+        TCHECK_EQ(app.Open("dlp:FKCx"), 0u);
+        for (const bool with_net : {true, false}) {
+            if (!with_net) {
+                app.StopNet();
+            }
+            Clnt cl{app, app.Open("dlp:CLNT")};
+            TCHECK(cl.h != 0);
+            Handle shm = 0, ev = 0;
+            TCHECK(R_SUCCEEDED(svcCreateEvent(&shm, RESET_ONESHOT)));
+            TCHECK(R_SUCCEEDED(svcCreateEvent(&ev, RESET_ONESHOT)));
+            Rep r = cl.Init(shm, ev);
+            TCHECK_EQ(r.hdr(), 0x00010040u);
+            TCHECK_EQ(r.res(), 0u);
+            for (int k = 0; k < 50; ++k) {
+                const int which = k % 5;
+                r = which == 0 ? cl.Status() : which == 1 ? cl.Channels() : which == 2 ? cl.InOrder() : which == 3 ? cl.ServerInfo(app.mac()) : cl.Nodes();
+                TCHECK(r.handled);
+                TCHECK(r.res() != R_INVALID_STATE);
+            }
+            TCHECK_EQ(cl.Finalize().res(), 0u);
+            const size_t at = LogSize();
+            app.Close(cl.h);
+            TCHECK_EQ(LogCount("uds: game closed its fake dlp:CLNT session", at), 1);  // (j)
+            TCHECK_EQ(static_cast<u32>(svcClearEvent(shm)), 0u);  // (c) never closed by the plugin
+            TCHECK_EQ(static_cast<u32>(svcClearEvent(ev)), 0u);
+            svcCloseHandle(shm);
+            svcCloseHandle(ev);
+        }
+    }
+    // (d) the application's ndm:u around its dlp:CLNT, five times
+    {
+        Lc app(room, 0x66, "DlpApp", Lc::Kind::Clnt, true);
+        for (int k = 0; k < 5; ++k) {
+            const Handle n = app.Open("ndm:u");
+            TCHECK(n != 0);
+            TCHECK_EQ(Do(app, n, req::NdmEnter(2)).res(), 0u);
+            Clnt cl{app, app.Open("dlp:CLNT")};
+            TCHECK_EQ(cl.Init().res(), 0u);
+            TCHECK_EQ(cl.Finalize().res(), 0u);
+            TCHECK_EQ(Do(app, n, req::NdmLeave()).res(), 0u);
+            app.Close(cl.h);
+            app.Close(n);
+        }
+    }
+    // (e), (f), (h): no network thread at first
+    {
+        Lc app(room, 0x67, "DlpApp", Lc::Kind::Clnt, false);
+        Clnt cl{app, app.Open("dlp:CLNT")};
+        const size_t at = LogSize();
+        Rep r = cl.Init();
+        TCHECK_EQ(r.hdr(), 0x00010040u);
+        TCHECK_EQ(r.res(), 0u);
+        TCHECK_EQ(cl.Channels().res(), 0u);
+        TCHECK_EQ(cl.Scan().res(), 0u);
+        for (int k = 0; k < 10; ++k) {
+            r = cl.InOrder();
+            TCHECK_EQ(r.hdr(), 0x00090040u);
+            TCHECK_EQ(r.res(), R_NO_DATA);
+        }
+        r = cl.Status();
+        TCHECK_EQ(r.w[2], 0x02000000u);
+        TCHECK_EQ(LogCount("dlp: dlp:CLNT command", at), 0);  // (nothing answered "wireless off" so far)
+        // (f) StartSession cannot wait
+        r = cl.Start(app.mac());
+        TCHECK_EQ(r.hdr(), 0x000D0040u);
+        TCHECK_EQ(r.res(), R_WIRELESS_OFF);
+        TCHECK_EQ(LogCount("dlp: dlp:CLNT command 0x0d answered \"wireless off\"", at), 1);
+        // the thread starts: the deferred Initialize and StartScan are the lobby's at its first round
+        app.StartNet();
+        TCHECK(WaitFor(1000, [&] { return cl.Status().w[2] == 0x02000000u && cl.StopScan().res() == 0 && cl.Shown() == 1; }));
+        app.StopNet();
+        TCHECK_EQ(cl.Finalize().res(), 0u);  // (no network thread: 0, left to the next round)
+        app.StartNet();
+        TCHECK(WaitFor(1000, [&] { return cl.Shown() == 1; }));
+        TCHECK_EQ(cl.Finalize().res(), 0u);
+        app.Close(cl.h);
+        // (h) a session that only called 0x0F
+        Clnt only{app, app.Open("dlp:CLNT")};
+        TCHECK_EQ(only.Nodes().hdr(), 0x000F0082u);
+        app.Close(only.h);
+        Clnt look{app, app.Open("dlp:CLNT")};
+        TCHECK(WaitFor(500, [&] { return look.Shown() <= 1; }));
+        TCHECK(!app.e().initialized());
+        app.Close(look.h);
+    }
+}
+
+/// (i) and (g): the fresh process.
+static int L16Child() {
+    g_rules.Reset();
+    MockRoom room;
+    Lc host(room, 0x71, "Gionko", Lc::Kind::RealHost, true);
+    Lc app(room, 0x72, "DlpApp", Lc::Kind::Clnt, true);
+    Game hg(host, false, true);
+    TCHECK_EQ(hg.SvInit(3, 0).res(), 0u);
+    TCHECK_EQ(hg.SvAccepting(0, 6).res(), 0u);
+    Clnt cl{app, app.Open("dlp:CLNT")};
+    TCHECK_EQ(cl.Init().res(), 0u);
+    TCHECK_EQ(cl.Scan().res(), 0u);
+    TCHECK(WaitFor(8000, [&] { return cl.InOrder().res() == 0; }));
+    TCHECK_EQ(LoadLE32(cl.title.data()), 0x000F82u);
+    const size_t at = LogSize();
+    TCHECK_EQ(cl.ServerInfo(host.mac()).res(), 0u);
+    TCHECK_EQ(cl.StopScan().res(), 0u);
+    Rep r = cl.Start(host.mac());
+    TCHECK_EQ(r.hdr(), 0x000D0040u);
+    TCHECK_EQ(r.res(), 0u);
+    TCHECK_EQ(cl.Shown(), 5u);
+    // (g) the request lines of 0x07 and 0x0D: the MAC's two words are zeros
+    TCHECK_EQ(LogCount("dlpc: dlp:CLNT 0x07 req 00000000 00000000", at), 1);
+    TCHECK_EQ(LogCount("dlpc: dlp:CLNT 0x0d req 00000000 00000000", at), 1);
+    // (i) HOME in 5: 0x80 at the next round, the engine given back
+    app.hub->RequestClntLeave();
+    TCHECK(WaitFor(1000, [&] { return cl.Shown() == 0x80; }));
+    TCHECK(WaitFor(1000, [&] { return !app.e().initialized(); }));
+    TCHECK_EQ(cl.StopSession().res(), 0u);
+    // again, to 9: then HOME changes nothing
+    TCHECK_EQ(cl.Scan().res(), 0u);
+    TCHECK(WaitFor(8000, [&] { return cl.InOrder().res() == 0; }));
+    TCHECK_EQ(cl.StopScan().res(), 0u);
+    TCHECK(WaitFor(4000, [&] { return cl.Start(host.mac()).res() == 0 && cl.Shown() == 5; }));
+    TCHECK_EQ(hg.SvDistribute().res(), 0u);
+    TCHECK(WaitFor(4000, [&] { return cl.Shown() == 7; }));  // (6 shown as 7)
+    TCHECK(WaitFor(4000, [&] { return hg.SvState().w[2] == 8; }));
+    TCHECK_EQ(hg.SvPass(kNine).res(), 0u);
+    TCHECK(WaitFor(4000, [&] { return cl.Shown() == 9; }));
+    const size_t at9 = LogSize();
+    r = cl.Pass();
+    TCHECK_EQ(r.hdr(), 0x00110100u);
+    TCHECK(std::memcmp(&r.w[2], kNine, 9) == 0);
+    TCHECK_EQ(LogCount("dlpc: dlp:CLNT 0x11 req", at9), 1);
+    TCHECK_EQ(LogCount("-> 0x00000000 rep 00000000 00000000 00000000", at9), 1);  // (the passphrase is not in the line)
+    TCHECK_EQ(LogCount("62326131", at9), 0);  // ("1a2b" of the passphrase, as the word the reply carries)
+    app.hub->RequestClntLeave();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    TCHECK_EQ(cl.Shown(), 9u);  // (in 9 the leave does nothing)
+    TCHECK_EQ(cl.Finalize().res(), 0u);
+    app.Close(cl.h);
+    TCHECK(WaitFor(1000, [&] { return !app.e().initialized(); }));
+    std::printf("%d checks, %d failures\n", g_checks + g_tchecks.load(), g_failures + g_tfails.load());
+    return (g_failures + g_tfails.load()) ? 1 : 0;
+}
+
+static void L16() {
+    L16Parts();
+    TCHECK(RunChild("--l16", nullptr));
+}
 
 int main(int argc, char** argv) {
     LogOn log_on;  // (the tests read the lines of the log; also the level the plugin's first-call lines need)
@@ -3801,6 +4189,11 @@ int main(int argc, char** argv) {
         Watchdog child_dog(90);
         child_dog.Step("L15 child");
         return L15Child(argv[2]);
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--l16") == 0) {  // (1.1.4, G1: (i) and (g) of L16 in a fresh process)
+        Watchdog child_dog(120);
+        child_dog.Step("L16 child");
+        return L16Child();
     }
     if (argc == 2 && std::strcmp(argv[1], "--l13") == 0) {  // (L13 in a fresh process)
         Watchdog child_dog(120);
@@ -3838,6 +4231,8 @@ int main(int argc, char** argv) {
     L14();
     dog.Step("L15");  // (six fresh processes: the slots of the trace are the process's)
     L15();
+    dog.Step("L16");  // (1.1.4, G1: dlp:CLNT of the Download Play application; its session in a fresh process)
+    L16();
     dog.Step("");
     // The trouble lines of the whole run: the first 8 events and one in 64, and only the events the test made
     const int lines = LogCount("answered \"wireless off\": the network side did not run it");

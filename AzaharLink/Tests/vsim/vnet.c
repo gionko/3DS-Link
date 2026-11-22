@@ -52,6 +52,7 @@ NetCfg g_net;
 uint64_t g_outage_from_us = 0, g_outage_to_us = 0;
 int g_outage_silent = 0;
 uint32_t g_drop_connects = 0;
+uint32_t g_rcvbuf_bytes = 0;
 NetStats g_ns;
 
 uint64_t t_inject[VS_MAX_FRAMES], t_arrive[VS_MAX_FRAMES], t_deliver[VS_MAX_FRAMES];
@@ -72,6 +73,8 @@ typedef struct {
 static Queue to_client, to_room;
 
 static void q_push(Queue* q, const Dgram* d) {
+    Dgram copy = *d; /* (the source may be an element of a queue that this call moves) */
+    d = &copy;
     if (q->tail == q->cap) {
         if (q->head > 0 && q->head >= q->cap / 2) {
             memmove(q->q, q->q + q->head, (q->tail - q->head) * sizeof(Dgram));
@@ -85,9 +88,32 @@ static void q_push(Queue* q, const Dgram* d) {
     q->q[q->tail++] = *d;
 }
 static int q_empty(const Queue* q) { return q->head == q->tail; }
-uint64_t vnet_client_next_arrival(void) { return q_empty(&to_client) ? UINT64_MAX : to_client.q[to_client.head].arr_us; }
+/* The console's receive ring (g_rcvbuf_bytes above 0): the datagrams that have arrived and are not read. A datagram that arrives when the ring has no
+   room for it (its length + 32) is lost, as the soc service loses it. The ring is brought up to date whenever the console looks at its socket (a
+   receive, a poll): nothing leaves it in between, so the datagrams that arrived since the last look are taken in their order against what it held. */
+static Queue ring_q;
+static uint64_t ring_bytes;
+static void walk(const uint8_t* p, size_t n, uint64_t arr_us, int* acks, int* other, uint8_t* cnt);
+static void q_push(Queue* q, const Dgram* d);
+static void ring_admit(uint64_t now) {
+    while (!q_empty(&to_client) && to_client.q[to_client.head].arr_us <= now) {
+        const Dgram* d = &to_client.q[to_client.head++];
+        if (ring_bytes + d->len + 32 > g_rcvbuf_bytes) {
+            ++g_ns.ring_drops;
+            walk(d->data, d->len, 0, NULL, NULL, g_lost_cnt);
+            continue;
+        }
+        q_push(&ring_q, d);
+        ring_bytes += d->len + 32;
+        if (ring_bytes > g_ns.ring_peak_bytes) g_ns.ring_peak_bytes = (uint32_t)ring_bytes;
+    }
+}
+uint64_t vnet_client_next_arrival(void) {
+    if (g_rcvbuf_bytes && !q_empty(&ring_q)) return ring_q.q[ring_q.head].arr_us;
+    return q_empty(&to_client) ? UINT64_MAX : to_client.q[to_client.head].arr_us;
+}
 uint32_t vnet_client_backlog(uint64_t now) {
-    uint32_t n = 0;
+    uint32_t n = (uint32_t)(ring_q.tail - ring_q.head);
     for (size_t i = to_client.head; i < to_client.tail && to_client.q[i].arr_us <= now; ++i) ++n;
     return n;
 }
@@ -184,6 +210,7 @@ static void spend(int kind, double us) {
 
 /* the plugin's own counters of the soc calls (Sources/azl/log.cpp): not needed here */
 void azl_c_soc_call(int kind, unsigned long long ticks) { (void)kind; (void)ticks; }
+void azl_c_soc_send(unsigned bytes, int outcome) { (void)bytes; (void)outcome; }
 void azl_c_room_datagram(unsigned bytes, unsigned long long gap) { (void)bytes; (void)gap; }
 void azl_c_soc_enter(void) {}
 void azl_c_soc_leave(void) {}
@@ -223,7 +250,7 @@ ssize_t sendto(int fd, const void* buf, size_t len, int flags, const struct sock
         errno = ENETDOWN;
         return -1;
     }
-    spend(SOC_SEND, cost(g_prof.send_us) + slow(SOC_SEND));
+    spend(SOC_SEND, cost(g_prof.send_us + g_prof.send_kb_us * (double)len / 1024.0) + slow(SOC_SEND));
     ++g_ns.dgrams_out;
     {
         int acks = 0, other = 0;
@@ -254,12 +281,14 @@ ssize_t recvfrom(int fd, void* buf, size_t len, int flags, struct sockaddr* from
         return -1;
     }
     vsim_run_room_until(vt_us);
-    if (q_empty(&to_client) || to_client.q[to_client.head].arr_us > vt_us) {
+    if (g_rcvbuf_bytes) ring_admit(vt_us);
+    if (g_rcvbuf_bytes ? q_empty(&ring_q) : (q_empty(&to_client) || to_client.q[to_client.head].arr_us > vt_us)) {
         spend(SOC_RECVE, cost(g_prof.recvE_us) + slow(SOC_RECVE));
         errno = EWOULDBLOCK;
         return -1;
     }
-    const Dgram* d = &to_client.q[to_client.head++];
+    const Dgram* d = g_rcvbuf_bytes ? &ring_q.q[ring_q.head++] : &to_client.q[to_client.head++];
+    if (g_rcvbuf_bytes) ring_bytes -= d->len + 32;
     const size_t n = d->len < len ? d->len : len;
     memcpy(buf, d->data, n);
     spend(SOC_RECV, cost(g_prof.recv_us) + slow(SOC_RECV));
@@ -285,6 +314,7 @@ int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
         return -1;
     }
     vsim_run_room_until(vt_us);
+    if (g_rcvbuf_bytes) ring_admit(vt_us);
     if (vnet_client_next_arrival() <= vt_us) {
         spend(SOC_POLLR, cost(g_prof.pollr_us) + slow(SOC_POLLR));
         fds[0].revents = POLLIN;

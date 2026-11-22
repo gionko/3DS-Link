@@ -387,6 +387,14 @@ public:
         const Rep r = SvClients(4, 8);
         return r.res() == 0 ? r.w[2] : 0xFFFFFFFFu;
     }
+    /// The creator's GetConnectingClients says `total` (true) or `ms` ran out. A game accepts the clients it LISTS: AcceptClient reads the lobby's
+    /// table on the game's thread (DlpHub::IsInline), and a client whose join has just ended on its own console enters that table at the next poll
+    /// of the creator's network thread (DlpLobby::kPollMs), not before. (2026-11-11: R8 and R10 accepted node 2 the moment the searcher's
+    /// StartFakeSession came back; with the network threads waking late - a machine busy with other work - the creator had not polled yet,
+    /// AcceptClient answered 0xC880AFEF and the searcher never saw 6: analysis/revisione-plugin-2026-11-10/collaudo.)
+    bool Lists(u32 total, u32 ms = 3000) {
+        return WaitFor(ms, [&] { return ClientsTotal() == total; });
+    }
     /// GetTitleInfoInOrder(1) until the host is listed (true) or `ms` ran out.
     bool Find(const Mac& host, u32 ms) {
         return WaitFor(ms, [&] {
@@ -502,7 +510,7 @@ static void Creator(RNode& n, u32 clients, Trace& t, std::atomic<u32>& in_sessio
     TCHECK(EngFree(n, "after the creator's Finalize"));
 }
 
-static void Searcher(RNode& n, RNode& host, u32 index, Trace& t, std::atomic<u32>& in_session) {
+static void Searcher(RNode& n, RNode& host, u32 index, u32 clients, Trace& t, std::atomic<u32>& in_session, std::atomic<u32>& rosters_read) {
     Game g(n);
     const std::string me = std::string("searcher ") + kNames[index];
     Rep r = g.FkInitName(kNames[index]);
@@ -548,6 +556,15 @@ static void Searcher(RNode& n, RNode& host, u32 index, Trace& t, std::atomic<u32
     t.Add(me, "roster at 9 " + roster);
     r = g.FkNodeInfo(1);
     t.Add(me, "host record " + Hex(r.res()) + " " + NameAt(reinterpret_cast<const u8*>(&r.w[2]) + 0x0C));
+    // (2026-11-11) No searcher finalises before every searcher has read its roster. A searcher freezes its roster at the poll that takes the GO
+    // (DlpLobby::ClientMessage, kF2FinalRoster: the members the engine has THEN), and the polls of two consoles are up to kPollMs apart: in the
+    // dialect a fellow that finalised a millisecond after its own 9 was already out of the network, and the roster of the last one read
+    // "2: 1 4" against the real Download Play's "4: 1 2 3 4" - the comparison of R3 fell on it whenever the network threads woke late
+    // (analysis/revisione-plugin-2026-11-10/collaudo: forced with one slow thread, 3 runs of 3). The rule of the test, not of the lobby: what a
+    // dialect searcher lists when a fellow leaves that early is NOT held by this test. With one client nothing waits here (Luigi's Finalize
+    // 1 ms after the passphrase stays as it was).
+    rosters_read.fetch_add(1);
+    TCHECK(WaitFor(5000, [&] { return rosters_read.load() >= clients; }));
     r = g.FkFinalize();
     t.Add(me, "finalize " + Hex(r.res()));
     TCHECK(EngFree(n, "after the searcher's Finalize"));
@@ -562,11 +579,12 @@ static std::vector<std::string> RunR3(bool real, u32 clients) {
     }
     Trace t;
     std::atomic<u32> in_session{0};
+    std::atomic<u32> rosters_read{0};  // (the searchers that have read their roster at 9: none finalises before all have, see Searcher)
     std::vector<std::thread> threads;
     const u64 t0 = platform::NowMs();
     threads.emplace_back([&] { Creator(*room.n[0], clients, t, in_session); });
     for (u32 i = 1; i <= clients; ++i) {
-        threads.emplace_back([&, i] { Searcher(*room.n[i], *room.n[0], i, t, in_session); });
+        threads.emplace_back([&, i] { Searcher(*room.n[i], *room.n[0], i, clients, t, in_session, rosters_read); });
     }
     for (auto& th : threads) {
         th.join();
@@ -710,6 +728,7 @@ static void R8() {
             Game ga(*r.n[0]), gb(*r.n[1]);
             ga.Open(1, "Alice");
             TCHECK_EQ(gb.ScanAndJoin("Bob", r.n[0]->mac()), 0u);
+            TCHECK(ga.Lists(1));
             TCHECK_EQ(ga.SvAccept(2).res(), 0u);
             TCHECK_EQ(ga.SvDistribute().res(), 0u);
             TCHECK(WaitFor(5000, [&] { return ga.ServerState() == 8; }));
@@ -726,6 +745,7 @@ static void R8() {
             Game ga(*r.n[0]), gb(*r.n[1]);
             ga.Open(1, "Alice");
             TCHECK_EQ(gb.ScanAndJoin("Bob", r.n[0]->mac()), 0u);
+            TCHECK(ga.Lists(1));
             TCHECK_EQ(ga.SvAccept(2).res(), 0u);
             TCHECK_EQ(ga.SvDistribute().res(), 0u);
             TCHECK(WaitFor(5000, [&] { return ga.ServerState() == 8; }));
@@ -780,6 +800,7 @@ static void R10() {
             ga.Open(1, "Alice");
             TCHECK_EQ(gb.ScanAndJoin("Bob", r.n[0]->mac()), 0u);
             if (state >= 6) {
+                TCHECK(ga.Lists(1));
                 TCHECK_EQ(ga.SvAccept(2).res(), 0u);
                 TCHECK_EQ(ga.SvDistribute().res(), 0u);
                 TCHECK(WaitFor(5000, [&] { return gb.StatusState() == 6; }));

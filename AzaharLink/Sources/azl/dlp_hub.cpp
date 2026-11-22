@@ -44,6 +44,9 @@ void DlpHub::SetFriendSeed(u64 seed) {
 // >>> game-thread code (Tests/policy_check.sh: no printf family, no Log()/DebugEvent() with a format, no big buffer)
 
 bool DlpHub::IsInline(DlpKind kind, u32 id) {
+    if (kind == DlpKind::Clnt) {
+        return clnt::IsInline(id);  // (1.1.4, G1: azl/dlp_clnt_map.hpp)
+    }
     if (id == 0 || id > (kind == DlpKind::Fkcl ? DlpService::kFkLast : DlpService::kSvLast)) {
         return true;  // (an id the service does not have: its own answer, no network)
     }
@@ -112,6 +115,9 @@ DlpOutcome DlpHub::Serve(DlpKind kind, u32* cmd, const u32* sbuf) {
     }
     DlpOutcome out = DlpOutcome::Done;
     if (!Post(kOpDispatch, kind, cmd, sbuf, &out)) {
+        if (kind == DlpKind::Clnt) {
+            return AnswerUnservedClnt(cmd);
+        }
         return AnswerUnserved(kind, cmd);
     }
     return out;
@@ -130,6 +136,21 @@ __attribute__((noinline)) DlpOutcome DlpHub::AnswerUnserved(DlpKind kind, u32* c
         cmd[1] = 0;
     } else {
         WriteFailure(cmd, id);
+    }
+    return DlpOutcome::Done;
+}
+
+__attribute__((noinline)) DlpOutcome DlpHub::AnswerUnservedClnt(u32* cmd) {
+    // (the Download Play application touches its first command before the room is joined: Initialize, StartScan, StopScan, StopSession and
+    // Finalize answer 0 and leave their work to the first Tick; GetMyStatus shows it meanwhile, StartSession and the rest are "wireless off")
+    bool deferred = false;
+    {
+        platform::LockGuard lock(dlp_mutex_);
+        deferred = svc_.ClntUnserved(cmd);
+    }
+    if (deferred) {
+        closing_.fetch_or(kClntDeferred, std::memory_order_release);
+        deferred_.fetch_add(1, std::memory_order_relaxed);
     }
     return DlpOutcome::Done;
 }
@@ -260,8 +281,9 @@ void DlpHub::FreeEngine() {
 void DlpHub::Refresh() {
     LobbyNet* const b = lobby_.net();
     const bool held = b != &net_ ? b->Holds() : net_.engine_held();
+    const bool awaiting = b != &net_ && b->ChildrenAwaited() != 0;  // (1.1.4, H5: the adapter still counts - no hold, no request: Tick must run its Pump)
     engine_held_.store(held, std::memory_order_relaxed);
-    active_.store(held || lobby_.active(), std::memory_order_relaxed);
+    active_.store(held || lobby_.active() || awaiting, std::memory_order_relaxed);
 }
 
 void DlpHub::RunHere(Op op, DlpKind kind) {
@@ -283,6 +305,12 @@ void DlpHub::RunDeferred() {
     }
     if ((bits & kClosingSrvr) != 0) {
         svc_.OnSessionClosed(DlpKind::Srvr);
+    }
+    if ((bits & kClntDeferred) != 0) {
+        svc_.ClntApplyDeferred();  // (1.1.4, G1: what dlp:CLNT deferred while no network thread ran)
+    }
+    if ((bits & kClntLeave) != 0) {
+        svc_.ClntLeave();  // (1.1.4, G1: HOME / the swap during a session of dlp:CLNT)
     }
 }
 

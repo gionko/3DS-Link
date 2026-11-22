@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "recv_filter.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -117,8 +119,11 @@ uint32_t dl_heap_free(void);
 
 // Checks a title and gets its size and its seed. 0 = it can be sent; otherwise `error` says why not.
 int dl_send_check(int item, uint64_t* size, char* error, size_t error_size);
-// Makes the manifest of the titles that were checked. 0 = ready; -1 = none or too many (more than DL_MAX_TITLES); -2 = a title was not checked.
+// Makes the manifest of the titles that were checked. 0 = ready; -1 = none or too many (more than DL_MAX_TITLES); -2 = a title was not checked;
+// -3 = (DPAPP-2j) a title this console never sends (recv_filter.h, or the app's word: dl_set_send_never).
 int dl_send_prepare(const int* items, int count);
+// (DPAPP-2j) The app's word on a title it never sends (dlp_guest_store.hpp NeverSent: a Download Play guest of any form, ours or not). NULL = none.
+void dl_set_send_never(int (*never)(uint64_t tid));
 int dl_send_title_count(void);
 void dl_send_title(int index, dl_title* out);
 uint64_t dl_send_total_bytes(void);
@@ -204,6 +209,7 @@ typedef struct {
     uint8_t exists[DL_MAX_TITLES];     // already installed on this console
     uint64_t old_size[DL_MAX_TITLES];  // the space it takes now (freed when it is written over)
     uint8_t n3ds_only[DL_MAX_TITLES];  // New 3DS only, and this is an Old 3DS
+    uint8_t refused[DL_MAX_TITLES];    // (DPAPP-2h-sec) DL_RECV_* of recv_filter.h: never installed here, never chosen (0 = it may be)
     uint8_t want[(DL_MAX_TITLES + 7) / 8]; // bit i = title i is chosen: the screen changes it while choosing
     uint8_t result[DL_MAX_TITLES];     // DL_RES_*: waiting, installed, not asked for, error
     uint32_t err[DL_MAX_TITLES];
@@ -228,6 +234,9 @@ typedef struct {
 } dl_recv_stats;
 
 typedef int (*dl_recv_tick_fn)(void* user, dl_recv_stats* stats);
+// (DPAPP-2h-sec) The app's own word on a title of the offer: 1 = a Download Play guest it prepared on this console (never installed over by
+// Titles Delivery). Set before dl_recv_run; NULL = none.
+void dl_set_recv_owned(int (*owned)(uint64_t tid));
 // Joins the room that dl_scan_pick took (the scan must be stopped), lets the tick choose and then receives. 0 = all received; 1 = something
 // failed or it was cancelled; -1 = it could not join (or no room was picked: the tick is not called then).
 int dl_recv_run(dl_recv_tick_fn tick, void* user);

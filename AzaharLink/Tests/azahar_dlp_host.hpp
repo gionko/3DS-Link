@@ -28,6 +28,10 @@
 // Options: `corrupt_frame` (a frame of the announcement with a wrong size field), `destroy_after_final_ms` (the network ends that long after BeginGame's final, from that thread: the "1 ms" of R2c, instead of
 // the next poll), `game_beacon_after_ms` (that long after the end, the same MAC hosts the game's own network: another wlancommid, with
 // application data), `child_tid` / `max_clients` (another game, another size).
+// 2026-11-13 (Mario Kart 7, Tests/dlp_real_mk7_test.cpp): up to SEVEN clients (Azahar's own limit is the game's max_clients: its table is
+// a vector), and the bytes of another capture: `wire` (AzaharDlpWire) names the announcement and the packets the model sends and the seed
+// of their checksums - Luigi's Mansion's capture when nothing is said, which is every test written before; `game_wlan_comm_id` is the game's
+// own network after the Download Play. What the model does with them is the same.
 #pragma once
 
 #include <atomic>
@@ -42,6 +46,21 @@
 #include "dlp_real_luigi_golden.inc"
 #include "mock_room.hpp"
 
+/// The bytes a model of Azahar's host sends: the five frames of its announcement, one packet of each kind of its dialogue (the client's
+/// sequence and id are put in, the checksum is made again with `seed`), all from one capture.
+struct AzaharDlpWire {
+    const DlpRealGolden* announce;  // [5]
+    const DlpRealGolden* a1;        // Auth
+    const DlpRealGolden* a3;        // StartDistribution
+    const DlpRealGolden* a5;        // the Finish without content
+    const DlpRealGolden* a7;        // the final with the passphrase
+    const DlpRealGolden* a8;        // the notice
+    const std::uint8_t* seed;       // [4]
+};
+/// Luigi's Mansion (2018), the capture 1c: what every test of the real Download Play before Mario Kart 7 has in front of it.
+inline const AzaharDlpWire kAzaharDlpLuigiWire = {kDlpRealLuigiAnnounce,   &kDlpRealLuigiDialog[0],  &kDlpRealLuigiDialog[4], &kDlpRealLuigiDialog[8],
+                                                  &kDlpRealLuigiDialog[10], &kDlpRealLuigiDialog[11], kDlpRealLuigiSeed};
+
 class AzaharDlpHost {
 public:
     // DLP_Srvr_State (dlp_srvr.h:17-25)
@@ -50,8 +69,9 @@ public:
     enum Cl : u8 { NotJoined, NeedsAuth, NeedsAuthAck, Accepted, NeedsDistributeAck, NeedsContent, DoesNotNeedContent, DistributeDone, SentPassphrase };
     static constexpr u32 kGameWlanCommId = 0x001D1A10;  // the game's own network after the Download Play (capture 1c, X:774.169)
 
-    AzaharDlpHost(MockRoom& room, u8 last, const char* name, u64 child_tid = 0x00040001001D1A00ULL, u8 max_clients = 1, u32 seed = 1)
-        : con(room, last), child_tid_(child_tid), max_clients_(max_clients), rng_(seed) {
+    AzaharDlpHost(MockRoom& room, u8 last, const char* name, u64 child_tid = 0x00040001001D1A00ULL, u8 max_clients = 1, u32 seed = 1,
+                  const AzaharDlpWire& wire = kAzaharDlpLuigiWire)
+        : con(room, last), wire_(wire), child_tid_(child_tid), max_clients_(max_clients > kMaxClients ? kMaxClients : max_clients), rng_(seed) {
         for (u32 i = 0; i < kNameUnits; ++i) {
             name_[i] = 0;
         }
@@ -59,13 +79,14 @@ public:
             name_[i] = static_cast<u8>(name[i]);
         }
         CHECK_EQ(e().InitializeForLobby(0xB0B0u + last, name_), 0u);  // (Azahar's nwm is up while the DLP service is)
+        e().SetHostTellsDepartures(false);  // (Azahar's host tells nobody about a departure: GB-01 is the console's, not Azahar's)
         for (u32 i = 0; i < 5; ++i) {
-            const DlpRealGolden& g = kDlpRealLuigiAnnounce[i];
+            const DlpRealGolden& g = wire_.announce[i];
             frames_[i].assign(g.bytes, g.bytes + g.size);
         }
         StoreBE64(frames_[0].data() + 0x10, child_tid_);
         frames_[0][0x20] = static_cast<u8>(max_clients_ + 1);
-        dlp_real::Seal(kDlpRealLuigiSeed, frames_[0].data(), frames_[0].size());
+        dlp_real::Seal(wire_.seed, frames_[0].data(), frames_[0].size());
         for (u32 i = 0; i < kMaxClients; ++i) {
             cl_[i].rate_ms = platform::NowMs();
         }
@@ -141,7 +162,7 @@ public:
                 ++errors_not_ready;  // "Client was not ready start distribution" (it is sent anyway)
             }
             cl.state = NeedsDistributeAck;
-            SendLocked(static_cast<u16>(s + 2), Packet(kDlpRealLuigiDialog[4], cl), "A3");
+            SendLocked(static_cast<u16>(s + 2), Packet(*wire_.a3, cl), "A3");
         }
     }
     /// EndHosting (311-321): the announcement stops, the state is Initialized; the network and the connection manager go on.
@@ -165,7 +186,7 @@ public:
             if (cl.state != DistributeDone) {
                 return -1;
             }
-            std::vector<u8> p = Packet(kDlpRealLuigiDialog[10], cl);
+            std::vector<u8> p = Packet(*wire_.a7, cl);
             std::memcpy(p.data() + 0x14, pass, 9);
             Reseal(&p);
             SendLocked(static_cast<u16>(s + 2), p, "A7");
@@ -230,9 +251,10 @@ public:
     u32 network_id = 0;
     u16 attributes = 0;
     std::atomic<u32> errors_not_ready{0}, already_sent{0}, begin_games{0}, size_skipped{0};
+    std::atomic<u32> game_wlan_comm_id{kGameWlanCommId};  // the game's own network after the Download Play (set before the end)
 
 private:
-    static constexpr u32 kMaxClients = 3;
+    static constexpr u32 kMaxClients = 7;
     struct Client {
         u8 state = NotJoined;
         u8 seq = 0;
@@ -243,11 +265,11 @@ private:
         StoreBE32(p, static_cast<u32>(v >> 32));
         StoreBE32(p + 4, static_cast<u32>(v));
     }
-    static void Reseal(std::vector<u8>* p) {
-        dlp_real::Seal(kDlpRealLuigiSeed, p->data(), p->size());
+    void Reseal(std::vector<u8>* p) const {
+        dlp_real::Seal(wire_.seed, p->data(), p->size());
     }
     /// A packet of the capture with this client's {seq, rid} (GetPkRespId), the Auth keeping its default_resp_id.
-    static std::vector<u8> Packet(const DlpRealGolden& g, const Client& cl) {
+    std::vector<u8> Packet(const DlpRealGolden& g, const Client& cl) const {
         std::vector<u8> p(g.bytes, g.bytes + g.size);
         if (p[0] != 2) {
             p[0x0D] = cl.seq;
@@ -274,7 +296,7 @@ private:
     }
     void SendAuthLocked(u16 node) {
         Client& cl = cl_[node - 2];
-        SendLocked(node, Packet(kDlpRealLuigiDialog[0], cl), "A1");
+        SendLocked(node, Packet(*wire_.a1, cl), "A1");
         if (cl.state == NeedsAuth) {
             cl.state = NeedsAuthAck;
         }
@@ -301,7 +323,7 @@ private:
                 ni.max_nodes = static_cast<u8>(max_clients_ + 1);
                 ni.channel = 6;
                 ni.initialized = 1;
-                StoreBE32(ni.wlan_comm_id_be, kGameWlanCommId);
+                StoreBE32(ni.wlan_comm_id_be, game_wlan_comm_id.load());
                 ni.id = 0x55;
                 StoreBE32(ni.network_id_be, static_cast<u32>(rng_()));
                 ni.application_data_size = 8;
@@ -366,12 +388,12 @@ private:
                     SendAuthLocked(node);
                 } else if (cl.state == DoesNotNeedContent) {
                     if (!ShouldRateLimit(cl, 100)) {
-                        std::vector<u8> p = Packet(kDlpRealLuigiDialog[8], cl);  // (seq_num 0: the no-content Finish)
+                        std::vector<u8> p = Packet(*wire_.a5, cl);  // (seq_num 0: the no-content Finish)
                         SendLocked(node, p, "A5");
                     }
                 } else if (cl.state == DistributeDone || cl.state == SentPassphrase) {
                     if (!ShouldRateLimit(cl, 100)) {
-                        SendLocked(node, Packet(kDlpRealLuigiDialog[11], cl), "A8");
+                        SendLocked(node, Packet(*wire_.a8, cl), "A8");
                     }
                 }
             }
@@ -469,6 +491,7 @@ private:
         End();
     }
 
+    const AzaharDlpWire& wire_;
     u16 name_[kNameUnits];
     u64 child_tid_;
     u32 max_clients_;

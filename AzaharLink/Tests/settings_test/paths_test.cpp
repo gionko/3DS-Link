@@ -242,60 +242,30 @@ static void TestAppConfig() {
     CHECK(!setup::SaveAppConfig("sdmc:/nodir/3DSLink.cfg", cfg));
 }
 
-static void TestDlpDeliverySwitch() {
-    std::printf("3DSLink.cfg: the emergency switch of 3DS Link Delivery (dlp_delivery): on unless the file says off, a slip is on\n");
+static void TestDlpDeliveryLineIgnored() {
+    std::printf("3DSLink.cfg: the emergency switch of 3DS Link Delivery is gone (1.1.4, spec 9): an old dlp_delivery line is ignored, none is written\n");
     Fresh();
     const std::string path = "sdmc:/3DSLink.cfg";
-    // on by default: a new config, an empty file, and every file an older app wrote (it has no such line)
-    CHECK(setup::AppConfig().dlp_delivery);
-    CHECK(setup::ParseAppConfig("").dlp_delivery);
-    CHECK(setup::ParseAppConfig("first_start_done=1\nboot9=sdmc:/x/boot9.bin\nplugin_stamp=1:2\n").dlp_delivery);
-    // the words of a switch, as the plugin's file knows them (any case, blanks and the CR of a CRLF file around them)
-    for (const char* word : {"0", "off", "false", "no", "OFF", " No ", "False", "off\r"}) {
-        CHECK(!setup::ParseAppConfig(std::string("dlp_delivery=") + word + "\n").dlp_delivery);
+    // the file an older app wrote, with the switch off: every other line is read as it was, and the line itself changes nothing
+    const std::string old = "# 3DS Link's own settings\nfirst_start_done=1\nboot9=sdmc:/x/boot9.bin\nplugin_stamp=1:2\ndlp_delivery=0\nupdate_check=0\nclock_warned=1\n";
+    const setup::AppConfig read = setup::ParseAppConfig(old);
+    CHECK(read.first_start_done && read.boot9_path == "sdmc:/x/boot9.bin" && read.plugin_stamp == "1:2" && !read.update_check && read.clock_warned);
+    const setup::AppConfig without = setup::ParseAppConfig("# 3DS Link's own settings\nfirst_start_done=1\nboot9=sdmc:/x/boot9.bin\nplugin_stamp=1:2\nupdate_check=0\nclock_warned=1\n");
+    CHECK(setup::SerialiseAppConfig(read) == setup::SerialiseAppConfig(without));
+    // whatever the old line says, on or off, typed well or not
+    for (const char* line : {"dlp_delivery=1\n", "dlp_delivery=off\n", "  dlp_delivery = 0 \r\n", "dlp_delivery\n", "dlp_delivery=maybe\n"}) {
+        CHECK(setup::SerialiseAppConfig(setup::ParseAppConfig(line)) == setup::SerialiseAppConfig(setup::AppConfig()));
     }
-    for (const char* word : {"1", "on", "true", "yes", "ON", " Yes ", "TRUE"}) {
-        CHECK(setup::ParseAppConfig(std::string("dlp_delivery=") + word + "\n").dlp_delivery);
-    }
-    // a value the app cannot read is the default, ON: a typo must not shut the feature (and a damaged file must not leave it shut either)
-    for (const char* word : {"", "2", "-1", "maybe", "of", "off off", "0x0", "nul", "\x01\x02\x03", "n0"}) {
-        CHECK(setup::ParseAppConfig(std::string("dlp_delivery=") + word + "\n").dlp_delivery);
-    }
-    // the line is looked for by its key alone: another key that contains it, a comment and a line with no value do not count
-    CHECK(setup::ParseAppConfig("my_dlp_delivery=0\n").dlp_delivery);
-    CHECK(setup::ParseAppConfig("# dlp_delivery=0\n").dlp_delivery);
-    CHECK(setup::ParseAppConfig("dlp_delivery\n").dlp_delivery);
-    CHECK(!setup::ParseAppConfig("  dlp_delivery = 0 \r\n").dlp_delivery);
-    // a file that is damaged in other lines still says what its own line says
-    CHECK(!setup::ParseAppConfig("garbage \x01\n\n=\ndlp_delivery=off\nmore garbage").dlp_delivery);
-    CHECK(setup::ParseAppConfig("\xFF\xFE\x01 not text at all").dlp_delivery);
-    // written every time, so that a hand edit on a PC only flips the digit
-    setup::AppConfig cfg;
-    cfg.first_start_done = true;
-    CHECK(setup::SerialiseAppConfig(cfg).find("dlp_delivery=1\n") != std::string::npos);
-    cfg.dlp_delivery = false;
-    CHECK(setup::SerialiseAppConfig(cfg).find("dlp_delivery=0\n") != std::string::npos);
-    CHECK(!setup::ParseAppConfig(setup::SerialiseAppConfig(cfg)).dlp_delivery);
-    // through the file, and the rest of the file is not disturbed by it
-    cfg.boot9_path = "sdmc:/mine/boot9.bin";
-    CHECK(setup::SaveAppConfig(path, cfg));
+    // nothing of it is written any more: not by a new config, not by one read from an old file
+    CHECK(setup::SerialiseAppConfig(setup::AppConfig()).find("dlp_delivery") == std::string::npos);
+    CHECK(setup::SerialiseAppConfig(read).find("dlp_delivery") == std::string::npos);
+    // through the file: the old one is read, the app writes its own, and the line is gone
+    Put(path, old);
     setup::AppConfig back;
-    CHECK(setup::LoadAppConfig(path, back) && !back.dlp_delivery && back.first_start_done && back.boot9_path == "sdmc:/mine/boot9.bin");
-    cfg.dlp_delivery = true;
-    CHECK(setup::SaveAppConfig(path, cfg) && setup::LoadAppConfig(path, back) && back.dlp_delivery && back.boot9_path == "sdmc:/mine/boot9.bin");
-    // the hand edit: the digit flipped in the file as the app wrote it
-    std::string text = Get(path);
-    const std::size_t at = text.find("dlp_delivery=1");
-    CHECK(at != std::string::npos);
-    if (at != std::string::npos) {
-        text[at + 13] = '0';
-        Put(path, text);
-        CHECK(setup::LoadAppConfig(path, back) && !back.dlp_delivery && back.first_start_done);
-    }
-    // a file that cannot be read leaves the config as it was: the app starts on the default, ON (and the Settings page can switch it off)
-    setup::AppConfig untouched;
-    CHECK(!setup::LoadAppConfig("sdmc:/nothing here.cfg", untouched) && untouched.dlp_delivery);
-    // the switch lives in the app's own file: the plugin's ini (15 keys, pinned) is another file, in another place
+    CHECK(setup::LoadAppConfig(path, back) && back.first_start_done && back.boot9_path == "sdmc:/x/boot9.bin" && !back.update_check);
+    CHECK(setup::SaveAppConfig(path, back) && Get(path).find("dlp_delivery") == std::string::npos);
+    CHECK(setup::LoadAppConfig(path, back) && back.first_start_done && back.boot9_path == "sdmc:/x/boot9.bin" && back.plugin_stamp == "1:2");
+    // the app's own file is not the plugin's ini (15 keys, pinned): another file, in another place
     CHECK(std::string(setup::kConfigFileName) == "3DSLink.cfg" && std::string(setup::kIniPath).find(setup::kConfigFileName) == std::string::npos);
 }
 
@@ -604,7 +574,7 @@ int main() {
     TestPathBuilding();
     TestMakeDirsAndFirstStart();
     TestAppConfig();
-    TestDlpDeliverySwitch();
+    TestDlpDeliveryLineIgnored();
     TestBoot9Lookup();
     TestResolvePluginFile();
     TestSearch();

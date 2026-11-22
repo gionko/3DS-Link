@@ -343,9 +343,12 @@ public:
 // ---------------------------------------------------------------------------------------------
 class DebugLines {
 public:
-    DebugLines() : before_(g_debug_level) {
+    DebugLines() : before_(g_debug_level), whole_before_(g_debug_whole) {
         CHECK(DebugInit());
         g_debug_level = 1;
+        // (every command a line and every frame whole, as a study build writes them: these tests read the capture as the record of
+        //  EVERY call of the game, with all its words; the diet of the capture - 1.1.4 - is Tests/capture_test.cpp's)
+        g_debug_whole = true;
         // what an earlier scope of this process left in the ring is not this one's
         DebugRecord stale;
         u8 buf[1700];
@@ -354,6 +357,7 @@ public:
     }
     ~DebugLines() {
         g_debug_level = before_;
+        g_debug_whole = whole_before_;
     }
     /// Moves what the capture holds into the list (each line without the "     0.000 " time).
     void Drain() {
@@ -438,6 +442,7 @@ public:
 
 private:
     int before_; ///< the level it gives back
+    bool whole_before_; ///< ... and whether the capture was a study build's
     std::deque<std::string> lines_;
     std::vector<std::string> raw_;
 };

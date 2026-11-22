@@ -21,6 +21,7 @@
 
 #include "azl/apt_sleep.hpp"
 #include "azl/common.hpp"
+#include "azl/hid_mirror.hpp"
 #include "azl/line.hpp"
 #include "azl/wallclock.hpp"
 
@@ -51,8 +52,41 @@ public:
     static constexpr u32 kExitGuardWaited = 31;
     static constexpr u32 kExitGuardWordLast = 32;
     static constexpr u32 kExitGuardAction = 33;
+    // The chat's keyboard over the running game and its input mirror (Sources/ctr/chat_overlay.cpp, Sources/ctr/input_mirror.cpp), with the
+    // log on. 2026-11-10: a console stopped 1.6-4.6 s after the keyboard closed (RR3D on a test build), when the game's HID page was due
+    // back - a hold of the game's threads, an unmap, a map - and the main log, written in batches by the lowest thread, ended at the close:
+    // nothing said whether the plugin had reached the way back, was inside it, or was past it. Five lines an opening, in this order:
+    //   the keyboard opened; the switch of the page was tried; the keyboard closed; the way back is ABOUT TO hold the game's threads
+    //   (pushed before the hold, and on the plugin's thread waited for, up to 100 ms, so that it is on the card first); the way back is
+    //   over, the threads let go (pushed after the let-go).
+    // Read it like this: "about to hold" with no "let go" after it - the console stopped inside the way back; "closed" and nothing after -
+    // before it (the wait for the release, or the plugin's thread never ran again); "let go" and nothing after - past it, the game on its own.
+    // One exception (2026-11-11, the second review), and the line says it itself: the PLUGIN'S THREAD pushes "about to hold" and only
+    // then gives the trail its time to reach the card (Sources/ctr/input_mirror.cpp, GiveTrailTime: up to 100 ms of sleeps of 2 ms, each
+    // of which a game that fills the CPU can stretch to a second), with the game's threads running and no call of the way back made
+    // yet. Its "about to hold" with nothing after it is a console that stopped in that wait OR inside the way back: look at the tick of
+    // the last lines of the other logs before taking it for the hold. A game's thread and the framework's thread push theirs right
+    // before the hold, and for them the rule above stands as it is.
+    static constexpr u32 kChatKeyboardOpen = 34;     ///< the value: the how-manieth opening of this launch
+    static constexpr u32 kChatMirrorOn = 35;         ///< the switch was tried; the value: PackMirror(outcome, threads, held us)
+    static constexpr u32 kChatKeyboardClosed = 36;   ///< the value: kChatClosed* bits
+    static constexpr u32 kChatMirrorBackBegins = 37; ///< BEFORE the hold; the value: PackMirror(who gives it back, threads, 0)
+    static constexpr u32 kChatMirrorBackDone = 38;   ///< AFTER the let-go; the value: PackMirror(outcome, threads, held us)
+    static constexpr u32 kChatClosedShown = 1;       ///< the keyboard was on the screen (its picture published)
+    static constexpr u32 kChatClosedMirror = 2;      ///< the game's HID page was the mirror's at the close
+    static constexpr u32 kChatClosedAtOnce = 4;      ///< the page goes back now (HOME, the room left, no longer shown), not after the release
+    /// Who gives the page back, besides the framework's event numbers (EXIT 0, SLEEP_ENTER 1, HOME_ENTER 3, SWAP_ENTER 5: its keep-alive thread).
+    static constexpr u32 kMirrorByPlugin = 99;        ///< the plugin's thread
+    static constexpr u32 kMirrorByNotification = 100; ///< a game's thread, in the hook, at an APT notification
+    /// What the plugin's thread's "about to hold" adds to its line (see "One exception" above).
+    static constexpr const char* kMirrorPluginWaitsText =
+        ", and this thread may first wait for it to be on the card: the game's threads run in that wait, the hold is not begun";
     static constexpr u32 kSlots = 32;        ///< events waiting for the thread (more between two of its turns: the oldest go)
     static constexpr u32 kMaxLines = 400;    ///< lines written in one launch
+    /// ... besides those of the chat's keyboard and input mirror (the kinds 34-38), which have this limit of their own (2026-11-11: five
+    /// lines an opening counted against kMaxLines used the whole launch's lines up in 80 openings, and the console that then stopped at a
+    /// HOME, at a swap or at its exit left no line of it - the very lines the trail exists for). 48 openings; the others keep their 400.
+    static constexpr u32 kMaxChatLines = 240;
     static constexpr u32 kPollMs = 250;      ///< the thread's turn while a sleep is watched (else it waits for an event)
     static constexpr u32 kWatchMs = 60000;   ///< ... at most this long after a sleep began without a wake-up
     static constexpr u32 kClockJumpMs = 200; ///< the console's clock ran this much ahead of the tick: the console slept
@@ -80,6 +114,41 @@ public:
         const u32 events = word >> 16;
         return Hex(word) + " (state " + std::to_string(state) + " " + (state < 4 ? kStates[state] : "?") + ", events " +
                (events < 4 ? std::string(kEvents[events]) : Hex(events)) + ")";
+    }
+
+    /// A line of the input mirror in one word: `low` (an outcome of azl/hid_mirror.hpp, or who gives the page back) in 8 bits, the game's
+    /// threads in 8 (255: that many or more; 0: not known), how long they were held in 16 (us; 65535: that long or longer).
+    /// (Runs on a game's thread too, the way back at a notification: arithmetic only.)
+    static constexpr u32 PackMirror(u32 low, u32 threads, u32 held_us) {
+        return (low & 0xFF) | (threads < 0xFF ? threads : 0xFF) << 8 | (held_us < 0xFFFF ? held_us : 0xFFFF) << 16;
+    }
+
+    static const char* MirrorWhoText(u32 who) {
+        switch (who) {
+        case kMirrorByPlugin:
+            return "the plugin's thread";
+        case kMirrorByNotification:
+            return "a game's thread, at a notification";
+        case 0:
+            return "the framework's thread, at EXIT";
+        case 1:
+            return "the framework's thread, at SLEEP_ENTER";
+        case 3:
+            return "the framework's thread, at HOME_ENTER";
+        case 5:
+            return "the framework's thread, at SWAP_ENTER";
+        default:
+            return "?";
+        }
+    }
+
+    /// "22 threads" / "255 or more threads" / "threads not counted", from a PackMirror word.
+    static std::string MirrorThreadsText(u32 packed) {
+        const u32 threads = (packed >> 8) & 0xFF;
+        if (threads == 0) {
+            return "threads not counted";
+        }
+        return std::to_string(threads) + (threads == 0xFF ? " or more threads" : " threads");
     }
 
     /// Used and total bytes of a memory region in one word, in units of 4 KB (a region is at most 256 MiB).
@@ -126,9 +195,13 @@ public:
         }
     }
 
-    /// Lines produced so far.
+    /// Lines produced so far, without those of the chat's keyboard (kMaxLines is their limit) ...
     u32 lines() const {
         return lines_;
+    }
+    /// ... and those of the chat's keyboard and input mirror (kMaxChatLines).
+    u32 chat_lines() const {
+        return chat_lines_;
     }
 
 private:
@@ -170,10 +243,20 @@ private:
     /// One line: "sleep: <text> | tick <ms> ms | written at console clock <time>" (`tick_ms`: the event's own).
     void Add(std::vector<std::string>* lines, u32 tick_ms, u64 now_os_ms, const std::string& text) {
         if (lines_ >= kMaxLines) {
-            return;
+            return; // (the launch's limit was said, "nothing more is written": the chat's lines neither)
         }
         std::string line = "sleep: ";
-        line += ++lines_ == kMaxLines ? "the limit of lines for one launch is reached: nothing more is written" : text;
+        if (chat_line_) {
+            // A line of the chat's keyboard (Event says so): counted apart, never against the lines of sleep, HOME, swap and exit.
+            if (chat_lines_ >= kMaxChatLines) {
+                return;
+            }
+            line += ++chat_lines_ == kMaxChatLines
+                        ? "the limit of lines about the chat's keyboard for one launch is reached: no more of those are written (the other lines go on)"
+                        : text;
+        } else {
+            line += ++lines_ == kMaxLines ? "the limit of lines for one launch is reached: nothing more is written" : text;
+        }
         char wall[24];
         FormatConsoleClock(now_os_ms, wall);
         line += " | tick " + std::to_string(tick_ms) + " ms | written at console clock " + wall;
@@ -182,6 +265,7 @@ private:
 
     /// An event of the ring: its line, and what it means for the watch.
     void Event(u32 kind, u32 value, u32 event_tick_ms, u32 now_tick_ms, u64 now_os_ms, std::vector<std::string>* lines) {
+        chat_line_ = kind >= kChatKeyboardOpen && kind <= kChatMirrorBackDone; // (their own limit of lines: Add; cleared below)
         switch (kind) {
         case kAptNoteNotification: {
             const u32 signal = AptSignalOf(value); // (the value is the word as it came)
@@ -256,6 +340,47 @@ private:
                 value == 2 ? std::string("exit guard: word set to running (state 1, no event): the kernel raises EXIT on it, Rosalina frees the block")
                            : std::string("exit guard: nothing to do"));
             break;
+        case kChatKeyboardOpen:
+            Add(lines, event_tick_ms, now_os_ms, "chat: keyboard open (#" + std::to_string(value) + " of this launch)");
+            break;
+        case kChatMirrorOn: {
+            const hidmirror::Outcome out = static_cast<hidmirror::Outcome>(value & 0xFF);
+            Add(lines, event_tick_ms, now_os_ms,
+                (out == hidmirror::Outcome::kDone ? std::string("chat: input mirror on, the game's HID page is the mirror's (")
+                                                  : std::string("chat: no input mirror (") + hidmirror::OutcomeText(out) + "; ") +
+                    MirrorThreadsText(value) + ", held " + std::to_string(value >> 16) + " us)");
+            break;
+        }
+        case kChatKeyboardClosed:
+            Add(lines, event_tick_ms, now_os_ms,
+                std::string("chat: keyboard closed") + ((value & kChatClosedShown) != 0 ? "" : ", never shown") +
+                    ((value & kChatClosedMirror) == 0 ? ", no input mirror to give back"
+                     : (value & kChatClosedAtOnce) != 0 ? ", the game's HID page goes back at once"
+                                                        : ", the game's HID page goes back once the keys are let go (1 s at most)"));
+            break;
+        case kChatMirrorBackBegins:
+            Add(lines, event_tick_ms, now_os_ms,
+                std::string("chat: input mirror: the game's HID page goes back, by ") + MirrorWhoText(value & 0xFF) +
+                    ": about to hold the game's threads (" + MirrorThreadsText(value) + "; this line is pushed before the hold" +
+                    ((value & 0xFF) == kMirrorByPlugin ? kMirrorPluginWaitsText : "") + ")");
+            break;
+        case kChatMirrorBackDone: {
+            const hidmirror::Outcome out = static_cast<hidmirror::Outcome>(value & 0xFF);
+            if (out == hidmirror::Outcome::kBusy) {
+                // (2026-11-11: the plugin's thread said "about to hold", gave the trail its time WITHOUT the mirror's lock, and then
+                // found the page already back or the lock taken - the line that closes its "about to hold")
+                Add(lines, event_tick_ms, now_os_ms,
+                    std::string("chat: input mirror: this thread did not hold the game's threads after all (") + hidmirror::OutcomeText(out) +
+                        ": the lines of that thread say how it went)");
+                break;
+            }
+            Add(lines, event_tick_ms, now_os_ms,
+                std::string("chat: input mirror: ") +
+                    (out == hidmirror::Outcome::kDone ? "the game's HID page is back" : "the way back ended without the page back") +
+                    ", the game's threads let go (" + hidmirror::OutcomeText(out) + "; " + MirrorThreadsText(value) + ", held " +
+                    std::to_string(value >> 16) + " us)");
+            break;
+        }
         case kAptNoteReceiveWord:
             Add(lines, event_tick_ms, now_os_ms, "after APT:ReceiveParameter, Luma3DS's plugin word " + LumaWordText(value));
             break;
@@ -300,6 +425,7 @@ private:
         default:
             break;
         }
+        chat_line_ = false;
     }
 
     void Arm(u32 now_tick_ms) {
@@ -352,6 +478,8 @@ private:
     // (the thread's own from here on)
     u32 tail_ = 0;
     u32 lines_ = 0;
+    u32 chat_lines_ = 0;     ///< the lines of the chat's keyboard, counted apart (kMaxChatLines)
+    bool chat_line_ = false; ///< the event in hand is one of them (Event sets it around its Add)
     bool ref_known_ = false;
     s64 ref_gap_ms_ = 0; ///< console clock minus tick as it was when no sleep had happened since (moves on at every wake)
     bool watch_ = false;

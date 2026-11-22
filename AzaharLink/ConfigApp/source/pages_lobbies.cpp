@@ -796,7 +796,9 @@ private:
                 continue;
             }
             for (const auto& game : titles::Scan().games()) {
-                if (lobbies::TitleKey(game->tid) == mine->key && setup::ReadSlot(game->tid).slot == setup::Slot::Off) {
+                // (a game that was SOLD only, setup::IsSoldGameTid, the rule of Enable Titles: what the user owns is every application title, 3DS Link
+                // itself and the homebrew too, and a member of a room declares the title id it likes; the plugin is not offered to any of those)
+                if (lobbies::TitleKey(game->tid) == mine->key && setup::IsSoldGameTid(game->tid) && setup::ReadSlot(game->tid).slot == setup::Slot::Off) {
                     const u64 tid = game->tid;
                     const std::string game_name = gfx::Clean(game->name);
                     PushPage(pages::NewConfirmPage("Enable the game?",

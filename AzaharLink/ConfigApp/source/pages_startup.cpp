@@ -13,16 +13,26 @@
 //   is not, each problem can be fixed from it), and only after that 3DSLink.cfg is written and the main page opens.
 // Every other start only scans the titles (the first screen only when there is no cache yet; otherwise it runs on behind the main page),
 // asks about the Plugin Loader when it is off, and opens the main page.
+#include "dlp_guest_am.hpp"
 #include "dlp_text.hpp"
 #include "heap_alloc.hpp"
 #include "pages.hpp"
 #include "plugin_resource.hpp"
 #include "titles.hpp"
 #include "zombie_census.hpp"
+#include "zombie_free.hpp"
 
 using namespace ui;
 
 namespace {
+
+// The Download Play guests 3DS Link prepared (1.1.4, dlp_guest_am.hpp): which titles are ours is read BEFORE the first scan, which leaves them out
+// (dlpguest::LoadRegistry), and what a run that died left is settled before any copy of the plugin is queued (RefreshInstall: the copy worker would
+// bring up to date a folder the start takes away). Nothing is made when nothing was ever prepared.
+void SettleDownloadPlayGuests() {
+    dlpguest::StartGuests();
+    zombie_free::FreeAtStart(g.paths.datadir); // (DPAPP-2j, R-A: after the records are read - their keys - and after the census wrote what was there)
+}
 
 class StartupPage : public Page {
 public:
@@ -30,6 +40,7 @@ public:
         if (g.first_start) {
             phase_ = Phase::Welcome;
         } else {
+            SettleDownloadPlayGuests();
             g.RefreshInstall();
             EnterScan();
         }
@@ -201,6 +212,7 @@ private:
         steps_[3].label = "Plugin file";
         steps_[4].label = "Plugin folder";
         steps_[5].label = "Plugin Loader";
+        SettleDownloadPlayGuests(); // (after the Yes: the start may write from here)
         EnterScan();
     }
 

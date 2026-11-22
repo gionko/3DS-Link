@@ -11,7 +11,10 @@
 #include <new>
 
 #include "azl/chat_core.hpp"
+#include "azl/dlp_title_block.hpp"
 #include "azl/exit_guard.hpp"
+#include "azl/flow_relief.hpp"
+#include "azl/one_game_host.hpp"
 #include "azl/log.hpp"
 #include "azl/plg_guard.hpp"
 #include "azl/plugin_compare.hpp"
@@ -21,13 +24,16 @@
 #include "azl/swap_gate.hpp"
 #include "azl/text_wrap.hpp"
 #include "azl/ticks.h"
+#include "azl/title_rules.hpp"
 #include "azl/wallclock.hpp"
+#include "azl/whole_file.hpp"
 #include "ctr/boot_diag.hpp"
 #include "ctr/gate_page.hpp"
 #include "ctr/input_mirror.hpp"
 #include "ctr/soc.hpp"
 #include "ctr/swap_gate.hpp"
 #include "ctr/teardown.hpp"
+#include "ctr/text_search_guard.hpp"
 #include "ctr/thread_core.hpp"
 #include "ctr/zombie_probe.hpp"
 
@@ -61,6 +67,9 @@ using CTRPluginFramework::File;
 constexpr const char* kDataDir = "/3ds/3DSLink/";
 constexpr const char* kConfigPath = "/3ds/3DSLink/AzaharLink.ini";
 constexpr const char* kOldConfigPath = "/luma/plugins/AzaharLink.ini";
+// F7: the old file a save takes aside (azl/whole_file.hpp, whole::BakOf(kConfigPath), the app's name): alone on the card when a save was cut
+// between its two renames, and then it is the settings.
+constexpr const char* kConfigBakPath = "/3ds/3DSLink/AzaharLink.ini.bak";
 // The memory figure of the last launch (title id, KB used, KB free of the application region at the start): written with the
 // log on only, read at the next start (CompareMemoryWithLastLaunch).
 constexpr const char* kMemPath = "/3ds/3DSLink/AzaharLink.mem";
@@ -71,6 +80,9 @@ constexpr const char* kLogSyncPath = "/3ds/3DSLink/AzaharLink.log";
 // The exit guard's line and the watch of Luma3DS's plugin word (REGISTRO, phase Q): a file of their own, written synchronously at any debug
 // level when they have something to say (and every exit with debug=1), never while the log's writer appends to its own file.
 constexpr const char* kLumaLogPath = "/3ds/3DSLink/AzaharLink.luma.log";
+// The Download Play application - its six regional titles, kDownloadPlayTitles of ctr/text_search_guard.hpp: the list the guard of GetTextSize answers, and no
+// other - is the one application that gets a line of its own in that file at its start (EarlyInit). Stage G0 of Mario Party: Island Tour
+// (Sources/ctr/text_search_guard.cpp lets the framework start inside it): what the card holds if the framework aborts there again.
 constexpr u32 kLumaWatchLines = 64;
 
 /// Makes /3ds/3DSLink (and /3ds) when they are missing: the files of the plugin have nowhere to go otherwise.
@@ -93,8 +105,10 @@ constexpr u32 kStatsIntervalMs = 5000;
 // game's threads take must not be preemptable by them: a LightLock has no priority inheritance, and with the writer at 0x38
 // (the lowest, until 2026-10-20) a game thread that found a lock in the preempted writer's hand waited for every thread above
 // the writer to leave the core, which a game that spins never does (Tekken froze twice in one session with the log on, at the
-// publisher's screen and on leaving a lobby; nothing froze with it off). Its CPU is small (formatting: a 64 KB chunk of the
-// capture is about a millisecond) and its writes block it in the file system, which is when the game runs.
+// publisher's screen and on leaving a lobby; nothing froze with it off). Its CPU is small and its writes block it in the file
+// system, which is when the game runs; the formatting of a 64 KB block of the capture is NOT small in one go (26 ms measured on
+// the console, 2026-11-10, not "about a millisecond" as this comment said), so a pass gives the core up every 2 ms of it
+// (LogFileLimits::capture_yield_ms).
 constexpr int kLogWriterPriority = 0x2E;
 constexpr u32 kNetStopTimeoutMs = 400;
 // Process events of the framework (Plugin::NoteProcessEvent, CTRPluginFramework's Process::Event): the index of
@@ -123,6 +137,7 @@ constexpr u32 kSwapDrainTimeoutMs = 1500;
 // then goes on as it did before the gate; the debug log says who was left, if the console survives it.)
 constexpr u32 kSwapGateTimeoutMs = 6100;
 constexpr u32 kRosalinaReplyWaitOffset = 0x28;               // PluginHeader.waitForReplyTimeout (Luma3DS plgldr.h): RaiseRosalinaReplyWait
+constexpr u32 kLoaderWordsOffset = 0x80;                     // PluginHeader.config[32] (Luma3DS plgldr.h): a plg:ldr command 4's words, NotePreparedChild
 constexpr u64 kRosalinaReplyWaitNs = 10000000000ull;        // what Luma3DS writes there (file_loader.c)
 constexpr u64 kRosalinaReplyWaitRaisedNs = 15000000000ull;  // Old 3DS: 15 s
 
@@ -142,6 +157,10 @@ constexpr u32 kMemIntervalMs = 30000;
 constexpr long kMinFreeHeapBytes = 512 * 1024;
 
 constexpr const char* kDefaultNickname = "3DS Player";
+// 1.1.4 (route B, spec 8 D-B9): how long from the launch the prepared Download Play child keeps the console's MAC and name in the room through a
+// collision: the 3DS Link app left it with them a moment before (its exit takes about 3 s at the worst; past 8 s the child's 10 rounds on an
+// Azahar host are over anyway).
+constexpr u32 kChildHoldIdMs = 8000;
 
 /// The console's wall clock (osGetTime), for LogFiles.
 u64 ConsoleClockMs() {
@@ -337,82 +356,110 @@ std::string ReadIconSelfNcch(u8 language) {
     return title;
 }
 
-// What the plugin does with the Download Play services (dlp:FKCL, dlp:SRVR) of a game, by title id (DlpGameMode, azl/dlp_hub.hpp):
-//   ProbeOnly: the games whose wireless mode (UDS, every player with their own copy) starts by asking dlp:FKCL whether the wireless
-//     is on and then never uses Download Play. dlp:FKCL is answered by the plugin (azl/dlp_fkcl_hle.hpp); dlp:SRVR stays the real one.
-//     Another game may need the same as Battle Royale: to add one, put its title id here and check in its log that the only
-//     dlp:FKCL commands are Initialize / InitializeWithName and Finalize (anything else is refused and written as
-//     "dlp: dlp:FKCL command 0x.. refused").
-//   Lobby: the games whose wireless mode goes on with the Download Play proper: Mario Tennis Open (its local multiplayer scene starts the
-//     Download Play client as soon as it opens: Initialize, GetMyStatus every 5 ms, GetChannels, scan, join; the real module answers "wireless off" because
-//     ndm is ours, and the game shows its Wi-Fi switch message), Kirby Triple Deluxe and Kirby Planet Robobot (tried
-//     with the probe on 2026-10-28: after Initialize they ask GetChannels, scan for a host and join; the probe refuses those
-//     ("invalid state") and the game answers with an error screen, 0xE0A0AC01). The room carries their lobby: BOTH services are
-//     served by the plugin's DlpHub (azl/dlp_hub.hpp), the host's announcement and the four messages of the creator go over the
-//     room like the game's own UDS frames, and the engine is given back to the game's nwm::UDS whole when the game starts it.
-//   RealDlp (1.1.3, Luigi's Mansion): the same hub and the same lobby, on another network: the adapter of the REAL Download Play
-//     (azl/dlp_real_net.hpp), which speaks on the wire what Azahar's Download Play emulates (the "fake client" case: every player has the
-//     game, nothing is downloaded) instead of the plugin's own dialect, so that a console and Azahar see each other's lobby. Its beacon and
-//     its messages are not the dialect's: a console of 1.1.2 (Lobby) and one of 1.1.3 (RealDlp) do not see each other in this game.
-//     Moving a game between Lobby and RealDlp is its row, and nothing else: no switch at run time (design PROGETTO-DLP-VERO-1.1.3.md 3.4).
-// A game that is not listed keeps the real services, as before (Zelda Tri Force Heroes has no entry). Only the games in Lobby and RealDlp
-// mode get a hub, and only the RealDlp ones its adapter: nothing of either exists in the others.
-// console_seed (Mario Tennis Open): the game keeps the players of the Download Play lobby in a table and, when the game's own network starts,
-// zeroes their ids and gives each one back by comparing the friend code seed of the lobby with the seed of the player's nwm::UDS node
-// (Tests: written from the debugger's reading of a stalled game, 2026-11-01). The seed the game gives nwm::UDS is the console's own, read from
-// the config block 0x00090000; the real Download Play modules give the same one. With the hash of the MAC in the lobby the two never match,
-// the guest keeps id 0 in the host's table and the game's synchronisation can never finish. The other Lobby games (Kirby) do not compare them.
-struct DlpGame {
-    u64 title_id;
-    DlpGameMode mode;
-    bool console_seed = false;  // Lobby only: the lobby announces the console's OWN friend code seed (see LobbySeedIsConsoles)
-};
-constexpr DlpGame kDlpGames[] = {
-    {0x00040000001C2100ull, DlpGameMode::ProbeOnly}, // Kirby Battle Royale (seen: InitializeWithName, Finalize 1 ms later, then nwm::UDS only)
-    {0x00040000001C2000ull, DlpGameMode::ProbeOnly}, // Kirby Battle Royale, another region's title id (not seen)
-    {0x000400000010C000ull, DlpGameMode::Lobby},     // Kirby Triple Deluxe (seen on a console: dlp:FKCL InitializeWithName, GetChannels, then the scan)
-    {0x000400000010BF00ull, DlpGameMode::Lobby},     // Kirby Triple Deluxe, another region's title id (from a catalogue, not seen)
-    {0x0004000000183600ull, DlpGameMode::Lobby},     // Kirby Planet Robobot (seen on a console; the ids of its other regions are not known here)
-    {0x000400000007C800ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Europe (the owner's copy, tried on two New 3DS with the plugin in 1.0.12: its local multiplayer scene starts the Download Play client at once, read from the code)
-    {0x000400000007C700ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, USA (catalogues and the Azahar list; not seen)
-    {0x0004000000064D00ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Japan (one source; not seen)
-    {0x00040000000B9100ull, DlpGameMode::Lobby, true},     // Mario Tennis Open, Taiwan (one source; not seen)
-    // Luigi's Mansion (the 2018 remake): seen on a New 3DS XL with 1.1.2 (2026-11-08): its local multiplayer opens the Download Play at once -
-    // dlp:SRVR InitializeWithName (0x0F) as the host and dlp:FKCL InitializeWithName (0x11) as the client - and the real modules answered
-    // 0xC940AC04 (wireless off); with the lobby it played (two New 3DS, 2026-11-09). The other regions' ids are 3DS Link's catalogue
-    // (ConfigApp titles.txt: the family BGN), not seen. (Mario Party: Island Tour opens dlp:SRVR the same way but did not play with the lobby:
-    // it has no Download Play client of its own.) 1.1.3: RealDlp, the real Download Play on the wire (the Azahar - Azahar capture of this
-    // game, analysis/luigi-azahar-2026-11-09, is the contract), so that a console and Azahar play it together; back to Lobby with these four
-    // rows if the test of two consoles (O5) fails.
-    {0x00040000001D1A00ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), Europe (seen)
-    {0x00040000001D1900ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), USA (catalogue)
-    {0x00040000001D1800ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), Japan (catalogue)
-    {0x00040000001D4F00ull, DlpGameMode::RealDlp},   // Luigi's Mansion (2018), Korea (catalogue)
-};
-
+// The Download Play column of each game is in azl/title_rules.hpp (Dlp, DlpOf: the application's id only, every region of a game in its one
+// row; the header says what each mode, the seed and the ceiling do); these are the plugin's names for it.
 DlpGameMode DlpModeOf(u64 title_id) {
-    for (const DlpGame& game : kDlpGames) {
-        if (game.title_id == title_id) {
-            return game.mode;
-        }
-    }
-    return DlpGameMode::None;
+    if (IsDownloadPlayTitle(title_id)) { return DlpGameMode::SystemClient; }  // 1.1.4 (G1): the system's Download Play application (ctr/text_search_guard.hpp's six ids): no row
+    return title_rules::DlpOf(title_id).mode;
 }
 
+/// 1.1.4 (route B, spec 8 D-B6): is a room member, by its game id, a guest whose child a host of the real Download Play waits for at its final?
+/// One in the system's Download Play application (ctr/text_search_guard.hpp's six ids) or in the 3DS Link app's Download Play page
+/// (title_rules::kAppTid): both leave the room once the passphrase came and come back as the prepared child. Any other id: no.
+bool AwaitsChildOf(u64 game_id) {
+    return IsDownloadPlayTitle(game_id) || game_id == title_rules::kAppTid;
+}
+
+/// 1.1.4 (G1, contract K5): does the system's Download Play application keep the system's own Download Play (the plugin stays out of it: no hooks,
+/// ndm:u and dlp:CLNT are the real ones, local Download Play and 3DS Link Delivery work)? Yes when the settings were not read at the start (no room
+/// can be known: the safe side) or when the plugin would not join a room by itself (clnt::UsesRoom, Sources/main.cpp's formula). Decided once, from
+/// the settings, in EarlyInit: the application's first touch comes before the room is joined (4.6 s against 5.7 s on a console), so the room's own
+/// state can never decide it. Every other title: false.
+bool ClntStaysLocal(u64 title_id, bool config_read_early, bool host_set, bool autoconnect, bool menu_off) {
+    return DlpModeOf(title_id) == DlpGameMode::SystemClient && (!config_read_early || !clnt::UsesRoom(host_set, autoconnect, menu_off));
+}
+static_assert(title_rules::kDlpTitlePlayers == kTitlePlayers && title_rules::kDlpPlayersMax == kMaxPlayers,
+              "the ceilings of the Download Play column are the lobby's: four unless the row says more, eight at the most");
+
 /// Does the lobby of this game announce the console's own friend code seed (config block 0x00090000, 8 bytes: what the game itself
-/// reads for nwm::UDS) instead of the hash of the MAC? Only where the game compares the two (Mario Tennis Open); false for every other game.
+/// reads for nwm::UDS) instead of the hash of the MAC? Where the game compares the two (Mario Tennis Open) and where a real console's
+/// Download Play would give it and nothing speaks against it (Mario Kart 7, the real Download Play); false for every other game.
 bool LobbySeedIsConsoles(u64 title_id) {
-    for (const DlpGame& game : kDlpGames) {
-        if (game.title_id == title_id) {
-            return game.console_seed;
-        }
-    }
-    return false;
+    return title_rules::DlpOf(title_id).console_seed;
+}
+
+/// The ceiling of players (host included) of this game's lobby: what its row says - four unless the row says more (Mario Kart 7: eight) -
+/// and four for a game that has no row (kNoDlp).
+u8 LobbyPlayersOf(u64 title_id) {
+    return title_rules::DlpOf(title_id).max_players;
+}
+
+/// Does the host of this game's OWN network (nwm::UDS, where the players go after the Download Play) send the Logoff of an admission to
+/// the members of the network one by one instead of broadcasting it (UdsEngine::SetAdmissionToMembers)? The rows of the real Download
+/// Play that say more than four players - Mario Kart 7's: its players come back from the Download Play all within a tenth of a
+/// second, and an Azahar that is Connecting adopts any Logoff it hears (the capture of eight Azahar of 2026-11-13: three of seven took
+/// another's node id, and the two whose id was taken fell out of the race). False for every other game - Luigi's Mansion among them:
+/// one client, nobody whose Logoff it could take - and for a game that has no row: their frames are what they were.
+bool AdmissionToMembersOf(u64 title_id) {
+    const title_rules::Dlp dlp = title_rules::DlpOf(title_id);
+    return dlp.mode == DlpGameMode::RealDlp && dlp.max_players > kTitlePlayers;
 }
 
 /// A game of the probe's kind (Battle Royale): dlp:FKCL is answered by the plugin's probe, nothing else of Download Play is.
 bool AsksDlpOnlyForTheWireless(u64 title_id) {
     return DlpModeOf(title_id) == DlpGameMode::ProbeOnly;
+}
+
+/// 1.1.4 (G4, contract K8): is `own` the Download Play child 3DS Link prepared, and whose? Only a title of the band (title_rules::IsPreparedId) whose
+/// row the index has - the row whose `prepared` is `own` (dlp_children::FindPrepared: who a prepared title is, is the index's, never a formula read
+/// backwards) -, copied to `*row`. Any other title, and one of the band with no row (no index, a line the parser refused, 3DS Link and the homebrew
+/// of the band), is not: the plugin runs as for any title it does not know. `text` is the index as Plugin::ReadDataFile gives it (nullptr: none);
+/// `scratch` is the caller's (an Index is about 520 bytes). Pure.
+bool PreparedChildRow(u64 own, const char* text, std::size_t size, dlp_children::Index* scratch, dlp_children::Row* row) {
+    // (the build 2h) the process's id is the system id 00040010|low of the child (or the key itself, 00040000|low: the fallback form and the
+    // children of the builds before): the index names the KEY, so the row is looked for by it - never 00040001, never a title out of the band
+    const u64 slot = title_rules::PreparedSlotOfProcess(own);
+    if (slot == 0 || text == nullptr || scratch == nullptr || !dlp_children::ParseIndex(text, size, scratch)) {
+        return false;
+    }
+    const int r = dlp_children::FindPrepared(*scratch, slot);
+    if (r < 0) {
+        return false;
+    }
+    *row = scratch->rows[r];
+    return true;
+}
+
+/// 1.1.4 (G4): does the prepared child join the room in EarlyInit (Plugin::EarlyConnect), before the game's first instruction? Its host's game waits
+/// 20 s for the players it counted. Only that title, only with the plugin on and where it joins a room by itself (clnt::UsesRoom: Sources/main.cpp's
+/// formula, from settings read at the start), and only on a New 3DS: an Old 3DS's gate of the plugin's threads is made in LateInit, so there the room
+/// is joined at the first frame, as for every title.
+bool JoinsEarly(bool prepared_child, bool active, bool new_console, bool config_read_early, bool host_set, bool autoconnect, bool menu_off) {
+    return prepared_child && active && new_console && config_read_early && clnt::UsesRoom(host_set, autoconnect, menu_off);
+}
+
+/// 1.1.4 (G4, review): what the game is told by the dlp:SRVR of the prepared child, for its line of the log. The plugin's service answers only through
+/// the hooks: with the plugin off for this launch, or the hooks out (no gate page, the diagnostic build's switch), the game talks to the real dlp:SRVR,
+/// which says "not a child" whatever service the plugin made.
+const char* ChildSrvrLine(bool has_service, bool active, bool hooked) {
+    return !active   ? "the real one (the plugin is off for this launch): IsChild says false"
+           : !hooked ? "the real one (no hooks for this launch): IsChild says false"
+           : has_service ? "answered by the plugin: IsChild says TRUE"
+                         : "the real one (a hub, or no memory for its service): IsChild says false";
+}
+
+/// 1.1.4 (G4): the 32 words Luma3DS's plugin loader put in the plugin's header for this launch (PluginHeader.config: what a plg:ldr command 4 gave,
+/// the prepared child's 16 bytes of the jump - G3), taken once: copied to `shelter` and wiped from the header, which nothing else then reads. True
+/// when one of them is not 0. The words never go to the log.
+constexpr std::size_t kLoaderWords = 32;
+bool TakeLoaderWords(volatile u32* header_words, u32 (&shelter)[kLoaderWords]) {
+    bool any = false;
+    for (std::size_t i = 0; i < kLoaderWords; ++i) {
+        shelter[i] = header_words[i];
+        header_words[i] = 0;
+        any = any || shelter[i] != 0;
+    }
+    return any;
 }
 
 /// FNV-1a, 64 bits: the friend code seed of the lobby is the hash of the console's MAC, so that it is the console's own (two
@@ -441,7 +488,7 @@ u8* MapGameAddress(void* /*ctx*/, u32 address, u32 size) {
 }
 
 /// The hub of a game in Lobby mode, or null (no memory: the game keeps the real services). `name` of the lobby's default player is
-/// "3DS Link" (the game's InitializeWithName replaces it).
+/// "3DS Link" (the game's InitializeWithName replaces it); the ceiling of players is the row's (four, eight for Mario Kart 7).
 std::unique_ptr<DlpHub> MakeDlpHub(UdsEngine* engine, KernelOps* kernel, u64 game_tid, const Mac& console_mac) {
     LobbyConfig config = {};
     config.game_tid = game_tid;
@@ -450,6 +497,7 @@ std::unique_ptr<DlpHub> MakeDlpHub(UdsEngine* engine, KernelOps* kernel, u64 gam
     for (std::size_t i = 0; i < kNameUnits && kDefaultName[i] != '\0'; ++i) {
         config.name[i] = static_cast<u16>(kDefaultName[i]);
     }
+    config.max_players = LobbyPlayersOf(game_tid);
     IpcResolver resolver;
     resolver.ctx = nullptr;
     resolver.map = &MapGameAddress;
@@ -457,7 +505,9 @@ std::unique_ptr<DlpHub> MakeDlpHub(UdsEngine* engine, KernelOps* kernel, u64 gam
 }
 
 /// The hub of a game in RealDlp mode, or null (no memory: the game keeps the real services): the configuration of MakeDlpHub, word for word, and
-/// the adapter of the real Download Play as the lobby's network (`real`, made by the caller and kept alive by it). The probes of the searcher take
+/// the adapter of the real Download Play as the lobby's network (`real`, made by the caller and kept alive by it), told the ceiling of players of
+/// the row as the lobby is (four, eight for Mario Kart 7); the engine is told how this game's own network admits (AdmissionToMembersOf:
+/// to the members one by one for Mario Kart 7, broadcast as ever for the others). The probes of the searcher take
 /// the engine as a spectator with the identity the lobby starts with (the hash of the MAC, "3DS Link"): nobody shows a spectator's.
 std::unique_ptr<DlpHub> MakeRealDlpHub(UdsEngine* engine, KernelOps* kernel, u64 game_tid, const Mac& console_mac, RealDlpNet* real) {
     LobbyConfig config = {};
@@ -467,6 +517,7 @@ std::unique_ptr<DlpHub> MakeRealDlpHub(UdsEngine* engine, KernelOps* kernel, u64
     for (std::size_t i = 0; i < kNameUnits && kDefaultName[i] != '\0'; ++i) {
         config.name[i] = static_cast<u16>(kDefaultName[i]);
     }
+    config.max_players = LobbyPlayersOf(game_tid);
     IpcResolver resolver;
     resolver.ctx = nullptr;
     resolver.map = &MapGameAddress;
@@ -476,8 +527,40 @@ std::unique_ptr<DlpHub> MakeRealDlpHub(UdsEngine* engine, KernelOps* kernel, u64
         probe.name[i] = config.name[i];
     }
     real->SetIdentity(probe);
+    real->SetPlayers(config.max_players);
+    real->SetChildWait(DlpModeOf(game_tid) == DlpGameMode::RealDlp);  // (1.1.4, H5: a game that hosts the real Download Play waits in its state 9 for the guests of the Download Play application that went to start their child)
+    engine->SetAdmissionToMembers(AdmissionToMembersOf(game_tid));  // (the game's own network after the lobby: Mario Kart 7 only)
     return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, config, resolver, real));
 }
+
+/// The player's name of the Download Play application's lobby until the profile's is known (the probes' spectator name too).
+constexpr char kClntPlayerName[] = "3DS Link";
+
+/// 1.1.4 (G1): the hub of the system's Download Play application, or null (no memory: the application keeps the system's Download Play). The
+/// searcher of the real Download Play (`real`, made by the caller) is the lobby's network and feeds `book`, the book of dlp:CLNT; the lobby lists
+/// ANY game's host (LobbyConfig::any_title), up to the tables' eight players; the engine's admissions stay as they are (the application has no
+/// network of its own after the lobby). The application never hosts: nothing of the creator is used.
+std::unique_ptr<DlpHub> MakeClntHub(UdsEngine* engine, KernelOps* kernel, u64 app_tid, const Mac& console_mac, RealDlpNet* real, DlpClntBook* book) {
+    LobbyConfig cfg = {};
+    cfg.game_tid = app_tid;
+    cfg.friend_seed = Fnv1a64(console_mac.data(), console_mac.size());
+    for (std::size_t k = 0; k < kNameUnits && kClntPlayerName[k] != '\0'; ++k) {
+        cfg.name[k] = static_cast<u16>(kClntPlayerName[k]);
+    }
+    cfg.max_players = static_cast<u8>(kMaxPlayers);  // (any game's lobby: the tables' ceiling, not a title's)
+    cfg.any_title = 1;
+    IpcResolver map;
+    map.ctx = nullptr;
+    map.map = &MapGameAddress;
+    Identity spectator = {};
+    spectator.seed = cfg.friend_seed;
+    std::memcpy(spectator.name, cfg.name, sizeof(spectator.name));
+    real->SetIdentity(spectator);
+    real->SetPlayers(cfg.max_players);
+    real->SetClntBook(book);
+    return std::unique_ptr<DlpHub>(new (std::nothrow) DlpHub(engine, kernel, cfg, map, real));
+}
+// <<< end of the Download Play wiring (Tests/plugin_dlp_extract.py)
 
 // ---------------------------------------------------------------------------------------------
 // Is the plugin that runs in this game the one 3DS Link keeps in /3ds/3DSLink/? (azl/plugin_compare.hpp)
@@ -549,6 +632,53 @@ MasterPlugin LookAtMasterPlugin(u64 game_id, std::string* detail) {
     return relation;
 }
 
+/// D-S1 (2026-11-15, the console probe of the Download Play client, analysis/piano-1.1.4-2026-11-15/mappa/dlp-client.md): in the system's Download Play
+/// application ONLY, what its process may open - a game's content 2 (its Download Play child, what tells "installed") on the SD and on the card, the
+/// prepared child (an application: Luma3DS loads plugins into applications only) and the service am:u. Two lines of results for each game of the index
+/// of the children (the first kProbeRows), then the line of am:u; every handle closed at once; nothing is read, nothing changes. 1.1.4 (G4, K1): the
+/// games are the index's and their prepared titles title_rules::PreparedOf of the GAME - the one formula; the first version derived the game from a
+/// fixed prepared id with a mask that lost the high bits of the Taiwanese and Korean low words.
+constexpr std::size_t kProbeRows = 4;
+__attribute__((noinline)) void ProbeDownloadPlayOpens() {
+    auto open_content = [](u64 tid, FS_MediaType media, u32 content) -> Result {
+        u32 archive_path[4] = {static_cast<u32>(tid), static_cast<u32>(tid >> 32), static_cast<u32>(media), 0};
+        u32 file_path[5] = {0 /* NCCH data */, content, 0 /* its RomFS */, 0, 0};
+        const FS_Path archive = {PATH_BINARY, sizeof(archive_path), archive_path};
+        const FS_Path file = {PATH_BINARY, sizeof(file_path), file_path};
+        Handle handle = 0;
+        const Result rc = FSUSER_OpenFileDirectly(&handle, ARCHIVE_SAVEDATA_AND_CONTENT, archive, file, FS_OPEN_READ, 0);
+        if (R_SUCCEEDED(rc)) {
+            FSFILE_Close(handle);
+        }
+        return rc;
+    };
+    std::string text;
+    std::unique_ptr<dlp_children::Index> index(new (std::nothrow) dlp_children::Index);
+    const bool listed = index && Plugin::ReadDataFile(dlp_children::kIndexPath, dlp_children::kIndexMaxBytes, text) &&
+                        dlp_children::ParseIndex(text.data(), text.size(), index.get());
+    const std::size_t games = listed ? index->count : 0;
+    if (games == 0) {
+        Log("dlp probe: no game in the index of the children (%s): no content to open", dlp_children::kIndexPath);
+    }
+    for (std::size_t r = 0; r < games && r < kProbeRows; ++r) {
+        const u64 game = index->rows[r].game;
+        const u64 prepared_tid = title_rules::PreparedOf(game);  // (K1: the one formula, on the game)
+        const Result game_sd = open_content(game, MEDIATYPE_SD, 2 /* its Download Play child */);
+        const Result game_card = open_content(game, MEDIATYPE_GAME_CARD, 2);
+        Log("dlp probe: from the Download Play application, the content 2 of %08lx%08lx: SD %s, card %s",
+            static_cast<unsigned long>(game >> 32), static_cast<unsigned long>(game), DescribeResult(game_sd).c_str(), DescribeResult(game_card).c_str());
+        const Result prepared = open_content(prepared_tid, MEDIATYPE_SD, 0);
+        Log("dlp probe: the prepared child %08lx%08lx, content 0 on the SD: %s", static_cast<unsigned long>(prepared_tid >> 32),
+            static_cast<unsigned long>(prepared_tid), DescribeResult(prepared).c_str());
+    }
+    Handle am = 0;
+    const Result am_rc = srvGetServiceHandle(&am, "am:u");
+    if (R_SUCCEEDED(am_rc)) {
+        svcCloseHandle(am);
+    }
+    Log("dlp probe: the service am:u from the Download Play application: %s", DescribeResult(am_rc).c_str());
+}
+
 /// Source 2: the title archive (what Checkpoint uses), trying the media this application was
 /// launched from first.
 std::string ReadIconTitleArchive(u64 title_id, u8 language) {
@@ -601,6 +731,135 @@ std::string ReadIconTitleArchive(u64 title_id, u8 language) {
         }
     }
     return "";
+}
+
+// The title in the announcement of the real Download Play (2026-11-14, azl/dlp_title_block.hpp): the names, the icon and the sizes of
+// the child that a real host announces, for every game whose host has the real Download Play (2026-11-15: no list, as the system's own service
+// does; dlp_real::AnnouncesTitle). Read from the title that is RUNNING - no table of names - once, at start, on
+// the plugin's own thread (LateInit: no thread of the game ever waits for a file here, and the room's thread, the only one that
+// builds the announcement, does not exist yet), into one block of 5 KB that is kept for as long as the adapter is (the user's choice: 5 KB of
+// the plugin's own memory, not the game's) and that a game with no hub never has. Whatever fails, the announcement is zeros and the game is told nothing.
+
+/// The content of a title that holds its Download Play children (the "child container": a RomFS with one CIA per child).
+constexpr u32 kDlpChildContent = 2;
+
+/// FSFILE_Read as dlp_real::ReadAt wants it (`ctx` = the file's handle): every byte asked for, or false.
+bool ReadFileAt(void* ctx, u64 offset, u8* out, u32 size) {
+    u32 read = 0;
+    return R_SUCCEEDED(FSFILE_Read(*static_cast<Handle*>(ctx), &read, offset, out, size)) && read == size;
+}
+
+// (Out of line: LateInit, which every game runs, keeps the frame it had.)
+__attribute__((noinline)) void GiveAnnouncementItsTitle(RealDlpNet* real, u64 game_id, u8 language) {
+    const u64 began_ms = platform::NowMs();
+    dlp_real::TitleBlock* block = new (std::nothrow) dlp_real::TitleBlock;
+    u8* smdh = new (std::nothrow) u8[dlp_real::kSmdhBytes];  // (14 KB, given back below)
+    if (block == nullptr || smdh == nullptr || R_FAILED(fsInit())) {
+        Log("dlp: the announcement stays without the game's name, icon and sizes (zeros, as before): %s",
+            block == nullptr || smdh == nullptr ? "no memory for them" : "fsInit failed");
+        delete block;
+        delete[] smdh;
+        return;
+    }
+    std::memset(block, 0, sizeof(*block));
+    block->child_tid_low = static_cast<u32>(game_id) & 0xFFFFFF00u;  // (the child 0: the announcement of another child gets none of this)
+    // 1. As a real host does: the child's package in the game's content 2, on the media the game was started from, then the other one.
+    //    Its sizes, and its own names and icon. (This archive has been read from a game's process on consoles - the icon of another
+    //    title, content 0; the RomFS of a content 2 never: the line below says how it went, on each media.)
+    FS_MediaType first = MEDIATYPE_SD;
+    const Result media_rc = FSUSER_GetMediaType(&first);
+    const FS_MediaType from = R_SUCCEEDED(media_rc) && (first == MEDIATYPE_SD || first == MEDIATYPE_GAME_CARD) ? first : MEDIATYPE_SD;
+    const FS_MediaType medias[2] = {from, from == MEDIATYPE_SD ? MEDIATYPE_GAME_CARD : MEDIATYPE_SD};
+    const char* names_from = nullptr;
+    dlp_real::PackageWhy why = dlp_real::PackageWhy::Read;
+    Result open_rc[2] = {0, 0};  // (one for each media: the refusal of the first one is not lost under the second one's)
+    int tried = 0;
+    unsigned long names_entry = dlp_real::kSmdhTitles;  // the SMDH's entry the names are of: the console's language, or the one in its place
+    dlp_real::ChildPackage package = {};
+    bool opened = false;       // (the first media where the content opens is the one: its verdict is the line's)
+    int sized_on = -1;
+    u64 opened_size = 0;       // of a package that opened and was not read: its length ...
+    u8 opened_head[8] = {};    // ... and its first two words (what the file system gives for a content's RomFS)
+    for (int i = 0; i < 2 && !opened; ++i) {
+        u32 archive_path[4] = {static_cast<u32>(game_id), static_cast<u32>(game_id >> 32), static_cast<u32>(medias[i]), 0};
+        u32 file_path[5] = {0 /* NCCH data */, kDlpChildContent, 0 /* its RomFS */, 0, 0};
+        const FS_Path archive = {PATH_BINARY, sizeof(archive_path), archive_path};
+        const FS_Path file = {PATH_BINARY, sizeof(file_path), file_path};
+        Handle handle = 0;
+        tried = i + 1;
+        open_rc[i] = FSUSER_OpenFileDirectly(&handle, ARCHIVE_SAVEDATA_AND_CONTENT, archive, file, FS_OPEN_READ, 0);
+        if (R_FAILED(open_rc[i])) {
+            continue;
+        }
+        opened = true;
+        why = dlp_real::FindChildPackage(&ReadFileAt, &handle, block->child_tid_low, &package);
+        if (why == dlp_real::PackageWhy::Ok) {
+            block->transfer_size = package.transfer_size;
+            block->required_size = package.required_size;
+            sized_on = static_cast<int>(medias[i]);
+            if (ReadFileAt(&handle, package.smdh_at, smdh, dlp_real::kSmdhBytes) &&
+                dlp_real::TitleFromSmdh(block, smdh, dlp_real::kSmdhBytes, language)) {
+                names_from = "the child's package";
+                names_entry = dlp_real::SmdhTitleEntry(smdh, language);
+            }
+        } else {
+            FSFILE_GetSize(handle, &opened_size);
+            ReadFileAt(&handle, 0, opened_head, sizeof(opened_head));
+        }
+        FSFILE_Close(handle);
+    }
+    // 2. Where that gave no names: the game's own icon file (the read ReadIconSelfNcch makes in every game), whole.
+    Result icon_rc = 0;
+    if (names_from == nullptr) {
+        const FS_Path self = {PATH_EMPTY, 1, ""};
+        u32 icon_words[3] = {2 /* ExeFS / system menu data */, 0x6E6F6369 /* "icon" */, 0};
+        const FS_Path icon = {PATH_BINARY, sizeof(icon_words), icon_words};
+        Handle handle = 0;
+        icon_rc = FSUSER_OpenFileDirectly(&handle, ARCHIVE_ROMFS, self, icon, FS_OPEN_READ, 0);
+        if (R_SUCCEEDED(icon_rc)) {
+            u32 read = 0;
+            icon_rc = FSFILE_Read(handle, &read, 0, smdh, dlp_real::kSmdhBytes);
+            FSFILE_Close(handle);
+            if (R_SUCCEEDED(icon_rc) && dlp_real::TitleFromSmdh(block, smdh, read, language)) {
+                names_from = "the game's own icon";
+                names_entry = dlp_real::SmdhTitleEntry(smdh, language);
+            }
+        }
+    }
+    fsExit();
+    delete[] smdh;
+    const unsigned long took_ms = static_cast<unsigned long>(platform::NowMs() - began_ms);
+    if (sized_on < 0) {
+        // (a line of its own, straight to the log: what each media answered, what the file that opened looks like, what the first file is called)
+        char second[12] = "not tried";
+        if (tried > 1) {
+            std::snprintf(second, sizeof(second), "0x%08lx", static_cast<unsigned long>(open_rc[1]));
+        }
+        Log("dlp: the child's package was not read: %s; open 0x%08lx on media %d, %s on media %d; what opened is 0x%08lx bytes and starts"
+            " %08lx %08lx; its first file is '%s', a name of %lu bytes",
+            !opened ? "it did not open" : dlp_real::PackageWhyText(why), static_cast<unsigned long>(open_rc[0]),
+            static_cast<int>(medias[0]), second, static_cast<int>(medias[1]), static_cast<unsigned long>(opened_size),
+            static_cast<unsigned long>(LoadBE32(opened_head)), static_cast<unsigned long>(LoadBE32(opened_head + 4)),
+            package.first_name, static_cast<unsigned long>(package.first_name_bytes));
+    }
+    if (names_from == nullptr && sized_on < 0) {
+        delete block;
+        Log("dlp: the announcement stays without the game's name and icon (zeros, as before): the game's own icon was not read (0x%08lx)"
+            " and neither was the child's package (the line before); %lu ms", static_cast<unsigned long>(icon_rc), took_ms);
+        return;
+    }
+    char sized[112];
+    const char* sizes = "NO sizes (zeros: the child's package was not read, the line before says why)";
+    if (sized_on >= 0) {
+        std::snprintf(sized, sizeof(sized), "the child's sizes 0x%08lx and 0x%08lx from its package (content %lu, media %d)",
+                      static_cast<unsigned long>(block->transfer_size), static_cast<unsigned long>(block->required_size),
+                      static_cast<unsigned long>(kDlpChildContent), sized_on);
+        sizes = sized;
+    }
+    real->SetTitleBlock(block);  // (from here the adapter's: never freed, never changed - as the adapter and the hub themselves)
+    Log("dlp: the announcement carries the game's name and icon from %s (language %lu, the names of entry %lu) and %s; %lu ms, %lu bytes kept",
+        names_from != nullptr ? names_from : "NOWHERE (zeros: neither the package's nor the game's own icon was read)",
+        static_cast<unsigned long>(language), names_entry, sizes, took_ms, static_cast<unsigned long>(sizeof(*block)));
 }
 
 /// 3DS Link's title id (DlpLink/tools/common.sh: UNIQUE_ID 0x0F83D1, variation 00: the app 000400000F83D100).
@@ -686,6 +945,30 @@ public:
     }
     bool Exists(const std::string& path) override {
         return File::Exists(path) == 1;
+    }
+};
+
+/// The card for azl/whole_file.hpp (F7): AzaharLink.ini goes down whole or not at all, in the order of the app's WriteTextFile. CTRPF's
+/// File::Rename is FSUSER_RenameFile alone (it never replaces: the order never asks it to); Rename and Remove answer File::SUCCESS (0) or the
+/// FS error (File.hpp of CTRPF 0.8.0), Exists 1 for a file that is there. F7-rev (File.o of 0.8.0, disassembled): Exists is one open of the
+/// card in read: 1 when it opens, 0 whenever it fails - a missing file and a passing error of the card alike - and -1 only for a path it
+/// cannot make; so `== 1`, and whole::Choose looks at the ini once more before it takes the .bak.
+struct CtrWhole {
+    bool Exists(const std::string& path) { return File::Exists(path) == 1; }
+    bool Rename(const std::string& from, const std::string& to) { return File::Rename(from, to) == File::SUCCESS; }
+    void Remove(const std::string& path) { File::Remove(path); }
+    bool WriteNew(const std::string& path, const std::string& text) {
+        {
+            File file;
+            if (File::Open(file, path, File::RWC | File::TRUNCATE | File::SYNC) != File::SUCCESS) {
+                return false;
+            }
+            if (file.Write(text.data(), static_cast<u32>(text.size())) != File::SUCCESS) {
+                return false;
+            }
+        } // (closed here: FSFILE_Close)
+        std::string back;
+        return Plugin::ReadDataFile(path.c_str(), text.size() + 1, back) && back == text;
     }
 };
 
@@ -793,16 +1076,14 @@ void Plugin::StartLogWriter() {
     if (!log_thread_.Start(
             [this]() {
                 platform::MarkLogWriterThread(); // (the one thread that may wait for the log's locks: azl/platform.hpp)
-                bool backlog = false; // the last pass of the capture was cut short (LogFiles::DrainDebug) with records left
-                u32 rest_ms = 20;     // ... and how long the card is left alone before the next pass then
                 bool capture_early = false; // something asked for the capture to be written at once (the HOME button)
                 bool master_checked = false; // the plugin of 3DS Link's folder was compared with this game's copy (once, a while after the start)
                 while (!log_stop_.load()) {
                     // Once a second is plenty for the statistics window (all there is to do with the log
-                    // off); the debug capture fills a 512 KB ring that wants emptying four times as often,
-                    // and a ring that still holds records after a bounded pass is not left for a whole pause.
-                    // A stop wakes it at once.
-                    const u32 wait_ms = backlog ? rest_ms : g_debug_level > 0 ? 250 : 1000;
+                    // off). With the log on the writer wakes every 250 ms for the main log, and sooner when the
+                    // capture has something for the card and waits for the card's rest to end, or stepped aside
+                    // for a file read of the game (LogFiles::WriterWaitMs: 20 ms at least). A stop wakes it at once.
+                    const u32 wait_ms = g_debug_level > 0 ? log_files_->WriterWaitMs(platform::NowMs()) : 1000;
                     const u64 asleep = platform::NowTicks();
                     if (log_wake_) {
                         svcWaitSynchronization(log_wake_, static_cast<s64>(wait_ms) * 1000000LL);
@@ -845,6 +1126,7 @@ void Plugin::StartLogWriter() {
                         }
                     }
                     const u64 card_before = log_files_->card_wait_ticks();
+                    const u64 yielded_before = log_files_->yielded_ticks();
                     ServiceLog();
                     if (g_debug_level > 0) {
                         LogProcessEvents();
@@ -852,29 +1134,37 @@ void Plugin::StartLogWriter() {
                             log_files_->Flush(); // (the HOME button: see OnHomeButton)
                             capture_early = true;
                         }
-                        // The capture goes to the card in few, large passes (LogFileLimits::capture_every_ms): the game reads from the
-                        // same card, and a pass every 250 ms kept it waiting (the writer spent 63-77% of its time in the card). A pass
-                        // that was cut short comes back soon (backlog); the ring is left to fill meanwhile (it is the plugin's memory).
-                        if (backlog || log_files_->CaptureDue(platform::NowMs(), DebugRingUsedBytes(), capture_early)) {
+                        // The capture goes to the card in few passes (LogFileLimits::capture_every_ms), ONE write each, and leaves the
+                        // card to the game (2026-11-10: the file system serves one call at a time, and with a capture the card could not
+                        // keep up with the writer held the card 97% of the time - Kirby Battle Royale read one block of its files per
+                        // pass and the session fell). LogFiles decides: a pass when one is due, not before the card has rested as long
+                        // as the last pass kept it (20 ms..5 s), and not while the game reads its files (10 s at the most, then one
+                        // small slice); the HOME button passes at once. The ring is left to fill meanwhile (it is the plugin's memory).
+                        const LogFiles::CaptureTurn turn = log_files_->NextCaptureTurn(platform::NowMs(), DebugRingUsedBytes(), capture_early);
+                        if (turn != LogFiles::CaptureTurn::kWait) {
                             capture_early = false;
-                            backlog = log_files_->DrainDebug(false);
+                            log_files_->DrainDebug(false, turn == LogFiles::CaptureTurn::kSmallPass);
                         }
-                    } else {
-                        backlog = false;
                     }
                     // The pass is CPU except for the time its writes spent in the SD card (a wait on the file system's
-                    // process, 64% of this thread's wall time in PROVA 2).
-                    const u64 pass_ticks = platform::NowTicks() - woke;
+                    // process, 64% of this thread's wall time in PROVA 2) and for the milliseconds a pass of the capture gave
+                    // the core up while it formatted (2026-11-10: a sleep, neither CPU nor card - charged as CPU it would
+                    // show the cure as the illness in the "writer" figure of the statistics).
+                    const u64 wall_ticks = platform::NowTicks() - woke;
+                    const u64 yielded_ticks = log_files_->yielded_ticks() - yielded_before;
+                    const u64 pass_ticks = wall_ticks > yielded_ticks ? wall_ticks - yielded_ticks : 0;
                     const u64 card_ticks = log_files_->card_wait_ticks() - card_before;
                     const u64 waited_ticks = card_ticks < pass_ticks ? card_ticks : pass_ticks;
                     StatsAdd64(g_stats.t_writer, pass_ticks - waited_ticks);
                     StatsAdd64(g_stats.t_writer_wait, waited_ticks);
-                    // A pass that was cut short comes back soon, but not before the card has had as long as the pass kept
-                    // it (20 ms at least, 250 at most): the game reads from the same card, and a capture the card cannot
-                    // keep up with (it drops records then, and says so) must not keep the game's loads waiting behind
-                    // write after write (2026-10-20).
-                    const u32 card_ms = static_cast<u32>(azl_ticks_to_ms(waited_ticks));
-                    rest_ms = card_ms < 20 ? 20 : card_ms > 250 ? 250 : card_ms;
+                    // (how long the card is then left alone is the pass's own business: LogFiles::DrainDebug, pace::RestAfterPass)
+                }
+                // The writer is leaving: the lines of the main log that are still waiting go to the card now (2026-11-10). When the
+                // writer was in a long write at the end of the launch, Shutdown's FlushWithin gave up and put its lines back in the
+                // queue, and nobody wrote them: 'shutdown: done' could be missing from the log of a clean exit.
+                if (g_debug_level > 0) { // (log off: no queue and no file, nothing is touched)
+                    const SwapGateScope gate(kGateWriter);
+                    log_files_->Flush();
                 }
             },
             0, kLogWriterPriority)) {
@@ -1303,8 +1593,8 @@ void Plugin::LogStats(u64 now_ms) {
     const RoomClient::LinkStats link = room_->link_stats();
     NoteStatusNumbers(s, dt, link);
     CheckStatsWarnings(s, now_ms);
-    CheckDebugLoad(s);
-    CheckLinkSilence(s);
+    CheckDebugLoad(s, dt);
+    CheckLinkSilence(s, dt);
     if (g_debug_level <= 0) {
         return;
     }
@@ -1388,6 +1678,17 @@ void Plugin::LogStats(u64 now_ms) {
     }
     LogStatsTiming(s, dt);
     LogStatsWire(s);
+    {
+        // The flow of the room's stream (2026-11-14; a line of its own, in every window - a zero is an answer too: azl/flow_relief.hpp): how late the
+        // room's packets reached the game, how near the waiting data came to ENet's limit and what the limit did, and what the relief of the listed
+        // titles did. (About 440 characters with ten digits in every number; longer than a line of Log() may be: straight to the queue.)
+        char flow_line[448];
+        flow::FormatStatsLine(s, flow::IsDenseTitle(rules_id_), flow_line, sizeof(flow_line));
+        log_files_->Append(flow_line);
+        // (and, in the same buffer, what was lost on the way and what the bound of the placeholders refused: the line "room stream losses")
+        flow::FormatLossLine(s, title_rules::RulesFor(rules_id_).cap_drop_max, flow_line, sizeof(flow_line));
+        log_files_->Append(flow_line);
+    }
     LogStatsCapture();
 
     // Command counts, once in a while.
@@ -1445,12 +1746,22 @@ void Plugin::LogStatsTiming(const Stats& s, u64 dt_ms) {
     const unsigned long hold_max_us = static_cast<unsigned long>(static_cast<u64>(s.lock_hold_max) / 268);
     const unsigned long hold_avg_us = static_cast<unsigned long>(s.lock_holds ? s.lock_hold_ticks / s.lock_holds / 268 : 0);
     const unsigned long net_waiting = static_cast<unsigned long>(c.soc10) + c.poll10 + c.pause10 + c.netlock10;
-    char text[1100];
+    char text[1536]; // (2m-diag: 1100 until then; with ten digits in every number and every clause the line is about 1500 characters)
     int n = 0;
     Append(text, sizeof(text), &n,
            "stats: ms per second, CPU time of our code (waiting is not counted) | plugin total %lu.%lu (CPU) = %lu.%lu%% of a core",
            static_cast<unsigned long>(c.plugin10) / 10, static_cast<unsigned long>(c.plugin10) % 10,
            static_cast<unsigned long>(c.plugin10) / 100, static_cast<unsigned long>(c.plugin10) / 10 % 10);
+    const u64 card_ms = azl_ticks_to_ms(s.t_writer_wait);
+    const StretchBy stretched_by = WhoStretchedTheWindow(dt_ms, kStatsIntervalMs, card_ms, s.writer_late_max, log_thread_.running());
+    if (stretched_by != StretchBy::None) {
+        // (2m-diag D3) a window twice the nominal one or more. (2m-rev) Who held it (the writer in the SD card or waking late, the caller of
+        // Tick with no writer thread, or something else), and what it does to the figures: those per second are averages over the real
+        // length and stay right, the counts of the window (frames, rounds longer than 50 ms) are those of all of it. (The SD card and the
+        // writer's late wake-ups are in the line already, in "SD card" and "log writer ... late": the line stays within its 1536 bytes.)
+        Append(text, sizeof(text), &n, " | WINDOW STRETCHED %s: %lu ms for %lu, per second: averages; counts: all of it",
+               StretchedByText(stretched_by), static_cast<unsigned long>(dt_ms), static_cast<unsigned long>(kStatsIntervalMs));
+    }
     Append(text, sizeof(text), &n,
            " | net thread %lu.%lu: enet %lu.%lu, frames+engine %lu.%lu, queue+tick %lu.%lu",
            static_cast<unsigned long>(c.net10) / 10, static_cast<unsigned long>(c.net10) % 10,
@@ -1484,10 +1795,10 @@ void Plugin::LogStatsTiming(const Stats& s, u64 dt_ms) {
            net_waiting % 10, static_cast<unsigned long>(c.other10) / 10, static_cast<unsigned long>(c.other10) % 10);
     Append(text, sizeof(text), &n,
            " | game: %lu frames (%lu.%lu fps), interval avg %lu.%lu max %lu ms, %lu longer than 50 ms | net rounds longer"
-           " than 50 ms: %lu",
+           " than 50 ms: %lu, %lu more only by the pause after a socket error",
            static_cast<unsigned long>(s.frames), fps10 / 10, fps10 % 10, gap_avg10 / 10, gap_avg10 % 10,
            static_cast<unsigned long>(s.frame_gap_max / AZL_TICKS_PER_MS), static_cast<unsigned long>(s.frame_hitches),
-           static_cast<unsigned long>(s.net_slow_rounds));
+           static_cast<unsigned long>(s.net_slow_rounds), static_cast<unsigned long>(s.net_pause_rounds));
     log_files_->Append(text);
 }
 
@@ -1495,7 +1806,10 @@ void Plugin::LogStatsTiming(const Stats& s, u64 dt_ms) {
 // between the datagrams of the room (its holds), the twin frames, and what the engine did with nodes.
 void Plugin::LogStatsWire(const Stats& s) {
     static const char* const kSocNames[kSocKinds] = {"recv", "recv-empty", "send", "poll"};
-    char text[1600];
+    char text[2304];
+    // (2304 since 2026-11-11; it was 1600: with every optional clause in it the fixed text of this line alone is about 1700 characters,
+    // and about 2200 with ten digits in every number - the clauses at the end, "beacons as host" the last, were cut or lost in the very
+    // windows that have the most to say. On the statistics' thread - the log's writer, or the network thread without one: 32 KB of stack.)
     int n = 0;
     Append(text, sizeof(text), &n, "stats: soc calls n (mean/max us, >20 ms, >100 ms):");
     for (int k = 0; k < kSocKinds; ++k) {
@@ -1570,6 +1884,11 @@ void Plugin::LogStatsWire(const Stats& s) {
                static_cast<unsigned long>(s.loss_declared), static_cast<unsigned long>(s.loss_deferred),
                static_cast<unsigned long>(s.loss_resumed), static_cast<unsigned long>(s.net_stalls));
     }
+    if (s.auth_other_game) {
+        // A host of a title that keeps to its game (azl/one_game_host.hpp) left newcomers that play another game unanswered.
+        Append(text, sizeof(text), &n, " | newcomers from another game not answered %lu",
+               static_cast<unsigned long>(s.auth_other_game));
+    }
     if (s.drop_foreign || s.foreign_shadow || s.deauth_late || s.hle_throttled) {
         // The filters of the link: another lobby of the room (dropped by a host; counted, and dropped only when the client's
         // filter is on), the second copy of a goodbye that came after the node had joined again, and a game thread that
@@ -1591,7 +1910,33 @@ void Plugin::LogStatsWire(const Stats& s) {
                static_cast<unsigned long>(s.sync_checks), static_cast<unsigned long>(s.sync_disagree),
                static_cast<unsigned long>(s.sync_streak_max));
     }
+    if (s.beacon_built || s.beacon_reused) {
+        // 2026-11-10: a host's beacon is made again only when its network changed (a player in or out, the application
+        // data): the rest go out from the copy of the last one (UdsEngine::BeaconFrameLocked). Last, so that the clauses
+        // before it keep their place for the scripts that read this line ("host beacons" is the uds line's count of the
+        // beacons HEARD from a host: these are the ones we send as one).
+        Append(text, sizeof(text), &n, " | beacons as host: %lu built, %lu sent again from the copy",
+               static_cast<unsigned long>(s.beacon_built), static_cast<unsigned long>(s.beacon_reused));
+    }
     log_files_->Append(text);
+    // The datagrams handed to the socket (2026-11-11; a line of its own, and only when there is something to say: the line
+    // above keeps its shape). A refused send is a datagram ENet believes sent; a large one that was taken whole and never
+    // reached the room was lost after the console. A datagram "of kSocSendBig bytes or more" is a FULL datagram, not "a
+    // fragment of a large frame": ENet fills every datagram to its MTU with whatever commands wait, so a round of ten small
+    // frames is one too, and the line comes out in games that send no large frame at all. To tell whether a game's large
+    // frames left the console, hold the count against the frames above ENet's fragment length that the capture shows going
+    // out in the same window - never read it alone.
+    if (s.soc_send_refused || s.soc_send_failed || s.soc_send_short || s.soc_send_big) {
+        n = 0;
+        Append(text, sizeof(text), &n,
+               "stats: socket sends: refused %lu (%lu of %lu bytes or more), failed %lu, short %lu | datagrams of %lu bytes"
+               " or more taken whole %lu, largest datagram %lu B",
+               static_cast<unsigned long>(s.soc_send_refused), static_cast<unsigned long>(s.soc_send_refused_big),
+               static_cast<unsigned long>(kSocSendBig), static_cast<unsigned long>(s.soc_send_failed),
+               static_cast<unsigned long>(s.soc_send_short), static_cast<unsigned long>(kSocSendBig),
+               static_cast<unsigned long>(s.soc_send_big), static_cast<unsigned long>(s.soc_send_max_bytes));
+        log_files_->Append(text);
+    }
 }
 
 // The capture's own window (a line of its own: the lines above keep their shape for the scripts that read them). What
@@ -1620,6 +1965,11 @@ void Plugin::LogStatsCapture() {
         static_cast<unsigned long>(now.agg_calls - before.agg_calls),
         static_cast<unsigned long>(now.agg_lines - before.agg_lines));
     capture_prev_ = now;
+    // What the writer asked of the SD card since the last of these lines, call by call, and how the capture kept out of the game's way
+    // (2026-11-10; a line of its own: azl/log_files.hpp, CardWindow). Longer than a line of Log() may be: straight to the queue.
+    char card[512];
+    LogFiles::FormatCardLine(log_files_->TakeCardWindow(), card, sizeof(card));
+    log_files_->Append(card);
 }
 
 // What the counters of the last interval say is wrong goes on screen too (once a minute per kind): the user
@@ -1654,12 +2004,14 @@ void Plugin::CheckStatsWarnings(const Stats& s, u64 now_ms) {
 
 // With the log on, a notice when it is the log that slows the game (the user, 2026-10-20: the debug mode may show more on the
 // screen than the production one): the writer's time in the SD card over the window, and the share of the capture's heavy
-// records the ring dropped. Once a minute at most (Warn), and in the log as every warning.
-void Plugin::CheckDebugLoad(const Stats& s) {
+// records the ring dropped. Once a minute at most (Warn), and in the log as every warning. The share of the card is taken over the REAL
+// length of the window (`window_ms`, 2026-11-10): the writer closes the window and it is the thread that sits in the card, so a window
+// "of 5 s" lasted up to 43 s and the notice said "SD card busy 868%".
+void Plugin::CheckDebugLoad(const Stats& s, u64 window_ms) {
     if (g_debug_level <= 0 || !DebugRingReady()) {
         return;
     }
-    const u32 card_pct = static_cast<u32>(azl_ticks_to_ms(s.t_writer_wait) * 100 / kStatsIntervalMs);
+    const u32 card_pct = pace::CardBusyPercent(azl_ticks_to_ms(s.t_writer_wait), window_ms);
     const CaptureTotals now = DebugCaptureTotals();
     const CaptureTotals& before = capture_prev_; // (LogStatsCapture, later in the same window, moves it on)
     const u64 lost = (now.lost_full[1] + now.lost_busy[1]) - (before.lost_full[1] + before.lost_busy[1]);
@@ -1677,14 +2029,23 @@ void Plugin::CheckDebugLoad(const Stats& s) {
 // the WiFi link (or the router), not the game and not this plugin: in the session of 2026-10-20 one console had 17-23 of these a
 // minute in a Tekken fight and the other 0-2, the same room and the same plugin, while the plugin's own pauses stayed under 70 ms.
 // A silence stops a lockstep game on both consoles for as long as it lasts, and each one costs the pair three or four stalls.
-void Plugin::CheckLinkSilence(const Stats& s) {
+// (2m-diag D2, 2026-11-21) The traffic is taken in datagrams per second over the REAL length of the window (LinkSilenceWorthANotice: a
+// window the log writer held for 17 s passed the old bound of 100 datagrams with a third of the rate), and with the shared page's WiFi
+// strength at 3 the notice names the room or the network, not the WiFi (Tetris with eight, console 63: six notices "WiFi", all of them
+// with full strength). Same notice otherwise, once a minute at most (Warn), and never with the log off.
+void Plugin::CheckLinkSilence(const Stats& s, u64 window_ms) {
     if (g_debug_level <= 0) {
         return;
     }
     const u32 silent = s.gap_hist[2] + s.gap_hist[3] + s.gap_hist[4]; // 150-249, 250-499 and 500+ ms
-    if (s.rx_datagrams >= 100 && silent >= 2) {
+    // (2m-rev) the lowest WiFi strength of the window that ends here (SampleLinkState, every 50 ms); the next one starts again
+    const u32 lowest = link_strength_min_.exchange(0xFFu, std::memory_order_relaxed);
+    if (LinkSilenceWorthANotice(s.rx_datagrams, silent, window_ms, kStatsIntervalMs)) {
+        const u32 now_strength = *reinterpret_cast<volatile const u8*>(kSharedPageWifiStrength);
+        const u8 strength = static_cast<u8>(now_strength < lowest ? now_strength : lowest); // (2m-rev) the window's, this reading included
         char text[96];
-        std::snprintf(text, sizeof(text), "AzaharLink debug: room link silent %lu times (150+ ms): WiFi", static_cast<unsigned long>(silent));
+        std::snprintf(text, sizeof(text), "AzaharLink debug: room link silent %lu times (150+ ms): %s", static_cast<unsigned long>(silent),
+                      LinkSilenceWhere(strength));
         Warn(kWarnSilence, text);
     }
 }
@@ -1783,6 +2144,9 @@ void Plugin::NoteProcessEvent(int event) {
             // The forced res line at HOME (New 3DS only: an Old 3DS gets SWAP_ENTER/EXIT instead, where no probe runs): a clean close then has
             // a per-class reference AT the event to compare the stuck one against.
             zombie::ForcedResLine(event == kEventHomeEnter ? "HOME_ENTER" : "HOME_EXIT");
+            if (event == kEventHomeEnter && clnt_room_) {
+                dlp_hub_->RequestClntLeave();  // (1.1.4, G1: the Download Play application leaves its session at the next Tick: one atomic)
+            }
         }
         if (event == kEventSleepEnter || event == kEventSleepExit) {
             // (the trail of the sleep: a few stores and one event signal)
@@ -1792,6 +2156,9 @@ void Plugin::NoteProcessEvent(int event) {
             // The trail first, on the card: a crash from here to SWAP_EXIT leaves it, and the memory of the regions at each swap shows what the HOME menu has to work with.
             NoteSwapToTrail(SleepCrumbs::kFwSwapEnter, event_count_[event] + 1);
             WaitForTrail(kSwapTrailWaitMs);
+            if (clnt_room_) {
+                dlp_hub_->RequestClntLeave();  // (1.1.4, G1: an Old 3DS gets the swap instead of HOME: the same leave, before the gate closes)
+            }
             // A net for an end with no EXIT event (a process killed, a block that does not come back): a game closed from the HOME menu gets
             // its EXIT all the same (Luma3DS maps the plugin's block back first, then sends it), and the Settle is made there. Here the gate's
             // page owes the limit its bytes back if LateInit has not settled them yet, and the game has its heap. Once (with LateInit and the
@@ -2059,6 +2426,9 @@ void Plugin::SampleLinkState(u64 now_ms) {
     next_link_sample_ms_ = now_ms + kLinkSampleIntervalMs;
     const u8 strength = *reinterpret_cast<volatile const u8*>(kSharedPageWifiStrength);
     const u8 state = *reinterpret_cast<volatile const u8*>(kSharedPageWifiState);
+    if (strength < link_strength_min_.load(std::memory_order_relaxed)) {
+        link_strength_min_.store(strength, std::memory_order_relaxed); // (2m-rev) the window's lowest, for CheckLinkSilence
+    }
     if (link_known_ && strength == link_strength_ && state == link_state_) {
         return;
     }
@@ -2105,6 +2475,7 @@ void Plugin::EarlyInit() {
     log_files_.reset(new LogFiles(file_layer_.get(), kDataDir, start_ms_));
     log_files_->SetConsoleClock(&ConsoleClockMs); // (the first line of every capture file)
     log_files_->SetStopCapture(&g_swap_gate.closed); // (the writer leaves the card when an Old 3DS is about to swap the block out)
+    log_files_->SetGameReads(&g_game_reads_begun, &g_game_reads_done, &GatePostsSkipped); // (... and keeps off it while the game reads its files: the hook counts them, log on only)
     SetLogSink([this](const char* line) { log_files_->Append(line); });
 
     // The settings come first. Two of them have to be known BEFORE the game runs and before the first line is
@@ -2113,11 +2484,18 @@ void Plugin::EarlyInit() {
     // (debug=0: Log() returns at once, no file is created and no ring is allocated). The framework opens the SD card
     // before calling PatchProcess. If the settings cannot be read, the plugin stays ON and the log stays off.
     const bool config_read_early = LoadConfig();
+    config_read_early_ = config_read_early;
     // The framework's connection to Luma3DS's plugin loader (azl/plg_guard.hpp), made before this: without it no event of the process (HOME, sleep, swap,
     // exit) reaches the plugin, and an Old 3DS would swap the block out under hooks and threads nobody stopped. The plugin then stays out of this launch
     // as when it is switched off (Sources/main.cpp, !active()): no hooks, no network, no chat, no mirror, and the reason on screen once.
     const bool loader_linked = CheckPluginLoaderLink();
     active_ = config_.enabled && config_.tunnel_enabled && loader_linked;
+    // 1.1.4 (G1, K5): the system's Download Play application takes the room's Download Play only when the plugin joins a room by itself; else the
+    // plugin stays out of it - no hooks: ndm:u and dlp:CLNT are the system's, local Download Play and 3DS Link Delivery work (ClntStaysLocal).
+    if (active_ && ClntStaysLocal(CTRPluginFramework::Process::GetTitleID(), config_read_early, !config_.host.empty(), config_.autoconnect, menu_off())) {
+        active_ = false;
+        clnt_local_ = true;
+    }
     if (!loader_linked) {
         startup_issue_ = "3DS Link: the plugin could not talk to Luma's plugin loader: restart the game";
         startup_issue_once_ = true;
@@ -2165,6 +2543,12 @@ void Plugin::EarlyInit() {
     Log("game: %s (title id %08lx%08lx), console MAC %s", process_name_.c_str(),
         static_cast<unsigned long>(game_id_ >> 32), static_cast<unsigned long>(game_id_),
         MacToString(console_mac_).c_str());
+    // 1.1.4 (G4, contract K8): a title of the band of the prepared children is the Download Play child the app prepared when the index has its row: it
+    // runs with the rules and the name of that row's game (the room is still told this process's own id, 2-G3.md D-f). No row: as any title.
+    rules_id_ = game_id_;
+    if (title_rules::PreparedSlotOfProcess(game_id_) != 0) { // (the build 2h: 00040010|low or 00040000|low of the band)
+        NotePreparedChild();
+    }
     // Which build this is, in a way the log can show: libctru's hidInit() opens ir:rst (C-stick, ZL, ZR) on a New 3DS unless
     // the program says otherwise (Sources/main.cpp), and a plugin that holds it leaves the game without its C-stick.
     {
@@ -2204,7 +2588,8 @@ void Plugin::EarlyInit() {
         }
     }
     // (ctr/thread_core.hpp: on an Old 3DS a worker that has not begun would escape the stop of the plugin's threads at the swap)
-    Log("threads: %lu framework start-up thread(s) moved from core 1 to core 0", static_cast<unsigned long>(threadcore::FrameworkThreadsMoved()));
+    Log("threads: %lu framework start-up thread(s) moved from core 1 to core 0%s", static_cast<unsigned long>(threadcore::FrameworkThreadsMoved()),
+        threadcore::MovedForListedTitle() ? " (this title is on the list of games whose own thread the kernel refuses on core 1 while the worker holds it)" : "");
     clock_base_os_ms_ = osGetTime();
     clock_base_ms_ = start_ms_;
     // Before the game's own start-up (this runs ahead of its first instruction): what the plugin
@@ -2214,6 +2599,12 @@ void Plugin::EarlyInit() {
 
     Log("config: read at startup: %s, plugin %s", config_read_early ? "yes" : "no (defaults)",
         active_ ? "ON" : !loader_linked ? "OFF (no connection to Luma3DS's plugin loader): no hooks, no network" : "OFF (enabled=0 or tunnel=0): no hooks, no network");
+    if (clnt_local_) {
+        // (no address, no MAC: the log is shared)
+        Log("dlp: the Download Play application with no room to join by itself (the settings %s): the plugin stays out of it, the system's"
+            " Download Play (ndm:u, dlp:CLNT) is untouched", config_read_early ? "say so" : "were not read at the start");
+        PostNotification("3DS Link: Download Play is local here (no room)");
+    }
     if (config_from_old_place_) {
         Log("config: read from the old place %s (there is no %s yet: the 3DS Link app moves the file when it runs)", kOldConfigPath,
             kConfigPath);
@@ -2292,9 +2683,9 @@ void Plugin::EarlyInit() {
             hle_->SetDlpHub(dlp_hub_.get());
             const u64 seed = Fnv1a64(console_mac_.data(), console_mac_.size());
             Log("dlp: the Download Play lobby is carried by the room for this game (title id %08lx%08lx): dlp:FKCL and dlp:SRVR are"
-                " served by the plugin, friend code seed %08lx%08lx, %lu bytes of hub",
+                " served by the plugin, friend code seed %04lx... (cut: the log is shared), %lu bytes of hub",
                 static_cast<unsigned long>(game_id_ >> 32), static_cast<unsigned long>(game_id_),
-                static_cast<unsigned long>(seed >> 32), static_cast<unsigned long>(seed), static_cast<unsigned long>(sizeof(DlpHub)));
+                static_cast<unsigned long>(seed >> 48), static_cast<unsigned long>(sizeof(DlpHub)));
         } else {
             Log("dlp: no memory for the Download Play lobby: dlp:FKCL and dlp:SRVR stay the real services for this game");
         }
@@ -2309,14 +2700,45 @@ void Plugin::EarlyInit() {
             hle_->SetDlpHub(dlp_hub_.get());
             const u64 seed = Fnv1a64(console_mac_.data(), console_mac_.size());
             Log("dlp: the real Download Play is carried by the room for this game (title id %08lx%08lx): dlp:FKCL and dlp:SRVR are served by"
-                " the plugin and speak Azahar's Download Play, friend code seed %08lx%08lx, %lu bytes of hub and %lu of adapter",
+                " the plugin and speak Azahar's Download Play, friend code seed %04lx... (cut: the log is shared), %lu bytes of hub and %lu of adapter",
                 static_cast<unsigned long>(game_id_ >> 32), static_cast<unsigned long>(game_id_),
-                static_cast<unsigned long>(seed >> 32), static_cast<unsigned long>(seed), static_cast<unsigned long>(sizeof(DlpHub)),
+                static_cast<unsigned long>(seed >> 48), static_cast<unsigned long>(sizeof(DlpHub)),
                 static_cast<unsigned long>(sizeof(RealDlpNet)));
         } else {
             dlp_real_.reset();
             Log("dlp: no memory for the real Download Play: dlp:FKCL and dlp:SRVR stay the real services for this game");
         }
+    } else if (DlpModeOf(game_id_) == DlpGameMode::SystemClient && active_) {
+        // 1.1.4 (G1): dlp:CLNT of the system's Download Play application, served as a client of the real Download Play over the room: the book, the
+        // adapter and the hub (about 1.3 KB + 1.8 KB + 536 B, this application only); ndm:u stays the fake one. Never a game: no row says it.
+        dlp_book_.reset(new (std::nothrow) DlpClntBook());
+        if (dlp_book_) {
+            RealDlpNet* const searcher = new (std::nothrow) RealDlpNet(engine_.get());
+            dlp_real_.reset(searcher);
+        }
+        if (dlp_real_) {
+            dlp_hub_ = MakeClntHub(engine_.get(), &kernel_, game_id_, console_mac_, dlp_real_.get(), dlp_book_.get());
+        }
+        if (dlp_hub_) {
+            hle_->SetDlpHub(dlp_hub_.get());
+            hle_->SetDlpClnt(true);
+            clnt_room_ = true;
+            Log("dlp: the Download Play application: dlp:CLNT is served by the plugin as a client of the real Download Play over the room (any game's"
+                " lobby is listed, nothing is downloaded, no host is joined: the join is the 3DS Link app's), %lu bytes of hub, %lu of adapter, %lu of"
+                " book",
+                static_cast<unsigned long>(sizeof(DlpHub)), static_cast<unsigned long>(sizeof(RealDlpNet)), static_cast<unsigned long>(sizeof(DlpClntBook)));
+            PostNotification("3DS Link: Download Play through the room");
+        } else {
+            dlp_real_.reset();
+            dlp_book_.reset();
+            active_ = false;  // (no hooks: the system's own Download Play; the socket block stays reserved, unused, for this launch)
+            Log("dlp: no memory for dlp:CLNT: the plugin stays out of the Download Play application");
+        }
+    }
+
+    if (prepared_child_ && active_) {
+        hle_->SetDlpChild(true);  // (1.1.4, G4: dlp:SRVR IsChild answers true - this title only, never with a hub: UdsHle refuses it then; the plugin off: no hooks, no service)
+        rejoin_.HoldIdentity(kChildHoldIdMs);  // (1.1.4, route B D-B9: the 3DS Link app that started it may still be listed with this MAC and name)
     }
 
     room_->SetWifiCallback([this](const WifiPacket& packet) { engine_->OnWifiPacket(packet); });
@@ -2331,7 +2753,7 @@ void Plugin::EarlyInit() {
     });
     room_->SetRoomInfoCallback([this](const room::RoomInfo& info) { OnRoomInfo(info); });
     // (chat=0: no block, no sink - the room's chat packets go where they always went, unread. A file the card could not give yet
-    // makes nothing either: the chat's default is on, but the file may say chat=0 - LateInit reads it again and wires the chat then)
+    // makes nothing either: the chat's default is off (DPAPP-2j), and the file may say chat=1 - LateInit reads it again and wires the chat then)
     if (config_read_early && config_.chat) {
         WireChat(true);
     }
@@ -2441,6 +2863,18 @@ void Plugin::EarlyInit() {
         SetTrailWaiter(&Plugin::WaitForCloseTrail); // (the close command 12: the log on, a New 3DS only)
         if (!bootdiag::Skip("hooks")) {
             hook_stats_ = InstallSvcHooks(hle_.get(), !swap_console_ && luma_alias_);
+            if (IsDownloadPlayTitle(CTRPluginFramework::Process::GetTitleID())) {
+                // The framework's GSP::Initialize runs right after this function, and the plugin's own log begins five seconds later: an abort there leaves a -1 in
+                // Luma3DS's dump and nothing else. This line is on the card before it: the size of the code and how many svc 0x32 the hooks left to the framework.
+                // 0x93000 and 1 are the application the guard of GetTextSize was made for (Europe, version 3073, read on a PC); another size, or 0, is another version
+                // or the build of another region (the five whose code was not read: the line is what tells them apart from the card).
+                char stamp[24];
+                FormatConsoleClock(osGetTime(), stamp);
+                AppendLumaLine(g_luma_line,
+                               std::snprintf(g_luma_line, sizeof(g_luma_line),
+                                             "[%s] start: the Download Play application, 0x%lx bytes of code, %lu svc 0x32 left to the framework\n", stamp,
+                                             static_cast<unsigned long>(hook_stats_.text_size), static_cast<unsigned long>(hook_stats_.framework_sites)));
+            }
             if (!swap_console_ && luma_alias_ && hook_stats_.gate_ready) {
                 // The exit guard (REGISTRO, phase Q): a New 3DS only (an Old 3DS swaps the block out, and the guard is in it).
                 g_exit_stats = InstallExitGuard([]() { RunExitGuard(); },
@@ -2462,6 +2896,17 @@ void Plugin::EarlyInit() {
             }
         }
     }
+    if (prepared_child_) {
+        // (after the hooks: what the game's dlp:SRVR says depends on them too)
+        Log("dlp: dlp:SRVR of the prepared child is %s", ChildSrvrLine(hle_->dlp_child(), active_, hook_stats_.gate_ready));
+        if (JoinsEarly(prepared_child_, active_, !swap_console_, config_read_early, !config_.host.empty(), config_.autoconnect, menu_off())) {
+            EarlyConnect();  // (1.1.4, G4: the prepared child only)
+        } else {
+            Log("room: the prepared Download Play child does not join early (%s)", !active_ ? "the plugin is off"
+                : swap_console_ ? "an Old 3DS: the gate of the plugin's threads comes with LateInit, the room at the first frame"
+                                : "the settings do not join a room by themselves, or were not read at the start");
+        }
+    }
 #ifdef AZL_BOOT_DIAG
     // The diagnostic build: what EarlyInit logged goes to the card now (the writer thread starts ~5 s from now, and a game that dies before leaves nothing),
     // the state of the process after our changes, and a watch of ten seconds.
@@ -2475,6 +2920,10 @@ void Plugin::EarlyInit() {
 }
 
 void Plugin::ResolveIdentity() {
+    if (identity_resolved_) {
+        return;  // (1.1.4, G4: the prepared child resolved it in EarlyInit for its early join)
+    }
+    identity_resolved_ = true;
     // The name set on the console (Settings > Other settings > Profile), as UTF-16 in the config
     // block 0x000A0000. The game normally has access to the config service; if not, Luma can lend
     // a session (see the srvGetServiceHandle wrapper in soc.cpp).
@@ -2492,11 +2941,12 @@ void Plugin::ResolveIdentity() {
         if (wants_seed) {
             if (R_SUCCEEDED(seed_rc) && console_seed != 0) {
                 dlp_hub_->SetFriendSeed(console_seed);
-                Log("dlp: the lobby's friend code seed is the console's own (config block 0x00090000): %08lx%08lx, the one this game gives nwm::UDS",
-                    static_cast<unsigned long>(console_seed >> 32), static_cast<unsigned long>(console_seed));
+                Log("dlp: the lobby's friend code seed is the console's own (config block 0x00090000): %04lx... (cut: the log is shared), the one this"
+                    " game gives nwm::UDS",
+                    static_cast<unsigned long>(console_seed >> 48));
             } else {
                 Log("WARNING: cannot read the console's friend code seed (config block 0x00090000, 0x%08lx): the lobby keeps the hash of the MAC and"
-                    " this game may stop at its character selection", static_cast<unsigned long>(seed_rc));
+                    " this game may not tell its players apart (Mario Tennis Open stops at its character selection)", static_cast<unsigned long>(seed_rc));
             }
         }
         if (R_SUCCEEDED(rc)) {
@@ -2517,7 +2967,7 @@ void Plugin::ResolveIdentity() {
         Log("identity: config service not available, the nickname will be generic");
         if (dlp_hub_ && LobbySeedIsConsoles(game_id_)) {
             Log("WARNING: cannot read the console's friend code seed (no config service): the lobby keeps the hash of the MAC and this game may"
-                " stop at its character selection");
+                " not tell its players apart (Mario Tennis Open stops at its character selection)");
         }
     }
     if (console_name_.empty()) {
@@ -2536,6 +2986,14 @@ void Plugin::ResolveGameName() {
         Log("game: name set in the configuration: '%s'", game_name_.c_str());
         return;
     }
+    {
+        platform::LockGuard lock(name_mutex_);
+        if (name_source_ == NameSource::Index) {
+            // (1.1.4, G4: the prepared child keeps its game's name from the index, what an early join told the room, on every console)
+            Log("game: name '%s' from the index of the prepared children (the game of this Download Play child)", game_name_.c_str());
+            return;
+        }
+    }
     if (R_FAILED(fsInit())) {
         Log("game: fsInit failed, cannot read the game's icon");
     } else {
@@ -2544,6 +3002,9 @@ void Plugin::ResolveGameName() {
         if (title.empty()) {
             title = ReadIconTitleArchive(game_id_, language_);
             source = "title archive icon";
+        }
+        if (IsDownloadPlayTitle(game_id_)) {
+            ProbeDownloadPlayOpens(); // (D-S1: the Download Play application only; the plugin thread, the file system open)
         }
         fsExit();
         if (!title.empty()) {
@@ -2580,6 +3041,28 @@ void Plugin::OnRoomInfo(const room::RoomInfo& info) {
             }
         }
         engine_->OnRoomMembers(members);
+        // A host of a title that keeps its network to its game (azl/one_game_host.hpp, the rows of azl/title_rules.hpp) answers no newcomer
+        // that plays another game in the room; for every other title the list stays empty.
+        std::vector<Mac> other_game;
+        if (one_game::HostKeepsToItsGame(game_id_)) {
+            for (const room::MemberInfo& member : info.members) {
+                if (one_game::PlaysAnotherGame(game_id_, member.game_id)) {
+                    other_game.push_back(member.mac);
+                }
+            }
+        }
+        engine_->SetOtherGameMembers(other_game);
+        // 1.1.4 (H5): a host of the real Download Play that waits for its guests' children is told who is in the system's Download Play
+        // application (a guest is awaited only if it is one of them at its final); every other title never sets the list.
+        if (dlp_real_ && dlp_real_->child_wait_on()) {
+            std::vector<Mac> download_play;
+            for (const room::MemberInfo& member : info.members) {
+                if (AwaitsChildOf(member.game_id)) {
+                    download_play.push_back(member.mac);
+                }
+            }
+            engine_->SetDownloadPlayMembers(download_play);
+        }
     }
     if (game_id_ == 0) {
         return;
@@ -2789,6 +3272,21 @@ void Plugin::OnHomeButton() {
 }
 // <<< game-thread code
 
+// The trail as the chat's input mirror asks about it on the plugin's thread (Sources/ctr/input_mirror.cpp, GiveTrailTime; 2026-11-10): the
+// mark is what was pushed up to now, and it is on the card once the trail's thread has written that many (crumb_written_, stored after the
+// write and the flush of a turn). With the log off, or no trail's thread, there is nothing to wait for.
+u32 Plugin::TrailMark() {
+    return Get().crumbs_.pushed();
+}
+
+bool Plugin::TrailOnCard(u32 mark) {
+    Plugin& self = Get();
+    if (g_debug_level <= 0 || self.crumb_wake_ == 0) {
+        return true;
+    }
+    return static_cast<s32>(self.crumb_written_.load() - mark) >= 0;
+}
+
 void Plugin::HandleWake(u64 now_ms) {
     // (`acts` is only looked at when the framework reported a wake-up: with sleep_stop=1 working it out takes the engine's
     // lock, which this frame callback has no business with on every frame)
@@ -2848,6 +3346,21 @@ void Plugin::LateInit() {
     platform::SetPreferredCore(config_.net_core);
     azl_enet_socket_buffers = config_.socket_buffers ? 1 : 0;
     room_->SetFastData(config_.radio_like);
+    // The relief of a dense broadcast stream, with the numbers of the title's row of azl/title_rules.hpp and for no other title (2026-11-14,
+    // Mario Party: Island Tour): no setting, no menu entry. Every other title leaves the three at their defaults - a packet a round, every
+    // frame sent, refused at ENet's limit - and its transport as it was.
+    if (flow::IsDenseTitle(rules_id_)) {
+        const title_rules::Rules rules = title_rules::RulesFor(rules_id_);
+        room_->SetHandOverBurst(rules.hand_over_burst);
+        engine_->SetSameFrameWindow(rules.same_frame_ms);
+        room_->SetCapDrop(rules.cap_drop_max);
+        room_->SetSendBudget(rules.send_budget_bytes);
+        Log("flow: dense-broadcast relief on for this title (%s): a broadcast frame equal to the last one is not sent again for %lu ms, up to %lu"
+            " packets of the room go to the game in one round, at ENet's limit up to %lu game frames are dropped instead of refused,"
+            " a round sends up to %lu bytes of the game's queue (0 = all)",
+            title_rules::NameOf(rules_id_), static_cast<unsigned long>(rules.same_frame_ms), static_cast<unsigned long>(rules.hand_over_burst),
+            static_cast<unsigned long>(rules.cap_drop_max), static_cast<unsigned long>(rules.send_budget_bytes));
+    }
     // (the file as read now: one the card could not give at start-up may switch the chat either way; off allocates nothing)
     if (config_.chat || chat_sink_.load(std::memory_order_relaxed)) {
         WireChat(config_.chat);
@@ -2860,6 +3373,13 @@ void Plugin::LateInit() {
     Log("debug: log ON (%s)", !active_ ? "AzaharLink.log only: no capture while the plugin is OFF"
                               : DebugRingReady() ? "AzaharLink.log and AzaharLink.debug.log"
                                                  : "AzaharLink.log only: no memory for the capture ring");
+    if (active_ && DebugRingReady()) {
+        // (what whoever reads the capture must know before its first frame: the diet of 1.1.4, azl/stats.hpp)
+        Log("debug: the capture keeps %s",
+            g_debug_whole ? "every data frame whole and every command (a study build)"
+                          : "the first 32 bytes of a game's data frame (cut) and counts the UDS commands a game polls;"
+                            " the Download Play's frames are whole");
+    }
 
     if (!active_) {
         Log("plugin is OFF for this launch (the game uses the real local wireless)");
@@ -2879,6 +3399,14 @@ void Plugin::LateInit() {
 
     ResolveIdentity();
     ResolveGameName();
+    if (dlp_real_ && dlp_hub_ && dlp_real::AnnouncesTitle(game_id_)) {
+        // (every game that has the hub of the real Download Play - Island Tour, Luigi's Mansion, Mario Kart 7, ...: the name, the icon and the
+        // sizes its host announces, read here once from its own copy; a game with no hub reads or keeps nothing)
+        GiveAnnouncementItsTitle(dlp_real_.get(), game_id_, language_);
+    }
+    if (clnt_room_) {
+        LoadDlpChildren();  // (1.1.4, G1/G2.3: the Download Play application in the room only)
+    }
     if (g_debug_level > 0) {
         LogAddressMap();
     }
@@ -3004,6 +3532,230 @@ void Plugin::Shutdown() {
 // Configuration
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// The children the app prepared, for the system's Download Play application in the room (1.1.4, G1 and G2.3 with the contract K2/K3)
+// ---------------------------------------------------------------------------------------------
+
+/// How the titles of a row are looked for (dlp_children::PresenceBy). The probe of D-S1 has not given its answer yet (no 'dlp probe:' line in the
+/// logs of the first session), so the plugin believes the app's index - the app writes it again at every start from what is installed - and asks
+/// the file system only for the one file of "ready": the plugin in the prepared title's folder. FileSystem or Am, once D-S1 says the opens work
+/// from the application, need the open of ProbeDownloadPlayOpens as a shared function first.
+constexpr dlp_children::PresenceBy kChildrenPresence = dlp_children::PresenceBy::Index;
+static_assert(kChildrenPresence == dlp_children::PresenceBy::Index, "FileSystem / Am need a title_present (the open of ProbeDownloadPlayOpens, shared)");
+
+/// /luma/plugins/<prepared>/AzaharLink.3gx (the name the app installs, ConfigApp/source/games.hpp; Luma3DS loads the first .3gx of the folder).
+/// (the build 2h) the folder of the child's system id (000400100F8...: the process's id, the folder Rosalina loads) or, for the fallback form and
+/// the children of the builds before, the key's.
+bool ChildPluginPresent(void* /*ctx*/, u64 prepared) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/luma/plugins/%016llX/AzaharLink.3gx", static_cast<unsigned long long>(prepared));
+    if (File::Exists(path) == 1) {
+        return true;
+    }
+    std::snprintf(path, sizeof(path), "/luma/plugins/%016llX/AzaharLink.3gx", static_cast<unsigned long long>(title_rules::PreparedSystemOf(prepared)));
+    return File::Exists(path) == 1;
+}
+
+const char* VerdictText(dlp_children::Verdict v) {
+    switch (v) {
+    case dlp_children::Verdict::Ready: return "ready";
+    case dlp_children::Verdict::NoRow: return "no row";
+    case dlp_children::Verdict::NoGame: return "no game";
+    case dlp_children::Verdict::NotPrepared: return "not prepared";
+    case dlp_children::Verdict::NoChildPlugin: return "no plugin in its folder";
+    case dlp_children::Verdict::OtherVersion: return "another version";
+    case dlp_children::Verdict::Unknown: break;
+    }
+    return "not known yet";
+}
+
+void Plugin::LoadDlpChildren() {
+    const u64 began_ms = platform::NowMs();
+    dlp_children::Table* table = new (std::nothrow) dlp_children::Table;
+    if (table == nullptr) {
+        Log("dlp: no memory for the table of the children: every host of the Download Play application is shown as it is and refused");
+        return;
+    }
+    dlp_children::Clear(table);
+    std::string text;
+    const bool read = ReadDataFile(dlp_children::kIndexPath, dlp_children::kIndexMaxBytes, text);
+    table->index_found = read && dlp_children::ParseIndex(text.data(), text.size(), &table->index);
+    const dlp_children::Probe probe = {nullptr, nullptr, &ChildPluginPresent};
+    dlp_children::JudgeAll(table->index, table->verdict, probe, kChildrenPresence);
+    for (std::size_t r = 0; r < table->index.count; ++r) {
+        const dlp_children::Row& row = table->index.rows[r];
+        Log("dlp: the child %016llx (game %016llx on the %s, prepared %016llx): %s%s", static_cast<unsigned long long>(row.child),
+            static_cast<unsigned long long>(row.game), row.where == 'C' ? "card" : "SD", static_cast<unsigned long long>(row.prepared),
+            VerdictText(static_cast<dlp_children::Verdict>(table->verdict[r])),
+            table->verdict[r] == static_cast<u8>(dlp_children::Verdict::Ready) ? " (its block is read when a host announces it)" : "");
+    }
+    dlp_children_.store(table, std::memory_order_release);
+    dlp_real_->SetChildren(table);  // (from here the adapter's and the book's: never freed, never changed but for the blocks)
+    if (!table->index_found) {
+        Log("dlp: no index of the children (%s%s): every host is shown not ready (%s) and refused; the 3DS Link app prepares them (it needs"
+            " boot9.bin); %lu ms", dlp_children::kIndexPath, read ? ": another version or no header" : ": no file",
+            dlp_children::MarkStyle::Text == dlp_children::kMarkStyle ? "NO" : "the cross", static_cast<unsigned long>(platform::NowMs() - began_ms));
+    } else {
+        Log("dlp: %lu children in the index (%lu lines refused), marks %s, checked by %s; %lu ms", static_cast<unsigned long>(table->index.count),
+            static_cast<unsigned long>(table->index.skipped), dlp_children::MarkStyle::Text == dlp_children::kMarkStyle ? "'OK/NO'" : "the two symbols",
+            kChildrenPresence == dlp_children::PresenceBy::Index ? "the index and the child's plugin" : "the file system",
+            static_cast<unsigned long>(platform::NowMs() - began_ms));
+    }
+}
+
+void Plugin::ServeDownloadPlayClient() {
+    const u32 refusals = dlp_book_->refusals();
+    if (refusals != clnt_refusals_seen_) {
+        clnt_refusals_seen_ = refusals;
+        const dlp_children::Verdict v = dlp_book_->refused_verdict();
+        if (v == dlp_children::Verdict::Ready) {
+            // (1.1.4, route B: clnt::kSystemAppJoins is false - the 3DS Link app runs the session with the host and starts the prepared child)
+            Log("dlp: the Download Play application asked to join a host whose child is ready on this console: refused: the join is 3DS Link's"
+                " (route B)");
+            PostNotification("3DS Link: join it from the 3DS Link app (Download Play page)");
+        } else {
+            Log("dlp: the Download Play application asked to join a host whose child is %s on this console: refused (no download through the room)", VerdictText(v));
+            PostNotification(v == dlp_children::Verdict::Unknown ? std::string("3DS Link: still reading the prepared games, try again")
+                                                                 : std::string("3DS Link: not ready") + dlp_children::TitleLongTail(v));
+        }
+    }
+    dlp_children::Table* table = dlp_children_.load(std::memory_order_acquire);
+    if (table == nullptr) {
+        return;
+    }
+    u32 wanted = dlp_book_->TakeWantedBlocks();
+    if (wanted == 0) {
+        return;
+    }
+    std::size_t r = 0;
+    while ((wanted & (1u << r)) == 0) {
+        ++r;
+    }
+    wanted &= ~(1u << r);
+    if (wanted != 0) {
+        dlp_book_->WantRows(wanted);  // (one block per round: the others at the next ones)
+    }
+    if (dlp_children::BlockStateOf(table, r) != dlp_children::BlockState::NotRead) {
+        return;
+    }
+    const dlp_children::Row& row = table->index.rows[r];
+    char name[dlp_children::kBlockNameBytes];
+    dlp_children::BlockName(row.prepared, name);
+    const std::string path = std::string(dlp_children::kGuestsDir) + name;
+    u8* block = nullptr;
+    File file;
+    if (row.prepared != 0 && File::Open(file, path, File::READ) == File::SUCCESS && file.GetSize() == dlp_children::kBlockBytes) {
+        block = new (std::nothrow) u8[dlp_children::kBlockBytes];
+        if (block != nullptr && file.Read(block, static_cast<u32>(dlp_children::kBlockBytes)) < 0) {
+            delete[] block;
+            block = nullptr;
+        }
+    }
+    if (block != nullptr && dlp_children::PutBlock(table, r, block)) {
+        Log("dlp: the block of the child %016llx read (its sizes 0x%08lx and 0x%08lx)", static_cast<unsigned long long>(row.child),
+            static_cast<unsigned long>(dlp_children::BlockTransfer(block)), static_cast<unsigned long>(dlp_children::BlockRequired(block)));
+        return;
+    }
+    delete[] block;
+    dlp_children::NoBlock(table, r);
+    Log("dlp: the block of the child %016llx is not there whole (%s): it is shown not prepared", static_cast<unsigned long long>(row.child),
+        path.c_str());
+}
+
+void Plugin::NoteClntSeam() {
+    const u64 armed = dlp_book_->armed_prepared();
+    const bool pass = dlp_book_->passphrase_ready();
+    if (armed == clnt_seam_armed_ && pass == clnt_seam_pass_) {
+        return;
+    }
+    clnt_seam_armed_ = armed;
+    clnt_seam_pass_ = pass;
+    if (armed == 0) {
+        Log("dlp: the Download Play application has no session with a prepared child now");
+    } else {
+        Log("dlp: the Download Play application joined a host whose child is prepared here (%016llx)%s", static_cast<unsigned long long>(armed),
+            pass ? ": the passphrase came (route B: never armed)" : "");
+    }
+}
+
+void Plugin::NoteRealDlpHost() {
+    dlp_real::ChildWait::End end;
+    if (dlp_real_->TakeChildWaitEnd(&end)) {
+        Log("dlp: the host waited %lu ms in its state 9 for the guests that went to start their child: %u back in the room, %u stayed in it (an"
+            " emulator), %u not back", static_cast<unsigned long>(end.waited_ms), static_cast<unsigned>(end.back), static_cast<unsigned>(end.stayed),
+            static_cast<unsigned>(end.missing));  // (no MAC, no name: privacy)
+    }
+    Mac guest;
+    while (dlp_real_->TakeContentGuest(&guest)) {
+        if (!content_notices_.First(guest)) {
+            continue;  // (once per guest for the game's run)
+        }
+        std::string name;
+        {
+            platform::LockGuard lock(members_mutex_);
+            name = dlp_real::GuestName(room_members_, guest);
+        }
+        Log("dlp: a guest asked for the content of the child and was ejected (the child never travels through the room): its name is on the screen%s",
+            name.empty() ? " (the room does not list it)" : "");
+        PostNotification(dlp_real::ContentNoticeText(name));
+    }
+}
+
+void Plugin::NotePreparedChild() {
+    std::string text;
+    const bool read = ReadDataFile(dlp_children::kIndexPath, dlp_children::kIndexMaxBytes, text);
+    std::unique_ptr<dlp_children::Index> scratch(new (std::nothrow) dlp_children::Index);
+    dlp_children::Row row = {};
+    prepared_child_ = scratch && PreparedChildRow(game_id_, read ? text.data() : nullptr, text.size(), scratch.get(), &row);
+    if (!prepared_child_) {
+        Log("dlp: this title is in the band of the prepared children with no row of its own (%s): the plugin runs as for any title it does not know",
+            !read ? "no index" : !scratch ? "no memory to read the index" : "not in the index");
+        return;
+    }
+    rules_id_ = row.game;
+    const char* const name = title_rules::NameOf(row.game);
+    if (name[0] != '\0') {
+        platform::LockGuard lock(name_mutex_);
+        game_name_ = name;
+        name_source_ = NameSource::Index;  // (LateInit keeps it: the child's own icon is not the game's name, and the room was told this one)
+    }
+    Log("dlp: this title is the Download Play child 3DS Link prepared: the child %016llx of the game %016llx (%s), with that game's rules",
+        static_cast<unsigned long long>(row.child), static_cast<unsigned long long>(row.game), name[0] != '\0' ? name : "no row of rules");
+    // The 16 bytes of the jump (G3): the loader's words of this launch, taken once and wiped from the header; never in the log.
+    const CTRPluginFramework::PluginHeader* header = CTRPluginFramework::FwkSettings::Header;
+    if (header == nullptr) {
+        Log("dlp: the plugin loader's words for this launch: the framework's header is not available");
+        return;
+    }
+    volatile u32* const words = reinterpret_cast<volatile u32*>(reinterpret_cast<uintptr_t>(header) + kLoaderWordsOffset);
+    u32 shelter[kLoaderWords];
+    const bool found = TakeLoaderWords(words, shelter);
+    if (found) {
+        loader_words_.reset(new (std::nothrow) u32[kLoaderWords]);
+        if (loader_words_) {
+            std::memcpy(loader_words_.get(), shelter, sizeof(shelter));
+        }
+    }
+    volatile u32* const wipe = shelter;  // (the copy on this stack goes too: a store the compiler cannot leave out)
+    for (std::size_t i = 0; i < kLoaderWords; ++i) {
+        wipe[i] = 0;
+    }
+    Log("dlp: the plugin loader's words for this launch (the 16 bytes of the jump): %s", !found ? "none"
+        : loader_words_ ? "found, kept for the answer to GetWirelessRebootInfo and wiped from the header" : "found and wiped, no memory to keep them");
+}
+
+void Plugin::EarlyConnect() {
+    // (what LateInit sets before a room starts, with the same values: it sets them again)
+    const Config& settings = config_;
+    platform::SetPreferredCore(settings.net_core);
+    azl_enet_socket_buffers = settings.socket_buffers ? 1 : 0;
+    room_->SetFastData(settings.radio_like);
+    ResolveIdentity();  // (the nickname of the join; LateInit's call then does nothing)
+    const bool started = Connect();
+    Log("room: the prepared Download Play child joins the room from the start (%s, %llu ms after the plugin started): the host's game waits 20 s for it",
+        started ? "attempt started" : "no attempt: the first frame tries again", static_cast<unsigned long long>(platform::NowMs() - start_ms_));
+}
+
 bool Plugin::ReadDataFile(const char* path, std::size_t max_bytes, std::string& out) {
     File file;
     if (File::Open(file, path, File::READ) != File::SUCCESS) {
@@ -3030,18 +3782,35 @@ bool Plugin::ReadDataFile(const char* path, std::size_t max_bytes, std::string& 
 bool Plugin::LoadConfig() {
     // The old place (an app older than this build) is read while the new file is missing, never written (SaveConfig writes the new
     // place; the app moves the file).
-    config_from_old_place_ = File::Exists(kConfigPath) != 1 && File::Exists(kOldConfigPath) == 1;
+    // F7: AzaharLink.ini missing but AzaharLink.ini.bak there: a save (the app's or the plugin's) was cut between its two renames
+    // (azl/whole_file.hpp); the .bak is the whole old file. It is only read here: the next save of the plugin (whole::Replace drops the .bak
+    // once the new ini is in place: F7-rev) or the app (ReadTextFile puts it back) puts the files in order.
+    // F7-rev: an ini or a .bak that is there and cannot be read whole (it does not open, it is over 4096 bytes, the read fails) is never
+    // written over: SaveConfig refuses while config_unreadable_ says so (the app's Unreadable, ConfigApp/source/main.cpp). An empty file holds
+    // nothing to keep (a cut of 1.1.3): a save writes it. The old place is never written, so its own failures do not count.
+    config_unreadable_ = false;
+    CtrWhole card;
+    const whole::Source source = whole::Choose(card, kConfigPath);
+    const bool ours = source != whole::Source::None; // (the file a save of the plugin replaces)
+    config_from_old_place_ = source == whole::Source::None && File::Exists(kOldConfigPath) == 1;
+    const char* const ini_path = source == whole::Source::Bak ? kConfigBakPath : config_from_old_place_ ? kOldConfigPath : kConfigPath;
+    if (source == whole::Source::Bak) {
+        Log("config: read from %s (a save was cut before its end)", kConfigBakPath);
+    }
     File file;
-    if (File::Open(file, config_from_old_place_ ? kOldConfigPath : kConfigPath, File::READ) != File::SUCCESS) {
+    if (File::Open(file, ini_path, File::READ) != File::SUCCESS) {
         config_from_old_place_ = false;
+        config_unreadable_ = ours;
         return false;
     }
     const u64 size = file.GetSize();
     if (size == 0 || size > 4096) {
+        config_unreadable_ = ours && size != 0;
         return false;
     }
     std::string content(static_cast<std::size_t>(size), '\0');
     if (file.Read(&content[0], static_cast<u32>(size)) < 0) {
+        config_unreadable_ = ours;
         return false;
     }
 
@@ -3098,7 +3867,7 @@ bool Plugin::LoadConfig() {
         } else if (key == "sleep_stop") {
             config_.sleep_stop = ini::SleepStop(value); // (0, 1, 2: see azl/ini_values.hpp)
         } else if (key == "chat") {
-            config_.chat = ini::ParseBool(value, true); // (a slip is the default, on)
+            config_.chat = ini::ParseBool(value, ini::kChatDefault); // (a slip is the default: off since DPAPP-2j, as the app)
         } else if (key == "chat_key") {
             if (!value.empty()) {
                 config_.chat_key = value;
@@ -3113,6 +3882,11 @@ bool Plugin::LoadConfig() {
 }
 
 bool Plugin::SaveConfig() {
+    if (config_unreadable_) {
+        // F7-rev: the defaults with one key of the menu never take the place of a file that is there and was not read (LoadConfig)
+        Log("config: %s is there but could not be read: not written over (the change holds for this launch only)", kConfigPath);
+        return false;
+    }
     // All 18 keys, always, in the order the Setup app writes them (ini::Render is the one writer of both): a file made by the
     // plugin can be edited by hand without knowing which keys exist. The advanced ones, rcvbuf_kb and sleep_stop, used to be
     // written only when they differed from the default, so a file never showed them.
@@ -3137,13 +3911,15 @@ bool Plugin::SaveConfig() {
     fields.chat_pos = config_.chat_pos;
     const std::string text = ini::Render(fields);
 
-    File file;
+    // F7: never in place (a cut between TRUNCATE's SetSize(0) and the write left 0 bytes, and the app then wrote the defaults over them):
+    // the new text finished in AzaharLink.ini.tmp and read back, the old file aside, the new one in its place (azl/whole_file.hpp)
     MakeDataDir();
-    if (File::Open(file, kConfigPath, File::RWC | File::TRUNCATE | File::SYNC) != File::SUCCESS) {
-        Log("config: cannot write %s", kConfigPath);
+    CtrWhole card;
+    if (!whole::Replace(card, kConfigPath, text)) {
+        Log("config: cannot write %s (the old file is left whole)", kConfigPath);
         return false;
     }
-    return file.Write(text.data(), static_cast<u32>(text.size())) == File::SUCCESS;
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3232,6 +4008,12 @@ bool Plugin::Tick(bool want_connected) {
         Log("menu: 'Connect to room' is now %s", want_connected ? "ON" : "OFF");
     }
     want_connected_ = want_connected;
+    if (dlp_book_) {
+        ServeDownloadPlayClient();  // (1.1.4, G1: the Download Play application in the room only; a load when nothing is asked)
+        NoteClntSeam();  // (1.1.4, G1/K7: the seam to G3, read on this thread - where G3 jumps - without the hub's lock, room link or not)
+    } else if (dlp_real_) {
+        NoteRealDlpHost();  // (1.1.4, H5/H3: a game that hosts the real Download Play only; two loads when nothing happened)
+    }
     if (config_.host.empty() && menu_off() && (last_hint_ms_ == 0 || now - last_hint_ms_ >= kHintIntervalMs)) {
         // With the in-game menu off the address can only come from the settings: say so, now and once a minute,
         // instead of sitting idle (a message at launch is easily missed behind the game's loading screens).
@@ -3293,6 +4075,10 @@ bool Plugin::Tick(bool want_connected) {
         break;
     case RejoinPolicy::Note::NameTaken:
         Log("room: name '%s' is taken, retrying with the MAC suffix", EffectiveNickname().c_str());
+        break;
+    case RejoinPolicy::Note::HeldIdentity:
+        Log("room: kept this console's MAC and name while the 3DS Link app leaves the room (%lu ms from the launch, held for %lu ms)",
+            static_cast<unsigned long>(now - start_ms_), static_cast<unsigned long>(rejoin_.hold_ms()));
         break;
     case RejoinPolicy::Note::OldLink:
         Log("room: the room still lists this console's old link: waiting for it to go (up to %lu s from the loss)",

@@ -13,6 +13,12 @@ mkdir -p "$OUT/obj"
 CF="-O2 -g -Wall -Wno-unused-function -Wno-unused-variable"
 # the ENet fields and counters the patched tree has (the model's knobs); the original tree does not have them
 KN=""; grep -q azlAckHoldEvents Includes/enet/enet.h && KN="-DVSIM_KNOBS=1"
+# (2026-11-14) ... and the counters of the limit of waiting data, which a tree before its remedy does not have
+if grep -q capRefused Includes/enet/enet.h; then KN="$KN -DVSIM_CAP=1"; fi
+# (plugin-causa, 2026-11-14) ... and the drop at the limit (ENetHost::azlCapDrop); the line was lost when the remedy came into the tree on 2026-11-15, found by N4
+if grep -q azlCapDrop Includes/enet/enet.h; then KN="$KN -DVSIM_CAPDROP=1"; fi
+# (2026-11-15) ... and the counters of the ring after an absence (N1), which the ring read first of the loop (N3) needs
+if grep -q azlAwayDatagrams Includes/enet/enet.h; then KN="$KN -DVSIM_AWAY=1"; fi
 for f in callbacks compress host list packet peer protocol; do gcc $CF -IIncludes -c Sources/enet/$f.c -o "$OUT/obj/c_$f.o"; done
 gcc $CF -IIncludes -I$V/shim -c Sources/enet/enet_3ds.c -o "$OUT/obj/c_plat.o"
 gcc $CF -IIncludes -I$V $KN -c $V/vsim_client.c -o "$OUT/obj/c_driver.o"

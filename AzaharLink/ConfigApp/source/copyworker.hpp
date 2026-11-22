@@ -14,7 +14,9 @@
 
 namespace setup {
 
-enum class CopyKind { Enable, Update, Disable }; // Update: the copy is made again because the plugin file was replaced by a newer one
+// Update: the copy is made again because the plugin file was replaced by a newer one. Guest: the folder of a Download Play child the app prepared
+// (1.1.4, dlp_guest.cpp): its copy put in or taken out by setup::EnableGuestFolder / DisableGuestFolder, quietly (no CopyDone: TakeGuestDone).
+enum class CopyKind { Enable, Update, Disable, Guest };
 
 struct CopyDone {
     u64 tid = 0;
@@ -33,6 +35,11 @@ public:
     // Queues a look at the copy of the plugin in a game's folder: if the folder holds ours and it differs from `source` it is made again, else nothing is
     // written. Done quietly: no finished job is reported, only the number of copies that were made (TakeRefreshedCount).
     void SubmitRefresh(u64 tid, const std::string& source);
+    // The folder of the prepared title `prepared` of the game `game` (1.1.4, the Download Play children): the copy of `source` put in (`on`) or taken out,
+    // in this thread like every other copy (one thread writes AzaharLink.3gx.part, never two). Quiet: its result is only for TakeGuestDone.
+    void SubmitGuest(u64 prepared, u64 game, bool on, const std::string& source);
+    // The result of the last guest job of `prepared` that ended (true = done); false when none ended since the last call.
+    bool TakeGuestDone(u64 prepared, bool* ok);
     // How many copies the quiet looks made since the last call.
     int TakeRefreshedCount();
     // Drops the quiet looks that are still waiting in the queue (the one that runs is finished: a copy is never cut in the middle). The user leaves in the
@@ -53,7 +60,7 @@ public:
 
 private:
     CopyWorker();
-    void Submit(u64 tid, CopyKind kind, const std::string& source, bool refresh);
+    void Submit(u64 tid, CopyKind kind, const std::string& source, bool refresh, u64 game = 0, bool on = false);
     Impl* impl_;
 };
 

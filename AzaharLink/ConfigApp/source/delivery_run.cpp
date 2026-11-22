@@ -7,6 +7,7 @@
 
 #include "delivery.hpp"
 #include "delivery_eta.hpp"
+#include "dlp_guest_store.hpp"
 #include "pages.hpp"
 
 using namespace ui;
@@ -19,15 +20,7 @@ namespace {
 // Pieces
 // ---------------------------------------------------------------------------------------------
 
-// A bar with two parts: what is there (green) and what is added to it (red); the rest is free.
-void DrawSpaceBar(float x, float y, float w, float h, double used, double added) {
-    gfx::FillRect(x, y, w, h, col::kTrack);
-    const float used_w = static_cast<float>(Clamp(used, 0.0, 1.0)) * w;
-    const float add_w = static_cast<float>(Clamp(used + added, 0.0, 1.0)) * w - used_w;
-    gfx::FillRect(x, y, used_w, h, col::kOn);
-    gfx::FillRect(x + used_w, y, add_w, h, col::kOff);
-    gfx::StrokeRect(x, y, w, h, 1.0f, col::kBorder);
-}
+// (The bar of the SD card, green what is there and red what is added, is ui::DrawSpaceBar: Download Play > Enable games draws it too.)
 
 std::string Percent(int pct) {
     return Fmt("%d%%", Clamp(pct, 0, 100));
@@ -734,10 +727,10 @@ protected:
         if (index == 0) {
             bool all = true;
             for (int i = 0; i < s_->count; ++i) {
-                all = all && dl_bit(s_->want, i);
+                all = all && (dl_bit(s_->want, i) || s_->refused[i] != DL_RECV_OK);
             }
             for (int i = 0; i < s_->count; ++i) {
-                dl_set_bit(s_->want, i, all ? 0 : 1);
+                dl_set_bit(s_->want, i, all || s_->refused[i] != DL_RECV_OK ? 0 : 1); // (DPAPP-2h-sec: never a title this console does not take)
             }
             return;
         }
@@ -804,7 +797,17 @@ protected:
                 // whether it is installed and what A does).
                 row.note = "Size " + SizeText(s.title[i].size) + ", " + DurationText(EstimateSeconds(s.title[i].size)) + " to download\nProduct code " +
                            gfx::Clean(s.title[i].code) + "\nID " + setup::TidText(s.title[i].tid) + (s.title[i].has_seed ? "\nAn eShop title (it comes with a seed)" : "");
-                if (s.exists[i]) {
+                if (s.refused[i] != DL_RECV_OK) {
+                    // (DPAPP-2h-sec) the module would delete it first, on the media it belongs to: never chosen, said
+                    row.chip = "not here";
+                    row.chip_color = col::kOff;
+                    row.note += s.refused[i] == DL_RECV_SELF    ? "\nIt is 3DS Link itself: it is never installed over while it runs."
+                                : s.refused[i] == DL_RECV_GUEST ? "\nIt is a Download Play guest this console prepared: it is never installed over."
+                                : s.refused[i] == DL_RECV_GUEST_OTHER
+                                    ? "\nIt is a Download Play guest: each console prepares its own in Download Play > Enable games." // (DPAPP-2j)
+                                                                : "\nIt is not a game, a demo, an update or a DLC of the SD card (a system title, a Download Play guest): "
+                                                                  "Titles Delivery never installs it.";
+                } else if (s.exists[i]) {
                     row.chip = "installed";
                     row.chip_color = col::kWarn;
                     row.note += "\nChoosing it replaces the installed copy: the title and its data are deleted first.";
@@ -835,9 +838,9 @@ protected:
                 any = any || dl_bit(s.want, i);
             }
             for (int i = first; i <= last; ++i) {
-                dl_set_bit(s.want, i, any ? 0 : 1);
+                dl_set_bit(s.want, i, any || s.refused[i] != DL_RECV_OK ? 0 : 1);
             }
-        } else if (row.id >= 0 && row.id < s.count) {
+        } else if (row.id >= 0 && row.id < s.count && s.refused[row.id] == DL_RECV_OK) {
             dl_set_bit(s.want, row.id, !dl_bit(s.want, row.id));
         }
     }
@@ -1203,6 +1206,8 @@ void RunReceive(const std::string& room_name) {
     int rc = 0;
     g.HoldHome();
     g.input.StartLatch();
+    // (DPAPP-2h-sec) the Download Play guests 3DS Link prepared here are never installed over (any id of the band of one: its key, M3c1, the system id)
+    dl_set_recv_owned([](uint64_t tid) { return dlpguest::IsOwnedGuestTid(tid) ? 1 : 0; });
     const bool started = RunOnBigStack([&]() { rc = dl_recv_run(&ReceiveTick, &run); });
     g.input.StopLatch();
     g.ReleaseHome();

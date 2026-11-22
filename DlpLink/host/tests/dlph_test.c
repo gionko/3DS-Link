@@ -80,7 +80,7 @@ static u32 xfer, total_frags;
 static bool downloading, complete;
 static u32 blocks_done, dropped, acks, mute_after, loss_permille;
 static u32 rng = 1;
-static u8 got[3000];
+static u8 got[(0x02000000u + DLPH_FRAG_SIZE - 1) / DLPH_FRAG_SIZE];   // one flag per fragment, up to the 32 MiB load_child accepts (3000 was 4.32 MB: the 1.1.4 child has 3026 and wrote past the end)
 static u8 rid[3];
 static u64 next_ack_at;
 static int unicast_count[8];
@@ -143,7 +143,7 @@ static void client_rx(const u8 *p, size_t n)
     unicast_count[p[0] & 7]++;
     memcpy(rid, p + 13, 3);
     if (p[0] == 2) { client_reset(); client_send(2, 0x18, fill_auth); }
-    else if (p[0] == 3) { downloading = true; blocks_done = 0; total_frags = g_has_version ? 0 : (xfer + DLPH_FRAG_SIZE - 1) / DLPH_FRAG_SIZE; next_ack_at = g_now + 100; client_send(3, 0x38, fill_need); }
+    else if (p[0] == 3) { downloading = true; blocks_done = 0; total_frags = g_has_version ? 0 : (xfer + DLPH_FRAG_SIZE - 1) / DLPH_FRAG_SIZE; CHECK(total_frags <= sizeof(got), "the child has %lu fragments, the simulated client tracks %lu", (unsigned long)total_frags, (unsigned long)sizeof(got)); if (total_frags > sizeof(got)) total_frags = sizeof(got); next_ack_at = g_now + 100; client_send(3, 0x38, fill_need); }
     else if (p[0] == 4) {
         u32 blk = (u32)p[0x14] << 24 | (u32)p[0x15] << 16 | (u32)p[0x16] << 8 | p[0x17], fi = (u32)p[0x18] << 8 | p[0x19], fs = (u32)p[0x1A] << 8 | p[0x1B];
         CHECK(n == 28 + fs, "fragment size");

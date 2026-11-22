@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "azl/title_rules.hpp"
+#include "../titleshare_host/recv_filter.h"
 #include "settings.hpp"
 
 namespace setup {
@@ -151,6 +153,56 @@ std::string TidText(u64 tid) {
 
 bool IsApplicationTid(u64 tid) {
     return static_cast<u32>(tid >> 32) == 0x00040000u;
+}
+
+static_assert(DL_SOLD_ID_FIRST == kSoldIdFirst && DL_SOLD_ID_LAST == kSoldIdLast && DL_SOLD_NEW_ID_FIRST == kSoldNewIdFirst && DL_SOLD_NEW_ID_LAST == kSoldNewIdLast,
+              "recv_filter.h's sold ranges are these (DPAPP-2j: Titles Delivery never sends nor takes a sold game's guest)");
+
+bool IsSoldGameTid(u64 tid) {
+    const u32 id = UniqueIdOf(tid);
+    return IsApplicationTid(tid) && ((id >= kSoldIdFirst && id <= kSoldIdLast) || (id >= kSoldNewIdFirst && id <= kSoldNewIdLast));
+}
+
+bool IsDownloadPlayTid(u64 tid) {
+    for (const u64 known : kDownloadPlayTids) {
+        if (tid == known) { // (the whole id: the high word of a system application, the unique id and the last byte)
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsDownloadPlayLeftover(u64 tid, Slot slot) {
+    return IsDownloadPlayTid(tid) && slot == Slot::On;
+}
+
+bool IsImpostor(u64 tid, const std::string& name) {
+    if (!IsApplicationTid(tid)) {
+        return false;
+    }
+    // The name as the table spells its parts: the ASCII letters in lower case and the digits, nothing else (no space, no hyphen, no byte of a longer character).
+    std::string plain;
+    for (const char c : name) {
+        const char l = Lower(c);
+        if ((l >= 'a' && l <= 'z') || (l >= '0' && l <= '9')) {
+            plain += l;
+        }
+    }
+    const u32 unique_id = UniqueIdOf(tid);
+    for (const Impostor& known : kImpostors) {
+        if (unique_id == known.unique_id && plain.find(known.name_part) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsEnableTitle(u64 tid, const std::string& name) {
+    return IsSoldGameTid(tid) && !IsImpostor(tid, name);
+}
+
+bool IsGuestGame(u64 tid, const std::string& name) {
+    return IsEnableTitle(tid, name) && !IsDownloadPlayTid(tid) && azl::title_rules::PreparedOf(tid) != 0;
 }
 
 std::string GamePluginDir(u64 tid) {
@@ -402,6 +454,30 @@ std::set<std::string> ListPluginFolders() {
     return folders;
 }
 
+Listing ListingOf(u64 tid, Slot slot, const std::string& name) {
+    if (IsEnableTitle(tid, name)) {
+        return Listing::Game;
+    }
+    return slot != Slot::Off ? Listing::OffOnly : Listing::Hidden; // (a plugin that is there must be seen, or it could never be switched off)
+}
+
+std::vector<EnableRow> EnableRows(const std::vector<u64>& tids, const std::vector<std::string>& names) {
+    std::vector<EnableRow> rows;
+    const std::set<std::string> folders = ListPluginFolders();
+    for (std::size_t i = 0; i < tids.size(); ++i) {
+        EnableRow row;
+        row.index = i;
+        if (folders.count(TidText(tids[i])) != 0) {
+            row.info = ReadSlot(tids[i]);
+        }
+        row.listing = ListingOf(tids[i], row.info.slot, i < names.size() ? names[i] : std::string());
+        if (row.listing != Listing::Hidden) {
+            rows.push_back(row);
+        }
+    }
+    return rows;
+}
+
 bool CopyPluginFile(const char* src, const char* dst) {
     FILE* in = std::fopen(src, "rb");
     if (!in) {
@@ -429,11 +505,23 @@ bool CopyPluginFile(const char* src, const char* dst) {
         std::remove(part.c_str());
         return false;
     }
-    std::remove(dst); // on the card a rename does not replace
-    if (std::rename(part.c_str(), dst) != 0) {
+    // (DPAPP-2h-sec) on the card a rename does not replace: the copy that is there goes aside first (.old) and comes back when the new one cannot be
+    // put in its place - a rename that fails never leaves the folder without the copy it had (it used to be deleted first)
+    const std::string old = std::string(dst) + ".old";
+    std::remove(old.c_str()); // (what a copy cut between its two renames left)
+    const bool had = FileSize(dst, nullptr);
+    if (had && std::rename(dst, old.c_str()) != 0) {
         std::remove(part.c_str());
         return false;
     }
+    if (std::rename(part.c_str(), dst) != 0) {
+        if (had) {
+            std::rename(old.c_str(), dst);
+        }
+        std::remove(part.c_str());
+        return false;
+    }
+    std::remove(old.c_str());
     return true;
 }
 
@@ -511,9 +599,30 @@ bool DisableGame(u64 tid) {
     const std::string path = GamePluginPath(tid);
     std::remove(path.c_str());
     std::remove((path + ".part").c_str()); // (what an interrupted copy leaves)
+    std::remove((path + ".old").c_str());  // (DPAPP-2h-sec: ... and a copy cut between its two renames)
     const bool gone = !FileSize(path, nullptr);
     rmdir(GamePluginDir(tid).c_str()); // only an empty folder goes: another file in it is never touched
     return gone;
+}
+
+// (the build 2h) the folder of a process id of the game's prepared child: the key (PreparedOf) or its system id (PreparedSystemOf) - no other folder
+static bool IsGuestFolderOf(u64 process_id, u64 game) {
+    const u64 key = azl::title_rules::PreparedOf(game);
+    return IsApplicationTid(game) && key != 0 && (process_id == key || process_id == azl::title_rules::PreparedSystemOf(key));
+}
+
+bool DisableGuestFolder(u64 prepared, u64 game) {
+    if (!IsGuestFolderOf(prepared, game)) {
+        return false;
+    }
+    return DisableGame(prepared);
+}
+
+EnableResult EnableGuestFolder(u64 prepared, u64 game, const char* source) {
+    if (!IsGuestFolderOf(prepared, game)) { // (the same guard as DisableGuestFolder's)
+        return EnableResult::CopyFailed;
+    }
+    return EnableGame(prepared, source);
 }
 
 } // namespace setup

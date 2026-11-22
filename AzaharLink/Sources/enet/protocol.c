@@ -19,6 +19,27 @@ enet_azl_counters_take (ENetHost * host, ENetAzlCounters * out)
 {
     * out = host -> azlCounters;
     memset (& host -> azlCounters, 0, sizeof (host -> azlCounters));
+    host -> azlCounters.capDropHeldMax = host -> azlCapDropHeld; /* (the next window starts from what is held now) */
+}
+
+/* AzaharLink: a reliable command of the channel was seen (taken or refused, before it is handled): the numbers it skips past the highest seen are counted
+   (ENetAzlCounters::seqSkipped). An earlier number, or the same one, is a copy or a command sent again: nothing. */
+static void
+enet_protocol_azl_note_sequence (ENetHost * host, ENetChannel * channel, enet_uint16 sequence)
+{
+    enet_uint16 ahead = (enet_uint16) (sequence - channel -> azlHighestSeen);
+
+    if (ahead == 0 || ahead >= 0x8000)
+      return;
+
+    if (ahead > 1)
+    {
+       host -> azlCounters.seqSkipped += (enet_uint32) ahead - 1;
+       if (host -> azlAwayBacklog)
+         host -> azlCounters.seqSkippedAway += (enet_uint32) ahead - 1;
+    }
+
+    channel -> azlHighestSeen = sequence;
 }
 
 static const size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
@@ -381,6 +402,7 @@ enet_protocol_handle_connect (ENetHost * host, ENetProtocolHeader * header, ENet
         channel -> outgoingUnreliableSequenceNumber = 0;
         channel -> incomingReliableSequenceNumber = 0;
         channel -> incomingUnreliableSequenceNumber = 0;
+        channel -> azlHighestSeen = 0;
 
         enet_list_clear (& channel -> incomingReliableCommands);
         enet_list_clear (& channel -> incomingUnreliableCommands);
@@ -580,7 +602,11 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
       startWindow += ENET_PEER_RELIABLE_WINDOWS;
 
     if (startWindow < currentWindow || startWindow >= currentWindow + ENET_PEER_FREE_RELIABLE_WINDOWS - 1)
-      return 0;
+    {
+       if ((enet_uint16) (channel -> incomingReliableSequenceNumber - startSequenceNumber) < 0x8000)
+         ENET_AZL_NOTE_DUP (host); /* (AzaharLink, 2026-11-15: a fragment of a packet handed over already: the room sent it again) */
+       return 0;
+    }
 
     fragmentNumber = ENET_NET_TO_HOST_32 (command -> sendFragment.fragmentNumber);
     fragmentCount = ENET_NET_TO_HOST_32 (command -> sendFragment.fragmentCount);
@@ -616,7 +642,10 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
             break;
         
           if (incomingCommand -> azlDispatched)
+          {
+            ENET_AZL_NOTE_DUP (host); /* (a copy sent again: counted as the copies of a whole command are, 2026-11-15) */
             return 0; /* AzaharLink: the packet of this fragment was handed over already (a late copy of one of its fragments) */
+          }
 
           if ((incomingCommand -> command.header.command & ENET_PROTOCOL_COMMAND_MASK) != ENET_PROTOCOL_COMMAND_SEND_FRAGMENT ||
               totalLength != incomingCommand -> packet -> dataLength ||
@@ -634,9 +663,16 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
 
        hostCommand.header.reliableSequenceNumber = startSequenceNumber;
 
+       /* AzaharLink: the packet's first bytes, when this fragment holds them, for the drop at the limit (ENetHost::azlCapDrop) */
+       host -> azlFragmentHead = fragmentOffset == 0 ? (const enet_uint8 *) command + sizeof (ENetProtocolSendFragment) : NULL;
+       host -> azlFragmentHeadLength = fragmentLength;
        startCommand = enet_peer_queue_incoming_command (peer, & hostCommand, NULL, totalLength, ENET_PACKET_FLAG_RELIABLE, fragmentCount);
+       host -> azlFragmentHead = NULL;
        if (startCommand == NULL)
          return -1;
+
+       if (startCommand -> azlDispatched)
+         return 0; /* AzaharLink: dropped at the limit (acknowledged): its other fragments find the placeholder and are acknowledged too */
     }
     
     if ((startCommand -> fragments [fragmentNumber / 32] & (1u << (fragmentNumber % 32))) == 0)
@@ -655,6 +691,8 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
         if (startCommand -> fragmentsRemaining <= 0)
           enet_peer_dispatch_incoming_reliable_commands (peer, channel, NULL);
     }
+    else
+      ENET_AZL_NOTE_DUP (host); /* (AzaharLink, 2026-11-15: this fragment was here already: the room sent it again) */
 
     return 0;
 }
@@ -1033,6 +1071,45 @@ enet_protocol_handle_verify_connect (ENetHost * host, ENetEvent * event, ENetPee
     return 0;
 }
 
+/* AzaharLink: the lag of a datagram whose header says when it was sent (see ENetHost::azlLagBase). */
+static enet_uint32
+enet_protocol_azl_lag (ENetHost * host, enet_uint16 sentTime)
+{
+    const enet_uint16 seen = (enet_uint16) ((host -> serviceTime & 0xFFFF) - sentTime);
+    enet_uint32 sinceLeak;
+    enet_uint16 lag;
+
+    if (! host -> azlLagKnown)
+    {
+       host -> azlLagKnown = 1;
+       host -> azlLagBase = seen;
+       host -> azlLagBaseTime = host -> serviceTime;
+
+       return 0;
+    }
+
+    sinceLeak = host -> serviceTime - host -> azlLagBaseTime;
+    if (sinceLeak >= ENET_AZL_LAG_LEAK_MS && sinceLeak < 0x7FFFFFFFu)
+    {
+       host -> azlLagBase = (enet_uint16) (host -> azlLagBase + sinceLeak / ENET_AZL_LAG_LEAK_MS);
+       host -> azlLagBaseTime += sinceLeak - sinceLeak % ENET_AZL_LAG_LEAK_MS;
+    }
+
+    lag = (enet_uint16) (seen - (enet_uint16) host -> azlLagBase);
+    if (lag >= 0x8000)
+    {
+       /* (earlier than the best so far: this is the base now) */
+       host -> azlLagBase = seen;
+       lag = 0;
+    }
+
+    return lag;
+}
+
+/* AzaharLink: a data command its handler did not take. Refused for the limit of waiting data (ENetHost::azlCapRefused): the command is not acknowledged and
+   the datagram is read on - what follows may be the command that closes the hole. Anything else: the datagram is dropped from here on, as ENet does. */
+#define ENET_AZL_NOT_TAKEN(host) { if ((host) -> azlCapRefused) continue; goto commandError; }
+
 static int
 enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 {
@@ -1122,6 +1199,8 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
     }
     
     currentData = host -> receivedData + headerSize;
+
+    host -> azlDatagramLag = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME) ? enet_protocol_azl_lag (host, ENET_NET_TO_HOST_16 (header -> sentTime)) : 0;
   
     while (currentData < & host -> receivedData [host -> receivedDataLength])
     {
@@ -1147,6 +1226,13 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
          break;
          
        command -> header.reliableSequenceNumber = ENET_NET_TO_HOST_16 (command -> header.reliableSequenceNumber);
+
+       host -> azlCapRefused = 0;
+
+       /* AzaharLink: a reliable command of a channel (data or a fragment; pings and the rest use no channel): the numbers it skips (ENetAzlCounters::seqSkipped) */
+       if (peer != NULL && (command -> header.command & ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE) && command -> header.channelID < peer -> channelCount &&
+           (commandNumber == ENET_PROTOCOL_COMMAND_SEND_RELIABLE || commandNumber == ENET_PROTOCOL_COMMAND_SEND_FRAGMENT))
+         enet_protocol_azl_note_sequence (host, & peer -> channels [command -> header.channelID], command -> header.reliableSequenceNumber);
 
        switch (commandNumber)
        {
@@ -1180,22 +1266,22 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 
        case ENET_PROTOCOL_COMMAND_SEND_RELIABLE:
           if (enet_protocol_handle_send_reliable (host, peer, command, & currentData))
-            goto commandError;
+            ENET_AZL_NOT_TAKEN (host)
           break;
 
        case ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE:
           if (enet_protocol_handle_send_unreliable (host, peer, command, & currentData))
-            goto commandError;
+            ENET_AZL_NOT_TAKEN (host)
           break;
 
        case ENET_PROTOCOL_COMMAND_SEND_UNSEQUENCED:
           if (enet_protocol_handle_send_unsequenced (host, peer, command, & currentData))
-            goto commandError;
+            ENET_AZL_NOT_TAKEN (host)
           break;
 
        case ENET_PROTOCOL_COMMAND_SEND_FRAGMENT:
           if (enet_protocol_handle_send_fragment (host, peer, command, & currentData))
-            goto commandError;
+            ENET_AZL_NOT_TAKEN (host)
           break;
 
        case ENET_PROTOCOL_COMMAND_BANDWIDTH_LIMIT:
@@ -1210,7 +1296,7 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 
        case ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT:
           if (enet_protocol_handle_send_unreliable_fragment (host, peer, command, & currentData))
-            goto commandError;
+            ENET_AZL_NOT_TAKEN (host)
           break;
 
        default:
@@ -1285,6 +1371,7 @@ enet_protocol_receive_pass (ENetHost * host, ENetEvent * event, int * datagramsR
        if (receivedLength == 0)
        {
           host -> azlSocketEmpty = 1; /* AzaharLink: this is what an empty socket looks like (see azlSkipEmptyRecv) */
+          host -> azlAwayBacklog = 0; /* (AzaharLink: what waited while the thread was away has all been read) */
           return 0;
        }
 
@@ -1294,6 +1381,15 @@ enet_protocol_receive_pass (ENetHost * host, ENetEvent * event, int * datagramsR
        host -> totalReceivedData += receivedLength;
        host -> totalReceivedPackets ++;
        ++ * datagramsRead;
+       if (host -> azlAwayBacklog)
+       {
+          /* AzaharLink: what had waited in the ring while the thread was away, read up to the empty socket (ENetAzlCounters::awayDatagramsMax) */
+          host -> azlAwayBytes += (enet_uint32) receivedLength;
+          if (++ host -> azlAwayDatagrams > host -> azlCounters.awayDatagramsMax)
+            host -> azlCounters.awayDatagramsMax = host -> azlAwayDatagrams;
+          if (host -> azlAwayBytes > host -> azlCounters.awayBytesMax)
+            host -> azlCounters.awayBytesMax = host -> azlAwayBytes;
+       }
 
        if (host -> intercept != NULL)
        {
@@ -1993,6 +2089,17 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
     /* AzaharLink: how long since the previous service (see ENetHost). */
     host -> azlServiceGap = host -> azlLastServiceTime != 0 ? ENET_TIME_DIFFERENCE (host -> serviceTime, host -> azlLastServiceTime) : 0;
     host -> azlLastServiceTime = host -> serviceTime != 0 ? host -> serviceTime : 1;
+    if (host -> azlServiceGap >= ENET_AZL_AWAY_MS)
+    {
+      if (! host -> azlAwayBacklog)
+      {
+         ++ host -> azlCounters.awayEpisodes; /* (a new one: the socket was found empty since the last) */
+         host -> azlAwayDatagrams = 0;
+         host -> azlAwayBytes = 0;
+         host -> azlAwayDups = 0;
+      }
+      host -> azlAwayBacklog = 1;
+    }
 
     timeout += host -> serviceTime;
 
@@ -2151,6 +2258,8 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
           trouble that way (the revents hold an error, not POLLIN), and the receive of the next call is where the error is reported - it is
           not left out. (One millisecond of slack: the clock steps by 1; a doubt costs one receive, never a datagram.) */
        host -> azlSocketEmpty = (waitCondition & ENET_SOCKET_WAIT_RECEIVE) ? 0 : ENET_TIME_GREATER_EQUAL (host -> serviceTime + 1, timeout);
+       if (host -> azlSocketEmpty)
+         host -> azlAwayBacklog = 0; /* (AzaharLink, 2026-11-15: the socket is empty - found by a poll, not only by a receive - so nothing waits from the absence) */
        azlSkipped = 0;
     } while (waitCondition & ENET_SOCKET_WAIT_RECEIVE);
 

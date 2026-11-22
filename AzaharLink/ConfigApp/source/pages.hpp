@@ -18,6 +18,11 @@
 //                       (modal.cpp, probe.cpp)
 //   the guide           "How to get boot9.bin": a picture of GodMode9's screen for each step (pages_guide.cpp, over ConfigApp/guide)
 //   the update          the check, the question, the download and the install (pages_update.cpp)
+//   DlpPage             Download Play, the entry of the main page: Join and Games (pages_dlpguest.cpp; 1.1.4, spec 9)
+//   DlpGamesPage        Download Play > Games: the games that have a Download Play child, a switch each (prepare, remove), their space, remove all;
+//                       the run of the worker (pages_dlpguest.cpp)
+//   DlpJoinPage         Download Play > Join: the hosts of the room, the join, the wait, the hand-over to the prepared child
+//                       (pages_dlpjoin.cpp; 1.1.4, route B)
 #pragma once
 
 #include <functional>
@@ -111,5 +116,23 @@ ui::Page* NewUpdateCheckPage();
 // Once a frame on the main page, before anything else it does: the quiet check of this start. It may only start the check, or (true) it has just pushed a popup: the question, or the
 // one word about the clock. Nothing else happens on the main page in that frame.
 bool PollUpdateAtStart(const ui::Input& in);
+
+// ---------------------------------------------------------------------------------------------
+// The Download Play children 3DS Link prepares (pages_dlpguest.cpp, dlp_guest.hpp)
+// ---------------------------------------------------------------------------------------------
+
+// Download Play, from the main page (1.1.4, spec 9): the rows Join and Games. When it opens, once, the quiet work of the children (a child whose game
+// is gone is removed): the only place where the children are worked on, but the reading of the background.
+ui::Page* NewDlpPage();
+// Download Play > Games: the games with a Download Play child, a switch each (A on Off prepares that game's child, A on On removes it), the space, X
+// removes them all, Y the guide of boot9.bin.
+ui::Page* NewDlpGamesPage();
+// Download Play > Join (1.1.4, route B: specifiche/8-INGRESSO-DA-3DSLINK.md): the gate, then the room's hosts of the games whose child is Ready here;
+// A joins, B leaves, and at the host's START the app hands the game over and ends into the prepared child.
+ui::Page* NewDlpJoinPage();
+// (the build 2h, U3) the work under way that a page of Download Play waits for - the scan of the titles, the copies of the plugin, a new scan, the
+// worker of the guests, the update, the public lobbies - said as Enable Titles says its own work: the card's title, the line under way, the detail,
+// and the bar (`fraction` -1: the dots). false: none (pages_dlpguest.cpp; Download Play > Enable games and Join lobby show the same card).
+bool WorkUnderWay(std::string& title, std::string& text, std::string& detail, float& fraction);
 
 } // namespace pages

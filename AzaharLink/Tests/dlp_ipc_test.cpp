@@ -11,9 +11,16 @@
 // ASan report).
 //
 //   dlp_ipc_test      (needs nothing; a plain test like dlp_lobby_test, for Tests/run.sh)
+//   dlp_ipc_test_joins (1.1.4, route B: the same file with -DAZL_CLNT_SYSTEM_JOINS=1 - G1's join path of dlp:CLNT, which the plugin no longer
+//                      builds (clnt::kSystemAppJoins false: every StartSession of the Download Play application is refused); only the dlp:CLNT tests run)
 //
 //   g++ -std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -IIncludes -ITests -pthread -fsanitize=address,undefined
 //       Tests/dlp_ipc_test.cpp -o /tmp/dlp_ipc_test
+// (the final review of 1.1.4: built with no -D this binary stands for the plugin's build, whose default the header decides; it must then be route B's,
+// never the join path: the tests below follow the switch, so without this check a default turned on would make them the joins build without a word)
+#ifndef AZL_CLNT_SYSTEM_JOINS
+#define AZL_TEST_PLUGIN_DEFAULT 1
+#endif
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -28,6 +35,13 @@
 #include "azl/dlp_fkcl_hle.hpp"
 #include "azl/dlp_ipc.hpp"
 #include "dlp_fakenet.hpp"
+
+#if AZL_CLNT_SYSTEM_JOINS
+#pragma GCC diagnostic ignored "-Wunused-function"  // (dlp_ipc_test_joins runs the dlp:CLNT tests only)
+#endif
+#ifdef AZL_TEST_PLUGIN_DEFAULT
+static_assert(!azl::clnt::kSystemAppJoins, "the plugin's build: the system's Download Play application never joins (route B, K10 / D-B5)");
+#endif
 
 using namespace azl;
 
@@ -525,8 +539,9 @@ static void TestSizesAndHelpers() {
     CHECK_EQ(kTitleInfoSize, 0x13A8u);
     CHECK_EQ(kServerInfoSize, 0x298u);
     CHECK_EQ(kDlpNodeInfoSize, 0x28u);
-    CHECK_EQ(kMaxPlayers, 4u);
-    CHECK_EQ(kMaxClients, 3u);
+    CHECK_EQ(kMaxPlayers, 8u);  // (2026-11-13: the capacity of the tables; the ceiling of a title that says nothing is still four)
+    CHECK_EQ(kMaxClients, 7u);
+    CHECK_EQ(kTitlePlayers, 4u);
     CHECK_EQ(kMaxGroups, 4u);
     // the defaults
     DlpService s;
@@ -626,42 +641,102 @@ static void TestProbeOnlyIsDlpFkclHle() {
 }
 
 static void TestProbeOnlyServer() {
-    // ProbeOnly on dlp:SRVR: IsChild answers "no" with success, everything else is "invalid state"; nothing else is touched
-    DlpService s;
-    u32 expect_refused = 0;
-    u32 expect_unknown = 0;
-    g_rng_state = 0xABCD1234u;
-    for (u32 id = 0; id < 0x30; ++id) {
-        for (u32 lo : {0x40u, 0x0000u, 0x0183u, 0x0303u, 0xFFFFu}) {
-            u32 a[64];
-            u32 b[64];
-            for (int i = 0; i < 64; ++i) {
-                a[i] = b[i] = Rnd();
+    // ProbeOnly on dlp:SRVR: IsChild answers "no" with success, everything else is "invalid state"; nothing else is touched. 1.1.4 (G4): after
+    // SetChild(true) - the Download Play child 3DS Link prepared - IsChild answers "yes", and every other word of every reply, and every counter,
+    // is what the first round had (the same requests: the same seed).
+    for (const bool child : {false, true}) {
+        DlpService s;
+        s.SetChild(child);
+        u32 expect_refused = 0;
+        u32 expect_unknown = 0;
+        u32 is_child_replies = 0;
+        g_rng_state = 0xABCD1234u;
+        for (u32 id = 0; id < 0x30; ++id) {
+            for (u32 lo : {0x40u, 0x0000u, 0x0183u, 0x0303u, 0xFFFFu}) {
+                u32 a[64];
+                u32 b[64];
+                for (int i = 0; i < 64; ++i) {
+                    a[i] = b[i] = Rnd();
+                }
+                a[0] = b[0] = (id << 16) | lo;
+                s.Dispatch(kSv, a, nullptr, IpcResolver{nullptr, nullptr});
+                if (id == 0x0E) {
+                    b[0] = 0x000E0080;
+                    b[1] = 0;
+                    b[2] = child ? 1u : 0u;
+                    ++is_child_replies;
+                } else if (id >= 1 && id <= 0x10) {
+                    b[0] = (id << 16) | 0x40;
+                    b[1] = 0xE0A0AC01;
+                    ++expect_refused;
+                } else {
+                    b[0] = 0x00000040;
+                    b[1] = 0xD9001830;
+                    ++expect_refused;
+                    ++expect_unknown;
+                }
+                CHECK_BYTES(a, b, sizeof(a));
             }
-            a[0] = b[0] = (id << 16) | lo;
-            s.Dispatch(kSv, a, nullptr, IpcResolver{nullptr, nullptr});
-            if (id == 0x0E) {
-                b[0] = 0x000E0080;
-                b[1] = 0;
-                b[2] = 0;
-            } else if (id >= 1 && id <= 0x10) {
-                b[0] = (id << 16) | 0x40;
-                b[1] = 0xE0A0AC01;
-                ++expect_refused;
-            } else {
-                b[0] = 0x00000040;
-                b[1] = 0xD9001830;
-                ++expect_refused;
-                ++expect_unknown;
-            }
-            CHECK_BYTES(a, b, sizeof(a));
         }
+        CHECK_EQ(is_child_replies, 5u);
+        CHECK_EQ(s.refused(), expect_refused);
+        CHECK_EQ(s.unknown_commands(), expect_unknown);
+        CHECK_EQ(s.initializes(), 0u);  // Initialize of the server is refused in this mode: not an initialisation
+        CHECK_EQ(s.finalizes(), 0u);
+        CHECK_EQ(s.commands(), 0x30u * 5u);
+        CHECK_EQ(s.last_id(), 0x2Fu);
+        CHECK(s.mode() == DlpMode::ProbeOnly);
     }
-    CHECK_EQ(s.refused(), expect_refused);
-    CHECK_EQ(s.unknown_commands(), expect_unknown);
-    CHECK_EQ(s.initializes(), 0u);  // Initialize of the server is refused in this mode: not an initialisation
-    CHECK_EQ(s.finalizes(), 0u);
-    CHECK_EQ(s.commands(), 0x30u * 5u);
+    // ... and on dlp:FKCL the flag changes nothing: the probe of Battle Royale, word for word
+    DlpService plain;
+    DlpService child;
+    child.SetChild(true);
+    g_rng_state = 0x0C41D000u;
+    u32 fk_diffs = 0;
+    for (u32 id = 0; id < 0x20; ++id) {
+        u32 a[64];
+        u32 b[64];
+        for (int i = 0; i < 64; ++i) {
+            a[i] = b[i] = Rnd();
+        }
+        a[0] = b[0] = (id << 16) | 0x40;
+        plain.Dispatch(kFk, a, nullptr, IpcResolver{nullptr, nullptr});
+        child.Dispatch(kFk, b, nullptr, IpcResolver{nullptr, nullptr});
+        fk_diffs += std::memcmp(a, b, sizeof(a)) != 0 ? 1u : 0u;
+    }
+    CHECK_EQ(fk_diffs, 0u);
+    CHECK_EQ(child.refused(), plain.refused());
+    CHECK_EQ(child.initializes(), plain.initializes());
+}
+
+static void TestChildNeverInLobby() {
+    // 1.1.4 (G4): a hub never says "child". SetChild over a lobby (before or after SetLobby) leaves the lobby's IsChild at [0x000E0080, 0, 0]; the same
+    // service without its lobby is the probe again, and then it says "yes".
+    World w(1);
+    Console& c = w[0];
+    c.svc.SetChild(true);
+    Reply v = c.Call(kSv, 0x000E0040, {0x20});
+    CHECK_EQ(v.hdr(), 0x000E0080u);
+    CHECK_EQ(v.res(), 0u);
+    CHECK_EQ(v.w[2], 0u);
+    CHECK(v.shape_ok);
+    c.svc.SetLobby(&c.lobby);  // (SetLobby again: the flag stays, the lobby's answer too)
+    v = c.Call(kSv, 0x000E0040, {0x20});
+    CHECK_EQ(v.w[2], 0u);
+    c.svc.SetChild(false);
+    c.svc.SetChild(true);
+    v = c.Call(kSv, 0x000E0040, {0x20});
+    CHECK_EQ(v.hdr(), 0x000E0080u);
+    CHECK_EQ(v.w[2], 0u);
+    c.svc.SetLobby(nullptr);
+    v = c.Call(kSv, 0x000E0040, {0x20});
+    CHECK_EQ(v.hdr(), 0x000E0080u);
+    CHECK_EQ(v.res(), 0u);
+    CHECK_EQ(v.w[2], 1u);
+    c.svc.SetChild(false);
+    v = c.Call(kSv, 0x000E0040, {0x20});
+    CHECK_EQ(v.w[2], 0u);
+    c.svc.SetLobby(&c.lobby);
 }
 
 // =====================================================================================================================
@@ -3286,12 +3361,799 @@ static void TestWidthsGaps() {
     }
 }
 
+// =====================================================================================================================
+// dlp:CLNT (1.1.4, G1 of analysis/piano-1.1.4-2026-11-15/specifiche/1-G1.md section 4.2): the system's Download Play application. A console whose
+// lobby lists any game's host (LobbyConfig::any_title) and whose network has the book of dlp:CLNT (FakeLobbyNet::book), driven with the raw words
+// the application sends (RAPPORTO section 1: its headers); the hosts are the dialect's hosts of the World (Triple Deluxe's lobby: child 0010C0xx).
+// The expected headers and results are literals.
+
+static constexpr DlpKind kCl = DlpKind::Clnt;
+// The headers of the replies of dlp:CLNT by id (1-G1.md section 3, column "Risposta"). Index = id.
+static const u32 kClReplyHeader[0x15] = {0,          0x00010040, 0x00020040, 0x000301C0, 0x00040080, 0x00050040, 0x00060040,
+                                         0x00070042, 0x00080042, 0x00090042, 0x000A0040, 0x000B0080, 0x000C0040, 0x000D0040,
+                                         0x000E0180, 0x000F0082, 0x001002C0, 0x00110100, 0x00120040, 0x001300C0, 0x00140080};
+static constexpr u32 R_WIRELESS_OFF = 0xC940AC04;
+static constexpr u32 R_NO_SYSTEM_DOWNLOAD = 0xD960AC02;
+static constexpr u32 kClTransfer = 0x00123400;   // the sizes of the test's child (its block, and what a host of the same version announces)
+static constexpr u32 kClRequired = 0x00ABC000;
+static constexpr u64 kClChild = 0x000400010010C000ull;   // Triple Deluxe's child 0: what the World's hosts announce
+static constexpr u64 kClGame = 0x000400000010C000ull;
+static constexpr u64 kClPrepared = 0x000400000F90C000ull; // the user's formula, written out: 0x0F800000 | (0x0010C000 & 0x007FFFFF)
+
+/// The children of the test: one row, Triple Deluxe's child, with the verdict `v` and (if `with_block`) its block read, whose sizes are the two above.
+struct ClChildren {
+    dlp_children::Table table;
+    u8 block[dlp_children::kBlockBytes];
+    explicit ClChildren(dlp_children::Verdict v = dlp_children::Verdict::Ready, bool with_block = true) {
+        dlp_children::Clear(&table);
+        dlp_children::Row& r = table.index.rows[0];
+        r.child = kClChild;
+        r.game = kClGame;
+        r.prepared = kClPrepared;
+        r.version = 0;
+        r.where = 'S';
+        table.index.count = 1;
+        table.index_found = true;
+        table.verdict[0] = static_cast<u8>(v);
+        std::memset(block, 0, sizeof(block));
+        StoreLE16(block + dlp_children::kBlockShortAt, 'K');  // (a name of one unit: "K")
+        StoreLE32(block + dlp_children::kBlockTransferAt, kClTransfer);
+        StoreLE32(block + dlp_children::kBlockRequiredAt, kClRequired);
+        if (with_block) {
+            dlp_children::PutBlock(&table, 0, block);
+        }
+    }
+};
+
+static LobbyConfig ClCfg() {
+    LobbyConfig c = MakeCfg(0x00022100, 0x9999, "DLPA");  // (the application's own low word: the lobby keeps the "any title" mark instead)
+    c.max_players = 8;
+    c.any_title = 1;
+    return c;
+}
+
+/// The Download Play application: a Console of any title, with the book of dlp:CLNT, its table's source and the requests it sends.
+struct ClConsole : Console {
+    DlpClntBook book;
+    std::atomic<const dlp_children::Table*> children{nullptr};
+    ClConsole(FakeAir& air, int i) : Console(air, i, ClCfg()) {
+        net.book = &book;
+        book.SetChildrenSource(&children);
+    }
+    void Give(const ClChildren& c) { children.store(&c.table); }
+    Reply ClInit() { return Call(kCl, 0x000100C3, {0x232000, 16, 0x200000, 0x04000000, 0x1234, 0x5678}); }
+    Reply ClFinalize() { return Call(kCl, 0x00020000, {}); }
+    Reply ClEventDesc() { return Call(kCl, 0x00030000, {}); }
+    Reply ClChannels() { return Call(kCl, 0x00040000, {}); }
+    Reply ClScan() { return Call(kCl, 0x00050180, {1, 0, 0, 0, 0, 0}); }
+    Reply ClStopScan() { return Call(kCl, 0x00060000, {}); }
+    Reply ClServerInfo(const Mac& m, const Sb& s) { return Call(kCl, 0x00070080, {MacW1(m), MacW2(m)}, s.w); }
+    Reply ClTitleInfo(const Mac& m, const Sb& s) { return Call(kCl, 0x00080100, {MacW1(m), MacW2(m), 0x0010C000, 0x00040001}, s.w); }
+    Reply ClInOrder(const Sb& s, u32 restart = 0) { return Call(kCl, 0x00090040, {restart}, s.w); }
+    Reply ClDelete(const Mac& m) { return Call(kCl, 0x000A0080, {MacW1(m), MacW2(m)}); }
+    Reply ClPrepare(const Mac& m) { return Call(kCl, 0x000B0100, {MacW1(m), MacW2(m), 0x0010C000, 0x00040001}); }
+    Reply ClSysDownload() { return Call(kCl, 0x000C0000, {}); }
+    Reply ClStart(const Mac& m) { return Call(kCl, 0x000D0100, {MacW1(m), MacW2(m), 0x0010C000, 0x00040001}); }
+    Reply ClStatus() { return Call(kCl, 0x000E0000, {}); }
+    Reply ClNodes(u32 n, const Sb& s) { return Call(kCl, 0x000F0040, {n}, s.w); }
+    Reply ClNodeInfo(u32 node) { return Call(kCl, 0x00100040, {node}); }
+    Reply ClPass() { return Call(kCl, 0x00110000, {}); }
+    Reply ClStopSession() { return Call(kCl, 0x00120000, {}); }
+    Reply ClCup(const Mac& m) { return Call(kCl, 0x00130100, {MacW1(m), MacW2(m), 0, 0}); }
+    Reply ClDup(const Mac& m) { return Call(kCl, 0x00140100, {MacW1(m), MacW2(m), 0, 0}); }
+    u32 Shown() { return ClStatus().w[2]; }
+};
+
+/// The hosts of a World (consoles 0..n-1, each with its own title) and the application on the same air.
+struct ClWorld {
+    World w;
+    ClConsole c;
+    explicit ClWorld(int hosts = 1, std::initializer_list<u32> tids = {}) : w(0), c(w.air, hosts) {
+        auto t = tids.begin();
+        for (int i = 0; i < hosts; ++i) {
+            const u32 tid = t != tids.end() ? *t++ : 0x0010C000u;
+            w.c.push_back(std::make_unique<Console>(w.air, i, MakeCfg(tid, 0x1000u + static_cast<u32>(i), kNames[i % 4])));
+        }
+    }
+    void Run(u32 ms, u32 step = 20) {
+        for (u32 t = 0; t < ms; t += step) {
+            w.air.Advance(step);
+            for (auto& x : w.c) {
+                x->lobby.Pump();
+            }
+            c.lobby.Pump();
+        }
+    }
+    void Host(int i, u32 max_clients = 3) {
+        Console& h = w[i];
+        h.SvInit(max_clients, 0);
+        h.SvDup();
+        h.SvAccepting(0, 6);
+        Run(40);
+    }
+    /// The application: Initialize, StartScan, a while; the scan goes on.
+    void Scan(u32 ms = 80) {
+        c.ClInit();
+        c.ClScan();
+        Run(ms);
+    }
+    /// StartSession of a host whose child is ready, then PollPending until the join ends: its reply.
+    Reply Join(const Mac& m, bool* pending) {
+        Reply j = c.ClStart(m);
+        *pending = j.out == DlpOutcome::JoinPending;
+        if (!*pending) {
+            return j;
+        }
+        for (u32 t = 0; t < 4000; t += 20) {
+            bool done = false;
+            const Reply r = c.Pending(&done);
+            if (done) {
+                return r;
+            }
+            Run(20);
+        }
+        return j;
+    }
+};
+
+static void TestClntMatrix() {
+    std::printf("dlp:CLNT: the application's requests in every state of the searcher, word for word\n");
+    for (int st = 0; st < 8; ++st) {  // 0 off, 1 idle, 2 scanning, 3 joining, 4 in session (5), 5 started (6), 6 complete (9), 7 lost (0x80)
+        if (!clnt::kSystemAppJoins && st >= 3) {
+            continue;  // (route B: the application never joins - states 3..7 are G1's join path, dlp_ipc_test_joins)
+        }
+        ClWorld cw(1);
+        ClChildren kids;
+        ClConsole& c = cw.c;
+        c.Give(kids);
+        cw.Host(0);
+        const Mac host = MacOf(cw.w[0]);
+        const Sb srv = c.NewSb(0x298), title = c.NewSb(0x13A8), nodes = c.NewSb(16);
+        if (st >= 1) {
+            cw.Scan();
+            const Reply d = c.ClInOrder(title);  // (delivered: the book knows it from here)
+            CHECK_EQ(d.res(), 0u);
+            if (st == 1) {
+                c.ClStopScan();
+            }
+        }
+        if (st >= 3) {
+            c.ClStopScan();
+            if (st == 3) {
+                c.net.ConnectDelay(100000);
+            }
+            const Reply j = c.ClStart(host);
+            CHECK(j.out == DlpOutcome::JoinPending);
+            if (st >= 4) {
+                bool done = false;
+                c.Pending(&done);
+                CHECK(done);
+            }
+        }
+        if (st >= 5 && st != 7) {
+            cw.w[0].SvDistribute();
+            cw.Run(400);
+        }
+        if (st == 6) {
+            const u8 nine[9] = {'1', '2', '3', '4', 'a', 'b', 'c', 'd', 0};
+            cw.w[0].SvPass(nine);
+            cw.Run(400);
+        }
+        if (st == 7) {
+            cw.w[0].SvFinalize();
+            cw.Run(2600);  // (the host gone for kHostGoneMs: 0x80)
+        }
+        static const u32 kShownState[8] = {0, 1, 2, 1, 5, 7, 9, 0x80};  // (6 is shown as 7: "waiting, nothing to download")
+        Reply r = c.ClStatus();
+        CHECK_EQ(r.hdr(), 0x000E0180u);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(r.w[2] >> 24, kShownState[st]);
+        CHECK_EQ(r.w[3], 0u);  // total and downloaded: 0 (nothing is downloaded)
+        CHECK_EQ(r.w[4], 0u);
+        CHECK_EQ(r.w[5], 0u);
+        CHECK_EQ(r.w[6], 0u);
+        // the commands the application calls whatever the state, and their headers
+        r = c.ClEventDesc();
+        CHECK_EQ(r.hdr(), kClReplyHeader[3]);
+        r = c.ClChannels();
+        CHECK_EQ(r.hdr(), kClReplyHeader[4]);
+        CHECK_EQ(r.w[2], 0x0421u);
+        r = c.ClPrepare(host);
+        CHECK_EQ(r.hdr(), kClReplyHeader[0x0B]);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(r.w[2], 0u);
+        r = c.ClSysDownload();
+        CHECK_EQ(r.hdr(), kClReplyHeader[0x0C]);
+        CHECK_EQ(r.res(), R_NO_SYSTEM_DOWNLOAD);
+        r = c.ClCup(host);
+        CHECK_EQ(r.hdr(), kClReplyHeader[0x13]);
+        CHECK(r.res() == 0 && r.w[2] == 0 && r.w[3] == 0);
+        r = c.ClDup(host);
+        CHECK_EQ(r.hdr(), kClReplyHeader[0x14]);
+        CHECK(r.res() == 0 && r.w[2] == 0);
+        // GetServerInfo: never an error with a good buffer (a known host: its record; a MAC never seen: zeros and the MAC)
+        r = c.ClServerInfo(host, srv);
+        CHECK_EQ(r.hdr(), kClReplyHeader[7]);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(r.w[2], 0x00A60002u);
+        CHECK_EQ(r.w[3], srv.addr);
+        const u8* rec = c.Data(srv);
+        CHECK_BYTES(rec, host.data(), 6);
+        if (st >= 1) {
+            CHECK_EQ(LoadLE16(rec + 0x1C), 'H');  // the host's name ("Host"), then the mark
+        }
+        const Mac never = {0x02, 0x99, 0x98, 0x97, 0x96, 0x95};
+        r = c.ClServerInfo(never, srv);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_BYTES(rec, never.data(), 6);
+        bool zeros = true;
+        for (u32 i = 6; i < 0x298; ++i) {
+            zeros = zeros && rec[i] == 0;
+        }
+        CHECK(zeros);
+        // GetTitleInfoInOrder: never 0xE0A0AC01
+        r = c.ClInOrder(title);
+        CHECK(r.res() == 0 || r.res() == R_NO_DATA);
+        CHECK(r.res() != R_INVALID_STATE);
+        CHECK_EQ(r.hdr(), r.res() == 0 ? kClReplyHeader[9] : 0x00090040u);
+        // GetTitleInfo: the book's record or "no data"
+        r = c.ClTitleInfo(never, title);
+        CHECK_EQ(r.hdr(), 0x00080040u);
+        CHECK_EQ(r.res(), R_NO_DATA);
+        // GetConnectingNodes / GetNodeInfo / the passphrase: FKCL's under their own numbers
+        r = c.ClNodes(4, nodes);
+        CHECK_EQ(r.id(), 0x0Fu);
+        CHECK_EQ(r.hdr(), kClReplyHeader[0x0F]);
+        r = c.ClNodeInfo(1);
+        CHECK_EQ(r.id(), 0x10u);
+        CHECK(r.hdr() == kClReplyHeader[0x10] || r.hdr() == 0x00100040u);
+        r = c.ClPass();
+        CHECK_EQ(r.hdr(), kClReplyHeader[0x11]);
+        CHECK_EQ(r.res(), 0u);
+        if (st == 6) {
+            CHECK_EQ(r.w[2] & 0xFF, static_cast<u32>('1'));  // (the passphrase of the session, as FKCL gives it)
+            CHECK(c.book.passphrase_ready());
+            CHECK_EQ(c.book.armed_prepared(), kClPrepared);  // the seam to G3: the prepared title of the row
+        }
+        if (st == 4) {
+            CHECK_EQ(c.book.armed_prepared(), kClPrepared);
+            CHECK(!c.book.passphrase_ready());
+        }
+        if (st == 7 || st == 0 || st == 1 || st == 2) {
+            CHECK_EQ(c.book.armed_prepared(), 0u);
+        }
+        // ids the service does not have
+        for (const u32 id : {0x00u, 0x15u, 0x16u, 0x40u}) {
+            r = c.Call(kCl, id << 16, {});
+            CHECK_EQ(r.hdr(), 0x00000040u);
+            CHECK_EQ(r.res(), R_BAD_HEADER);
+        }
+        // StopSession: always 0 under 0x12, the state 0x80 forced lifted
+        r = c.ClStopSession();
+        CHECK_EQ(r.hdr(), kClReplyHeader[0x12]);
+        CHECK_EQ(r.res(), 0u);
+        CHECK(c.Shown() >> 24 != 0x80u || st == 0);
+        // Finalize: 0 in every state, the book emptied, the seam disarmed
+        r = c.ClFinalize();
+        CHECK_EQ(r.hdr(), kClReplyHeader[2]);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(c.book.records(), 0u);
+        CHECK_EQ(c.book.armed_prepared(), 0u);
+        CHECK(c.mem.Intact());
+    }
+
+    // StartSession: a child that is not ready is refused with 0 and NO connection, 0x80 at the next GetMyStatus, then StopSession lifts it
+    for (const dlp_children::Verdict v : {dlp_children::Verdict::NoRow, dlp_children::Verdict::NoGame, dlp_children::Verdict::NotPrepared,
+                                          dlp_children::Verdict::NoChildPlugin, dlp_children::Verdict::Unknown}) {
+        ClWorld cw(1);
+        ClChildren kids(v);
+        if (v != dlp_children::Verdict::NoRow) {
+            cw.c.Give(kids);  // (NoRow: a table with no row for that child; the empty table of no index)
+        } else {
+            static ClChildren empty;
+            empty.table.index.count = 0;
+            cw.c.Give(empty);
+        }
+        if (v == dlp_children::Verdict::Unknown) {
+            cw.c.children.store(nullptr);  // (no table yet)
+        }
+        cw.Host(0);
+        cw.Scan();
+        const Sb title = cw.c.NewSb(0x13A8);
+        CHECK_EQ(cw.c.ClInOrder(title).res(), 0u);
+        cw.c.ClStopScan();
+        const int connects = cw.c.net.st().connect_begin_calls;
+        const Reply r = cw.c.ClStart(MacOf(cw.w[0]));
+        CHECK(r.out == DlpOutcome::Done);
+        CHECK_EQ(r.hdr(), 0x000D0040u);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(cw.c.net.st().connect_begin_calls, connects);  // nothing was sent: no connection at all
+        CHECK_EQ(cw.c.Shown() >> 24, 0x80u);
+        CHECK_EQ(cw.c.book.refusals(), 1u);
+        CHECK(cw.c.book.refused_verdict() == v || (v == dlp_children::Verdict::Unknown && cw.c.book.refused_verdict() == v));
+        CHECK_EQ(cw.c.book.armed_prepared(), 0u);
+        cw.Run(200);
+        CHECK_EQ(cw.c.Shown() >> 24, 0x80u);  // (it stays until the application stops the session or scans again)
+        CHECK_EQ(cw.c.ClStopSession().res(), 0u);
+        CHECK_EQ(cw.c.Shown() >> 24, 1u);
+        cw.c.ClStart(MacOf(cw.w[0]));
+        CHECK_EQ(cw.c.Shown() >> 24, 0x80u);
+        CHECK_EQ(cw.c.ClScan().res(), 0u);  // StartScan lifts it too
+        CHECK_EQ(cw.c.Shown() >> 24, 2u);
+    }
+    // ... another version (the host announces sizes that are not the block's) is refused too; the same sizes join
+    for (const bool same : {false, true}) {
+        ClWorld cw(1);
+        ClChildren kids;
+        cw.c.Give(kids);
+        cw.Host(0);
+        cw.Scan();
+        u8 frame0[0xC0] = {};
+        StoreBE32(frame0 + 0x38, same ? kClTransfer : kClTransfer + 0x100);
+        StoreBE32(frame0 + 0x3C, kClRequired);
+        cw.c.book.NoteTitle(MacOf(cw.w[0]), 0x0010C000, frame0, sizeof(frame0));
+        const Sb title = cw.c.NewSb(0x13A8);
+        CHECK_EQ(cw.c.ClInOrder(title).res(), 0u);
+        cw.c.ClStopScan();
+        bool pending = false;
+        const int connects = cw.c.net.st().connect_begin_calls;
+        const Reply r = cw.Join(MacOf(cw.w[0]), &pending);
+        const bool joins = same && clnt::kSystemAppJoins;  // (route B: the same sizes are Ready, refused all the same)
+        CHECK_EQ(pending, joins);
+        CHECK_EQ(r.hdr(), 0x000D0040u);  // (a join collected by PollPending answers under 0x0D, not FKCL's 0x0B)
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(cw.c.svc.last_id(), 0x0Du);
+        CHECK_EQ(cw.c.Shown() >> 24, joins ? 5u : 0x80u);
+        CHECK_EQ(cw.c.book.armed_prepared(), joins ? kClPrepared : 0u);
+        if (!joins) {
+            CHECK(cw.c.book.refused_verdict() == (same ? dlp_children::Verdict::Ready : dlp_children::Verdict::OtherVersion));
+            CHECK_EQ(cw.c.net.st().connect_begin_calls, connects);  // (refused: no connection at all)
+        }
+    }
+    // a block not read yet: Unknown (refused, the block asked of the plugin's thread); a missing block: not prepared
+    {
+        ClWorld cw(1);
+        ClChildren kids(dlp_children::Verdict::Ready, false);
+        cw.c.Give(kids);
+        cw.Host(0);
+        cw.Scan();
+        const Sb title = cw.c.NewSb(0x13A8);
+        CHECK_EQ(cw.c.ClInOrder(title).res(), 0u);
+        CHECK_EQ(cw.c.book.TakeWantedBlocks(), 1u);  // (row 0 asked for)
+        const Sb srv = cw.c.NewSb(0x298);
+        CHECK_EQ(cw.c.ClServerInfo(MacOf(cw.w[0]), srv).res(), 0u);
+        const u8* rec = cw.c.Data(srv);
+        CHECK(LoadLE16(rec + 0x1C) == 'H' && LoadLE16(rec + 0x1C + 2 * 4) == 0);  // (Unknown: the name as it is, "Host", no mark)
+        cw.c.ClStopScan();
+        CHECK_EQ(cw.c.ClStart(MacOf(cw.w[0])).res(), 0u);
+        CHECK_EQ(cw.c.Shown() >> 24, 0x80u);
+        dlp_children::NoBlock(&kids.table, 0);
+        CHECK_EQ(cw.c.ClServerInfo(MacOf(cw.w[0]), srv).res(), 0u);
+        CHECK(LoadLE16(rec + 0x1C + 2 * 5) == 'N' && LoadLE16(rec + 0x1C + 2 * 6) == 'O');  // "Host NO"
+    }
+    // GetServerInfo of a delivered host that the lobby forgot (it closed, the entry expired): the same record, but for the tick
+    {
+        ClWorld cw(1);
+        ClChildren kids;
+        cw.c.Give(kids);
+        cw.Host(0);
+        cw.Scan();
+        const Sb title = cw.c.NewSb(0x13A8), srv = cw.c.NewSb(0x298);
+        CHECK_EQ(cw.c.ClInOrder(title).res(), 0u);
+        CHECK_EQ(cw.c.ClServerInfo(MacOf(cw.w[0]), srv).res(), 0u);
+        u8 before[0x298];
+        std::memcpy(before, cw.c.Data(srv), sizeof(before));
+        CHECK_EQ(before[9], 1u);  // (the host alone of its 4)
+        CHECK_EQ(before[8], 4u);
+        CHECK(LoadLE16(before + 0x1C + 2 * 5) == 'O' && LoadLE16(before + 0x1C + 2 * 6) == 'K');  // "Host OK"
+        cw.w[0].SvFinalize();
+        cw.Run(10000);
+        GroupView v;
+        CHECK_EQ(cw.c.lobby.ClientServerInfo(MacOf(cw.w[0]), &v), R_NO_DATA);  // (the lobby forgot it)
+        const Reply r = cw.c.ClServerInfo(MacOf(cw.w[0]), srv);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_BYTES(cw.c.Data(srv), before, 0x290);  // byte for byte, but for the tick at +0x290
+        CHECK(LoadLE64(cw.c.Data(srv) + 0x290) > LoadLE64(before + 0x290));
+        // a bad buffer is the one error it gives
+        Sb small = cw.c.NewSb(0x100);
+        CHECK_EQ(cw.c.ClServerInfo(MacOf(cw.w[0]), small).res(), R_BAD_POINTER);
+    }
+    // the record of GetTitleInfoInOrder: the child's ids, the MAC, the block's names and icon and size, title_long "Hosted by Host - ..."
+    {
+        ClWorld cw(1);
+        ClChildren kids;
+        cw.c.Give(kids);
+        cw.Host(0);
+        cw.Scan();
+        const Sb title = cw.c.NewSb(0x13A8);
+        const Reply r = cw.c.ClInOrder(title);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(r.w[2], (0x13A8u << 14) | 2u);
+        const u8* rec = cw.c.Data(title);
+        CHECK_EQ(LoadLE32(rec + 0x00), 0x0010C0u);
+        CHECK_EQ(LoadLE32(rec + 0x04), 0u);
+        CHECK_BYTES(rec + 0x08, MacOf(cw.w[0]).data(), 6);
+        CHECK_EQ(LoadLE16(rec + 0x20), 'K');  // the block's name
+        CHECK_EQ(LoadLE32(rec + 0x13A0), kClTransfer);
+        const char* want = "Hosted by Host - join it from the 3DS Link app";  // (1.1.4, route B)
+        for (u32 i = 0; want[i] != '\0'; ++i) {
+            CHECK_EQ(LoadLE16(rec + 0xA0 + 2 * i), static_cast<u8>(want[i]));
+        }
+        // with no title heard and no block: the child's eight hex digits
+        ClWorld cw2(1);
+        ClChildren none(dlp_children::Verdict::NotPrepared, false);
+        cw2.c.Give(none);
+        cw2.Host(0);
+        cw2.Scan();
+        const Sb t2 = cw2.c.NewSb(0x13A8);
+        CHECK_EQ(cw2.c.ClInOrder(t2).res(), 0u);
+        const char* hex = "0010C000";
+        for (u32 i = 0; i < 8; ++i) {
+            CHECK_EQ(LoadLE16(cw2.c.Data(t2) + 0x20 + 2 * i), static_cast<u8>(hex[i]));
+        }
+    }
+    // the passphrase reply under 0x11, the nodes under 0x0F / 0x10 in a session
+    {
+        ClWorld cw(1);
+        ClChildren kids;
+        cw.c.Give(kids);
+        cw.Host(0);
+        cw.Scan();
+        const Sb title = cw.c.NewSb(0x13A8), nodes = cw.c.NewSb(16);
+        CHECK_EQ(cw.c.ClInOrder(title).res(), 0u);
+        cw.c.ClStopScan();
+        bool pending = false;
+        CHECK_EQ(cw.Join(MacOf(cw.w[0]), &pending).res(), 0u);
+        CHECK_EQ(pending, clnt::kSystemAppJoins);
+        Reply r = cw.c.ClNodes(4, nodes);
+        CHECK_EQ(r.hdr(), 0x000F0082u);
+        CHECK_EQ(r.w[2], clnt::kSystemAppJoins ? 2u : 0u);  // host + us (route B: no session, no node)
+        if (clnt::kSystemAppJoins) {
+            r = cw.c.ClNodeInfo(1);
+            CHECK_EQ(r.hdr(), 0x001002C0u);
+            CHECK_EQ(r.res(), 0u);
+        }
+    }
+}
+
+/// 1.1.4, route B (spec 8 D-B5): the Download Play application shows a host whose child is ready ("Host OK", title_long " - join it from the 3DS
+/// Link app") but StartSession refuses it like a child that is not ready: [0x000D0040, 0], 0x80 at the next GetMyStatus, no ConnectBegin, the
+/// refusal noted as Ready (the plugin's notice points to the 3DS Link app), the seam never armed - also after a new scan and a second try. With
+/// AZL_CLNT_SYSTEM_JOINS (dlp_ipc_test_joins) the same host is joined: G1's path, still built there.
+static void TestClntRouteB() {
+    std::printf("dlp:CLNT, route B: a ready host is listed and refused (kSystemAppJoins %d)\n", clnt::kSystemAppJoins ? 1 : 0);
+    ClWorld cw(1);
+    ClChildren kids;
+    cw.c.Give(kids);
+    cw.Host(0);
+    cw.Scan();
+    const Mac host = MacOf(cw.w[0]);
+    const Sb title = cw.c.NewSb(0x13A8), srv = cw.c.NewSb(0x298);
+    CHECK_EQ(cw.c.ClInOrder(title).res(), 0u);
+    CHECK_EQ(cw.c.ClServerInfo(host, srv).res(), 0u);
+    CHECK(LoadLE16(cw.c.Data(srv) + 0x1C + 2 * 5) == 'O' && LoadLE16(cw.c.Data(srv) + 0x1C + 2 * 6) == 'K');  // "Host OK": shown ready
+    cw.c.ClStopScan();
+    const int connects = cw.c.net.st().connect_begin_calls;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const Reply r = cw.c.ClStart(host);
+        if (clnt::kSystemAppJoins) {
+            CHECK(r.out == DlpOutcome::JoinPending);
+            bool done = false;
+            for (u32 t = 0; t < 4000 && !done; t += 20) {
+                cw.c.Pending(&done);
+                cw.Run(20);
+            }
+            CHECK(done);
+            CHECK_EQ(cw.c.Shown() >> 24, 5u);
+            CHECK_EQ(cw.c.book.armed_prepared(), kClPrepared);
+            CHECK(cw.c.net.st().connect_begin_calls > connects);
+            break;
+        }
+        CHECK(r.out == DlpOutcome::Done);
+        CHECK_EQ(r.hdr(), 0x000D0040u);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_EQ(cw.c.svc.last_id(), 0x0Du);
+        CHECK_EQ(cw.c.Shown() >> 24, 0x80u);
+        CHECK_EQ(cw.c.net.st().connect_begin_calls, connects);  // nothing was sent: no connection at all
+        CHECK_EQ(cw.c.book.refusals(), static_cast<u32>(attempt + 1));
+        CHECK(cw.c.book.refused_verdict() == dlp_children::Verdict::Ready);
+        CHECK_EQ(cw.c.book.armed_prepared(), 0u);  // the seam (K7) is never armed
+        CHECK(!cw.c.book.passphrase_ready());
+        CHECK(!cw.c.svc.join_pending());
+        cw.Run(400);
+        CHECK_EQ(cw.c.Shown() >> 24, 0x80u);
+        CHECK(cw.c.lobby.client_state() != 3 && cw.c.lobby.client_state() != 5);
+        CHECK_EQ(cw.c.ClStopSession().res(), 0u);
+        CHECK_EQ(cw.c.ClScan().res(), 0u);  // (the application scans again and tries once more: refused again)
+        cw.Run(80);
+        CHECK_EQ(cw.c.ClInOrder(title).res(), 0u);
+        cw.c.ClStopScan();
+    }
+    CHECK(cw.c.mem.Intact());
+}
+
+static void TestClntDelivery() {
+    std::printf("dlp:CLNT: GetTitleInfoInOrder delivers every host of any game once per scan, a late one too, and the book keeps them\n");
+    ClWorld cw(3, {0x0010C000u, 0x001D1A00u, 0x000F8200u});  // Triple Deluxe, Luigi's Mansion, Island Tour: any game is listed
+    ClChildren kids;
+    cw.c.Give(kids);
+    cw.Host(0);
+    cw.Host(1);
+    cw.Scan();
+    const Sb title = cw.c.NewSb(0x13A8);
+    for (int scan = 0; scan < 2; ++scan) {
+        std::vector<u32> seen;
+        for (int k = 0; k < 6; ++k) {
+            const Reply r = cw.c.ClInOrder(title);
+            CHECK(r.res() != R_INVALID_STATE);
+            if (r.res() != 0) {
+                CHECK_EQ(r.res(), R_NO_DATA);
+                CHECK_EQ(r.hdr(), 0x00090040u);
+                break;
+            }
+            seen.push_back(LoadLE32(cw.c.Data(title)));
+        }
+        CHECK_EQ(seen.size(), 2u);  // each host once in a scan
+        CHECK(seen.size() == 2 && seen[0] != seen[1]);
+        CHECK_EQ(cw.c.ClInOrder(title).res(), R_NO_DATA);  // ... and then "no data", again and again
+        CHECK_EQ(cw.c.ClInOrder(title).res(), R_NO_DATA);
+        // a host that comes up after the others were delivered is delivered too (no cursor has passed it)
+        if (scan == 0) {
+            cw.Host(2);
+            cw.Run(100);
+            const Reply r = cw.c.ClInOrder(title);
+            CHECK_EQ(r.res(), 0u);
+            CHECK_EQ(LoadLE32(cw.c.Data(title)), 0x000F82u);
+            CHECK_EQ(cw.c.ClInOrder(title).res(), R_NO_DATA);
+            CHECK_EQ(cw.c.book.records(), 3u);
+            cw.w[2].SvFinalize();  // (gone again: two in the second scan)
+            cw.Run(2000);
+        }
+        CHECK_EQ(cw.c.ClScan().res(), 0u);  // a new scan: every record may be delivered again (StartScan restarts a scan under way)
+        cw.Run(100);
+    }
+    CHECK_EQ(cw.c.book.records(), 3u);  // the book never forgets a host before Initialize / Finalize
+    // the restart word (never set by the application) is a new scan of the book too
+    CHECK_EQ(cw.c.ClInOrder(title, 1).res(), 0u);
+    // a host of another game is listed with the cross: no row for its child
+    const Sb srv = cw.c.NewSb(0x298);
+    CHECK_EQ(cw.c.ClServerInfo(MacOf(cw.w[1]), srv).res(), 0u);
+    CHECK(LoadLE16(cw.c.Data(srv) + 0x1C + 2 * 5) == 'N' && LoadLE16(cw.c.Data(srv) + 0x1C + 2 * 6) == 'O');  // "Cli1 NO"
+    CHECK_EQ(cw.c.ClServerInfo(MacOf(cw.w[0]), srv).res(), 0u);
+    CHECK(LoadLE16(cw.c.Data(srv) + 0x1C + 2 * 5) == 'O' && LoadLE16(cw.c.Data(srv) + 0x1C + 2 * 6) == 'K');  // "Host OK"
+    // sixteen records, and a seventeenth host in a slot of the scan table BEFORE a known one: the seventeenth waits, the known host after it is
+    // still delivered in this scan (it is not hidden), and then "no data"
+    {
+        ClWorld cw2(2, {0x0010C000u, 0x001D1A00u});
+        ClChildren kids2;
+        cw2.c.Give(kids2);
+        cw2.Host(0);
+        cw2.Host(1);
+        cw2.Scan();
+        const Mac stranger = MacOf(cw2.w[0]), known = MacOf(cw2.w[1]);
+        u32 slot_stranger = kMaxGroups, slot_known = kMaxGroups;
+        for (u32 s = 0; s < kMaxGroups; ++s) {
+            const Group* g = cw2.c.lobby.ClientScanEntry(s);
+            if (g != nullptr && g->host == stranger) {
+                slot_stranger = s;
+            }
+            if (g != nullptr && g->host == known) {
+                slot_known = s;
+            }
+        }
+        CHECK(slot_stranger < slot_known && slot_known < kMaxGroups);  // (the case: the stranger in the earlier slot)
+        CHECK(cw2.c.book.Deliver(*cw2.c.lobby.ClientScanEntry(slot_known)));  // (known from a scan before)
+        for (u8 i = 1; cw2.c.book.records() < DlpClntBook::kRecords; ++i) {
+            Group other{};
+            other.host = {0x02, 0x7A, 0x00, 0x00, 0x00, i};
+            CHECK(cw2.c.book.Deliver(other));
+        }
+        cw2.c.book.NewScan();  // (a new scan: StartScan's)
+        const Sb t2 = cw2.c.NewSb(0x13A8);
+        const Reply r = cw2.c.ClInOrder(t2);
+        CHECK_EQ(r.res(), 0u);
+        CHECK_BYTES(cw2.c.Data(t2) + 0x08, known.data(), 6);
+        CHECK_EQ(cw2.c.ClInOrder(t2).res(), R_NO_DATA);
+        CHECK(cw2.c.book.Find(stranger) == nullptr);  // (the seventeenth: refused, nothing evicted)
+        CHECK_EQ(cw2.c.book.records(), DlpClntBook::kRecords);
+    }
+}
+
+static void TestClntNoBook() {
+    std::printf("dlp:CLNT without a book (every game's network) or without a lobby: an id the service does not have\n");
+    {
+        World w(1);
+        Console& c = w[0];
+        for (const u32 header : {0x000100C3u, 0x00020000u, 0x00050180u, 0x00070080u, 0x000D0100u, 0x000E0000u, 0x00120000u}) {
+            const Reply r = c.Call(kCl, header, {1, 2, 3, 4, 5, 6});
+            CHECK_EQ(r.hdr(), 0x00000040u);
+            CHECK_EQ(r.res(), R_BAD_HEADER);
+        }
+        CHECK(c.lobby.client_state() == 0);  // (nothing of the lobby ran)
+        // ... the dialect's FKCL of the same console is unchanged
+        CHECK_EQ(c.FkInit().res(), 0u);
+        CHECK_EQ(CliState(c), 1u);
+    }
+    {
+        DlpService probe;  // ProbeOnly
+        u32 cmd[8] = {0x000100C3, 0, 16, 0, 0, 0, 0, 0};
+        IpcResolver r = {nullptr, nullptr};
+        CHECK(probe.Dispatch(kCl, cmd, nullptr, r) == DlpOutcome::Done);
+        CHECK_EQ(cmd[0], 0x00000040u);
+        CHECK_EQ(cmd[1], R_BAD_HEADER);
+        CHECK_EQ(probe.unknown_commands(), 1u);
+    }
+    // the deferred commands with no network thread (ClntUnserved / ClntApplyDeferred) and the leave (ClntLeave)
+    {
+        ClWorld cw(1);
+        ClChildren kids;
+        cw.c.Give(kids);
+        cw.Host(0);
+        ClConsole& c = cw.c;
+        for (const u32 id : {0x01u, 0x05u}) {
+            u32 cmd[4] = {(id << 16) | 0x40, 0, 16, 0};
+            CHECK(c.svc.ClntUnserved(cmd));
+            CHECK_EQ(cmd[0], (id << 16) | 0x40u);
+            CHECK_EQ(cmd[1], 0u);
+        }
+        CHECK_EQ(c.Shown() >> 24, 2u);  // (StartScan deferred: "scanning")
+        u32 start[4] = {0x000D0100, 0, 0, 0};
+        CHECK(!c.svc.ClntUnserved(start));
+        CHECK_EQ(start[0], 0x000D0040u);
+        // (route B: the refusal needs no network thread - 0, then 0x80, and the notice's count, as when the thread runs it; the final review of 1.1.4.
+        // G1's join path cannot wait for the network: "wireless off")
+        CHECK_EQ(start[1], clnt::kSystemAppJoins ? R_WIRELESS_OFF : 0u);
+        CHECK_EQ(c.book.refusals(), clnt::kSystemAppJoins ? 0u : 1u);
+        CHECK_EQ(c.Shown() >> 24, clnt::kSystemAppJoins ? 2u : 0x80u);
+        if (!clnt::kSystemAppJoins) {
+            u32 scan[4] = {(0x05u << 16) | 0x40, 0, 16, 0};  // (a new StartScan lifts the 0x80, as the application's own does)
+            CHECK(c.svc.ClntUnserved(scan));
+            CHECK_EQ(c.Shown() >> 24, 2u);
+        }
+        CHECK(c.lobby.client_state() == 0);  // (nothing ran yet)
+        c.svc.ClntApplyDeferred();
+        CHECK(c.lobby.client_state() == 2);  // the first round of the network thread: Initialize, then StartScan
+        CHECK_EQ(c.Shown() >> 24, 2u);
+        cw.Run(80);
+        const Sb title = c.NewSb(0x13A8);
+        CHECK_EQ(c.ClInOrder(title).res(), 0u);
+        c.ClStopScan();
+        if (!clnt::kSystemAppJoins) {
+            c.svc.ClntLeave();  // (route B: no session to leave - HOME does nothing to the lobby, the seam was never armed)
+            CHECK(c.lobby.client_state() == 1);
+            CHECK_EQ(c.book.armed_prepared(), 0u);
+        }
+        bool pending = false;
+        if (clnt::kSystemAppJoins) {  // (G1's join path: dlp_ipc_test_joins)
+        CHECK_EQ(cw.Join(MacOf(cw.w[0]), &pending).res(), 0u);
+        CHECK_EQ(c.Shown() >> 24, 5u);
+        c.svc.ClntLeave();  // HOME in 5
+        CHECK_EQ(c.Shown() >> 24, 0x80u);
+        CHECK(c.lobby.client_state() == 1);
+        CHECK_EQ(c.book.armed_prepared(), 0u);
+        c.svc.ClntLeave();  // ... and again: nothing more
+        CHECK_EQ(c.Shown() >> 24, 0x80u);
+        // HOME during the join (a StartSession still waiting in WaitForClntJoin): the next PollPending answers 0 under 0x0D, never 0xE0A0AC01, and
+        // GetMyStatus shows 0x80 - the refusal's path, not an error screen
+        {
+            CHECK_EQ(c.ClStopSession().res(), 0u);
+            CHECK_EQ(c.ClScan().res(), 0u);
+            cw.Run(80);
+            CHECK_EQ(c.ClInOrder(title).res(), 0u);
+            c.ClStopScan();
+            c.net.ConnectDelay(100000);  // (the join goes on until it is left)
+            const Reply j = c.ClStart(MacOf(cw.w[0]));
+            CHECK(j.out == DlpOutcome::JoinPending);
+            CHECK(c.lobby.client_state() == 3);
+            CHECK_EQ(c.book.armed_prepared(), kClPrepared);
+            bool done = true;
+            c.Pending(&done);
+            CHECK(!done);  // (still joining)
+            c.svc.ClntLeave();  // HOME in 3, the join pending
+            CHECK(!c.svc.join_pending());
+            const Reply r = c.Pending(&done);
+            CHECK(done);
+            CHECK_EQ(r.hdr(), 0x000D0040u);
+            CHECK_EQ(r.res(), 0u);
+            CHECK_EQ(c.svc.last_id(), 0x0Du);
+            CHECK_EQ(c.Shown() >> 24, 0x80u);
+            CHECK(c.lobby.client_state() == 1);
+            CHECK_EQ(c.book.armed_prepared(), 0u);
+            const Reply again = c.Pending(&done);  // (collected: a PollPending with no join is FKCL's answer again)
+            CHECK(done);
+            CHECK_EQ(again.hdr(), 0x000B0040u);
+            CHECK_EQ(again.res(), R_INVALID_STATE);
+            c.net.ConnectDelay(0);
+        }
+        }  // (clnt::kSystemAppJoins)
+        (void)pending;
+        // a game's service: ClntUnserved answers "wireless off", ClntLeave and ClntApplyDeferred do nothing
+        World w(1);
+        u32 fin[4] = {0x00020000, 0, 0, 0};
+        CHECK(!w[0].svc.ClntUnserved(fin));
+        CHECK_EQ(fin[1], R_WIRELESS_OFF);
+        w[0].svc.ClntApplyDeferred();
+        w[0].svc.ClntLeave();
+        CHECK(w[0].lobby.client_state() == 0);
+    }
+}
+
+static void TestClntFuzz() {
+    std::printf("dlp:CLNT: 20000 random requests of the application's service (headers coherent, 0x09 never 'invalid state', 0x07 never an error with a good buffer)\n");
+    ClWorld cw(2, {0x0010C000u, 0x001D1A00u});
+    ClChildren kids;
+    cw.c.Give(kids);
+    cw.Host(0);
+    cw.Host(1);
+    ClConsole& c = cw.c;
+    const Sb srv = c.NewSb(0x298), title = c.NewSb(0x13A8), small = c.NewSb(8);
+    u64 seed = 0x5EEDC1E7ull;
+    auto rnd = [&seed]() {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<u32>(seed >> 33);
+    };
+    const Mac hosts[3] = {MacOf(cw.w[0]), MacOf(cw.w[1]), {0x02, 1, 2, 3, 4, 5}};
+    u32 joins = 0, served = 0;
+    for (int n = 0; n < 20000; ++n) {
+        if (n % 401 == 0) {
+            cw.Scan();  // (now and then the application's own order: a scan and its deliveries, so that StartSession finds a ready host)
+            c.ClInOrder(title);
+            c.ClInOrder(title);
+        }
+        const u32 id = rnd() % 0x17;
+        const Mac& m = hosts[rnd() % 3];
+        const u32 pick = rnd() % 4;
+        const Sb& sb = pick == 0 ? small : (id == 7 ? srv : title);
+        const u32 args[6] = {MacW1(m), MacW2(m), rnd(), rnd(), rnd(), rnd()};
+        const u32 normal = rnd() % 7;
+        const Reply r = c.CallN(kCl, (id << 16) | (normal << 6), args, 6, pick == 3 ? nullptr : sb.w, nullptr);
+        ++served;
+        if (r.out == DlpOutcome::JoinPending) {
+            CHECK_EQ(id, 0x0Du);
+            ++joins;
+            bool done = false;
+            for (int k = 0; k < 300 && !done; ++k) {
+                const Reply p = c.Pending(&done);
+                if (done) {
+                    CHECK_EQ(p.hdr(), 0x000D0040u);
+                }
+                cw.Run(20);
+            }
+            CHECK(done);
+            continue;
+        }
+        const bool known = id >= 1 && id <= 0x14;
+        CHECK_EQ(r.id(), known ? id : 0u);
+        if (!known) {
+            CHECK_EQ(r.res(), R_BAD_HEADER);
+        }
+        if (id == 0x09) {
+            CHECK(r.res() != R_INVALID_STATE);
+        }
+        if (id == 0x07) {
+            CHECK(r.res() == 0 || r.res() == R_BAD_POINTER);
+            CHECK(r.res() == 0 || pick == 0 || pick == 3);
+        }
+        if (r.res() == 0 && known) {
+            CHECK_EQ(r.hdr(), kClReplyHeader[id]);
+        }
+        if ((rnd() & 7) == 0) {
+            cw.Run(20 + rnd() % 200);
+        }
+    }
+    std::printf("  %u requests, %u joins begun\n", served, joins);
+    CHECK(clnt::kSystemAppJoins ? joins > 0 : joins == 0);  // (route B: not one join begun in 20000 requests)
+    CHECK(c.mem.Intact());
+}
+
 int main() {
+#if !AZL_CLNT_SYSTEM_JOINS
     std::printf("sizes and helpers\n");
     TestSizesAndHelpers();
     std::printf("ProbeOnly = DlpFkclHle\n");
     TestProbeOnlyIsDlpFkclHle();
     TestProbeOnlyServer();
+    TestChildNeverInLobby();
     TestMatrixProbeOnly();
     std::printf("unknown ids, handles, books\n");
     TestUnknownIdsInLobbyMode();
@@ -3335,6 +4197,13 @@ int main() {
     TestWidthsGaps();
     std::printf("fuzz\n");
     TestFuzz();
+#endif  // (dlp_ipc_test_joins: only the dlp:CLNT tests, with G1's join path)
+    std::printf("dlp:CLNT (1.1.4, G1)\n");
+    TestClntMatrix();
+    TestClntDelivery();
+    TestClntNoBook();
+    TestClntFuzz();
+    TestClntRouteB();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

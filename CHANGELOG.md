@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.1.4 - 2026-11-22
+
+**A Download Play page in the app (join a host, prepare the game's child from your own copy), Mario Kart 7 with the real Download Play and up to eight players, Mario Party: Island Tour hosted by a console, a debug log that no longer stalls the game, and Ridge Racer 3D and Pac-Man & Galaga Dimensions starting on a New 3DS. Tried with consoles of the New 3DS family and with Azahar on a PC; not tried on an Old 3DS.**
+
+### At a glance
+
+| Area | Now | Tried | Since |
+|---|---|---|---|
+| **Download Play page** (app) | *Join* lists the hosts of the room that have a child ready and jumps into the game; *Games* prepares, per game and on demand, a hidden child from **your own copy** (needs `boot9.bin`; for a few games it also reads the key from your console's `boot.firm`, in RAM, read-only). Nothing is sent through the room | consoles with Azahar hosting, and console to console. Not on an Old 3DS | 1.1.4 |
+| ***Mario Kart 7*** | the real Download Play, the same as Azahar's, so consoles and Azahar see each other; up to **eight** players (four for every other Download Play game) | one console and Azahar, host and guest, **10/10**; eight players of this game not tried | 1.1.4 |
+| ***Tetris*** with eight | a room of 16 seats, eight real nodes | 5 consoles and 3 Azahar, no defect seen | 1.1.4 |
+| ***Mario Party: Island Tour*** | a console can host it with the real Download Play; the name and icon show in the announcement | **partly**: lobbies form and children start, but no full match with four players was completed (see below) | 1.1.4 |
+| **The debug log** | writes one slice at a time and steps aside while the game uses the card (before, *New Super Mario Bros. 2*, *Fantasy Life*, *Tekken* and *Kirby Battle Royale* stalled or fell with it on) | *Tekken* sessions with the log on ran clean; not every game of that list was tried again | 1.1.4 |
+| ***Ridge Racer 3D*, *Pac-Man & Galaga Dimensions*** | start on a New 3DS (the plugin's service thread goes to the first core for these titles) | both start, a race of *Ridge Racer 3D* played. *Ocarina of Time 3D* has the same entry, not tried | 1.1.4 |
+| **Enable Titles** | lists only games sold as games, not homebrew | checked on a PC; used on consoles in the tests | 1.1.4 |
+| **The settings file** | `AzaharLink.ini` is written whole or not at all, from the app and from the in-game menu, so a power cut cannot leave it empty | consoles | 1.1.4 |
+| **The chat** | after the keyboard closes, a key still held does not reach the game until it is released | - | 1.1.4 |
+
+### Good to know
+
+* A child is installed on the SD card, hidden from HOME, and is removed from the page when you switch the game off. To install it, the system's AM service writes the title's ticket in the NAND's ticket database, as FBI does for any title; 3DS Link writes nothing else in the NAND, and removes the ticket again when the child goes.
+* **After a Download Play child, open 3DS Link before starting anything else** (or restart the console). The closed child stays in memory, about 64 MB, until 3DS Link starts and frees it; another game or `ftpd` started first can fail to map its memory.
+
+### Not fixed or not tried
+
+| What | Notes |
+|---|---|
+| Everything on an Old 3DS or Old 2DS | **not tried** |
+| *Mario Party: Island Tour* | a console hosting does **not** let Azahar players in: they ask for the child's content, which never travels through the room, and are turned away (the game starts with the others and closes the match after a few seconds). With Azahar hosting and two consoles joining, matches ran from one to five minutes and ended when the stream from the room stalled for several seconds; which side stalls is not known yet |
+| A console hosting *Luigi's Mansion* or *Ridge Racer 3D* with Azahar joining | not working well yet |
+| Starting other software right after a child | see *Good to know* |
+
 ## 1.1.3 - 2026-11-10
 
 **Luigi's Mansion (2018) now speaks the real Download Play, so consoles and Azahar play it together, and Fantasy Life reaches the room: the plugin now uses the game's own network connection. Tried with two consoles of the New 3DS family and with Azahar on a PC; not tried on an Old 3DS.**

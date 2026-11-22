@@ -135,6 +135,10 @@ struct App {
     InputPoller input;
     bool quit = false;
     bool relaunch = false; // an update was installed: when the app ends, the system starts this title again
+    // 1.1.4, route B: the Download Play page handed a game over (ns:s holds its 16 bytes): when the app ends it chain-loads this prepared child (main.cpp),
+    // and child_jump_left_ms is when the page left the room (the log's "from the room exit to the jump"). 0: no jump.
+    u64 child_jump = 0;
+    u64 child_jump_left_ms = 0;
     bool save_ok = true;
     bool home_blocked = false; // the HOME button does nothing now (a transfer, the search for rooms): the bottom bar says so
     // HOME is switched off by whoever needs it (the list of rooms, a transfer, the copies of the plugin, the choice of what to send) and given
@@ -370,6 +374,9 @@ void DrawCard(float x, float y, float w, float h);
 void DrawDotText(float x, float yc, u32 dot, u32 text_color, const std::string& text, float scale, float max_w);
 // A bar that is `fraction` (0..1) full.
 void DrawProgressBar(float x, float y, float w, float h, float fraction);
+// The bar of the SD card: what is there (`used`, green) and what is added to it (`added`, red), fractions of the card; the rest is free. Titles Delivery
+// (what is received) and Download Play > Enable games (a guest switched on) draw it the same way.
+void DrawSpaceBar(float x, float y, float w, float h, double used, double added);
 // Three bars of rising height, the first `level` (0..3) lit: the WiFi signal. 14 pixels wide.
 void DrawSignalBars(float x, float yc, int level);
 // A touch button with a key chip, e.g. [B] Back. `compact` is the smaller type of the START button of the footer.
@@ -407,6 +414,9 @@ FooterRects LayoutFooter(const Footer& footer);
 void DrawFooter(const Footer& footer);
 // The strip behind the buttons of a footer.
 void DrawFooterBackground();
+// (the build 2h, U6) where that strip begins (its line, ui.cpp DrawFooterBackground): a card of a page with a footer is centred above it, in the
+// space between the title bar and the strip - the same black above and below.
+constexpr float kFooterTop = 213.0f;
 // Four dots, one of them lit, that move on while the app works: in the middle of the touch screen, `yc` high.
 void DrawSpinner(float yc);
 // The touch screen of a page that only waits: a title bar, the moving dots and the footer.

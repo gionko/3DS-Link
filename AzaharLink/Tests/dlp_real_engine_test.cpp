@@ -22,6 +22,7 @@
 //   R11b the churn and extra scenarios in the real Download Play's network: join / leave / join / leave within 3 s, the silent loss
 //        and the rejoin, the creator's goodbye, a Logoff and a node map of another network, a stale node map, and two churn fuzzes
 //        (two nodes, as Luigi's Mansion: rosters and messages; four nodes: no ghost, no node 0)
+//   H5   (1.1.4) the presence the host's wait for the children asks: NodeMac, InRoom (at once, before the debounce) and InDownloadPlay
 //   R13  (the client's half) a searcher of the dialect does not see a real Download Play's host and cannot join it, a searcher of
 //        the real Download Play does not see a lobby of the dialect
 //
@@ -489,6 +490,74 @@ static void D12_Spectators() {
     CHECK_EQ(h.e().SpectatorCount(), 0u);
     s2.Leave();
     h.Leave();
+    CHECK_RULES();
+}
+
+/// H5 (1.1.4): what the adapter's wait asks of the engine - NodeMac (the host's own for node 1, a client's, none for a node that is not there or
+/// after the end of the network), InRoom (false before any list, true when listed, false AT ONCE when out of the list - before the 3 s of the
+/// debounce - and true again when back, false after ResetRoomPresence, the same with no network at all) and InDownloadPlay (the list the plugin
+/// gives, replaced whole, voided with the room link).
+static void H5_Presence() {
+    std::printf("H5: NodeMac, InRoom and InDownloadPlay\n");
+    g_rules.Reset();
+    MockRoom room;
+    DNode h(room, 1, "Host"), c(room, 2, "Cli");
+    Ticker ticker(Es({&h, &c}));
+    Mac m = {};
+    CHECK(!h.e().NodeMac(2, &m));  // (no network)
+    CHECK(h.Host(4, 6));
+    CHECK(h.e().NodeMac(1, &m));
+    CHECK(m == h.mac());
+    CHECK(!h.e().NodeMac(2, &m));
+    CHECK(c.Join(h.mac(), 6));
+    CHECK(WaitFor(3000, [&] { return c.Poll() == 1; }));
+    CHECK(WaitFor(1000, [&] { return h.Mask() == 3u; }));
+    m = Mac{};
+    CHECK(h.e().NodeMac(2, &m));
+    CHECK(m == c.mac());
+    CHECK(!h.e().NodeMac(3, &m));
+    CHECK(!h.e().NodeMac(0, &m));
+    // the room's lists
+    CHECK(!h.e().InRoom(c.mac()));  // before any list
+    h.e().OnRoomMembers({h.mac(), c.mac()});
+    CHECK(h.e().InRoom(c.mac()));
+    CHECK(h.e().InRoom(h.mac()));
+    h.e().OnRoomMembers({h.mac()});
+    CHECK(!h.e().InRoom(c.mac()));  // out of the list: false at once (the node is still in the network: the debounce)
+    CHECK_EQ(h.Mask(), 3u);
+    h.e().OnRoomMembers({h.mac(), c.mac()});
+    CHECK(h.e().InRoom(c.mac()));  // back
+    CHECK_EQ(h.Mask(), 3u);
+    // the Download Play application's members
+    CHECK(!h.e().InDownloadPlay(c.mac()));
+    h.e().SetDownloadPlayMembers({c.mac()});
+    CHECK(h.e().InDownloadPlay(c.mac()));
+    CHECK(!h.e().InDownloadPlay(h.mac()));
+    h.e().SetDownloadPlayMembers({h.mac()});
+    CHECK(!h.e().InDownloadPlay(c.mac()));  // (replaced whole)
+    h.e().SetDownloadPlayMembers({c.mac()});
+    // the end of the network: no client's MAC, the room's presence stays (the wait counts after the Download Play's network is gone)
+    c.Leave();
+    h.Leave();
+    CHECK(!h.e().initialized());
+    CHECK(!h.e().NodeMac(2, &m));  // (no client node; node 1 is the last network's host address, never asked by the wait)
+    CHECK(h.e().InRoom(c.mac()));
+    CHECK(h.e().InDownloadPlay(c.mac()));
+    h.e().OnRoomMembers({h.mac()});
+    CHECK(!h.e().InRoom(c.mac()));
+    h.e().OnRoomMembers({h.mac(), c.mac()});
+    CHECK(h.e().InRoom(c.mac()));
+    // a room member out for longer than the debounce, the engine ticked meanwhile: still false, then true when it comes back
+    h.e().OnRoomMembers({h.mac()});
+    Sleep(3300);
+    CHECK(!h.e().InRoom(c.mac()));
+    h.e().OnRoomMembers({h.mac(), c.mac()});
+    CHECK(h.e().InRoom(c.mac()));
+    // the room link ends: nothing is known
+    h.e().ResetRoomPresence();
+    CHECK(!h.e().InRoom(c.mac()));
+    CHECK(!h.e().InRoom(h.mac()));
+    CHECK(!h.e().InDownloadPlay(c.mac()));
     CHECK_RULES();
 }
 
@@ -1202,6 +1271,7 @@ int main() {
     E1_Kinds();
     D11_Calls();
     D12_Spectators();
+    H5_Presence();
     CH_Channels();
     R7_Goodbyes(100);
     R7_Goodbyes(2000);

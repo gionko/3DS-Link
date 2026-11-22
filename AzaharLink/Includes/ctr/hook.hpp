@@ -48,6 +48,16 @@ HookStats InstallSvcHooks(UdsHle* hle, bool reserve_exit_tramp);
 /// LateInit, the plugin's main thread: the books of the gate's page back in line once the game has its heap (ctr/gate_page.hpp).
 void SettleGatePage();
 
+/// The game's calls to the file system, begun and ended, counted by the hook with the log on only (atomic adds on the game's thread,
+/// nothing else): the log's writer reads them to keep the capture off the SD card while the game is at its files (LogFiles::SetGameReads).
+/// Every command of fs:USER and of its file and directory sessions since 2026-11-11 (azl/game_card_calls.hpp); the names are those of
+/// 2026-11-10, when the two counted FSFILE_Read alone.
+extern u32 g_game_reads_begun;
+extern u32 g_game_reads_done;
+/// The posts the gate did not call because the plugin's block was away when the game's call came back (Sources/ctr/gate.s; 0 before the
+/// gate is written). The end of a file call that was among them is never counted: the writer's watch of the calls asks (the writer thread).
+u32 GatePostsSkipped();
+
 /// Told when the game's APT session gets the system's "the console goes to sleep now" (`enter`) and "it woke up"
 /// notifications. Called on the game's own thread, right after the call returned: it must be short and must never
 /// wait on a kernel object or issue an IPC call (the game's command buffer is in use); engine entry points are fine.
